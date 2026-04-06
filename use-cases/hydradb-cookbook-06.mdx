@@ -1,0 +1,1649 @@
+---
+title: "Build an AI Chief of Staff"
+description: "Build an AI Chief of Staff that takes real actions across your workspace using HydraDB function routing. every callable function in your workspace as a knowledge object in HydraDB. Any agent or user can say "prepare for tomorrow's boar"
+category: Automation
+difficulty: Advanced
+readTime: "60 min"
+tags:
+  - automation
+  - multi-agent
+  - cookbook
+---
+
+# Build an AI Chief of Staff
+
+
+An AI that doesn't just answer questions — it *takes action*. Register every callable function in your workspace as a knowledge object in HydraDB. Any agent or user can say "prepare for tomorrow's board meeting" and receive a structured, personalized execution plan: which functions to call, in which order, with which parameters. Every API call is real and copy-paste ready.
+
+
+---
+
+
+Most AI assistants are read-only. They answer questions, summarize documents, and draft emails. What they can't do is *act* — book the meeting, update the CRM, send the Slack message, trigger the deployment. To cross that threshold, the agent needs to know not just what functions exist in your workspace, but which one to call for any given task, in what order, with what parameters, and for which user.
+
+
+This cookbook builds an **AI Chief of Staff** — an autonomous reasoning layer that turns natural language into structured function calls across every app in your stack. Think of it as n8n, but driven by intent rather than rigid if-then workflows. You register your callable functions into HydraDB as knowledge objects. Any agent then asks HydraDB: *"What should I do for this task?"* HydraDB returns the right function, the right parameters, and the right sequence — all personalized to the requesting user's preferences and the current context.
+
+
+The architectural insight is separation of concerns: your primary LLM handles conversation and intent extraction, while HydraDB becomes the **function selection oracle** — a reasoning layer that has learned which functions work for which tasks, which sequences tend to succeed together, and how individual users prefer to work. Over time, it builds institutional knowledge that your agents can tap into.
+
+
+ℹ️
+> **All code in this cookbook is real.** Base URL: `https://api.hydradb.com`. Get your API key by contacting [[email protected]](/cdn-cgi/l/email-protection#f59d9099999ab59d8c9187949197db969a98) or booking a demo at [hydradb.com](https://hydradb.com).
+
+
+**❌ // Traditional automation (n8n, Zapier, Make)**
+
+- Rigid if-then workflows — break when conditions change
+- Every automation hardcoded — no personalization
+- No memory of past executions or user preferences
+- Requires manual mapping of triggers to actions
+- Context window resets on every run
+
+**✅ // HydraDB AI Chief of Staff**
+
+- Intent-driven routing — adapts to how requests are phrased
+- Per-user personalization via AI Memories
+- Learns function composition patterns from execution history
+- One natural language request returns a full execution plan
+- Compound intelligence — every run makes future runs smarter
+
+
+## How HydraDB Enables This
+
+
+Four HydraDB capabilities make a Chief of Staff possible:
+
+
+- **Functions as knowledge objects** — each callable function is uploaded to HydraDB via `POST /ingestion/upload_knowledge` with `type: "function"`. The function's natural-language description becomes the retrieval surface. HydraDB matches tasks to functions semantically — not by keyword — so "tell the team about the delay" correctly surfaces `send_slack_announcement` even though neither word appears in the function name.
+- **Personalized function selection** — when a user frequently chooses Slack over email for urgent updates, HydraDB's AI Memories encode that preference. Future function suggestions for that user automatically favour `send_slack_message` over `send_email`. This happens without any manual configuration — the pattern emerges from usage stored via `POST /memories/add_memory`.
+- **Multi-step plan generation** — `mode: "thinking"` on `POST /recall/full_recall` enables multi-query reasoning. Ask HydraDB to return a JSON array of functions with dependencies and it decomposes a complex request like "onboard the new hire" into a sequenced execution plan automatically.
+- **Self-improving function routing** — feeding execution results back to HydraDB via `POST /memories/add_memory` closes the learning loop. Slow functions, failed calls, and successful sequences all become training signal. The agent gets measurably smarter with every run, without any manual tuning.
+
+
+## Architecture
+
+
+One HydraDB tenant. Functions registered as knowledge objects. An Action Orchestrator that translates HydraDB suggestions into real API calls. Per-user memories that personalize every suggestion.
+
+
+> **Architecture Diagram** — see original HTML for SVG rendering.
+
+
+The flow: a user or agent sends a natural-language task to the Action Orchestrator. The Orchestrator queries HydraDB, which matches the task semantically against registered function knowledge objects and returns a ranked suggestion. The Orchestrator executes the function via the real API, logs the result back to HydraDB as a memory, and the loop closes. Each execution makes the next suggestion smarter.
+
+
+ℹ️
+> **The Orchestrator is thin by design.** It has no opinion about which function to call — that decision belongs to HydraDB. The Orchestrator's only job is: receive suggestion, authorize it against the policy engine, inject the correct OAuth token from the auth vault, call the real API, and report the outcome. All routing intelligence lives in HydraDB.
+
+
+ STEP 1 
+
+
+## Create Tenant
+
+
+One tenant for the whole Chief of Staff system. All functions, all user memories, and all execution history live under this tenant. Sub-tenants scope function access per team or department — the sales team's agent only sees sales functions, the engineering team's agent only sees deployment and monitoring functions.
+
+
+```python title="setup.py"
+import requests, os
+
+API_KEY   = os.environ["HYDRADB_API_KEY"]
+TENANT_ID = "chief-of-staff"
+BASE_URL  = "https://api.hydradb.com"
+HEADERS   = {
+    "Authorization": f"Bearer {API_KEY}",
+    "Content-Type": "application/json",
+}
+
+def create_tenant():
+    """Create the main tenant. Idempotent — safe to call multiple times."""
+    resp = requests.post(
+        f"{BASE_URL}/tenants/create",
+        headers=HEADERS,
+        json={"tenant_id": TENANT_ID},
+    )
+    resp.raise_for_status()
+    print(f"Tenant '{TENANT_ID}' ready.")
+
+# Sub-tenants scope functions per team. Created automatically on first write.
+# Sales agents only see sales functions. Engineering agents only see deploy functions.
+# Examples:
+#   sub_tenant_id = "sales"        → CRM, calendar, email, proposals
+#   sub_tenant_id = "engineering"  → deploys, incidents, GitHub, monitoring
+#   sub_tenant_id = "executive"    → board decks, reporting, scheduling
+#   sub_tenant_id = "hr"           → hiring, onboarding, HRIS actions
+
+if __name__ == "__main__":
+    create_tenant()
+```
+
+
+ STEP 2 
+
+
+## Define & Register Functions
+
+
+Every action your Chief of Staff can take must be registered in HydraDB as a knowledge object. HydraDB treats each function as a document: its natural-language description is the retrieval surface, its schema is the execution contract, and its metadata controls who can access it and under what conditions.
+
+
+The quality of your function descriptions directly determines routing accuracy. Write descriptions that explain *what the function achieves* and *when it should be used*, not just what it does technically. HydraDB reasons over these descriptions during function selection.
+
+
+### Function schema
+
+
+Each function schema has four components: `id` (stable identifier for versioning and logging), `description` (the natural-language surface HydraDB matches tasks against — write this carefully), `parameters` (JSON Schema for the execution contract), and `meta` (access control, constraints, and routing hints).
+
+
+```json title="schemas/send_slack_message.json"
+{
+  "id": "send_slack_message",
+  "name": "Send a Slack message",
+  "description": "Posts a message to a Slack channel or DM on behalf of the user. Use this when the user wants to notify a team, send an update, share information with a colleague, or make an announcement. Prefer this over send_email for internal, time-sensitive, or informal communications.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "channel":   { "type": "string",  "description": "#channel-name or @username or user ID" },
+      "text":      { "type": "string",  "description": "Message body — supports Slack mrkdwn" },
+      "thread_ts": { "type": "string",  "description": "Optional. Reply in thread by passing parent message ts." }
+    },
+    "required": ["channel", "text"]
+  },
+  "auth": {
+    "oauth_provider": "slack",
+    "scopes": ["chat:write"]
+  },
+  "meta": {
+    "collections":       ["communication", "slack"],
+    "side_effects":      "Sends a visible message. Cannot be unsent programmatically.",
+    "idempotent":        false,
+    "permissions":       ["all_users"],
+    "business_hours_only": false
+  }
+}
+```
+
+
+💡
+> **The description field is your routing budget.** HydraDB matches tasks to functions by reading the description semantically. Include: (1) what the function *achieves*, not just what it does, (2) when it should be preferred over similar functions, and (3) any important constraints or side effects. A description like *"Posts a Slack message"* routes poorly. A description that explains "Use this for internal, time-sensitive, or informal communications — prefer over send_email" routes correctly even when the user says "ping the team".
+
+
+Here is a more complex schema — a finance function with approval constraints and metadata filters that prevent it from being suggested outside authorized contexts:
+
+
+```json title="schemas/approve_expense.json"
+{
+  "id": "approve_expense",
+  "name": "Approve an expense report",
+  "description": "Approves a pending expense report in the finance system. Use when a manager or finance lead needs to sign off on submitted expenses. Always confirm the amount and submitter before calling. Do not suggest this function outside business hours or for users without manager-level permissions.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "expense_id":  { "type": "string", "description": "Expense report ID from finance system" },
+      "approver_id": { "type": "string", "description": "User ID of the approving manager" },
+      "note":        { "type": "string", "description": "Optional approval note for audit log" }
+    },
+    "required": ["expense_id", "approver_id"]
+  },
+  "meta": {
+    "department":         "finance",
+    "permission_level":   "manager",
+    "cost_threshold":     5000,         // escalate to CFO above this
+    "business_hours_only": true,
+    "collections":        ["finance", "approvals"],
+    "side_effects":       "Triggers payment processing. Irreversible without finance team intervention.",
+    "idempotent":         false
+  }
+}
+```
+
+
+### Upload to HydraDB
+
+
+Upload functions using the same `POST /ingestion/upload_knowledge` endpoint used for documents. Set `type: "function"` and include the full JSON schema as the content body. Group functions into collections so HydraDB can scope retrieval per team without returning irrelevant options.
+
+
+```python title="register/upload_functions.py"
+import json, time
+
+# All functions in the workspace. Each schema loaded from its own file.
+FUNCTION_SCHEMAS = [
+    "schemas/send_slack_message.json",
+    "schemas/send_email.json",
+    "schemas/create_calendar_event.json",
+    "schemas/update_crm_opportunity.json",
+    "schemas/create_jira_ticket.json",
+    "schemas/approve_expense.json",
+    "schemas/trigger_deployment.json",
+    "schemas/notify_pagerduty.json",
+    "schemas/generate_report.json",
+    "schemas/add_to_notion.json",
+]
+
+def load_schema(path: str) -> dict:
+    with open(path) as f:
+        return json.load(f)
+
+def upload_functions(schema_paths: list, sub_tenant_id: str = "functions") -> list:
+    """
+    Upload function schemas to HydraDB as knowledge objects.
+    sub_tenant_id: scopes which agents can see these functions.
+    Use per-team sub-tenants to limit scope and improve routing precision.
+
+    Tip: re-running this is idempotent — HydraDB upserts on 'id'.
+    """
+    batch   = []
+    all_ids = []
+
+    for path in schema_paths:
+        schema = load_schema(path)
+        fn_id  = schema["id"]
+
+        batch.append({
+            "id":        fn_id,
+            "title":     schema["name"],
+            "type":      "function",     # tells HydraDB this is callable
+            "timestamp": "2025-01-01T00:00:00Z",
+            "content":   {"text": json.dumps(schema, indent=2)},
+            "metadata": {
+                "type":         "function",
+                "collections":  schema.get("meta", {}).get("collections", []),
+                "department":   schema.get("meta", {}).get("department", "all"),
+                "permissions":  schema.get("meta", {}).get("permissions", ["all_users"]),
+                "idempotent":   schema.get("meta", {}).get("idempotent", True),
+                "side_effects": schema.get("meta", {}).get("side_effects", ""),
+            },
+        })
+
+        if len(batch) == 20:
+            all_ids += _upload_batch(batch, sub_tenant_id)
+            batch = []; time.sleep(1)
+
+    if batch:
+        all_ids += _upload_batch(batch, sub_tenant_id)
+
+    print(f"Functions: {len(all_ids)} schemas indexed.")
+    return all_ids
+
+
+def _upload_batch(batch: list, sub_tenant_id: str) -> list:
+    resp = requests.post(
+        f"{BASE_URL}/ingestion/upload_knowledge",
+        headers={**HEADERS, "Content-Type": "application/json"},
+        params={
+            "tenant_id":     TENANT_ID,
+            "sub_tenant_id": sub_tenant_id,
+        },
+        json=batch,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return [item.get("id") for item in data.get("items", [])]
+
+
+# Upload all functions (all teams, scoped to "functions" sub-tenant)
+# For team-scoped variants, call again with sub_tenant_id="sales", "engineering", etc.
+if __name__ == "__main__":
+    upload_functions(FUNCTION_SCHEMAS, sub_tenant_id="functions")
+```
+
+
+⚠️
+> **Use team-scoped sub-tenants for precision.** If your function library grows to 50+ functions, a single `sub_tenant_id="functions"` will degrade routing quality because HydraDB must rank more candidates per query. Instead, upload sales functions to `sub_tenant_id="sales"`, engineering functions to `sub_tenant_id="engineering"`, and so on. Agents query only their team's sub-tenant. Fewer candidates = more accurate suggestions. Aim for fewer than 30 functions per sub-tenant for optimal routing.
+
+
+### Versioning & deprecation
+
+
+As functions evolve, use a `_v2` suffix on the ID for new versions. Mark deprecated versions in metadata so HydraDB stops routing to them while preserving historical execution records. Never delete old function objects — they anchor memory traces from past executions.
+
+
+```python title="register/versioning.py"
+def deprecate_function(fn_id: str, sub_tenant_id: str, reason: str):
+    """
+    Mark a function as deprecated so HydraDB stops suggesting it.
+    Never delete — old executions reference this ID for audit and provenance.
+    Use 'deprecated: true' in metadata + upload new version as fn_id_v2.
+    """
+    resp = requests.post(
+        f"{BASE_URL}/ingestion/upload_knowledge",
+        headers={**HEADERS, "Content-Type": "application/json"},
+        params={
+            "tenant_id":     TENANT_ID,
+            "sub_tenant_id": sub_tenant_id,
+        },
+        json=[{
+            "id":        fn_id,
+            "title":     f"[DEPRECATED] {fn_id}",
+            "type":      "function",
+            "timestamp": "2025-01-01T00:00:00Z",
+            "content":   {"text": f"DEPRECATED: {reason}. Use {fn_id}_v2 instead."},
+            "metadata": {
+                "deprecated":         True,   # HydraDB avoids suggesting deprecated functions
+                "deprecated_reason":  reason,
+                "successor_id":       f"{fn_id}_v2",
+            },
+        }],
+    )
+    resp.raise_for_status()
+    print(f"Deprecated {fn_id}. Successor: {fn_id}_v2")
+
+
+# Example: old create_calendar_event used Google Calendar v3 API (now sunset)
+# New version uses Google Calendar v4 with conferencing support
+deprecate_function(
+    fn_id="create_calendar_event",
+    sub_tenant_id="functions",
+    reason="Google Calendar v3 API sunset. Migrated to v4 with conferencing support.",
+)
+```
+
+
+ STEP 3 
+
+
+## Build the Action Orchestrator
+
+
+The Orchestrator is the runtime layer between HydraDB suggestions and real API calls. It receives a natural-language task, asks HydraDB which function solves it, authorizes the call against the policy engine, injects the correct OAuth token, executes the API, and logs the outcome back to HydraDB. It has no opinion about which function to call — that belongs to HydraDB entirely.
+
+
+### Core orchestrator class
+
+
+```python title="orchestrator/core.py"
+import uuid, json, requests as req_lib
+
+class ChiefOfStaffOrchestrator:
+    """
+    The Orchestrator bridges HydraDB function suggestions and real workspace APIs.
+    It does NOT decide which function to call — that is HydraDB's job.
+    It does: authorize, inject tokens, execute, log outcomes.
+    """
+
+    def __init__(self, registry: dict, policy_engine, auth_vault):
+        """
+        registry:     Map of function_id → callable that executes the real API call.
+        policy_engine: Object with .check(user, function_id, params) → bool
+        auth_vault:   Object with .get_token(user_id, oauth_provider) → str
+        """
+        self.registry      = registry
+        self.policy        = policy_engine
+        self.vault         = auth_vault
+
+    def handle_task(
+        self,
+        task:        str,   # natural language — "book a 30-min call with alice next tuesday"
+        user_id:     str,
+        session_id:  str = None,
+        sub_tenant:  str = "functions",
+    ) -> dict:
+        """
+        Single-function task handling.
+        1. Ask HydraDB which function to call.
+        2. Authorize against policy engine.
+        3. Inject OAuth token from vault.
+        4. Execute via registry callable.
+        5. Log result back to HydraDB as memory.
+        """
+        session_id = session_id or str(uuid.uuid4())
+
+        # Step 1 — Ask HydraDB for the best function
+        recall = req_lib.post(
+            f"{BASE_URL}/recall/full_recall",
+            headers=HEADERS,
+            json={
+                "tenant_id":     TENANT_ID,
+                "sub_tenant_id": sub_tenant,
+                "query":         task,
+                "max_results":   5,
+                "mode":          "thinking",  # multi-query rerank + personalised recall
+                "metadata_filters": {"deprecated": False},
+            },
+        ).json()
+
+        chunks = recall.get("chunks", [])
+        if not chunks:
+            return {"status": "no_match", "message": "No function found for this task."}
+
+        # Top chunk is the best-matching function schema
+        top_chunk   = chunks[0]
+        schema      = json.loads(top_chunk["chunk_content"])
+        function_id = schema["id"]
+
+        # Step 2 — Authorize: check user permissions against policy engine
+        if not self.policy.check(user_id, function_id, schema):
+            self._log_blocked(user_id, task, function_id)
+            return {"status": "blocked", "reason": "Policy engine denied this function for your role."}
+
+        # Step 3 — Resolve parameters: use LLM to extract params from task + schema
+        params = self._extract_params(task, schema, user_id, session_id)
+
+        # Step 4 — Inject OAuth token for the function's provider
+        oauth_provider = schema.get("auth", {}).get("oauth_provider")
+        if oauth_provider:
+            params["_token"] = self.vault.get_token(user_id, oauth_provider)
+
+        # Step 5 — Execute via registry
+        exec_fn = self.registry.get(function_id)
+        if not exec_fn:
+            return {"status": "error", "message": f"No executor registered for {function_id}."}
+
+        result = exec_fn(params)
+
+        # Step 6 — Log outcome to HydraDB memory for self-improvement
+        self._log_execution(user_id, task, function_id, params, result)
+
+        return {"status": "done", "function_id": function_id, "result": result}
+
+
+    def _extract_params(self, task: str, schema: dict, user_id: str, session_id: str) -> dict:
+        """
+        Use /search/qna to extract structured parameters from the task.
+        The question is the task, the context is the function schema.
+        Returns a dict matching the schema's required parameters.
+        """
+        result = req_lib.post(
+            f"{BASE_URL}/search/qna",
+            headers=HEADERS,
+            json={
+                "question":    (
+                    f"Extract the parameters needed to call this function.\n"
+                    f"Task: {task}\n"
+                    f"Function schema: {json.dumps(schema['parameters'])}\n"
+                    f"Return ONLY a valid JSON object with the extracted parameter values."
+                ),
+                "session_id":  session_id,
+                "tenant_id":   TENANT_ID,
+                "user_name":   user_id,
+                "max_results": 3,
+                "mode":        "thinking",
+            },
+        ).json()
+        answer = result.get("answer", "{}")
+        try:
+            return json.loads(answer)
+        except json.JSONDecodeError:
+            return {}
+
+
+    def _log_execution(self, user_id, task, function_id, params, result):
+        """Log execution outcome back to HydraDB. Closes the learning loop."""
+        success = result.get("success", True)
+        outcome = "success" if success else "failure"
+        req_lib.post(
+            f"{BASE_URL}/memories/add_memory",
+            headers=HEADERS,
+            json={
+                "tenant_id":     TENANT_ID,
+                "sub_tenant_id": f"user-{user_id}",
+                "memories": [{
+                    "text": (
+                        f"Task: {task}\n"
+                        f"Function used: {function_id}\n"
+                        f"Outcome: {outcome}\n"
+                        f"Summary: {str(result.get('summary',''))[:300]}"
+                    ),
+                    "user_name": user_id,
+                    "infer": True,    # HydraDB extracts function preference signals
+                }],
+                "upsert": True,
+            },
+        )
+
+    def _log_blocked(self, user_id, task, function_id):
+        """Log a blocked attempt for audit trail."""
+        req_lib.post(
+            f"{BASE_URL}/memories/add_memory", headers=HEADERS,
+            json={
+                "tenant_id": TENANT_ID,
+                "memories": [{
+                    "text": f"BLOCKED: User {user_id} attempted {function_id} for task: {task}. Policy denied.",
+                    "user_name": "audit-log",
+                    "infer": False,   # store verbatim for compliance
+                }],
+                "upsert": True,
+            },
+        )
+```
+
+
+### Function registry
+
+
+The registry maps each `function_id` to the Python callable that makes the real API call. This is where OAuth tokens are consumed, retries happen, and real side effects occur. The Orchestrator passes `params` from HydraDB's parameter extraction directly to the executor.
+
+
+```python title="orchestrator/registry.py"
+from slack_sdk import WebClient
+from googleapiclient.discovery import build as google_build
+import backoff
+
+def execute_send_slack_message(params: dict) -> dict:
+    """
+    Execute send_slack_message using the injected OAuth token.
+    params["_token"] injected by Orchestrator from auth vault.
+    Idempotent on retry: Slack's API deduplicates with the same text in 5s.
+    """
+    token   = params.pop("_token", None)
+    client  = WebClient(token=token)
+    channel = params["channel"]
+    text    = params["text"]
+    kwargs  = {"channel": channel, "text": text}
+    if params.get("thread_ts"):
+        kwargs["thread_ts"] = params["thread_ts"]
+    resp = client.chat_postMessage(**kwargs)
+    return {"success": True, "ts": resp["ts"], "channel": resp["channel"],
+            "summary": f"Slack message sent to {channel}."}
+
+
+@backoff.on_exception(backoff.expo, Exception, max_tries=3)
+def execute_create_calendar_event(params: dict) -> dict:
+    """
+    Create a Google Calendar event via the Calendar API v3.
+    Exponential back-off handles transient 429s and 500s automatically.
+    """
+    token    = params.pop("_token", None)
+    service  = google_build("calendar", "v3", credentials=token)
+    event    = {
+        "summary":     params.get("title", "Meeting"),
+        "start":       {"dateTime": params["start_time"], "timeZone": params.get("timezone", "UTC")},
+        "end":         {"dateTime": params["end_time"],   "timeZone": params.get("timezone", "UTC")},
+        "attendees":   [{"email": e} for e in params.get("attendees", [])],
+        "description": params.get("description", ""),
+    }
+    result = service.events().insert(calendarId="primary", body=event, sendUpdates="all").execute()
+    return {"success": True, "event_id": result["id"], "link": result.get("htmlLink"),
+            "summary": f"Calendar event '{result['summary']}' created."}
+
+
+# Registry: maps function_id → executor callable
+FUNCTION_REGISTRY = {
+    "send_slack_message":     execute_send_slack_message,
+    "create_calendar_event":  execute_create_calendar_event,
+    # "send_email":             execute_send_email,
+    # "update_crm_opportunity": execute_update_crm,
+    # "create_jira_ticket":     execute_create_jira_ticket,
+    # "approve_expense":        execute_approve_expense,
+    # "trigger_deployment":     execute_trigger_deployment,
+}
+```
+
+
+💡
+> **Start with read-only functions.** Before enabling write actions, build confidence with read-only lookups: `get_calendar_events`, `get_crm_opportunity`, `get_open_tickets`. These validate HydraDB's routing accuracy without side effects. Once routing is correct on reads, graduate to writes. The Chief of Staff earns trust incrementally — never by starting with "approve_expense".
+
+
+### Result feedback loop
+
+
+The feedback loop is what separates a static function router from a learning system. After every execution, write a structured memory to HydraDB with `infer: true`. HydraDB extracts: which function was chosen, whether it succeeded, and what the user was trying to do. Over time, these signals shift the function preference profile for each user, making suggestions increasingly accurate without any manual tuning.
+
+
+```python title="orchestrator/feedback.py"
+def log_function_feedback(
+    user_id:     str,
+    function_id: str,
+    task:        str,
+    outcome:     str,   # "success" | "failure" | "slow" | "user_rejected"
+    latency_ms:  int = 0,
+    details:     str = "",
+):
+    """
+    Write execution feedback as a memory so HydraDB learns from outcomes.
+    infer: true — HydraDB extracts preference signals and builds graph links
+    between this user, this function, and similar tasks.
+
+    outcome="user_rejected" is especially valuable: the agent suggested the
+    wrong function, the user corrected it. That correction shifts the routing
+    weight for this user's context in future calls.
+    """
+    text = (
+        f"Function: {function_id}\n"
+        f"Task: {task}\n"
+        f"Outcome: {outcome}\n"
+        f"Latency: {latency_ms}ms\n"
+    )
+    if details:
+        text += f"Details: {details}"
+
+    requests.post(
+        f"{BASE_URL}/memories/add_memory",
+        headers=HEADERS,
+        json={
+            "tenant_id":     TENANT_ID,
+            "sub_tenant_id": f"user-{user_id}",
+            "memories": [{
+                "text":      text,
+                "user_name": user_id,
+                "infer":     True,   # extracts preference + success signals
+            }],
+            "upsert": True,
+        },
+    )
+
+
+# Usage: called automatically by the Orchestrator's _log_execution method.
+# Also call explicitly for user-driven corrections:
+log_function_feedback(
+    user_id="sarah",
+    function_id="send_email",
+    task="tell the team the deploy is done",
+    outcome="user_rejected",
+    details="Sarah always uses Slack for internal updates, not email. Corrected to send_slack_message.",
+)
+# → HydraDB learns: for Sarah, "tell the team" maps to send_slack_message
+```
+
+
+ STEP 4 
+
+
+## Store Agent Memory
+
+
+Two types of memory drive personalization. **User preference memory** stores how each person prefers to work — which channels they favour, which functions they trust, how they phrase requests. **Execution outcome memory** stores what happened when functions were called — successes, failures, latency patterns, user corrections. Together, these build a complete model of each user's working style that HydraDB uses to shift function suggestion rankings on every recall.
+
+
+### User preference memory
+
+
+Write explicit preference profiles during onboarding and update them whenever a user changes how they work. Use `infer: true` so HydraDB extracts the implicit signals — channel preferences, communication style, urgency thresholds — and builds graph connections to related functions automatically.
+
+
+```python title="memory/user_preferences.py"
+def store_user_preferences(user_id: str, profile: str):
+    """
+    Store a user's working preferences so HydraDB personalizes function
+    suggestions for them. infer: true — HydraDB extracts channel preferences,
+    urgency signals, communication style, and links these to specific functions.
+
+    Call during onboarding and whenever preferences change.
+    Use the same user_id consistently across all memory writes for this user.
+    """
+    requests.post(
+        f"{BASE_URL}/memories/add_memory",
+        headers=HEADERS,
+        json={
+            "tenant_id":     TENANT_ID,
+            "sub_tenant_id": f"user-{user_id}",
+            "memories": [{
+                "text":      profile,
+                "user_name": user_id,
+                "infer":     True,
+            }],
+            "upsert": True,
+        },
+    )
+
+
+# Onboard team members — called once per user at setup, then updated as needed
+store_user_preferences(
+    user_id="sarah",
+    profile=(
+        "Sarah is the VP of Engineering. She prefers Slack DMs over email for all internal "
+        "communication. For urgent issues she always uses PagerDuty, not Jira. "
+        "She approves expenses only during business hours. "
+        "Her calendar blocks 9–10am daily for deep work — never schedule meetings there. "
+        "She likes executive summaries, not raw data. Always call generate_report before "
+        "presenting metrics to her."
+    ),
+)
+
+store_user_preferences(
+    user_id="james",
+    profile=(
+        "James is an Account Executive on the sales team. He prefers email for external "
+        "communications and Slack for internal ones. He runs a lot of demos — when he says "
+        "'prepare for a call', always check the CRM for the prospect's deal stage first. "
+        "He is in the Pacific timezone. Do not schedule past 5pm his time. "
+        "He always CC's his manager when sending proposals."
+    ),
+)
+```
+
+
+### Execution outcome memory
+
+
+Beyond preferences, HydraDB needs to know what actually happened. Store each execution outcome as a memory with enough detail for HydraDB to identify patterns: which functions tend to succeed together, which fail under specific conditions, which are consistently slow. Use `infer: false` for exact outcome records and `infer: true` for synthesized pattern summaries.
+
+
+```python title="memory/outcomes.py"
+from datetime import datetime, timezone
+
+def log_execution_outcome(
+    user_id:     str,
+    task:        str,
+    function_id: str,
+    outcome:     str,         # "success" | "failure" | "timeout" | "user_rejected"
+    latency_ms:  int,
+    error_msg:   str = "",
+    chained_fns: list = None,   # other functions called in the same task
+):
+    """
+    Log an execution outcome verbatim (infer: false) for the audit trail.
+    Also write a synthesized pattern summary (infer: true) for learning.
+    These two writes serve different purposes:
+      - infer: false → exact record, queryable for compliance and audit
+      - infer: true  → HydraDB extracts patterns and links to similar tasks
+    """
+    ts = datetime.now(timezone.utc).isoformat()
+
+    # Write 1: exact record
+    requests.post(
+        f"{BASE_URL}/memories/add_memory", headers=HEADERS,
+        json={
+            "tenant_id":     TENANT_ID,
+            "sub_tenant_id": "execution-log",  # shared log sub-tenant
+            "memories": [{
+                "text": (
+                    f"[{ts}] user={user_id} fn={function_id} "
+                    f"outcome={outcome} latency={latency_ms}ms\n"
+                    f"task={task}\n"
+                    f"chained={chained_fns or []}\n"
+                    f"error={error_msg or 'none'}"
+                ),
+                "user_name": "system",
+                "infer":     False,   # verbatim audit record
+            }],
+            "upsert": True,
+        },
+    )
+
+    # Write 2: synthesized pattern (only for notable events)
+    if outcome in ("failure", "timeout", "user_rejected") or latency_ms > 3000:
+        summary = (
+            f"{function_id} returned {outcome} for task type '{task[:80]}'. "
+        )
+        if latency_ms > 3000:
+            summary += f"Latency was {latency_ms}ms — above 3s threshold. "
+        if error_msg:
+            summary += f"Error: {error_msg}. "
+        if outcome == "user_rejected":
+            summary += f"User manually overrode this suggestion for user_id={user_id}."
+
+        requests.post(
+            f"{BASE_URL}/memories/add_memory", headers=HEADERS,
+            json={
+                "tenant_id":     TENANT_ID,
+                "sub_tenant_id": f"user-{user_id}",
+                "memories": [{
+                    "text":      summary,
+                    "user_name": user_id,
+                    "infer":     True,   # HydraDB extracts the failure pattern signal
+                }],
+                "upsert": True,
+            },
+        )
+```
+
+
+ STEP 5 
+
+
+## Multi-Step Planning
+
+
+Many real-world tasks require more than one function call. "Onboard the new hire" isn't one action — it's creating accounts, sending welcome materials, scheduling orientation, assigning equipment, and notifying the team. Instead of hardcoding this sequence, ask HydraDB to generate the plan. It returns a JSON array of functions with their parameters and dependency order. Your execution engine runs them sequentially, injecting earlier outputs into later calls.
+
+
+ℹ️
+> **Use `mode: "thinking"` for plan generation.** `mode: "thinking"` enables HydraDB's multi-query decomposition — it breaks the task into sub-questions, matches each to a function, and assembles the ordered plan. `mode: "fast"` returns a single best-match function. Always use `"thinking"` when the task is complex or ambiguous. Plan generation typically takes 200–600ms.
+
+
+### Generate a plan
+
+
+```python title="planning/generate_plan.py"
+from openai import OpenAI
+openai_client = OpenAI()
+
+def generate_execution_plan(
+    task:       str,
+    user_id:    str,
+    sub_tenant: str = "functions",
+    max_steps:  int = 8,
+) -> list:
+    """
+    Generate a multi-step execution plan for a complex task.
+    1. Recall the most relevant functions from HydraDB using mode: "thinking".
+    2. Pass the ranked functions + task to an LLM for sequencing.
+    3. Return a structured plan: [{step, function_id, params, depends_on}].
+
+    max_steps: cap the plan length to avoid runaway chains.
+    """
+    # Step 1: recall candidate functions with thinking mode
+    recall = requests.post(
+        f"{BASE_URL}/recall/full_recall",
+        headers=HEADERS,
+        json={
+            "tenant_id":     TENANT_ID,
+            "sub_tenant_id": sub_tenant,
+            "query":         task,
+            "max_results":   12,
+            "mode":          "thinking",   # multi-query decomposition
+            "graph_context": True,          # surfaces composed function chains
+            "metadata_filters": {"deprecated": False},
+        },
+    ).json()
+
+    chunks = recall.get("chunks", [])
+    if not chunks:
+        return []
+
+    # Build the function catalogue string for the planner
+    fn_catalogue = "\n\n".join(
+        f"FUNCTION {i+1}: {c['source_title']}\n{c['chunk_content'][:600]}"
+        for i, c in enumerate(chunks)
+    )
+
+    # Recall user preferences to personalise the plan
+    user_prefs = requests.post(
+        f"{BASE_URL}/recall/recall_preferences",
+        headers=HEADERS,
+        json={
+            "tenant_id":     TENANT_ID,
+            "sub_tenant_id": f"user-{user_id}",
+            "query":         "channel preferences urgency communication style",
+            "mode":          "thinking",
+        },
+    ).json()
+
+    # Step 2: use LLM to sequence the plan
+    resp = openai_client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a task planner. Given a task and a catalogue of available functions, "
+                    "produce a minimal, ordered execution plan. "
+                    "Return ONLY valid JSON: a list of objects with keys: "
+                    "step (int), function_id (str), params (object), depends_on (list of step ints), reason (str). "
+                    "Maximum steps: " + str(max_steps) + ". "
+                    "Use user preferences to choose the right channels and timing. "
+                    "Only include functions that are strictly necessary."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Task: {task}\n\n"
+                    f"User preferences: {user_prefs}\n\n"
+                    f"Available functions:\n{fn_catalogue}"
+                ),
+            },
+        ],
+        temperature=0.1,
+    )
+
+    try:
+        plan = json.loads(resp.choices[0].message.content)
+        return plan
+    except (json.JSONDecodeError, KeyError):
+        return []
+
+
+# Usage
+plan = generate_execution_plan(
+    task="Onboard Alex Chen who starts Monday as a backend engineer on the payments team.",
+    user_id="sarah",
+)
+# → [
+#    {step:1, function_id:"create_gsuite_account",    params:{...}, depends_on:[], reason:"..."},
+#    {step:2, function_id:"create_jira_account",      params:{...}, depends_on:[1], reason:"..."},
+#    {step:3, function_id:"create_github_access",     params:{...}, depends_on:[1], reason:"..."},
+#    {step:4, function_id:"send_slack_message",        params:{channel:"#engineering",...}, depends_on:[1,2,3], reason:"..."},
+#    {step:5, function_id:"create_calendar_event",    params:{title:"Orientation...",...}, depends_on:[1], reason:"..."},
+#    {step:6, function_id:"send_email",               params:{to:"[email protected]",...}, depends_on:[1,2,3,4], reason:"..."},
+#  ]
+```
+
+
+### Execute with dependency resolution
+
+
+Run the plan in topological order: steps with no dependencies run first, then steps whose dependencies are complete. Pass outputs from earlier steps into later ones — the new hire's `account_id` from step 1 flows into step 2's Jira onboarding, their `email` flows into step 6's welcome message.
+
+
+```python title="planning/executor.py"
+def execute_plan(
+    plan:        list,    # [{step, function_id, params, depends_on, reason}]
+    user_id:     str,
+    orchestrator,
+) -> dict:
+    """
+    Execute a plan in dependency order.
+    Outputs from completed steps are available to downstream steps
+    via the results dict keyed by step number.
+    Stops on first failure unless the step is marked optional.
+    """
+    results    = {}   # step_number → execution result
+    completed  = set()
+    failed     = set()
+
+    def _ready(step: dict) -> bool:
+        """A step is ready when all its dependencies have completed successfully."""
+        return all(d in completed for d in step.get("depends_on", []))
+
+    remaining = list(plan)
+    max_iterations = len(plan) * 2   # guard against circular deps
+    iterations = 0
+
+    while remaining and iterations < max_iterations:
+        iterations += 1
+        progress = False
+
+        for step in list(remaining):
+            if not _ready(step): continue
+
+            step_num    = step["step"]
+            function_id = step["function_id"]
+            params      = dict(step.get("params", {}))
+
+            # Inject outputs from dependency steps into params
+            for dep_step in step.get("depends_on", []):
+                dep_result = results.get(dep_step, {}).get("result", {})
+                params.update({
+                    k: v for k, v in dep_result.items()
+                    if k in params.get("_inject_from_deps", {})
+                })
+
+            print(f"  Step {step_num}: {function_id} — {step.get('reason','')[:60]}")
+
+            result = orchestrator.registry.get(function_id, lambda p: {"success": False, "error": "not registered"})(params)
+            results[step_num] = {"function_id": function_id, "result": result}
+
+            if result.get("success", False):
+                completed.add(step_num)
+            else:
+                failed.add(step_num)
+                print(f"  Step {step_num} FAILED: {result.get('error','unknown error')}")
+                if not step.get("optional", False):
+                    return {"status": "failed", "failed_step": step_num, "results": results}
+
+            remaining.remove(step)
+            progress = True
+
+        if not progress:
+            break   # circular dependency or all remaining steps blocked
+
+    return {"status": "complete", "completed": list(completed), "failed": list(failed), "results": results}
+```
+
+
+### Rollback & compensation
+
+
+For destructive or irreversible actions, register a compensation function alongside the main one. If step *n* fails after steps 1–*n-1* have completed, the compensation chain runs in reverse order to undo what it can. Not all actions have meaningful rollbacks — a sent Slack message cannot be unsent. Mark those as `compensatable: false` in their schema metadata.
+
+
+```python title="planning/rollback.py"
+# Compensation registry: maps function_id → compensation callable
+# Compensation functions undo the side effects of their paired function.
+# Not every function has a compensation — mark those as non-compensatable.
+COMPENSATION_REGISTRY = {
+    "create_gsuite_account":   lambda r: delete_gsuite_account(r.get("account_id")),
+    "create_jira_account":    lambda r: delete_jira_account(r.get("jira_id")),
+    "create_github_access":   lambda r: revoke_github_access(r.get("username")),
+    "create_calendar_event":  lambda r: delete_calendar_event(r.get("event_id")),
+    # "send_slack_message":    None,  — cannot be meaningfully rolled back
+    # "send_email":            None,  — cannot be recalled programmatically
+}
+
+def rollback_plan(results: dict, failed_step: int):
+    """
+    Compensate for completed steps in reverse order after a failure.
+    Skips steps without a compensation function.
+    Logs each compensation attempt to HydraDB's execution-log sub-tenant.
+    """
+    completed_steps = sorted(
+        [s for s in results if s < failed_step], reverse=True
+    )
+    for step_num in completed_steps:
+        entry       = results[step_num]
+        function_id = entry["function_id"]
+        result      = entry["result"]
+        compensate  = COMPENSATION_REGISTRY.get(function_id)
+
+        if compensate:
+            try:
+                compensate(result)
+                print(f"  Rolled back step {step_num}: {function_id}")
+                log_execution_outcome(
+                    user_id="system", task=f"rollback {function_id}",
+                    function_id=f"rollback_{function_id}",
+                    outcome="success", latency_ms=0,
+                )
+            except Exception as e:
+                print(f"  Rollback FAILED for step {step_num}: {e}")
+        else:
+            print(f"  Step {step_num} ({function_id}): no compensation registered. Manual review needed.")
+```
+
+
+ STEP 6 
+
+
+## Event & Trigger Model
+
+
+The Chief of Staff should react to three types of input: direct commands from users, scheduled jobs, and system events from external services. All three converge on the same `Orchestrator.handle_task()` call — only the source of the natural-language task differs.
+
+
+**Flow:** Direct command → Scheduled job → System event → Orchestrator → Execution
+
+
+### Slack slash-command (direct commands)
+
+
+Expose a Slack slash-command that forwards the user's natural-language instruction directly to the Orchestrator. The Slack user ID maps to the `user_id` used for memory recall, so HydraDB already knows this user's preferences and personalizes the function suggestion accordingly.
+
+
+```python title="triggers/slack_command.py"
+from flask import Flask, request, jsonify
+from slack_sdk import WebClient
+
+flask_app  = Flask(__name__)
+slack_bot  = WebClient(token=os.environ["SLACK_BOT_TOKEN"])
+orchestrator = ChiefOfStaffOrchestrator(
+    registry=FUNCTION_REGISTRY,
+    policy_engine=PolicyEngine(),
+    auth_vault=AuthVault(),
+)
+
+# Maps Slack user IDs to internal user IDs (use CRM or HRIS lookup in production)
+def slack_to_user_id(slack_uid: str) -> str:
+    return f"slack-{slack_uid}"   # simplest — use CRM lookup in production
+
+@flask_app.route("/slack/ai", methods=["POST"])
+def handle_slack_ai_command():
+    """
+    Handles /ai slash-command from Slack.
+    /ai book a 30-min call with alice next tuesday
+    /ai send the deploy-complete message to #engineering
+    /ai prepare for board meeting next Tuesday
+    """
+    slack_uid  = request.form["user_id"]
+    task       = request.form.get("text", "").strip()
+    channel    = request.form["channel_id"]
+    user_id    = slack_to_user_id(slack_uid)
+
+    if not task:
+        return jsonify({"text": "Please describe what you'd like me to do."})
+
+    # Ack immediately so Slack doesn't time out the slash-command (3s limit)
+    slack_bot.chat_postEphemeral(
+        channel=channel, user=slack_uid,
+        text=f"_Working on it: “{task[:80]}…”_"
+    )
+
+    # Detect multi-step task and route accordingly
+    MULTI_STEP_SIGNALS = ["prepare", "onboard", "set up", "ship", "launch"]
+    is_multi = any(s in task.lower() for s in MULTI_STEP_SIGNALS)
+
+    if is_multi:
+        plan   = generate_execution_plan(task, user_id)
+        result = execute_plan(plan, user_id, orchestrator)
+        steps  = result.get("completed", [])
+        reply  = f"Done. Completed {len(steps)} step(s): {', '.join(str(s) for s in steps)}."
+    else:
+        result = orchestrator.handle_task(task, user_id)
+        reply  = result.get("result", {}).get("summary", "Done.")
+
+    slack_bot.chat_postEphemeral(channel=channel, user=slack_uid, text=reply)
+    return jsonify({})   # already replied via ephemeral — return empty 200
+
+if __name__ == "__main__":
+    flask_app.run(host="0.0.0.0", port=8080)
+```
+
+
+### Scheduled jobs
+
+
+For recurring tasks — daily standup summaries, weekly metric reports, Monday morning briefings — use a cron-triggered cloud function. The task description is static, but HydraDB's function selection and personalization still apply because the `user_id` carries the recipient's memory and preferences. The CEO's Monday briefing looks different from the CTO's even though both come from the same cron.
+
+
+```python title="triggers/scheduled_jobs.py"
+# Cron: 0 8 * * 1  (Monday 8am UTC) — Weekly executive briefing
+def weekly_executive_briefing():
+    """
+    Generate and deliver a personalized weekly briefing to each exec.
+    HydraDB uses each exec's memory profile to select the right
+    report type, channel, and level of detail automatically.
+    """
+    execs = [
+        {"user_id": "sarah",   "task": "Generate and send this week's engineering team briefing."},
+        {"user_id": "james",   "task": "Generate and send this week's sales pipeline summary."},
+        {"user_id": "priya",   "task": "Generate and send this week's customer health report."},
+    ]
+    for exec_user in execs:
+        try:
+            plan   = generate_execution_plan(exec_user["task"], exec_user["user_id"])
+            result = execute_plan(plan, exec_user["user_id"], orchestrator)
+            print(f"Briefing sent to {exec_user['user_id']}: {result['status']}")
+        except Exception as e:
+            print(f"Briefing failed for {exec_user['user_id']}: {e}")
+
+
+# Cron: 0 9 * * *  (Daily 9am) — standup prompt for each team channel
+def daily_standup_prompt():
+    """Send the daily standup prompt to each team channel via Slack."""
+    teams = [
+        ("eng-lead",   "#engineering"),
+        ("design-lead", "#design"),
+        ("sales-lead",  "#sales"),
+    ]
+    for user_id, channel in teams:
+        orchestrator.handle_task(
+            task=f"Post the daily standup prompt to {channel}.",
+            user_id=user_id,
+        )
+
+if __name__ == "__main__":
+    weekly_executive_briefing()
+    daily_standup_prompt()
+```
+
+
+### System event webhooks
+
+
+Monitoring alerts, new Jira tickets, CRM stage changes, and GitHub PR events all carry natural-language context when translated into task descriptions. A thin webhook handler converts each event into an actionable task description and routes it through the Orchestrator. HydraDB decides the appropriate response based on severity, time of day, and the team's learned patterns.
+
+
+```python title="triggers/webhooks.py"
+@flask_app.route("/webhooks/monitoring", methods=["POST"])
+def handle_monitoring_alert():
+    """
+    Receives a monitoring alert and routes it to the correct on-call response.
+    HydraDB's memory of past incidents and the team's learned response patterns
+    determine whether this triggers immediate escalation or scheduled review.
+    """
+    data     = request.json
+    service  = data.get("service", "unknown")
+    severity = data.get("severity", "low")   # "low" | "medium" | "high" | "critical"
+    message  = data.get("message", "")
+
+    # Translate the monitoring event into a natural-language task.
+    # HydraDB's context graph knows which functions respond to incidents for this service.
+    task = (
+        f"{severity.upper()} monitoring alert for {service}: {message}. "
+        f"Determine the appropriate incident response and take action."
+    )
+
+    # For critical alerts: immediately escalate, do not wait for plan generation
+    if severity == "critical":
+        orchestrator.handle_task(task=task, user_id="oncall-system")
+    else:
+        # For non-critical: generate a plan (may include "monitor and review at standup")
+        plan   = generate_execution_plan(task, user_id="oncall-system")
+        execute_plan(plan, user_id="oncall-system", orchestrator=orchestrator)
+
+    return jsonify({"status": "handled"}), 200
+
+
+@flask_app.route("/webhooks/crm", methods=["POST"])
+def handle_crm_event():
+    """
+    Handles CRM stage-change events.
+    When a deal moves to 'Demo Requested', HydraDB suggests:
+    check_customer_tier → find_available_demo_slots → create_demo_meeting
+    → update_crm_opportunity → send_confirmation_email
+    — all from one natural language task description.
+    """
+    data        = request.json
+    deal_id     = data.get("deal_id")
+    new_stage   = data.get("new_stage")
+    company     = data.get("company_name", "the prospect")
+    owner_id    = data.get("deal_owner_id", "sales-lead")
+
+    # Translate CRM event → natural language task
+    stage_tasks = {
+        "Demo Requested":  f"Schedule a product demo for {company} (deal {deal_id}) and send confirmation.",
+        "Proposal Sent":   f"Log a follow-up task in 3 days for {company} deal {deal_id} and set a reminder.",
+        "Closed Won":      f"Celebrate the {company} win in Slack, update CRM deal {deal_id}, and trigger onboarding.",
+        "Closed Lost":     f"Log loss reason for {company} deal {deal_id} and schedule a retrospective.",
+    }
+    task = stage_tasks.get(new_stage)
+    if task:
+        plan   = generate_execution_plan(task, owner_id)
+        execute_plan(plan, owner_id, orchestrator)
+
+    return jsonify({"status": "ok"}), 200
+```
+
+
+💡
+> **The task description quality determines the response quality.** Don't pass raw webhook payloads to the Orchestrator. Always translate them into a clear natural-language task first: *"CRITICAL alert for payments-service: response time degraded to 8s. Determine appropriate incident response."* is far better than *"alert: payments-service, latency: 8000ms"*. HydraDB reasons over the task description — the more context you include, the more accurate the function selection.
+
+
+ STEP 7 
+
+
+## Security & Governance
+
+
+An agent that takes real actions needs real guardrails. Four layers of protection: a policy engine that blocks unauthorized functions before they reach the execution layer, an auth vault that stores OAuth tokens and injects them per-function, an approval workflow that routes risky actions through a human gate, and a persistent audit log stored in HydraDB.
+
+
+### Policy engine
+
+
+The policy engine sits between HydraDB's suggestion and the execution. It checks: does this user have the required `permission_level`? Is this function restricted to specific departments? Is the current time within `business_hours_only` constraints? Is the function flagged as requiring human approval above a cost threshold?
+
+
+```python title="security/policy.py"
+from datetime import datetime, timezone
+
+# User role definitions — load from your HRIS or auth system in production
+USER_ROLES = {
+    "sarah":  {"level": "manager", "departments": ["engineering", "all"]},
+    "james":  {"level": "contributor", "departments": ["sales"]},
+    "priya":  {"level": "manager", "departments": ["customer-success", "all"]},
+}
+PERMISSION_HIERARCHY = ["viewer", "contributor", "manager", "admin"]
+
+class PolicyEngine:
+    def check(self, user_id: str, function_id: str, schema: dict) -> bool:
+        """
+        Return True if the user is authorized to call this function.
+        Checks: permission_level, department, business_hours, cost_threshold.
+        """
+        user_role = USER_ROLES.get(user_id, {"level": "viewer", "departments": []})
+        meta      = schema.get("meta", {})
+
+        # Check permission level
+        required_level = meta.get("permission_level", "contributor")
+        user_level     = user_role["level"]
+        if PERMISSION_HIERARCHY.index(user_level) < PERMISSION_HIERARCHY.index(required_level):
+            print(f"Policy blocked {user_id}: needs {required_level}, has {user_level}.")
+            return False
+
+        # Check department scope
+        fn_dept       = meta.get("department", "all")
+        user_depts    = user_role.get("departments", [])
+        if fn_dept != "all" and fn_dept not in user_depts and "all" not in user_depts:
+            print(f"Policy blocked {user_id}: {function_id} is department '{fn_dept}'.")
+            return False
+
+        # Check business hours constraint
+        if meta.get("business_hours_only", False):
+            now  = datetime.now(timezone.utc)
+            hour = now.hour   # UTC — adjust for user timezone in production
+            if not (9 <= hour <= 17) or now.weekday() >= 5:
+                print(f"Policy blocked {function_id}: business hours only.")
+                return False
+
+        return True
+
+    def requires_approval(self, user_id: str, schema: dict, params: dict) -> bool:
+        """
+        Return True if this call needs human approval before execution.
+        Triggered when: cost exceeds threshold, function has 'requires_approval: true',
+        or user is requesting an action outside their normal patterns.
+        """
+        meta      = schema.get("meta", {})
+        threshold = meta.get("cost_threshold", None)
+        amount    = params.get("amount", 0)
+        if threshold and amount > threshold:
+            return True
+        return meta.get("requires_approval", False)
+```
+
+
+### Approval workflow
+
+
+When `policy.requires_approval()` returns `True`, route the action through a Slack approval message before executing. Store the pending action in HydraDB so the Orchestrator can resume it after approval without losing context.
+
+
+```python title="security/approval.py"
+def request_approval(
+    user_id:     str,
+    function_id: str,
+    params:      dict,
+    task:        str,
+    approver_id: str,   # Slack user ID of the approver (their manager, finance, etc.)
+) -> str:
+    """
+    Send an approval request via Slack and store the pending action in HydraDB.
+    Returns an approval_id that the approver sends back to resume execution.
+    """
+    approval_id = str(uuid.uuid4())[:8]
+
+    # Store the pending action in HydraDB so it can be resumed after approval
+    requests.post(
+        f"{BASE_URL}/memories/add_memory", headers=HEADERS,
+        json={
+            "tenant_id":     TENANT_ID,
+            "sub_tenant_id": "approvals",
+            "memories": [{
+                "text": json.dumps({
+                    "approval_id": approval_id,
+                    "user_id":     user_id,
+                    "function_id": function_id,
+                    "params":      params,
+                    "task":        task,
+                    "status":      "pending",
+                }),
+                "user_name": "approval-system",
+                "infer":     False,   # verbatim — exact pending action
+            }],
+            "upsert": True,
+        },
+    )
+
+    # Send the Slack approval request to the approver
+    slack_bot.chat_postMessage(
+        channel=approver_id,
+        text=(
+            f"*Approval required* [ID: `{approval_id}`]\n"
+            f"*Requested by:* {user_id}\n"
+            f"*Action:* `{function_id}`\n"
+            f"*Task:* {task}\n"
+            f"*Params:* ```{json.dumps(params, indent=2)}```\n\n"
+            f"Reply `/approve {approval_id}` or `/reject {approval_id} [reason]`"
+        ),
+    )
+    return approval_id
+```
+
+
+⚠️
+> **Never skip the policy check for system-triggered events.** Monitoring alerts and CRM webhooks bypass human input — there is no user to correct a bad suggestion. Always run `policy.check()` even for automated triggers, and set `user_id="oncall-system"` or a role-specific service account with appropriately scoped permissions. Automated triggers with admin-level access are the most dangerous pattern in this architecture.
+
+
+ STEP 8 
+
+
+## Observability & Self-Improvement
+
+
+Track three metrics to understand if the Chief of Staff is working. Feed failures back to HydraDB to close the improvement loop. The system gets measurably better over time — not by manual tuning, but by accumulating execution memory.
+
+
+| Metric | What to measure | Target | Action if below target |
+| --- | --- | --- | --- |
+| Suggestion acceptance rate | % of suggested functions the user actually runs without rejecting | >85% | Improve function descriptions; add more user preference memories |
+| Multi-step plan completion rate | % of generated plans that complete all steps without rollback | >90% | Add compensation functions; fix idempotency issues in executors |
+| P95 end-to-end latency | Time from task submission to last function execution complete | <3s single-step, <15s 5-step plan | Use mode: "fast" for single-function tasks; cache function registry |
+| Rollback frequency | % of plans that trigger rollback due to mid-plan failure | <2% | Add retries with back-off; mark flaky functions as optional: true |
+| Function routing accuracy | % of tasks where HydraDB's top-1 suggestion matches what the user intended | >90% | Add user_rejected feedback memories; rewrite function descriptions |
+
+
+### Feeding metrics back to HydraDB
+
+
+Every execution metric is a signal HydraDB can learn from. A consistent `slow_response` signal for `create_calendar_event` eventually influences the plan generator to place that function at the end of plans where it won't block other steps. Routing accuracy below threshold triggers re-examination of the function description and preference memory quality.
+
+
+```python title="observability/metrics.py"
+def report_function_performance(
+    function_id: str,
+    signal:      str,    # "slow_response" | "frequent_failure" | "high_rejection"
+    details:     dict,   # {"p95_ms": 2500, "failure_rate": 0.12, "rejection_rate": 0.22}
+):
+    """
+    Write performance signals to HydraDB's function sub-tenant.
+    HydraDB uses these signals to down-weight problematic functions
+    in future suggestions without removing them from the registry.
+    Combine with function description updates for best results.
+    """
+    text = (
+        f"Performance signal for {function_id}: {signal}.\n"
+        f"Details: {json.dumps(details)}\n"
+        f"Observed: {datetime.now(timezone.utc).isoformat()}"
+    )
+    requests.post(
+        f"{BASE_URL}/memories/add_memory", headers=HEADERS,
+        json={
+            "tenant_id":     TENANT_ID,
+            "sub_tenant_id": "function-performance",
+            "memories": [{
+                "text":      text,
+                "user_name": "observability-system",
+                "infer":     True,   # HydraDB extracts and links the performance signal
+            }],
+            "upsert": True,
+        },
+    )
+
+
+# Example — called by a weekly metrics job
+report_function_performance(
+    function_id="create_calendar_event",
+    signal="slow_response",
+    details={"p95_ms": 2800, "sample_size": 412, "period": "2025-W22"},
+)
+
+report_function_performance(
+    function_id="send_email",
+    signal="high_rejection",
+    details={
+        "rejection_rate": 0.34,
+        "most_common_correction": "send_slack_message",
+        "note": "Users reject email in favour of Slack for 34% of internal tasks.",
+    },
+)
+# → HydraDB learns: for internal communication tasks, weight send_slack_message higher
+```
+
+
+💡
+> **The compound effect.** Every execution memory shifts the routing for the next call. After 500 executions per user, HydraDB has a detailed model of how that person works — which functions they trust, which channels they prefer, which task types they delegate vs. handle personally. The Chief of Staff becomes measurably more useful without any manual configuration. Track suggestion acceptance rate week-over-week as your primary health metric — it should trend upward continuously as memories accumulate.
+
+
+## Complete API Reference
+
+
+All endpoints used in this cookbook. Base URL: `https://api.hydradb.com`  
+Header: `Authorization: Bearer YOUR_API_KEY`
+
+
+### Create tenant
+
+
+**`POST /tenants/create`** — One tenant for the full Chief of Staff system
+
+
+```json title="body"
+{ "tenant_id": "chief-of-staff" }
+```
+
+
+### Upload function schemas
+
+
+**`POST /ingestion/upload_knowledgewas: /upload/upload_app_sources?tenant_id=chief-of-staff&sub_tenant_id=functions`** — Max 20/call, 1s between batches
+
+
+```json title="body — one function"
+[{
+  "id":        "send_slack_message",
+  "title":     "Send a Slack message",
+  "type":      "function",               // tells HydraDB this is callable
+  "timestamp": "2025-01-01T00:00:00Z",
+  "content":   { "text": "{ full JSON schema as string }" },
+  "metadata": {
+    "type":         "function",
+    "collections":  ["communication", "slack"],
+    "permissions":  ["all_users"],
+    "idempotent":   false,
+    "side_effects": "Sends a visible Slack message. Cannot be unsent.",
+    "deprecated":   false
+  }
+}]
+```
+
+
+### Recall function suggestions (single-step)
+
+
+**`POST /recall/full_recall`** — Returns top-matched function knowledge objects
+
+
+```json title="body"
+{
+  "tenant_id":     "chief-of-staff",
+  "sub_tenant_id": "functions",         // or team-scoped sub-tenant
+  "query":         "book a 30-min call with alice next tuesday",
+  "max_results":   5,
+  "mode":          "thinking",         // multi-query rerank + personalised recall
+  "graph_context": false,              // not needed for single function lookup
+  "metadata_filters": { "deprecated": false }
+}
+```
+
+
+### Recall function candidates (multi-step planning)
+
+
+**`POST /recall/full_recall`** — graph_context: true surfaces composed function chains
+
+
+```json title="body"
+{
+  "tenant_id":     "chief-of-staff",
+  "sub_tenant_id": "functions",
+  "query":         "Onboard Alex Chen who starts Monday as a backend engineer.",
+  "max_results":   12,
+  "mode":          "thinking",         // multi-query decomposition for complex tasks
+  "graph_context": true,               // surfaces function composition chains
+  "metadata_filters": { "deprecated": false }
+}
+```
+
+
+### Recall user preferences (personalise suggestions)
+
+
+**`POST /recall/recall_preferences`** — Returns channel preferences, urgency signals, communication style
+
+
+```json title="body"
+{
+  "tenant_id":     "chief-of-staff",
+  "sub_tenant_id": "user-sarah",         // per-user sub-tenant
+  "query":         "channel preferences urgency communication timing",
+  "mode":          "thinking"
+}
+```
+
+
+### Store user preference memory
+
+
+**`POST /memories/add_memory`** — infer: true extracts channel + style signals
+
+
+```json title="body"
+{
+  "memories": [{
+    "text":      "Sarah always uses Slack DMs for urgent internal updates, not email.",
+    "user_name": "sarah",
+    "infer":     true        // extracts channel preference signal
+  }],
+  "tenant_id":     "chief-of-staff",
+  "sub_tenant_id": "user-sarah",
+  "upsert":        true
+}
+```
+
+
+### Store execution outcome (audit log)
+
+
+**`POST /memories/add_memory`** — infer: false for verbatim audit records
+
+
+```json title="body"
+{
+  "memories": [{
+    "text":      "[2025-06-10T09:12:44Z] user=sarah fn=send_slack_message outcome=success latency=180ms",
+    "user_name": "system",
+    "infer":     false   // verbatim audit record — exact facts, no interpretation
+  }],
+  "tenant_id":     "chief-of-staff",
+  "sub_tenant_id": "execution-log",
+  "upsert":        true
+}
+```
+
+
+### Store performance signal (self-improvement)
+
+
+**`POST /memories/add_memory`** — infer: true so HydraDB links signal to future suggestions
+
+
+```json title="body"
+{
+  "memories": [{
+    "text":      "create_calendar_event returned slow_response: p95=2800ms over 412 calls in W22.",
+    "user_name": "observability-system",
+    "infer":     true    // HydraDB links signal to function routing weight
+  }],
+  "tenant_id":     "chief-of-staff",
+  "sub_tenant_id": "function-performance",
+  "upsert":        true
+}
+```
+
+
+### Parameter extraction via Q&A
+
+
+**`POST /search/qna`** — Used to extract structured params from a natural language task
+
+
+```json title="body"
+{
+  "question":    "Extract the parameters needed to call send_slack_message for: 'ping #engineering that the deploy is done'. Return only valid JSON.",
+  "session_id":  "session-uuid",
+  "tenant_id":   "chief-of-staff",
+  "user_name":   "sarah",
+  "max_results": 3,
+  "mode":        "thinking"
+}
+```
+
+
+## Benchmarks
+
+
+Tested across 3,200 task executions spanning 48 registered functions and 6 user profiles. Comparison baseline: a standard LLM agent with function-calling and no persistent memory layer, using the same function schemas as tool definitions.
+
+
+| Metric | Standard LLM function-calling | HydraDB Chief of Staff | Delta |
+| --- | --- | --- | --- |
+| Top-1 function routing accuracy (week 1) | 71% | 78% | +10% |
+| Top-1 function routing accuracy (week 8, after memory accumulation) | 72% | 93% | +29% |
+| Multi-step plan completion rate (5-step plans) | 54% | 88% | +63% |
+| Personalization accuracy (correct channel/timing per user) | 31% | 86% | +177% |
+| Suggestion acceptance rate (no user rejection) | 68% | 91% | +34% |
+| P95 function selection latency (single step, mode: fast) | N/A | <120ms | Sub-second |
+| P95 plan generation latency (5-step, mode: thinking) | N/A | <680ms | Sub-second |
+
+
+ℹ️
+> **Benchmark methodology.** Figures are based on internal HydraDB testing. For the formal benchmark paper and methodology, see [research.hydradb.com/hydradb.pdf](https://research.hydradb.com/hydradb.pdf). Results will vary by function library size, description quality, and the volume of execution memory accumulated.
+
+
+ℹ️
+> The jump from 78% to 93% routing accuracy between week 1 and week 8 reflects HydraDB's memory accumulation. In week 1, function selection is purely semantic — it reads descriptions and matches tasks. By week 8, 3,200 execution outcomes have been stored as memory, and HydraDB has learned that Sarah always uses Slack over email, that the engineering team routes alerts to PagerDuty not Jira, and that "prepare for a call" for sales users means checking the CRM first. Standard LLM function-calling stays flat at 72% because it resets every session.
+
+
+---
+
+
+---
+
+**← Prev** Build an AI Competitive Intelligence Agent  
+**Next →** Build a Multi-Agent Research Pipeline
