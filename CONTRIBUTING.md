@@ -188,7 +188,7 @@ git rebase upstream/main
 - **Use proper MDX formatting.** Follow the existing patterns in the repository for headings, code blocks, callouts, and tabs.
 - **Use placeholder values in code examples.** Never include real API keys, tokens, or credentials. Use `YOUR_API_KEY` or similar placeholders.
 - **Verify links.** Ensure all internal and external links are valid before submitting.
-- **Test locally.** Run `npx mintlify dev` and verify your changes render correctly in the browser.
+- **Test locally.** Run `make dev` and verify your changes render correctly in the browser.
 
 ---
 
