@@ -1,0 +1,632 @@
+---
+title: "Build Your Own Notion AI"
+description: "Ingest your entire workspace — Notion, Confluence, Slack — into HydraDB and build a conversational interface that understands relationships between documents. Answer 'why did we decide X?' using HydraDB's context graph. Every endpoint in this guide is real and copy-paste ready."
+---
+
+> **Cookbook 04** · Intermediate · 38 min read · Knowledge Management
+
+Notion's built-in AI keyword-searches. It returns the document you asked about and stops. It can't tell you **why** a decision was made, who influenced it, or whether it's been superseded by something newer.
+
+HydraDB is different. It doesn't just store vectors — it builds a **living context graph**. Every memory is parsed, enriched, and connected to other memories. When your agent calls `POST /recall/full_recall`, it doesn't just get semantically similar chunks. It gets the most useful context for that exact query — weighted by recency, relevance, relationships, and historical usage patterns.
+
+> **All code in this cookbook is real.** Base URL is `https://api.hydradb.com`. Get your API key at [hydradb.com](https://hydradb.com) or email [hello@hydradb.com](mailto:hello@hydradb.com).
+
+---
+
+## How HydraDB Works
+
+Before writing code, understand the three primitives you'll use throughout this cookbook:
+
+- **Tenant** — your workspace. All data is isolated per tenant. Think of it as your "company" in HydraDB. Create one per application.
+- **Memory** — any unit of context: a Notion page, a Confluence doc, a Slack thread, a user preference. HydraDB automatically chunks, embeds, and connects memories into a context graph.
+- **Recall** — the retrieval call your agent makes before acting. HydraDB's recall runs a multi-stage pipeline: metadata filtering → graph traversal → semantic retrieval → personalized ranking.
+
+**LongMemEvals recall accuracy: 90%**
+
+---
+
+## Comparison: Traditional RAG vs HydraDB Recall
+
+| Feature | Traditional RAG | HydraDB recall |
+|---------|-----------------|----------------|
+| Search method | Vector search — nearest neighbors only | Multi-stage: intent → graph → semantic → rank |
+| Scale | Context collapses at 10M+ documents | Petabyte scale, sub-second latency |
+| Personalization | No personalization across users | Personalized per user via `user_name` |
+| Context awareness | No relationship or decision awareness | Context graph links docs, people, decisions |
+| Accuracy | Constant tuning of ranking heuristics | 90% accuracy on LongMemEvals |
+
+---
+
+## Step 01 — Create a Tenant
+
+Every HydraDB workspace starts with a tenant. Create one for your knowledge base — it provides complete data isolation and multi-tenant support out of the box.
+
+**Endpoint:** `POST /tenants/create` — Create your workspace
+
+### Bash
+
+```bash
+curl -X POST 'https://api.hydradb.com/tenants/create' \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"tenant_id": "notion-ai-workspace"}'
+```
+
+### Python
+
+```python
+import requests, os, time, uuid
+
+API_KEY   = os.environ["HYDRADB_API_KEY"]
+TENANT_ID = "notion-ai-workspace"
+BASE_URL  = "https://api.hydradb.com"
+
+HEADERS = {
+    "Authorization": f"Bearer {API_KEY}",
+    "Content-Type": "application/json",
+}
+
+# Create tenant — idempotent, safe to re-run
+resp = requests.post(
+    f"{BASE_URL}/tenants/create",
+    headers=HEADERS,
+    json={"tenant_id": TENANT_ID},
+)
+resp.raise_for_status()
+print("Tenant:", resp.json())
+```
+
+> **Sub-tenants for teams:** Use `sub_tenant_id` to isolate data by department. Engineering, Sales, HR each get their own namespace within your tenant — no configuration needed, just pass the ID on upload.
+
+---
+
+## Step 02 — Upload Knowledge Memories
+
+HydraDB automatically parses, chunks, embeds, and connects your content into a context graph. You don't manage embeddings or vector indexes. You just upload.
+
+### Notion Connector
+
+Fetch pages from Notion, format them into HydraDB's app source structure, and batch upload. HydraDB builds the context graph automatically — no edge creation needed.
+
+> **Batch limit:** Max **20 sources per request**. Wait **1 second between batches** to respect rate limits.
+
+```python
+import requests, time
+from notion_client import Client
+
+notion = Client(auth=os.environ["NOTION_TOKEN"])
+
+def extract_text(page_id: str) -> str:
+    """Extract plain text from all rich_text blocks on a page."""
+    blocks = notion.blocks.children.list(block_id=page_id)["results"]
+    lines  = []
+    for b in blocks:
+        rt   = b.get(b["type"], {}).get("rich_text", [])
+        text = "".join(r["plain_text"] for r in rt)
+        if text:
+            lines.append(text)
+    return "\n\n".join(lines)
+
+
+def upload_batch(sources: list, sub_tenant_id: str = None) -> list:
+    """Upload up to 20 sources. Returns list of file IDs."""
+    if sub_tenant_id:
+        for s in sources:
+            s["sub_tenant_id"] = sub_tenant_id
+    resp = requests.post(
+        f"{BASE_URL}/ingestion/upload_knowledge",
+        headers=HEADERS,
+        json={"app_knowledge": sources},  # FIX: single key, correct wrapper
+    )
+    resp.raise_for_status()
+    return resp.json().get("ids", [])  # FIX: "ids" not "results"
+
+
+def ingest_notion_database(database_id: str, sub_tenant_id: str = None) -> list:
+    pages   = notion.databases.query(database_id=database_id)["results"]
+    batch   = []
+    all_ids = []
+
+    for page in pages:
+        props      = page["properties"]
+        title_prop = props.get("Name", props.get("Title", {}))
+        title_arr  = title_prop.get("title", [])
+        title      = title_arr[0]["plain_text"] if title_arr else "Untitled"
+        text       = extract_text(page["id"])
+        author     = page["created_by"]["id"]
+
+        batch.append({
+            "id":        page["id"],
+            "title":     title,
+            "type":      "notion_page",                    # required
+            "timestamp": page["last_edited_time"],         # required ISO
+            "content":   {"text": text},
+            "url":       f"https://notion.so/{page['id'].replace('-','')}",
+            "metadata": {
+                "author": author,
+                "tags":   ["notion", "knowledge"],
+            },
+        })
+
+        if len(batch) == 20:
+            all_ids += upload_batch(batch, sub_tenant_id)
+            batch = []
+            time.sleep(1)  # required 1-second interval between batches
+
+    if batch:
+        all_ids += upload_batch(batch, sub_tenant_id)
+    return all_ids
+```
+
+### Confluence Connector
+
+Confluence pages follow the same upload format. Use `type: "confluence"` so HydraDB can distinguish sources during recall and apply metadata filtering.
+
+```python
+from atlassian import Confluence
+from bs4 import BeautifulSoup
+
+conf = Confluence(
+    url=os.environ["CONFLUENCE_URL"],
+    username=os.environ["CONFLUENCE_USER"],
+    password=os.environ["CONFLUENCE_TOKEN"],
+    cloud=True,
+)
+
+def ingest_space(space_key: str, sub_tenant_id: str = None) -> list:
+    pages   = conf.get_all_pages_from_space(
+        space_key, expand="body.storage,history,version"
+    )
+    batch   = []
+    all_ids = []
+
+    for page in pages:
+        html = page["body"]["storage"]["value"]
+        text = BeautifulSoup(html, "html.parser").get_text("\n\n")
+
+        batch.append({
+            "id":        page["id"],
+            "title":     page["title"],
+            "type":      "confluence",                    # required
+            "timestamp": page["version"]["when"],         # required ISO
+            "content":   {"text": text},
+            "metadata": {
+                "author": page["history"]["createdBy"]["accountId"],
+                "tags":   ["confluence", space_key.lower()],
+            },
+        })
+
+        if len(batch) == 20:
+            all_ids += upload_batch(batch, sub_tenant_id)
+            batch = []
+            time.sleep(1)
+
+    if batch:
+        all_ids += upload_batch(batch, sub_tenant_id)
+    return all_ids
+```
+
+### Verify Indexing
+
+After uploading, always verify that HydraDB has fully processed and indexed your content before running recall queries.
+
+**Endpoint:** `POST /ingestion/verify_processing?file_ids=FILE_ID&tenant_id=TENANT` — Check indexing status
+
+```python
+def verify_processing(file_id: str, timeout: int = 120, interval: int = 3):
+    """Poll until indexed, errored, or timeout."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        resp = requests.post(
+            f"{BASE_URL}/ingestion/verify_processing",
+            headers=HEADERS,
+            params={"file_ids": file_id, "tenant_id": TENANT_ID},
+        )
+        resp.raise_for_status()
+        statuses = resp.json().get("statuses", [])
+        status   = statuses[0].get("indexing_status") if statuses else None
+        if status == "completed":
+            return True
+        if status == "errored":
+            raise RuntimeError(f"Indexing failed for {file_id}")
+        time.sleep(interval)
+    raise TimeoutError(f"Indexing timed out for {file_id}")
+
+def verify_all(ids: list):
+    for fid in ids:
+        verify_processing(fid)
+```
+
+---
+
+## Step 03 — Add User Memories
+
+Beyond documents, HydraDB stores **user memories** — preferences, habits, and patterns that personalize recall per user. Set `infer: true` to let HydraDB extract implicit signals from text. Set `infer: false` to store facts verbatim.
+
+**Endpoint:** `POST /memories/add_memory` — Add a user memory
+
+### Bash
+
+```bash
+curl -X POST 'https://api.hydradb.com/memories/add_memory' \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "memories": [{
+      "text": "Alice prefers concise bullet-point answers and always wants source links",
+      "user_name": "alice",
+      "infer": true
+    }],
+    "tenant_id": "notion-ai-workspace",
+    "sub_tenant_id": "user-alice",
+    "upsert": true
+  }'
+```
+
+### Python
+
+```python
+def add_user_memory(
+    user_name: str,
+    preference: str,
+    sub_tenant_id: str = None,
+    infer: bool = True,
+) -> dict:
+    """
+    Store a user memory/preference in HydraDB.
+    Uses the SDK-spec body format with the memories[] array wrapper.
+    """
+    payload = {
+        "memories": [{
+            "text":      preference,
+            "user_name": user_name,
+            "infer":     infer,
+        }],
+        "tenant_id": TENANT_ID,
+        "upsert":    True,
+    }
+    if sub_tenant_id:
+        payload["sub_tenant_id"] = sub_tenant_id
+
+    resp = requests.post(
+        f"{BASE_URL}/memories/add_memory",
+        headers=HEADERS,
+        json=payload,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+# Example usage
+add_user_memory(
+    user_name="alice",
+    preference="Alice prefers concise bullet-point answers and always wants source links",
+    sub_tenant_id="user-alice",
+    infer=True,
+)
+```
+
+After a few interactions, HydraDB builds a behavioral model per user. Alice's recall results will be ranked and formatted differently from Bob's — automatically, without any extra code.
+
+---
+
+## Step 04 — Recall Context
+
+This is the call your agent makes before answering any question. `POST /recall/full_recall` runs HydraDB's full multi-stage pipeline and returns ranked, contextually relevant chunks — including graph context showing relationships between entities.
+
+**Endpoint:** `POST /recall/full_recall` — Retrieve agent context
+
+```python
+def recall_context(
+    query: str,
+    sub_tenant_id: str  = None,
+    max_results: int    = 10,
+    alpha: float        = 0.8,    # FIX: single definition, no duplicate
+    recency_bias: float = 0.3,
+    graph_context: bool = True,
+) -> dict:
+    """
+    Full recall — searches knowledge base (documents).
+    To also retrieve user memories, call /recall/recall_preferences separately.
+    sub_tenant_id: scope to a specific workspace or user namespace.
+    mode: "thinking" enables personalised ranking.
+    graph_context: true enables cross-document entity linking.
+    """
+    payload = {
+        "tenant_id":     TENANT_ID,
+        "query":         query,
+        "max_results":   max_results,
+        "mode":          "thinking",
+        "graph_context": graph_context,
+        "alpha":         alpha,       # FIX: single key only
+        "recency_bias":  recency_bias,
+    }
+    if sub_tenant_id:
+        payload["sub_tenant_id"] = sub_tenant_id
+
+    resp = requests.post(
+        f"{BASE_URL}/recall/full_recall",
+        headers=HEADERS,
+        json=payload,
+    )
+    resp.raise_for_status()
+    return resp.json()
+    # Response shape:
+    # data["chunks"]        — ranked context chunks with relevancy_score
+    # data["graph_context"] — entity paths and chunk_relations
+
+
+# Example
+context = recall_context(
+    "Why did we migrate from MySQL to Postgres?",
+    sub_tenant_id="workspace",
+)
+for chunk in context["chunks"]:
+    print(f"[{chunk['relevancy_score']:.2f}] {chunk['source_title']}")
+    print(chunk["chunk_content"][:200])
+```
+
+---
+
+## Step 05 — Q&A Search
+
+For conversational, AI-generated answers, use `/search/qna`. Key parameters: `alpha` (0–1, balance semantic vs lexical), `recency_bias` (0–1, prefer newer content), `user_name` (enables personalized recall).
+
+**Endpoint:** `POST /search/qna` — AI-generated answer with citations
+
+```python
+def ask_workspace(
+    question: str,
+    user_name: str      = None,
+    session_id: str     = None,
+    sub_tenant_id: str  = None,
+    source_filter: str  = None,
+    alpha: float        = 0.5,   # FIX: single alpha definition, was duplicated
+    recency_bias: float = 0.3,
+    max_results: int    = 10,
+) -> dict:
+    """
+    Ask a question against your knowledge base.
+    Returns AI answer + source chunks with citations.
+    Pass the same session_id across follow-up questions to maintain
+    conversation context — HydraDB remembers what was asked before.
+    """
+    payload = {
+        "question":      question,
+        "session_id":    session_id or str(uuid.uuid4()),
+        "tenant_id":     TENANT_ID,
+        "stream":        False,
+        "max_results":   max_results,
+        "graph_context": True,
+        "mode":          "thinking",
+        "alpha":         alpha,       # FIX: one definition only
+        "recency_bias":  recency_bias,
+    }
+    if user_name:
+        payload["user_name"] = user_name
+    if sub_tenant_id:
+        payload["sub_tenant_id"] = sub_tenant_id
+    if source_filter:
+        payload["metadata"] = {"source_type": source_filter}
+
+    resp = requests.post(
+        f"{BASE_URL}/search/qna",
+        headers=HEADERS,
+        json=payload,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+# Usage examples
+session = str(uuid.uuid4())
+result = ask_workspace(
+    "Why did we choose Postgres over MySQL?",
+    user_name="alice",
+    session_id=session,
+)
+print(result.get("answer", ""))
+
+# Follow-up — same session, HydraDB remembers context
+result2 = ask_workspace(
+    "What were the tradeoffs they considered?",
+    user_name="alice",
+    session_id=session,   # same session = conversation memory
+)
+print(result2.get("answer", ""))
+
+# Filter to only Notion pages
+notion_result = ask_workspace(
+    "What's in our engineering RFC library?",
+    source_filter="notion_page",
+)
+```
+
+> **Maintaining conversation context:** Pass the same `session_id` across follow-up questions. HydraDB uses it to maintain conversation memory — the agent remembers what was discussed earlier in the session without you re-sending it.
+
+---
+
+## Step 06 — Slack Interface
+
+Expose your knowledge base as a Slack bot. When a user mentions `@wiki`, the bot calls `/search/qna` with their Slack user ID so HydraDB personalizes the response based on their stored memory profile.
+
+```python
+from slack_bolt import App
+
+app = App(token=os.environ["SLACK_BOT_TOKEN"])
+
+# Persist session IDs so conversation memory works across turns
+user_sessions: dict = {}
+
+def get_session(user_id: str) -> str:
+    """Return or create a persistent session ID for this Slack user."""
+    return user_sessions.setdefault(user_id, str(uuid.uuid4()))
+
+@app.event("app_mention")
+def handle_mention(event, client):
+    slack_user = event["user"]
+    question   = event["text"].split(">", 1)[-1].strip()
+
+    # Acknowledge immediately so Slack doesn't time out
+    msg = client.chat_postMessage(
+        channel=event["channel"],
+        thread_ts=event["ts"],
+        text="_Searching your workspace..._",
+    )
+
+    session_id = get_session(slack_user)
+    result     = ask_workspace(
+        question,
+        user_name=slack_user,
+        session_id=session_id,
+    )
+
+    answer  = result.get("answer", "No results found.")
+    sources = result.get("sources", [])
+
+    if sources:
+        links  = "\n".join(f"• {s.get('title','')}" for s in sources[:3])
+        answer += f"\n\n*Sources:*\n{links}"
+
+    client.chat_update(
+        channel=event["channel"],
+        ts=msg["ts"],
+        text=answer,
+    )
+
+if __name__ == "__main__":
+    from slack_bolt.adapter.socket_mode import SocketModeHandler
+    SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"]).start()
+```
+
+---
+
+## API Reference
+
+All endpoints used in this cookbook. Base URL: `https://api.hydradb.com`. Header: `Authorization: Bearer YOUR_API_KEY`
+
+### Tenant management
+
+**POST** `/tenants/create` — Create workspace — idempotent
+
+```json
+{ "tenant_id": "notion-ai-workspace" }
+```
+
+### Upload app sources (Notion, Slack, Confluence…)
+
+**POST** `/ingestion/upload_knowledge` — Max 20/call, 1s between batches
+
+```json
+[{
+  "id":        "page-uuid",
+  "title":     "RFC-041 Database Migration",
+  "type":      "notion_page",                    // required
+  "timestamp": "2024-09-01T08:00:00Z",          // required ISO
+  "content":   { "text": "We chose Postgres because..." },
+  "url":       "https://notion.so/...",
+  "metadata": {
+    "author": "alice@company.com",
+    "tags":   ["rfc", "database"]
+  }
+}]
+```
+
+### Upload a single file (PDF / DOCX)
+
+**POST** `/ingestion/upload_knowledge` — Single file with tenant_id as form field
+
+```bash
+curl -X POST 'https://api.hydradb.com/ingestion/upload_knowledge' \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -F "file=@/path/to/document.pdf" \
+  -F "tenant_id=notion-ai-workspace"
+```
+
+### Verify processing
+
+**POST** `/ingestion/verify_processing?file_ids=FILE_ID&tenant_id=YOUR_TENANT` — Poll until status = "completed"
+
+### Full recall
+
+**POST** `/recall/full_recall` — Searches knowledge base — returns chunks + graph_context
+
+```json
+{
+  "tenant_id":     "notion-ai-workspace",
+  "sub_tenant_id": "workspace",
+  "query":         "Why did we choose Postgres?",
+  "max_results":   10,
+  "mode":          "thinking",
+  "graph_context": true,
+  "alpha":         0.8,
+  "recency_bias":  0.3
+}
+```
+
+### Q&A search
+
+**POST** `/search/qna` — AI-generated answer — personalized via user_name
+
+```json
+{
+  "question":      "Why did we choose Postgres?",
+  "session_id":    "user-alice-session-001",
+  "tenant_id":     "notion-ai-workspace",
+  "user_name":     "alice",
+  "max_results":   10,
+  "mode":          "thinking",
+  "alpha":         0.5,
+  "recency_bias":  0.3,
+  "metadata":      { "source_type": "notion_page" }
+}
+```
+
+### Add user memory
+
+**POST** `/memories/add_memory` — memories[] array wrapper — consistent SDK format
+
+```json
+{
+  "memories": [{
+    "text":      "Alice prefers bullet-point responses",
+    "user_name": "alice",
+    "infer":     true
+  }],
+  "tenant_id":     "notion-ai-workspace",
+  "sub_tenant_id": "user-alice",
+  "upsert":        true
+}
+```
+
+### Recall user memories
+
+**POST** `/recall/recall_preferences` — user_name key — consistent across all calls
+
+```json
+{
+  "tenant_id":     "notion-ai-workspace",
+  "sub_tenant_id": "user-alice",
+  "user_name":     "alice",
+  "query":         "How should I format answers for this user?"
+}
+```
+
+### Delete memory
+
+**DELETE** `/memories/delete_memory` — Remove stale or incorrect data by memory_id
+
+---
+
+## Benchmarks
+
+HydraDB leads LongMemEvals with 90% recall accuracy. Compared to a naive RAG pipeline over the same 12,400-document corpus:
+
+| Query type | Naive RAG | HydraDB | Delta |
+|-----------|-----------|---------|-------|
+| Factual lookup queries | 81% recall | 90% recall | +11% |
+| "Why did we…" decision queries | 34% recall | 79% recall | +132% |
+| Stale doc surface rate | 41% of results | 7% of results | −83% |
+| P95 query latency | 220ms | <200ms | Sub-second |
+
+> **Benchmark methodology.** Figures are based on internal HydraDB testing. For the formal benchmark paper see [research.hydradb.com/hydradb.pdf](https://research.hydradb.com/hydradb.pdf). Results will vary by corpus size, content quality, and query distribution.
