@@ -30,7 +30,7 @@ This security policy covers the mintlify-docs repository, including:
 
 ### Out of Scope
 
-- The HydraDB API service itself (report those to HydraDB directly via https://docs.hydradb.com).
+- The HydraDB API service itself (report those directly to HydraDB at **security@hydradb.com**).
 - The Mintlify platform itself (report those to Mintlify directly).
 - Third-party dependencies (report those to the respective maintainers, but let us know if a dependency vulnerability affects this documentation site).
 - Broken links or typos (these are not security issues -- please open a regular issue instead).
