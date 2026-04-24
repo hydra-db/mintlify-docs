@@ -1,0 +1,229 @@
+---
+title: "Ingestion Pipeline Metrics"
+description: "Monitor document ingestion with Prometheus metrics and Grafana dashboards"
+---
+
+HydraDB exposes Prometheus metrics for the ingestion pipeline. Use them to monitor workflow completion rates, stage latencies, LLM token consumption, and throughput. Three pre-built Grafana dashboards give you end-to-end visibility into document processing.
+
+## Pipeline Overview
+
+The ingestion pipeline processes documents through six stages:
+
+| Stage | Name | Description |
+|-------|------|-------------|
+| A | Parse | Extract text and structure from uploaded documents |
+| B | Chunk | Split parsed content into semantic chunks |
+| X | Inference | Run optional inference to extract insights (when `infer: true`) |
+| C1 | Embeddings | Generate vector embeddings for semantic search |
+| C2 | Knowledge Graph | Build entity graph from document content |
+| D1 | Vector Write | Write embeddings to Milvus vector database |
+| D2 | Graph Write | Write entities and relationships to FalkorDB |
+| E | Complete | Mark document as indexed and notify completion |
+
+Stages C1/D1 and C2/D2 run in parallel. The pipeline tracks timing for both parallel legs and reports any skew between them.
+
+## Available Metrics
+
+HydraDB exposes 10 Prometheus metrics with the `cortex_ingestion_*` prefix.
+
+### Workflow Metrics
+
+These metrics track overall workflow execution and completion.
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `cortex_ingestion_workflow_total` | Counter | `env`, `plan`, `source_type`, `status` | Total completed ingestion workflows |
+| `cortex_ingestion_workflow_duration_seconds` | Histogram | `env`, `plan`, `source_type` | End-to-end workflow duration (buckets: 1s to 1h) |
+| `cortex_ingestion_active_workflows` | Gauge | `env`, `plan` | Currently active ingestion workflows |
+
+### Stage Metrics
+
+These metrics track individual pipeline stage performance.
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `cortex_ingestion_stage_total` | Counter | `env`, `stage`, `plan`, `source_type`, `status` | Total stage completions |
+| `cortex_ingestion_stage_duration_seconds` | Histogram | `env`, `stage`, `plan`, `source_type` | Duration of individual stages (buckets: 100ms to 30min) |
+| `cortex_ingestion_parallel_skew_seconds` | Histogram | `env`, `plan` | Time difference between C1/D1 and C2/D2 parallel legs |
+
+### Throughput Metrics
+
+These metrics track data volume processed by the pipeline.
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `cortex_ingestion_tokens_total` | Counter | `env`, `stage`, `plan` | LLM tokens consumed by pipeline stages |
+| `cortex_ingestion_chunks_total` | Counter | `env`, `plan`, `source_type` | Chunks produced by the chunking stage |
+| `cortex_ingestion_items_written_total` | Counter | `env`, `stage`, `plan` | Items written by sink stages (vectors for D1, triplets for D2) |
+
+### Activity Metrics
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `cortex_ingestion_activity_attempts_total` | Counter | `env`, `stage`, `plan` | Activity execution attempts including retries |
+
+Use `activity_attempts_total` to identify stages with high retry rates. When `attempt > 1`, the activity is being retried due to a previous failure.
+
+## Label Reference
+
+### Common Labels
+
+| Label | Description |
+|-------|-------------|
+| `env` | Deployment environment (from `ENV` variable) |
+| `plan` | Tenant's subscription plan |
+| `source_type` | Type of document source (e.g., `pdf`, `notion`, `slack`) |
+| `status` | Outcome of the operation (`success`, `failure`) |
+| `stage` | Pipeline stage identifier (`A`, `B`, `X`, `C1`, `C2`, `D1`, `D2`, `E`) |
+
+## Configuration
+
+Set the `ENV` environment variable to identify your deployment environment. This value appears in all metrics as the `env` label.
+
+```bash
+export ENV=production
+```
+
+If not set, the `env` label defaults to `unknown`.
+
+## Grafana Dashboards
+
+HydraDB includes three pre-built Grafana dashboards in `deployment/grafana/dashboards/`.
+
+### Pipeline Overview
+
+**File:** `ingestion-pipeline-overview.json`
+**UID:** `cortex-ingestion-pipeline-overview`
+
+This dashboard provides a high-level view of ingestion health with panels for:
+
+- **Key Stats**: Ingestion rate, success rate, active workflows, p95 latency
+- **Completion Heatmap**: End-to-end workflow duration distribution over time
+- **Stage Waterfall**: Average time spent in each pipeline stage
+- **Parallel Fork Comparison**: C1/D1 vs C2/D2 timing comparison
+- **Failures by Stage**: Which stages contribute most to failures
+- **Throughput**: Documents processed per minute
+
+**Template Variables:** `$env`, `$plan`, `$source_type`
+
+### Stage Deep-Dive
+
+**File:** `ingestion-stage-deep-dive.json`
+**UID:** `cortex-ingestion-stage-deep-dive`
+
+This dashboard provides detailed stage-level analysis:
+
+- **Latency Percentiles**: p50, p95, p99 for each stage
+- **LLM Stage Latency**: Detailed view of stages X, C1, C2 that call LLMs
+- **Sink Latency**: D1 (vector) and D2 (graph) write performance
+- **Parallel Skew Distribution**: Heatmap showing imbalance between parallel legs
+- **Retry Rate by Stage**: Identify stages with reliability issues
+- **Failure Trend**: Track stage failures over time
+
+**Template Variables:** `$env`, `$plan`, `$source_type`, `$stage`
+
+### Capacity & Cost
+
+**File:** `ingestion-capacity-cost.json`
+**UID:** `cortex-ingestion-capacity-cost`
+
+This dashboard focuses on resource consumption and capacity planning:
+
+- **Token Burn Rate**: LLM tokens consumed per second by stage
+- **Token Consumption by Plan**: Compare usage across subscription tiers
+- **Tokens per Chunk**: Efficiency ratio for chunking
+- **Chunks per Ingestion**: Average document granularity
+- **Write Rate**: D1 vectors/s and D2 triplets/s
+- **Throughput by Plan**: Capacity utilization across tiers
+- **Token Trend**: Historical token consumption for cost forecasting
+
+**Template Variables:** `$env`, `$plan`
+
+## Importing Dashboards
+
+To use these dashboards, configure a Prometheus datasource in Grafana and import the dashboard JSON files.
+
+### Configure Datasource
+
+1. In Grafana, go to **Connections** > **Data sources** > **Add data source**
+2. Select **Prometheus**
+3. Set the URL to your Prometheus server (e.g., `http://prometheus:9090`)
+4. Click **Save & test**
+5. Note the datasource UID for the next step
+
+### Import Dashboards
+
+1. Go to **Dashboards** > **Import**
+2. Upload the JSON file or paste its contents
+3. Select your Prometheus datasource for the `DS_PROMETHEUS` variable
+4. Click **Import**
+
+Alternatively, use Grafana provisioning to load dashboards automatically:
+
+```yaml
+# /etc/grafana/provisioning/dashboards/cortex.yaml
+apiVersion: 1
+providers:
+  - name: 'Cortex Ingestion'
+    folder: 'HydraDB'
+    type: file
+    options:
+      path: /var/lib/grafana/dashboards/cortex
+```
+
+Then copy the dashboard JSON files to `/var/lib/grafana/dashboards/cortex/`.
+
+## Example Queries
+
+### Ingestion Success Rate
+
+Calculate the percentage of workflows completing successfully:
+
+```promql
+sum(rate(cortex_ingestion_workflow_total{status="success"}[5m]))
+/
+sum(rate(cortex_ingestion_workflow_total[5m]))
+* 100
+```
+
+### P95 End-to-End Latency
+
+Track the 95th percentile workflow duration:
+
+```promql
+histogram_quantile(0.95,
+  sum(rate(cortex_ingestion_workflow_duration_seconds_bucket[5m])) by (le)
+)
+```
+
+### Token Consumption by Stage
+
+Monitor LLM token burn rate across pipeline stages:
+
+```promql
+sum(rate(cortex_ingestion_tokens_total[5m])) by (stage)
+```
+
+### Stage Retry Rate
+
+Identify stages with reliability issues:
+
+```promql
+sum(rate(cortex_ingestion_activity_attempts_total[5m])) by (stage)
+-
+sum(rate(cortex_ingestion_stage_total[5m])) by (stage)
+```
+
+When this value is greater than zero, the stage is experiencing retries.
+
+### Parallel Leg Imbalance
+
+Check if the embedding or graph leg is consistently slower:
+
+```promql
+histogram_quantile(0.95,
+  sum(rate(cortex_ingestion_parallel_skew_seconds_bucket[5m])) by (le)
+)
+```
+
+High skew values indicate one parallel leg is bottlenecking the pipeline.
