@@ -1,0 +1,599 @@
+---
+title: "Recall"
+description: "How HydraDB retrieves the right context for each query — across knowledge, memories, and the context graph."
+---
+
+# Recall
+
+Recall is how HydraDB turns stored context into the *right* context for a specific query. This page explains what recall does, the three recall endpoints, the parameters you can tune, and the patterns that work in production.
+
+For full request/response schemas, see the [Full Recall](/api-reference/endpoint/full-recall), [Memory Recall](/api-reference/endpoint/recall-preferences), and [Lexical Recall](/api-reference/endpoint/boolean-recall) endpoint references.
+
+---
+
+## 1. What is Recall
+
+> A short overview of what recall does and why it's different from vector search.
+
+Recall returns the chunks most likely to help your agent succeed on a specific task — not just the chunks most textually similar to the query. Pure vector search gives you similarity; recall gives you usefulness.
+
+Every recall call runs through the same pipeline:
+
+1. **Filter** the candidate set using metadata (deterministic).
+2. **Retrieve** candidates via hybrid semantic + keyword search.
+3. **Traverse** the context graph for related entities and relationships.
+4. **Rank** results by relevance and — in `thinking` mode — personalization signals.
+
+### Knowledge vs Memory
+
+Recall operates on two separate stores:
+
+- **Knowledge** — ingested documents, files, and app sources (e.g. Notion, Drive, Slack exports). Shared reference material.
+- **Memories** — user preferences, conversation history, and per-user inferred content. Personal, user-scoped state.
+
+You call a **different endpoint for each store**. Cross-store recall in a single call is not supported. To get both in one prompt, make two calls and merge.
+
+### The Context Graph
+
+HydraDB maintains a context graph that links chunks, sources, and entities. During recall, the graph is traversed to surface related material that pure vector similarity would miss — for example, pulling in a linked contract when the query matches an invoice.
+
+Relationships in the context graph are derived automatically from stored data; developers do not manually define graph edges.
+
+### Mental Model
+
+Every recall call, regardless of mode, follows the same conceptual path:
+
+- **Query** — the input text plus any `additional_context`.
+- **Filter** — deterministic metadata constraints narrow the candidate set.
+- **Retrieve** — hybrid semantic + keyword search over the filtered set.
+- **Graph** — traversal over the context graph to surface related chunks.
+- **Rank** — scoring by relevance, recency, and frequency.
+- **Personalize** — user-specific reranking (only in `thinking` mode).
+
+In `fast` mode, retrieval runs as a single query for faster response. In `thinking` mode, the system uses multi-query generation with reranking for higher quality.
+
+---
+
+## 2. When to use recall
+
+Use recall when your system needs:
+
+- Grounded answers from documents
+- Personalized responses for a user
+- Context-aware reasoning across multiple sources
+- Deterministic filtering combined with semantic search
+- Traversal of related entities and sources
+
+### When NOT to use Recall
+
+Recall is not the right tool when:
+
+- You only need raw vector similarity over a flat corpus — a plain vector DB is simpler.
+- You need the full document, not ranked chunks — fetch the source directly.
+- You need keyword-exact matching with no ranking — use `POST /recall/boolean_recall`, not `POST /recall/full_recall`.
+- You're doing bulk analytics or aggregation over stored data — recall is a retrieval API, not an analytics engine.
+- You need the raw, unranked candidate set — recall always ranks.
+
+---
+
+## 3. Types of Recall
+
+> HydraDB exposes three recall endpoints. Pick one based on what you're searching.
+
+| Endpoint | Searches | Use when |
+|---|---|---|
+| `POST /recall/full_recall` | Knowledge only | You need facts from documents or app sources |
+| `POST /recall/recall_preferences` | Memories only | You need user preferences or conversation history |
+| `POST /recall/boolean_recall` | Knowledge or memories (via `search_mode`) | You need exact term, AND, or phrase matching |
+
+Key points:
+
+- `POST /recall/full_recall` searches indexed sources (documents). `POST /recall/recall_preferences` searches user memories (inferred content). They are separate stores.
+- `POST /recall/full_recall` and `POST /recall/recall_preferences` share the same request schema (`RecallSearchRequest`) and response schema (`RetrievalResult`).
+- `POST /recall/boolean_recall` uses a different request schema (`FullTextSearchRequest`) and supports a `search_mode` of `sources` or `memories`. See its endpoint page.
+
+To combine knowledge and memories in a single LLM prompt, call both endpoints and merge the results — see [Minimal Working Example](#6-minimal-working-example).
+
+### Choosing the right endpoint
+
+Use this decision guide:
+
+| Question | Endpoint |
+|---|---|
+| Do I need facts from ingested documents or app sources? | `POST /recall/full_recall` |
+| Do I need this user's preferences or past conversations? | `POST /recall/recall_preferences` |
+| Do I need both for a personalized answer? | Both — call each and merge |
+| Do I need exact-phrase or boolean-operator matching? | `POST /recall/boolean_recall` |
+| Do I want ranked, context-aware results? | `POST /recall/full_recall` or `POST /recall/recall_preferences` |
+| Do I want deterministic keyword matching with no ranking intelligence? | `POST /recall/boolean_recall` |
+
+If you are unsure, start with `POST /recall/full_recall` for content questions and `POST /recall/recall_preferences` for user-specific questions. Reach for `POST /recall/boolean_recall` only when you need exact-match semantics.
+
+---
+
+## 4. How Recall Works
+
+> The two-mode pipeline that controls latency, retrieval quality, and graph traversal.
+
+The `mode` parameter controls the retrieval pipeline for `POST /recall/full_recall` and `POST /recall/recall_preferences`:
+
+| Mode | Pipeline | Latency |
+|---|---|---|
+| `fast` (default) | Single query, faster response | Lower |
+| `thinking` | Multi-query generation with reranking, higher quality | Higher |
+
+`thinking` mode runs a richer pipeline: it expands the query into multiple sub-queries and reranks candidates. If the purpose of your call is to deliver a high-quality answer, prefer `thinking`.
+
+`POST /recall/boolean_recall` has no `mode` parameter; it always runs deterministic term matching.
+
+<Info>
+  **Fast mode trade-off.** `fast` reduces latency by skipping multi-query expansion and reranking. Use it for high-volume lookups where latency matters; use `thinking` when you need higher retrieval quality.
+</Info>
+
+### Latency vs Quality tradeoff
+
+| Scenario | Recommended mode | Why |
+|---|---|---|
+| Autocomplete, suggestions, typeahead | `fast` | Latency dominates |
+| Lookup of canonical facts | `fast` | Single query is sufficient |
+| Personalized Q&A for an end user | `thinking` | Reranking materially improves the answer |
+| Agent reasoning over multi-entity context | `thinking` | Multi-query expansion surfaces linked material |
+| Batch background jobs | `thinking` | Latency budget is loose; quality matters more |
+| High-QPS internal tooling | `fast` | Throughput over nuance |
+
+As a rule of thumb: if a human will read the result, use `thinking`. If a machine will filter it further or latency is user-facing in milliseconds, use `fast`.
+
+---
+
+## 5. Key Parameters
+
+> All parameters below apply to `POST /recall/full_recall` and `POST /recall/recall_preferences`. `POST /recall/boolean_recall` uses a different set.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `tenant_id` | string | — (required) | Your tenant identifier. |
+| `sub_tenant_id` | string \| null | none | Scopes recall to a specific sub-tenant. Omit to use the default sub-tenant created during tenant setup. |
+| `query` | string | — (required) | Search terms to find relevant content. |
+| `mode` | `"fast"` \| `"thinking"` | `"fast"` | See [How Recall Works](#4-how-recall-works). |
+| `max_results` | integer \| null | none | Maximum number of results to return. Start with 10–20. |
+| `alpha` | number \| `"auto"` | `0.8` | Search ranking parameter (0.0 = sparse/keyword, 1.0 = dense/semantic). `"auto"` lets HydraDB decide. |
+| `recency_bias` | number | `0.0` | Preference for newer content (0.0 = no bias, 1.0 = strong recency preference). |
+| `graph_context` | boolean | `false` | When `true`, enables graph context for search results. |
+| `metadata_filters` | object \| null | `null` | Exact-match filters. Top-level keys are matched against `tenant_metadata` and must correspond to fields defined in `tenant_metadata_schema` during tenant creation. To filter on `document_metadata`, nest filters under a `document_metadata` key. |
+| `additional_context` | string \| null | `null` | Additional context to guide retrieval (e.g. `"User is debugging production"`). Does not replace `query`. |
+| `search_forceful_relations` | boolean | `true` | Whether to fetch forceful-relation extra context in `thinking` mode. |
+
+<Warning>
+  **Two defaults that surprise developers:**
+  - `graph_context: false` — set it to `true` to enable graph context in the response.
+  - `recency_bias: 0` — no recency boost is applied unless you set it.
+</Warning>
+
+<Warning>
+  **`metadata_filters` requires a pre-declared schema.** Top-level filter keys must be defined in `tenant_metadata_schema` when the tenant is created. The schema is immutable — plan your filterable keys before your first ingestion. See [Create Tenant](/api-reference/endpoint/create-tenant).
+
+  Example combining tenant and document metadata filters:
+
+```json
+  {
+    "metadata_filters": {
+      "category": "engineering",
+      "document_metadata": { "source": "account_plan" }
+    }
+  }
+```
+</Warning>
+
+<Info>
+  **TODO:** OpenAPI describes `search_forceful_relations` as fetching forceful-relation extra context **in `thinking` mode**. Confirm whether the flag has any effect when `mode: "fast"` is used (silently ignored, partially honored, or rejected).
+</Info>
+
+### Scoping strategies
+
+Three parameters control *what subset of your data* recall searches. Choose the narrowest scope that still contains the answer.
+
+- **`tenant_id`** — the outermost boundary. Every recall call is scoped to a single tenant. This is your isolation guarantee, not a filter you tune.
+- **`sub_tenant_id`** — scopes recall to a specific user, workspace, or logical partition within the tenant. Use it when each end-user has their own store (memories, private workspaces). Omit it to use the default sub-tenant.
+- **`metadata_filters`** — deterministic exact-match filters on declared metadata fields. Use for attributes like `source_type`, `language`, `department`, or `status`.
+
+Common scoping patterns:
+
+| Pattern | Scope |
+|---|---|
+| Shared company knowledge base | `tenant_id` only, default sub-tenant |
+| Per-user memories | `tenant_id` + user's `sub_tenant_id` |
+| Per-workspace documents | `tenant_id` + workspace `sub_tenant_id` |
+| Filtered knowledge (e.g. only published docs) | `tenant_id` + `metadata_filters: { status: "published" }` |
+| Personalized answer from shared docs | Two calls: `POST /recall/full_recall` (tenant only) + `POST /recall/recall_preferences` (tenant + user sub-tenant) |
+
+### Parameter tuning heuristics
+
+- **`alpha`** — Start at `0.8` (semantic-leaning). Lower toward `0.3–0.5` when the query contains product names, error codes, SKUs, or other literal tokens. Raise toward `0.9` for conceptual questions. Use `"auto"` when the query shape varies across users.
+- **`recency_bias`** — Leave at `0` for static reference material (policies, manuals). Set `0.2–0.4` for mixed content where newer usually beats older. Set `0.6–0.8` for news, incidents, status updates, or changelogs. Anything above `0.8` effectively sorts by recency.
+- **`max_results`** — Start with `10`. Reduce to `5` when feeding a tight LLM context window. Raise to `20` when you rerank downstream or the query is broad. Returning more than you need wastes tokens without improving answers.
+- **`mode`** — Default to `fast`. Flip to `thinking` whenever the result reaches an end user or an agent making a decision.
+- **`graph_context`** — Enable when you want graph-derived paths and chunk relations in the response. Leave off for simple Q&A to keep responses compact.
+- **`additional_context`** — Use when the query alone is ambiguous (e.g. `"reset"` is clearer with `"User is on the billing page"`). Keep it short and factual; it biases retrieval, it does not replace the query.
+
+---
+
+## 6. Minimal Working Example
+
+> A complete flow: recall knowledge, recall user memories, merge into an LLM prompt. This is the core pattern for personalized answers.
+
+### Step 1 — Recall knowledge
+
+```bash
+curl -X POST https://api.hydradb.com/recall/full_recall \
+  -H "Authorization: Bearer $HYDRADB_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "tenant_id": "acme_corp",
+    "query": "How do I reset my password?",
+    "mode": "thinking",
+    "max_results": 5,
+    "graph_context": true
+  }'
+```
+
+<Note>
+  Include `sub_tenant_id` only if your knowledge is scoped to a specific user or workspace.
+</Note>
+
+### Step 2 — Recall user memories
+
+```bash
+curl -X POST https://api.hydradb.com/recall/recall_preferences \
+  -H "Authorization: Bearer $HYDRADB_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "tenant_id": "acme_corp",
+    "sub_tenant_id": "user_john_123",
+    "query": "answer style and tone preferences",
+    "mode": "thinking",
+    "max_results": 3,
+    "graph_context": true
+  }'
+```
+
+### Step 3 — Merge and prompt the LLM
+
+Both calls return a `RetrievalResult`. Use the helper from [How to Use API Results](/essentials/api-results) to format each one into a clean context string:
+
+```ts
+import { buildContextString } from "./contextBuilder";
+
+const knowledgeCtx = buildContextString(knowledgeResult);
+const memoryCtx = buildContextString(memoryResult);
+
+const completion = await openai.chat.completions.create({
+  model: "gpt-4o",
+  messages: [
+    {
+      role: "system",
+      content:
+        "Answer using only the provided context. Match the user's preferred style.",
+    },
+    {
+      role: "user",
+      content: `User preferences:\n${memoryCtx}\n\nRelevant docs:\n${knowledgeCtx}\n\nQuestion: How do I reset my password?`,
+    },
+  ],
+});
+```
+
+### Response shape
+
+Both `POST /recall/full_recall` and `POST /recall/recall_preferences` return the same structure:
+
+```json
+{
+  "chunks": [ /* ranked chunks with content and scores */ ],
+  "sources": [ /* deduplicated source metadata for the chunks */ ],
+  "graph_context": {
+    "query_paths": [],
+    "chunk_relations": [],
+    "chunk_id_to_group_ids": {},
+    "synthesis_context": null
+  },
+  "additional_context": {}
+}
+```
+
+When present, `graph_context` is an object containing `query_paths`, `chunk_relations`, `chunk_id_to_group_ids`, and `synthesis_context`. `synthesis_context` is an LLM-generated summary of how sub-query results connect; it is present only for multi-step queries with `requires_synthesis=True`, and may be `null` otherwise.
+
+When present, `additional_context` is an **object (map)** of `chunk_uuid` to chunk, used to look up extra context for chunks that have populated `extra_context_ids`.
+
+<Info>
+  **TODO:** Confirm presence guarantees of `graph_context` and `additional_context` in the response. Neither is marked `required` in OpenAPI, so clients should treat them as optional and handle absence defensively until guarantees are documented.
+</Info>
+
+### Production pattern
+
+The example above is the skeleton. In production, wrap it with the following:
+
+1. **Parallelize the two recall calls.** They are independent — fire them concurrently and `await` both. This saves one full network round-trip per request.
+2. **Set per-call timeouts.** Give `thinking` mode a generous timeout (e.g. 3–5s) and `fast` mode a tight one (e.g. 500ms). Do not let a slow recall block the whole request.
+3. **Degrade gracefully.** If `POST /recall/recall_preferences` fails or times out, continue with knowledge only rather than failing the whole user request. Personalization is an enhancement, not a hard dependency.
+4. **Cache by `(tenant_id, sub_tenant_id, query, mode, filters)`** for idempotent reads. Keep TTLs short (tens of seconds) so new ingestions surface quickly.
+5. **Log the request and chunk score distribution.** Score distributions are your primary signal when tuning `alpha`, `recency_bias`, or `max_results`.
+6. **Pass `additional_context`** with known request state (page, feature, user role). It sharpens retrieval at zero extra cost.
+7. **Enable `graph_context`** when you plan to show provenance or let the agent reason over relationships; leave it off otherwise to keep responses small.
+
+---
+
+## 7. Common Mistakes
+
+> Real traps developers hit on their first integration.
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `query_paths` and `chunk_relations` are empty | `graph_context` was not set to `true`, or no graph relations exist for the result set | Set `graph_context: true` in the request. Empty arrays are also normal when no relations exist. |
+| Results don't reflect recent uploads | Processing isn't complete | Check status via [`/ingestion/verify_processing`](/api-reference/endpoint/verify-processing). Chunks aren't searchable until `completed`. |
+| `metadata_filters` returns zero results | Filter key wasn't declared in `tenant_metadata_schema` | Top-level keys must be defined at tenant creation. The schema is immutable. |
+| Expected memories in `POST /recall/full_recall` results (or vice versa) | Knowledge and memories are separate stores | Make two calls — one per endpoint — and merge. |
+| Recency doesn't seem to matter | `recency_bias` defaults to `0` | Set `recency_bias` between `0.1` and `1.0` explicitly. |
+| Search is too literal or too fuzzy | `alpha` mismatched to query type | Lower `alpha` for keyword precision; raise it for conceptual queries; use `"auto"` if unsure. |
+| Latency is higher than expected | `mode: "thinking"` on a hot path | Move to `fast` where acceptable, or parallelize calls. |
+| Tried to filter `document_metadata` at the top level | `metadata_filters` top-level keys map to `tenant_metadata` only | Nest document filters under a `document_metadata` key inside `metadata_filters`. |
+
+### Debugging Recall issues — checklist
+
+When recall results look wrong, walk this list in order:
+
+1. **Scope** — Is `tenant_id` correct? Is `sub_tenant_id` the one you think it is (user vs default vs workspace)?
+2. **Store** — Are you calling the right endpoint? `POST /recall/full_recall` searches sources; `POST /recall/recall_preferences` searches memories.
+3. **Ingestion status** — Has the source finished processing? Query [`/ingestion/verify_processing`](/api-reference/endpoint/verify-processing). Unfinished chunks are invisible to recall.
+4. **Filters** — Is every top-level key in `metadata_filters` present in `tenant_metadata_schema`? Are document-level filters nested under `document_metadata`? A typo or undeclared key silently narrows results to zero.
+5. **Mode** — Is `mode` set to `thinking` when you need higher-quality multi-query retrieval? Remember `fast` is the default.
+6. **Graph output** — If `query_paths` or `chunk_relations` is empty, confirm `graph_context: true` was sent. Empty arrays are also expected when no relations exist for the result set.
+7. **Recency** — If newer content isn't surfacing, `recency_bias` is almost certainly still `0`.
+8. **Alpha** — If results miss literal terms (product names, error codes), lower `alpha`. If they're too rigid, raise it or set `"auto"`.
+9. **max_results** — Too few and the right chunk falls off the list; too many and noise dilutes the prompt.
+10. **additional_context** — Is the query ambiguous without session state? Add a short factual hint.
+
+If you've walked the checklist and results are still wrong, capture a request/response pair and open a support ticket — include `tenant_id`, the full request body, and the top three returned chunks.
+
+---
+
+## 8. Error Codes & Failure Modes
+
+> HTTP status codes recall can return, what each typically means, and how to handle them.
+
+All HydraDB error responses follow this shape:
+
+```json
+{
+  "detail": {
+    "success": false,
+    "message": "Human-readable description of what went wrong.",
+    "error_code": "MACHINE_READABLE_CODE"
+  }
+}
+```
+
+Read errors as `response.detail.message` and `response.detail.error_code`.
+
+The recall endpoints return the following statuses (per OpenAPI):
+
+| Status | Meaning | Recommended handling |
+|---|---|---|
+| `200` | Success | Process `chunks[]` and `sources[]` |
+| `400` | Bad Request — invalid input parameters | Fix the request; do not retry unchanged |
+| `401` | Unauthorized — authentication required | Refresh or re-issue the API key; do not retry unchanged |
+| `403` | Forbidden — access denied | Verify key scope; do not retry unchanged |
+| `404` | Not Found — resource does not exist | Verify tenant; do not retry unchanged |
+| `422` | Unprocessable Entity — validation failed | Fix offending field |
+| `429` | Too Many Requests — rate limit exceeded | Back off and retry — see below |
+| `500` | Internal Server Error | Retry with backoff; escalate if persistent |
+| `503` | Service Unavailable | Retry with backoff |
+
+### Retry policy
+
+- **Retry on:** `429`, `500`, `503`.
+- **Do not retry on:** `400`, `401`, `403`, `404`, `422` — the request is wrong and will keep failing.
+- **Strategy:** exponential backoff with jitter, capped at a small number of attempts (e.g. 3).
+- **Idempotency:** recall is a read operation, so retries are safe with respect to state. They are not safe with respect to latency budgets — set a hard overall deadline and surface a degraded response rather than queueing retries forever.
+
+---
+
+## 9. Response Field Reference
+
+> Every field returned by `POST /recall/full_recall` and `POST /recall/recall_preferences`.
+
+Both endpoints return a `RetrievalResult`:
+
+```json
+{
+  "chunks": [ /* ranked chunks */ ],
+  "sources": [ /* deduplicated source metadata */ ],
+  "graph_context": {
+    "query_paths": [],
+    "chunk_relations": [],
+    "chunk_id_to_group_ids": {},
+    "synthesis_context": null
+  },
+  "additional_context": {}
+}
+```
+
+### `chunks[]`
+
+List of retrieved chunks (`VectorStoreChunk`). Each entry describes a single piece of retrieved context.
+
+| Field | Purpose |
+|---|---|
+| `chunk_uuid` | Stable chunk identifier, usable as a key for caching, dedup, and feedback. Also the key used in `additional_context` and referenced by `extra_context_ids`. |
+| `chunk_content` | The chunk text you feed to the LLM. |
+| `relevancy_score` | Per-chunk relevancy score. Nullable. |
+| `source_id` | Foreign key into `sources[]` — join to get source-level metadata. |
+| `extra_context_ids` | IDs of related chunks providing extra context (from forceful relations). Look up entries in `additional_context` using these IDs. |
+
+<Info>
+  **TODO:** Confirm whether `chunks` are guaranteed to be returned in ranked order, and whether ordering is determined solely by `relevancy_score` or by a composite of ranking signals.
+</Info>
+
+### `sources[]`
+
+Deduplicated list of the sources the `chunks[]` were drawn from. Use this to render citations, source cards, or "view original" links without repeating metadata for every chunk.
+
+| Field | Purpose |
+|---|---|
+| `id` | Source identifier referenced by `chunks[].source_id`. |
+| `title` | Short human-readable title for the source. |
+| `type` | Category of the source (e.g. document, email, ticket). |
+| `description` | Long-form description, if provided at ingestion. |
+| `url` | Canonical URL or reference link, if available. |
+| `timestamp` | Creation or last-updated timestamp in ISO-8601. |
+| `metadata` | Tenant-level metadata set at ingestion time. |
+| `additional_metadata` | Document-level metadata set at ingestion time. |
+
+### `graph_context`
+
+When present, an object containing graph-derived data. Per OpenAPI, none of its fields are marked required; treat each as optional.
+
+| Field | Type | Purpose |
+|---|---|---|
+| `query_paths` | array of `ScoredPathResponse` | Paths in the context graph that connect the query to retrieved chunks. |
+| `chunk_relations` | array of `ScoredPathResponse` | Relations between returned chunks. Useful for grouping and provenance. |
+| `chunk_id_to_group_ids` | object (map) | Maps each chunk id to the graph groups it belongs to. |
+| `synthesis_context` | string \| null | LLM-generated summary of how sub-query results connect. Present only for multi-step queries with `requires_synthesis=True`; otherwise `null`. |
+
+`graph_context` data is populated when `graph_context: true` is set in the request and graph data exists for the result set.
+
+<Info>
+  **TODO:** Confirm whether `graph_context` is guaranteed to be present in every response (with empty arrays when there is nothing to return) or whether it can be absent/null. The OpenAPI schema does not list it under `required`.
+</Info>
+
+### `additional_context`
+
+When present, an object (map) of `chunk_uuid` → chunk for extra context surfaced from forcefully related sources. Use `chunks[].extra_context_ids` to look up entries in this map.
+
+<Info>
+  **TODO:** Confirm whether `additional_context` is guaranteed to be present in every response (as an empty object when there is nothing extra to surface) or whether it can be absent under some conditions.
+</Info>
+
+<Info>
+  **TODO:** Confirm referential integrity between `chunks[].extra_context_ids` and the keys of `additional_context` — specifically whether every referenced ID is guaranteed to be present in `additional_context`, and how the server behaves on partial availability.
+</Info>
+
+---
+
+## 10. Worked Multi-Tenant Example
+
+> A realistic SaaS scenario showing how `tenant_id`, `sub_tenant_id`, and `metadata_filters` compose.
+
+### Scenario
+
+Imagine a B2B SaaS product, "Acme Docs":
+
+- **Acme Corp** is a customer — a single `tenant_id`: `acme_corp`.
+- Inside Acme, there are multiple **workspaces** — e.g. `ws_engineering`, `ws_legal`. Each has its own private knowledge.
+- Inside each workspace, there are **users** — e.g. `user_john_123`, `user_maria_456`. Each user has personal memories (preferred tone, recent conversations).
+- All knowledge is tagged at ingestion with `status: "published" | "draft"` and `language: "en" | "de"` (both declared in `tenant_metadata_schema`).
+
+### Scoping choices
+
+| Data | `tenant_id` | `sub_tenant_id` | `metadata_filters` |
+|---|---|---|---|
+| Company-wide knowledge (e.g. HR policies) | `acme_corp` | default | `{ status: "published" }` |
+| Engineering workspace docs | `acme_corp` | `ws_engineering` | `{ status: "published" }` |
+| Engineering workspace *drafts* (for editors) | `acme_corp` | `ws_engineering` | `{ status: "draft" }` |
+| John's personal memories | `acme_corp` | `user_john_123` | — |
+| Maria's personal memories | `acme_corp` | `user_maria_456` | — |
+
+### Request flow
+
+When John (in the Engineering workspace, German UI) asks *"What's the on-call rotation policy?"*, the backend fires two calls in parallel:
+
+```bash
+# 1. Engineering workspace knowledge, published only, German
+curl -X POST https://api.hydradb.com/recall/full_recall \
+  -H "Authorization: Bearer $HYDRADB_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "tenant_id": "acme_corp",
+    "sub_tenant_id": "ws_engineering",
+    "query": "on-call rotation policy",
+    "mode": "thinking",
+    "max_results": 5,
+    "graph_context": true,
+    "metadata_filters": {
+      "status": "published",
+      "language": "de"
+    }
+  }'
+```
+
+```bash
+# 2. John's personal memories
+curl -X POST https://api.hydradb.com/recall/recall_preferences \
+  -H "Authorization: Bearer $HYDRADB_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "tenant_id": "acme_corp",
+    "sub_tenant_id": "user_john_123",
+    "query": "answer style and tone preferences",
+    "mode": "thinking",
+    "max_results": 3
+  }'
+```
+
+The results merge into the LLM prompt exactly as in [Minimal Working Example](#6-minimal-working-example).
+
+### Why this works
+
+- **Tenant isolation** — `tenant_id: "acme_corp"` is the hard boundary. No request can accidentally reach another customer's data.
+- **Workspace scoping** — `sub_tenant_id: "ws_engineering"` limits knowledge recall to the workspace John is in. If he switches to Legal, you change the `sub_tenant_id`, not the tenant.
+- **User personalization** — the second call uses `sub_tenant_id: "user_john_123"` because memories are *personal*, not workspace-shared.
+- **Content filtering** — `metadata_filters` enforces that drafts never leak into end-user answers, and that German users get German sources. Both keys must have been declared in `tenant_metadata_schema` at tenant creation.
+
+---
+
+## 11. Advanced Patterns
+
+> Composite patterns once the basic recall flow is working.
+
+### Hybrid: `boolean_recall` + `full_recall`
+
+When a query mixes an exact token (an error code, SKU, function name) with a natural-language intent, combine deterministic and ranked retrieval:
+
+1. Run `POST /recall/boolean_recall` with the exact token to guarantee inclusion of literal matches.
+2. Run `POST /recall/full_recall` with the full query for semantic breadth.
+3. Merge results, deduplicating by `chunk_uuid`. Treat `boolean_recall` hits as a floor ("must include").
+
+This pattern gives you recall guarantees on the literal token without sacrificing semantic quality on the rest of the query.
+
+### Fallback chain
+
+Build a chain that degrades gracefully under failure or empty results:
+
+1. **Primary:** `POST /recall/full_recall` with `mode: "thinking"` and strict `metadata_filters`.
+2. **If zero results:** retry with relaxed `metadata_filters` (e.g. drop `language`).
+3. **If still zero:** retry with `mode: "fast"` and no filters — last-resort broad sweep.
+4. **If `POST /recall/recall_preferences` fails or times out:** proceed with knowledge only. Never block the user request on personalization.
+
+Log which rung of the chain fired; sustained fallbacks are a signal to tune filters or ingestion.
+
+### Recall-then-rerank
+
+Use HydraDB recall as the first stage, then apply your own reranker (e.g. a cross-encoder, an LLM, or a business-rules layer) before selecting the final top-k for the prompt:
+
+1. Request more chunks than you need — `max_results: 20` instead of `5`.
+2. Rerank the 20 with your domain-specific logic (recency windows you control, legal/compliance filters, user-specific boosts that live outside HydraDB).
+3. Feed the final top-k into the LLM.
+
+This keeps HydraDB responsible for high-recall retrieval and your own layer responsible for business-specific precision — without you rebuilding retrieval yourself.
+
+### Two-call personalization (canonical)
+
+The pattern you will reach for most often: `POST /recall/full_recall` + `POST /recall/recall_preferences`, fired in parallel, merged into one prompt. Already covered in [Minimal Working Example](#6-minimal-working-example); mentioned here because it *is* the default advanced pattern for any user-facing agent.
+
+---
+
+## Related
+
+- [Memories](/essentials/memories) — what you can store
+- [Metadata](/essentials/metadata) — designing filterable fields
+- [Context Graphs](/essentials/context-graphs) — how graph traversal enriches recall
+- [How to Use API Results](/essentials/api-results) — turning `RetrievalResult` into an LLM prompt

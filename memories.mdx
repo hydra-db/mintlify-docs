@@ -1,0 +1,243 @@
+---
+title: "Memories"
+description: "What memories are, how they differ from ingested knowledge, and how to write them correctly."
+---
+
+# Memories
+
+## What it is
+
+In simple terms: memories are how your system remembers things about a user over time.
+
+A memory is a unit of user-specific context HydraDB stores on behalf of an agent. It can be a preference, a past conversation, an inferred trait, or a raw fact.
+
+Memories are user-scoped state that lets an agent adapt its responses to a specific user. They are typically used across sessions and surface again through [Recall](/essentials/recall) when they're relevant.
+
+Think of memories as the agent's side of the relationship — what it has learned about *this* user over time. That's distinct from **knowledge**, which is the shared, tenant-wide context ingested from documents and apps.
+
+## What it does
+
+When you add a memory, HydraDB:
+
+1. Parses structured or unstructured input (text, markdown, or user–assistant pairs).
+2. Optionally runs inference (`infer: true`) to extract preferences and insights from the raw content.
+3. Chunks and embeds the result.
+4. Links it into the retrieval system. Memories may participate in context graph traversal during recall.
+5. Makes it available to [`recall_preferences`](/api-reference/endpoint/recall-preferences) for future queries.
+
+Memories are not just stored — they are structured for retrieval. The `infer` flag decides how much of that structure is extracted automatically.
+
+## When to use it
+
+Use memories when your system needs responses to adapt to a specific user over time:
+
+- Capture stated or implied preferences ("prefers concise answers").
+- Store past conversations so the agent can reference them later.
+- Record decisions, outcomes, or feedback tied to a user.
+- Build up a behavioral profile that compounds across sessions.
+
+Use [knowledge](/api-reference/endpoint/add-knowledge-memories) instead when the content is shared across users — product docs, policy PDFs, internal wikis, Slack threads, Gmail threads.
+
+Rule of thumb:
+
+| If the content is... | Store it as... |
+|---|---|
+| About a specific user or their session | Memory |
+| Shared across all users in your tenant | Knowledge |
+
+Memories are written via API and used for personalization. Knowledge is ingested in bulk and used for shared retrieval.
+
+## Types of memories
+
+HydraDB's memory endpoint accepts three content shapes. All three go through the same API.
+
+By usage convention, a single memory item should use **either** `text` **or** `user_assistant_pairs`, not both.
+
+### Raw text
+
+Plain text. Use `infer: true` if you want HydraDB to extract preferences and insights; use `infer: false` to store the text as-is.
+
+```json
+{
+  "text": "Prefers detailed technical explanations and works in PST.",
+  "infer": true
+}
+```
+
+### Markdown
+
+Same as text, but flagged so HydraDB preserves structure.
+
+```json
+{
+  "text": "# Meeting Notes\n\n## Key Points\n- Budget approved",
+  "is_markdown": true,
+  "infer": false
+}
+```
+
+### User–assistant pairs
+
+Pass a conversation directly. Best for capturing implicit signals from dialogue. The field is an array of objects, each with a `user` and an `assistant` string.
+
+```json
+{
+  "user_assistant_pairs": [
+    { "user": "Remember I like dark mode", "assistant": "Noted." }
+  ],
+  "infer": true
+}
+```
+
+## How it works
+
+Memories live in a separate store from knowledge. Two things follow from this:
+
+- `recall_preferences` searches memories only.
+- `full_recall` searches knowledge only.
+
+<Warning>
+  Memories and knowledge are separate systems. `recall_preferences` returns memories only, and `full_recall` returns knowledge only. For personalized responses grounded in shared context, call both endpoints and merge the results before prompting your LLM.
+</Warning>
+
+Within a tenant, memories may be scoped by `sub_tenant_id`. For per-user separation (B2C), the user's ID is typically used as the `sub_tenant_id`. For shared memory across a workspace, a stable workspace-level ID is typically used. See [Multi-tenant support](/essentials/multi-tenant).
+
+The `infer` flag controls the ingestion pipeline:
+
+| `infer` | Behavior |
+|---|---|
+| `true` | HydraDB extracts preferences, traits, and insights, then indexes them. Use for conversations, feedback, unstructured input. |
+| `false` | Content is stored as-is. Faster. Use for factual statements or pre-structured data. |
+
+The default for `infer` is `false` (per OpenAPI). Set it explicitly if you want inference.
+
+<Info>
+  Inference adds latency but produces richer, more retrievable memory. When in doubt for conversational content, set `infer: true` explicitly.
+</Info>
+
+<Info>
+  **TODO:** Confirm inference failure behavior — fallback to raw storage, item failure, or retry (OpenAPI does not specify).
+</Info>
+
+## Key parameters
+
+### Top-level request body
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `memories` | array of objects | Yes | One or more memory items. Must be a list, even for a single memory. |
+| `tenant_id` | string | Yes | Your tenant identifier. |
+| `sub_tenant_id` | string | No | Sub-tenant scope for these memories. Defaults to the tenant's default sub-tenant. |
+| `upsert` | boolean | No | Default `true` (per OpenAPI). If `true`, replaces existing memory entries with the same `source_id`. |
+
+### Memory item fields
+
+| Field | Type | Description |
+|---|---|---|
+| `source_id` | string \| null | Optional unique identifier for the memory (used as the upsert key). Auto-generated if omitted. |
+| `text` | string \| null | Raw text or markdown content. Use this **or** `user_assistant_pairs` per item. |
+| `user_assistant_pairs` | array of `{ user, assistant }` \| null | Conversation pairs. Use this **or** `text` per item. |
+| `is_markdown` | boolean | Treat `text` as markdown. Default `false`. |
+| `infer` | boolean | Run inference on the content. Default `false`. See [How it works](#how-it-works). |
+| `custom_instructions` | string \| null | Guides how inference extracts signals. Applied **only** when `infer: true`; ignored otherwise. |
+| `user_name` | string | The user's name. Used by the inference and personalization pipelines — it influences how memories are extracted, not just how they are displayed. Defaults to `"User"`. |
+| `title` | string \| null | Display title for this memory. |
+| `expiry_time` | integer \| null | TTL in seconds. After this duration, the memory is no longer returned by retrieval. |
+| `tenant_metadata` | string | Tenant-level metadata. **JSON string** (must be stringified). |
+| `document_metadata` | string | Document-level metadata. **JSON string** (must be stringified). |
+| `metadata` | object | Key-value metadata attached to this memory. |
+| `additional_metadata` | object | Additional key-value metadata for this memory. |
+| `relations` | object \| null | Forceful relations payload to connect this memory to other sources. |
+
+<Warning>
+  Per OpenAPI, `tenant_metadata` and `document_metadata` on memory items are typed as **JSON strings**, not objects. This differs from the knowledge upload endpoint, which accepts objects directly. `metadata` and `additional_metadata` are separate fields typed as objects.
+</Warning>
+
+<Info>
+  **TODO:** Confirm interaction and precedence between `metadata`, `additional_metadata`, `tenant_metadata`, and `document_metadata` — filterability, conflict resolution, and downstream usage (OpenAPI does not specify).
+</Info>
+
+<Info>
+  **TODO:** Confirm `expiry_time` semantics — hard delete, soft delete, or excluded from recall only (OpenAPI does not specify).
+</Info>
+
+## Minimal working example
+
+Store a user preference as a memory, scoped to a specific user.
+
+```bash
+curl -X POST https://api.hydradb.com/memories/add_memory \
+  -H "Authorization: Bearer $HYDRADB_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "tenant_id": "acme_corp",
+    "sub_tenant_id": "user_john_123",
+    "memories": [
+      {
+        "text": "Prefers short, direct answers with no preamble.",
+        "infer": true,
+        "user_name": "John"
+      }
+    ]
+  }'
+```
+
+Response (`AddMemoryResponse`):
+
+```json
+{
+  "success": true,
+  "message": "Memories queued for ingestion successfully",
+  "results": [
+    {
+      "source_id": "mem_abc123",
+      "status": "queued",
+      "infer": true
+    }
+  ],
+  "success_count": 1,
+  "failed_count": 0
+}
+```
+
+Per OpenAPI, only `source_id` is required on each `results[]` item. Other top-level fields (`success`, `message`, `success_count`, `failed_count`) are not marked required and may be omitted in some responses — handle them defensively.
+
+Ingestion is asynchronous. To confirm the memory is fully indexed, poll [`/ingestion/verify_processing`](/api-reference/endpoint/verify-processing) with the returned `source_id`. Once status is `completed`, the memory will surface in [`recall_preferences`](/api-reference/endpoint/recall-preferences).
+
+## Error responses
+
+All HydraDB error responses follow this shape:
+
+```json
+{
+  "detail": {
+    "success": false,
+    "message": "Human-readable description of what went wrong.",
+    "error_code": "MACHINE_READABLE_CODE"
+  }
+}
+```
+
+Read errors as `response.detail.message` and `response.detail.error_code`. There is no `request_id` field in error responses.
+
+## Common mistakes
+
+| Mistake | What goes wrong | Fix |
+|---|---|---|
+| Sending `"memory": "..."` | The endpoint expects a list under `memories`, not a singular `memory` field | Use `"memories": [ { "text": "..." } ]` |
+| Passing a string instead of an array | The request fails validation | Wrap every item in an object inside the `memories` array |
+| Omitting `tenant_id` | 400 error | `tenant_id` is required on every call |
+| Omitting `sub_tenant_id` for per-user data | The memory lands in the default sub-tenant and may surface across users | Use the user's ID as `sub_tenant_id` for B2C separation |
+| Passing `tenant_metadata` as an object | Validation failure — the field is typed as a JSON **string** on memory items | `JSON.stringify(yourMetadata)` before sending |
+| Setting `custom_instructions` with `infer: false` | The instructions are ignored — they apply only during inference | Set `infer: true` if you need `custom_instructions` to take effect |
+| Treating `user_name` as cosmetic | It feeds inference and personalization, so the wrong name biases what HydraDB extracts | Pass the actual user's name |
+| Storing shared docs as memories | They won't surface in `full_recall` and won't be visible to other users | Use [knowledge ingestion](/api-reference/endpoint/add-knowledge-memories) instead |
+| Expecting immediate searchability | Ingestion is asynchronous | Poll [`/ingestion/verify_processing`](/api-reference/endpoint/verify-processing) until `completed` |
+| Forgetting `infer` for conversational input | Raw dialogue gets stored without preference extraction | Set `infer: true` explicitly for conversations |
+
+## Related
+
+- [Recall](/essentials/recall) — how memories are retrieved at query time
+- [Knowledge ingestion](/api-reference/endpoint/add-knowledge-memories) — for shared, tenant-wide content
+- [Multi-tenant support](/essentials/multi-tenant) — scoping memories per user or workspace
+- [Metadata](/essentials/metadata) — designing filterable fields

@@ -1,0 +1,524 @@
+---
+title: "How to Use API Results (full_recall)"
+description: "Turn a full_recall response into a grounded LLM answer."
+category: Essentials
+---
+
+# How to Use API Results (full_recall)
+
+## What it is
+
+A guide for turning the response from [`/recall/full_recall`](/api-reference/endpoint/full-recall) into a grounded LLM answer.
+
+When personalization is required, it also shows how to combine it with [`/recall/recall_preferences`](/api-reference/endpoint/recall-preferences).
+
+HydraDB returns structured JSON. Your model needs clean, readable context. This page shows how to bridge that gap.
+
+## What it does
+
+The response contains retrieved chunks, their sources, and — when requested — graph context. Raw JSON is not prompt-ready. You extract the relevant parts, format them into a readable context string, and pass that string to your model alongside the user's question.
+
+## When to use it
+
+Use this pattern whenever you call `full_recall` and want to generate a grounded answer with an LLM. If you also need the response to reflect a specific user's preferences, call `recall_preferences` in parallel and merge both results into one prompt.
+
+## How it works
+
+`full_recall` returns a `RetrievalResult`. Illustrative shape (fields may be omitted or empty depending on request configuration and result data):
+
+```json
+{
+  "chunks": [ /* ranked content chunks */ ],
+  "sources": [ /* deduplicated source metadata */ ],
+  "graph_context": {
+    "query_paths": [],
+    "chunk_relations": [],
+    "chunk_id_to_group_ids": {}
+  },
+  "additional_context": {}
+}
+```
+
+Per OpenAPI:
+
+- `chunks` — the primary output. Returned in a server-determined order.
+- `graph_context` — optional. May be omitted entirely, depending on request configuration and result data. Handle defensively.
+- `additional_context` — optional map keyed by ID (referenced from `chunks[].extra_context_ids`). Not an array. May be omitted entirely, empty, or partial.
+- `sources` — optional. May be omitted entirely; when present, contains deduplicated source metadata.
+
+You do not pass this object directly to your LLM. Always convert it into a structured context string first.
+
+<Info>
+  **TODO:** Confirm whether `additional_context` is guaranteed to be present (empty vs omitted) (OpenAPI does not specify).
+</Info>
+
+## Key concepts
+
+**Chunks may be ranked by HydraDB.** Preserve the order returned by the server when building your context string. Do not re-sort. The exact ordering mechanism is not guaranteed.
+
+**Graph context may be optional in the response.** When `graph_context: true` is set in the request and graph data is available, `query_paths` and `chunk_relations` may populate. When unavailable or not requested, they may be empty arrays, or `graph_context` may be absent entirely. Including graph relations in the prompt is **selective** — useful for queries that benefit from relational structure, less useful for simple lookups.
+
+<Info>
+  **TODO:** Confirm whether `graph_context` is guaranteed to be present (empty vs omitted vs null) (OpenAPI does not specify).
+</Info>
+
+**Additional context is wired by ID.** `additional_context` may be an optional map keyed by ID. When chunks reference related content via `extra_context_ids`, the helper below looks up each ID inside the map and appends it under the chunk. Do not assume `additional_context` is present, do not assume it is complete, and do not assume every ID in `extra_context_ids` resolves to an entry in it.
+
+<Info>
+  **TODO:** Confirm referential integrity between `chunks[].extra_context_ids` and `additional_context` keys (OpenAPI does not specify).
+</Info>
+
+**Memory and knowledge are separate calls.** `full_recall` returns knowledge. `recall_preferences` returns memories. For personalized answers, call both, format each, and merge them into a single prompt before calling the LLM. No specific ordering between memory and knowledge is required or guaranteed to improve answer quality.
+
+**Control context size.** Start with `max_results: 10`. If you hit model token limits, reduce it. Total prompt size depends on `max_results`, chunk length, graph context inclusion, and `additional_context` payloads — token usage is not bounded by the API.
+
+## Minimal working example
+
+> Illustrative only. The snippets below show one way to build a prompt from a `RetrievalResult`. They do not imply guarantees about response shape, field presence, or ranking semantics.
+
+### Step 1 — Call `full_recall`
+
+<CodeGroup>
+```python Python
+import httpx
+
+response = httpx.post(
+    "https://api.hydradb.com/recall/full_recall",
+    headers={"Authorization": "Bearer YOUR_HYDRADB_API_KEY"},
+    json={
+        "tenant_id": "your-tenant",
+        "sub_tenant_id": "your-sub-tenant",
+        "query": "How does authentication work?",
+        "max_results": 10,
+        "mode": "thinking",
+        "graph_context": True,
+    },
+)
+
+result = response.json()
+```
+
+```typescript TypeScript
+const res = await fetch("https://api.hydradb.com/recall/full_recall", {
+  method: "POST",
+  headers: {
+    "Content-Type": "application/json",
+    Authorization: "Bearer YOUR_HYDRADB_API_KEY",
+  },
+  body: JSON.stringify({
+    tenant_id: "your-tenant",
+    sub_tenant_id: "your-sub-tenant",
+    query: "How does authentication work?",
+    max_results: 10,
+    mode: "thinking",
+    graph_context: true,
+  }),
+});
+
+const result = (await res.json()) as RetrievalResult;
+```
+</CodeGroup>
+
+### Step 2 — Build a context string
+
+Use the `build_context_string` helper. It extracts content, preserves the server's chunk order, formats graph relations when present, and appends related context defensively. The helper does not assume `graph_context` or `additional_context` are present, and skips `extra_context_ids` that do not resolve.
+
+<CodeGroup>
+```python context_builder.py
+from __future__ import annotations
+
+from typing import Any
+
+
+def _format_path_chain(path: Any) -> str:
+    """Format a ScoredPathResponse into a readable chain string.
+
+    Each triplet becomes: [src] -> predicate -> [tgt]: context [Time: ...]
+    Multiple triplets are joined with ↳ to show traversal direction.
+    """
+    if not isinstance(path, dict):
+        return str(path)
+
+    triplets = path.get("triplets") or []
+    parts = []
+    for t in triplets:
+        src  = (t.get("source") or {}).get("name", "")
+        tgt  = (t.get("target") or {}).get("name", "")
+        rel  = t.get("relation") or {}
+        pred = rel.get("canonical_predicate", "")
+        line = f"[{src}] -> {pred} -> [{tgt}]"
+        ctx  = rel.get("context")
+        if ctx:
+            line += f": {ctx}"
+        temporal = rel.get("temporal_details")
+        if temporal:
+            line += f" [Time: {temporal}]"
+        parts.append(line)
+
+    return "\n  ↳ ".join(parts)
+
+
+def build_context_string(result: dict[str, Any]) -> str:
+    """
+    Build a formatted context string from a HydraDB full_recall response dict.
+
+    Combines entity paths, chunk content, graph relations, and extra context
+    into a single readable string ready to pass into an LLM prompt.
+
+    Preserves the server-provided ordering of `chunks`. Treats `graph_context`
+    and `additional_context` as optional — missing fields and unresolved IDs
+    are skipped.
+    """
+    lines: list[str] = []
+    gc: dict[str, Any] = result.get("graph_context") or {}
+
+    # --- Entity paths -----------------------------------------------------------
+    query_paths = gc.get("query_paths") or []
+    if query_paths:
+        lines.append("=== ENTITY PATHS ===")
+        for path in query_paths:
+            lines.append(_format_path_chain(path))
+        lines.append("")
+
+    # --- Chunks -----------------------------------------------------------------
+    chunks: list[dict[str, Any]] = result.get("chunks") or []
+    additional_context: dict[str, Any] = result.get("additional_context") or {}
+    chunk_id_to_group_ids: dict[str, list[str]] = gc.get("chunk_id_to_group_ids") or {}
+    chunk_relations: list[dict[str, Any]] = gc.get("chunk_relations") or []
+
+    if chunks:
+        lines.append("=== CONTEXT ===")
+        for i, chunk in enumerate(chunks):
+            lines.append(f"Chunk {i + 1}")
+            source = chunk.get("source_title") or chunk.get("source") or ""
+            if source:
+                lines.append(f"Source: {source}")
+            lines.append(chunk.get("chunk_content") or chunk.get("content") or "")
+
+            # Graph relations for this chunk (only if graph_context was returned)
+            chunk_uuid = chunk.get("chunk_uuid") or chunk.get("id") or ""
+            if chunk_uuid and chunk_id_to_group_ids and chunk_relations:
+                group_ids = chunk_id_to_group_ids.get(chunk_uuid, [])
+                relevant_relations = [
+                    r for r in chunk_relations
+                    if r.get("group_id") in group_ids
+                ]
+                if relevant_relations:
+                    lines.append("Graph Relations:")
+                    for rel in relevant_relations:
+                        for triplet in rel.get("triplets") or []:
+                            src  = (triplet.get("source") or {}).get("name", "")
+                            tgt  = (triplet.get("target") or {}).get("name", "")
+                            rel_ = triplet.get("relation") or {}
+                            pred = rel_.get("canonical_predicate", "")
+                            ctx  = rel_.get("context", "")
+                            line = f"  [{src}] -> {pred} -> [{tgt}]: {ctx}"
+                            temporal = rel_.get("temporal_details")
+                            if temporal:
+                                line += f" [Time: {temporal}]"
+                            lines.append(line)
+
+            # Extra context — defensive lookup, missing IDs are skipped
+            extra_ids = chunk.get("extra_context_ids") or []
+            if extra_ids and additional_context:
+                extras = [
+                    additional_context[eid]
+                    for eid in extra_ids
+                    if eid in additional_context
+                ]
+                if extras:
+                    lines.append("Extra Context:")
+                    for extra in extras:
+                        extra_source = extra.get("source_title", "")
+                        extra_content = extra.get("chunk_content") or extra.get("content", "")
+                        lines.append(f"  Related Context ({extra_source}): {extra_content}")
+
+            lines.append("---")
+            lines.append("")
+
+    return "\n".join(lines)
+```
+
+```typescript contextBuilder.ts
+export interface VectorStoreChunk {
+  chunk_uuid: string;
+  source_id: string;
+  chunk_content: string;
+  source_type: string;
+  source_upload_time: string;
+  source_title: string;
+  source_last_updated_time: string;
+  layout: string | null;
+  relevancy_score: number | null;
+  document_metadata: Record<string, unknown> | null;
+  tenant_metadata: Record<string, unknown> | null;
+  extra_context_ids: string[] | null;
+}
+
+export interface Entity {
+  name: string;
+  type: string;
+  namespace: string;
+  entity_id: string;
+  identifier: string | null;
+}
+
+export interface RelationEvidence {
+  canonical_predicate: string;
+  raw_predicate: string;
+  context: string;
+  confidence: number;
+  temporal_details: string | null;
+  timestamp: string;
+  relationship_id: string;
+  chunk_id: string | null;
+  source_entity_id: string | null;
+  target_entity_id: string | null;
+}
+
+export interface PathTriplet {
+  source: Entity;
+  relation: RelationEvidence;
+  target: Entity;
+}
+
+export interface ScoredPathResponse {
+  triplets: PathTriplet[];
+  relevancy_score: number;
+  combined_context: string | null;
+  group_id: string | null;
+  source_chunk_ids: string[] | null;
+}
+
+// graph_context and additional_context are optional in the response — handle defensively.
+export interface GraphContext {
+  query_paths?: ScoredPathResponse[];
+  chunk_relations?: ScoredPathResponse[];
+  chunk_id_to_group_ids?: Record<string, string[]>;
+}
+
+export interface SourceInfo {
+  id: string;
+  title: string;
+  type: string;
+  description: string;
+  url: string;
+  timestamp: string;
+  tenant_metadata: Record<string, unknown>;
+  document_metadata: Record<string, unknown>;
+}
+
+export interface RetrievalResult {
+  chunks: VectorStoreChunk[];
+  sources?: SourceInfo[];
+  graph_context?: GraphContext;
+  additional_context?: Record<string, VectorStoreChunk>;
+}
+
+function formatPathChain(path: ScoredPathResponse): string {
+  return path.triplets
+    .map((t) => {
+      let str = `[${t.source.name}] -> ${t.relation.canonical_predicate} -> [${t.target.name}]`;
+      if (t.relation.context) str += `: ${t.relation.context}`;
+      if (t.relation.temporal_details) str += ` [Time: ${t.relation.temporal_details}]`;
+      return str;
+    })
+    .join("\n  ↳ ");
+}
+
+export function buildContextString(result: RetrievalResult): string {
+  const lines: string[] = [];
+  const gc = result.graph_context;
+
+  // --- Entity paths -----------------------------------------------------------
+  if (gc?.query_paths?.length) {
+    lines.push("=== ENTITY PATHS ===");
+    for (const path of gc.query_paths) {
+      lines.push(formatPathChain(path));
+    }
+    lines.push("");
+  }
+
+  // --- Chunks -----------------------------------------------------------------
+  if (result.chunks?.length) {
+    lines.push("=== CONTEXT ===");
+    for (let i = 0; i < result.chunks.length; i++) {
+      const chunk = result.chunks[i];
+      lines.push(`Chunk ${i + 1}`);
+      lines.push(`Source: ${chunk.source_title}`);
+      lines.push(chunk.chunk_content);
+
+      // Graph relations for this chunk (only if graph_context was returned)
+      if (gc?.chunk_id_to_group_ids && gc.chunk_relations) {
+        const groupIds = gc.chunk_id_to_group_ids[chunk.chunk_uuid] || [];
+        const relations = gc.chunk_relations.filter(
+          (r) => r.group_id && groupIds.includes(r.group_id)
+        );
+        if (relations.length) {
+          lines.push("Graph Relations:");
+          for (const rel of relations) {
+            for (const t of rel.triplets) {
+              let line = `  [${t.source.name}] -> ${t.relation.canonical_predicate} -> [${t.target.name}]: ${t.relation.context}`;
+              if (t.relation.temporal_details) line += ` [Time: ${t.relation.temporal_details}]`;
+              lines.push(line);
+            }
+          }
+        }
+      }
+
+      // Extra context — defensive lookup, missing IDs are skipped
+      if (chunk.extra_context_ids?.length && result.additional_context) {
+        const extras = chunk.extra_context_ids
+          .map((id) => result.additional_context![id])
+          .filter(Boolean);
+        if (extras.length) {
+          lines.push("Extra Context:");
+          for (const extra of extras) {
+            lines.push(`  Related Context (${extra.source_title}): ${extra.chunk_content}`);
+          }
+        }
+      }
+
+      lines.push("---");
+      lines.push("");
+    }
+  }
+
+  return lines.join("\n");
+}
+```
+</CodeGroup>
+
+### Step 3 — Call the LLM with the context
+
+<CodeGroup>
+```python Python
+from openai import OpenAI
+from context_builder import build_context_string
+
+client = OpenAI(api_key="YOUR_OPENAI_API_KEY")
+
+context = build_context_string(result)
+question = "How does authentication work?"
+
+completion = client.chat.completions.create(
+    model="gpt-4o",
+    messages=[
+        {
+            "role": "system",
+            "content": "You are a helpful assistant. Answer the user's question using only the context provided. If the answer is not in the context, say you don't know.",
+        },
+        {
+            "role": "user",
+            "content": f"Context:\n{context}\n\nQuestion: {question}",
+        },
+    ],
+)
+
+print(completion.choices[0].message.content)
+```
+
+```typescript TypeScript
+import OpenAI from "openai";
+import { buildContextString, RetrievalResult } from "./contextBuilder";
+
+const client = new OpenAI({ apiKey: "YOUR_OPENAI_API_KEY" });
+
+const context = buildContextString(result);
+const question = "How does authentication work?";
+
+const completion = await client.chat.completions.create({
+  model: "gpt-4o",
+  messages: [
+    {
+      role: "system",
+      content:
+        "You are a helpful assistant. Answer the user's question using only the context provided. If the answer is not in the context, say you don't know.",
+    },
+    {
+      role: "user",
+      content: `Context:\n${context}\n\nQuestion: ${question}`,
+    },
+  ],
+});
+
+console.log(completion.choices[0].message.content);
+```
+</CodeGroup>
+
+### Combining memory and knowledge
+
+For personalized answers, call `recall_preferences` in addition to `full_recall`, format both, and combine them in a single prompt. The example below places memory before knowledge for illustration only — no specific ordering is required or guaranteed to improve answer quality.
+
+<CodeGroup>
+```python Python
+memory_context = build_context_string(memory_result)
+knowledge_context = build_context_string(knowledge_result)
+
+completion = client.chat.completions.create(
+    model="gpt-4o",
+    messages=[
+        {
+            "role": "system",
+            "content": "You are a helpful assistant. Answer the user's question using only the context provided. If the answer is not in the context, say you don't know.",
+        },
+        {
+            "role": "user",
+            "content": (
+                f"User preferences:\n{memory_context}\n\n"
+                f"Relevant docs:\n{knowledge_context}\n\n"
+                f"Question: {question}"
+            ),
+        },
+    ],
+)
+```
+
+```typescript TypeScript
+const memoryContext = buildContextString(memoryResult);
+const knowledgeContext = buildContextString(knowledgeResult);
+
+const completion = await client.chat.completions.create({
+  model: "gpt-4o",
+  messages: [
+    {
+      role: "system",
+      content:
+        "You are a helpful assistant. Answer the user's question using only the context provided. If the answer is not in the context, say you don't know.",
+    },
+    {
+      role: "user",
+      content:
+        `User preferences:\n${memoryContext}\n\n` +
+        `Relevant docs:\n${knowledgeContext}\n\n` +
+        `Question: ${question}`,
+    },
+  ],
+});
+```
+</CodeGroup>
+
+**LLMs must be grounded.**
+The model should never answer outside the provided context. Always enforce this via the system prompt. If the context is insufficient, the model should respond with uncertainty instead of guessing.
+
+## Common mistakes
+
+| Mistake | What goes wrong | Fix |
+|---|---|---|
+| Passing the raw `RetrievalResult` to the LLM | Wastes tokens on IDs and metadata; the model struggles to extract content | Format it into a string first — use `build_context_string`. |
+| Ignoring memory results when personalization matters | Answers feel generic; user preferences aren't reflected | Call `recall_preferences` and include it in the prompt alongside knowledge. |
+| Including too many chunks | May exceed model token limits or degrade answer quality | Start with `max_results: 10`; reduce if needed. |
+| Including graph relations on every query | Adds prompt size without clear benefit on simple lookups | Include graph relations selectively, based on query type. |
+| Missing a grounding instruction | The model may invent answers when context is thin | Use a strict system prompt that forces the model to answer only from context. |
+| Re-sorting chunks client-side | Overrides HydraDB's server-side ordering | Preserve the order returned by the API. |
+| Treating `additional_context` as an array | When present, it is a map keyed by ID | Look up entries by the IDs in `chunks[].extra_context_ids`. |
+| Assuming `additional_context` is always present | It may be omitted entirely, empty, or partial | Handle defensively before reading. |
+| Assuming `graph_context` is always present | It may be omitted entirely depending on request configuration and result data | Same — read defensively. |
+| Assuming every `extra_context_ids` entry resolves | Missing keys raise errors or produce silent gaps | Skip unresolved IDs. |
+| Expecting graph context without requesting it | `query_paths` and `chunk_relations` may come back empty — or `graph_context` may be absent | Set `graph_context: true` in the recall request. |
+
+## Related
+
+- [Recall](/essentials/recall) — request parameters and response shape
+- [Memories](/essentials/memories) — what `recall_preferences` searches
+- [Context Graphs](/essentials/context-graphs) — what `graph_context` fields contain

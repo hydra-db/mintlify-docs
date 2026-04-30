@@ -1,0 +1,163 @@
+---
+title: Context Graphs
+description: How HydraDB models relationships between chunks using triplets to improve recall quality.
+category: Essentials
+---
+
+# Context Graphs
+
+## What it is
+
+A context graph is a structured map of relationships between chunks in your tenant.
+
+It represents relationships as **triplets**: `source → relation → target`. Each triplet captures a directional connection between two pieces of context.
+
+Context graphs augment retrieval. They do not replace it.
+
+---
+
+## What it does
+
+When enabled, the context graph surfaces how retrieved chunks relate to each other and to your query — giving your LLM structured relationship data alongside raw content.
+
+This is designed to improve reasoning on questions that require connecting information across multiple chunks or sources. Simple similarity search returns relevant content; the context graph is intended to explain how that content fits together.
+
+---
+
+## When to use it
+
+Use context graphs when:
+
+- Answers require synthesizing information across multiple chunks
+- Relational context matters for correctness (e.g. cause-effect, ownership, sequence)
+- You are using `thinking` mode
+
+Skip it for straightforward factual lookups. Graph traversal may add overhead — use it only when the relational structure improves your output.
+
+In `thinking` mode, graph traversal may run internally regardless of the `graph_context` request flag. The flag controls whether graph fields are populated in the response, not whether traversal occurs.
+
+---
+
+## How it works
+
+Context graphs are a **hybrid** system. Relationships are extracted during ingestion and used at recall time.
+
+**At ingestion time:**
+
+Relationships are extracted during ingestion and stored. Memories ingested through the memory endpoints may also participate in the same graph. Explicit links can be supplied via the `relations` payload (e.g. `relations.hydradb_source_ids`) to record edges between sources.
+
+**At recall time:**
+
+1. HydraDB runs standard similarity retrieval to find relevant chunks.
+2. HydraDB may traverse relationships over the chunks and entities involved in the query.
+3. Multi-hop chains of triplets may be returned as `query_paths`.
+4. Direct chunk-to-chunk relations may be returned as `chunk_relations`.
+5. Group mappings may be returned as `chunk_id_to_group_ids`.
+
+If no relationships are found among retrieved chunks, graph fields may be returned empty or omitted.
+
+The two modes differ in two distinct ways:
+
+- **Traversal behavior.** In `fast` mode, graph traversal generally runs only when `graph_context: true` is set. In `thinking` mode, traversal may run internally regardless of the flag.
+- **Response population.** In both modes, graph fields are populated in the response only when `graph_context: true` is set.
+
+---
+
+## Key concepts
+
+**Triplets**
+The core unit of the context graph. Each triplet is a directional statement: `source → relation → target`. For example: `billing_policy → governs → failed_payment_handling`. `source`, `relation`, and `target` are returned as objects, not plain strings.
+
+**`query_paths`**
+Optional. When present, an array of multi-hop chains of triplets connecting the query to retrieved chunks. Each path captures a sequence of relationships surfaced during recall.
+
+**`chunk_relations`**
+Optional. When present, relationship data attached to retrieved chunks, returned alongside `query_paths`.
+
+<Info>
+  **TODO:** Confirm exact semantics of `chunk_relations` — what relationships it contains, how it differs from `query_paths`, and how to consume it (OpenAPI does not specify).
+</Info>
+
+**`chunk_id_to_group_ids`**
+Optional. When present, a mapping from chunk IDs to group IDs.
+
+<Info>
+  **TODO:** Confirm meaning of group IDs in `chunk_id_to_group_ids` — logical source, cluster, ingestion batch, or other (OpenAPI does not specify).
+</Info>
+
+**`synthesis_context`**
+Optional. A field in the response model that may be populated with a relational summary for LLM consumption. May be `null`.
+
+---
+
+## Minimal working example
+
+Request:
+
+```python
+response = client.recall.full_recall(
+    tenant_id="your_tenant_id",
+    query="How does the billing system handle failed payments?",
+    graph_context=True,
+    mode="thinking"
+)
+```
+
+Response structure (illustrative only — fields may be omitted or empty):
+
+```json
+{
+  "chunks": [...],
+  "graph_context": {
+    "query_paths": [
+      {
+        "triplets": [
+          {
+            "source": {},
+            "relation": {},
+            "target": {}
+          }
+        ]
+      }
+    ],
+    "chunk_relations": [],
+    "chunk_id_to_group_ids": {},
+    "synthesis_context": null
+  }
+}
+```
+
+`graph_context` may be present in the response depending on request configuration. Per OpenAPI, neither `graph_context` nor any of its child fields (`query_paths`, `chunk_relations`, `chunk_id_to_group_ids`, `synthesis_context`) are marked required — handle them defensively. When present, missing relationships may be represented as empty arrays or objects, and `synthesis_context` may be `null`.
+
+---
+
+## Common mistakes
+
+**Not setting `graph_context: true` in `fast` mode**
+Graph traversal in `fast` mode generally runs only when the flag is set. In `thinking` mode, traversal may run internally regardless — but the response payload is populated only when `graph_context: true`.
+
+**Assuming the graph replaces retrieval**
+It does not. `chunks` remains the primary retrieval result. The graph enriches it with relationship data — always use both.
+
+**Assuming the graph is built only at recall time**
+It is hybrid. Relationships are extracted during ingestion and used at recall.
+
+**Misreading triplet structure**
+Each triplet has `source`, `relation`, and `target` fields. These are objects, not plain strings. Do not treat them as flat text.
+
+**Treating `synthesis_context` as always populated**
+It may be `null`. Always check before using.
+
+**Treating graph fields as guaranteed to be present**
+`graph_context` and its child fields are optional in the response. Always handle them defensively — check for presence before accessing.
+
+**Enabling `graph_context: true` on every request**
+Returning graph fields adds payload size and may add latency. Reserve it for queries where relational context materially improves the answer.
+
+---
+
+## Related
+
+- [Recall](/essentials/recall)
+- [Memories](/essentials/memories)
+- [full_recall API Reference](/api-reference/full-recall)
