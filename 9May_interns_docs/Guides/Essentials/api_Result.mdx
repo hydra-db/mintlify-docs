@@ -1,0 +1,202 @@
+---
+title: "How to Use API Results"
+description: "Turn a recall response into a grounded LLM answer."
+category: Essentials
+---
+
+# How to Use API Results
+
+A recall response is structured JSON. Your model wants prose. This page shows how to bridge that gap — turning a `RetrievalResult` into a clean, grounded prompt for an LLM.
+
+The same pattern works for [`full_recall`](/api-reference/endpoint/full-recall), [`recall_preferences`](/api-reference/endpoint/recall-preferences), and combinations of the two.
+
+## 1. What you get back
+
+The retrieval endpoints (`full_recall` and `recall_preferences`) return the same core response shape:
+
+```json
+{
+  "chunks": [ /* ranked content chunks */ ],
+  "sources": [ /* deduplicated source metadata */ ],
+  "graph_context": { /* paths and chunk relations, when requested */ },
+  "additional_context": { /* extra chunks keyed by chunk_uuid */ }
+}
+```
+
+Three things matter for prompt construction:
+
+- **`chunks`** — the primary retrieval output. Ranked by relevance; preserve the order HydraDB returns.
+- **`graph_context`** — returned when `graph_context: true` is requested and relevant graph data is available. Useful for relational reasoning. See [Context Graphs](/essentials/context-graphs).
+- **`additional_context`** — a map keyed by `chunk_uuid`. When a chunk includes `extra_context_ids`, use those IDs to look up related chunks here.
+
+Don't pass the raw object to the LLM. Convert it into a structured context string first.
+
+## 2. From response to prompt
+
+Three steps:
+
+1. Iterate `chunks` in the order returned. Pull `source_title` and `chunk_content` for each.
+2. For any chunk with `extra_context_ids`, look up each ID in `additional_context` and append the related text under the chunk.
+3. (Optional) If `graph_context.query_paths` is non-empty, include a short relations block for queries that benefit from it.
+
+Concatenate the result into a single string and pass it to the LLM alongside the user's question, with a system prompt that grounds the model in the provided context.
+
+## 3. Minimal working example
+
+A compact helper that handles chunks and `additional_context`. Extend it with graph-relation formatting when your queries need it.
+
+<CodeGroup>
+
+```python Python
+def build_context_string(result) -> str:
+    lines: list[str] = []
+    chunks = result.chunks or []
+    additional = result.additional_context or {}
+
+    for i, chunk in enumerate(chunks, 1):
+        title = chunk.source_title or ""
+        lines.append(f"[Chunk {i}]" + (f" Source: {title}" if title else ""))
+        lines.append(chunk.chunk_content or "")
+
+        for extra_id in chunk.extra_context_ids or []:
+            extra = additional.get(extra_id)
+            if extra is not None:
+                lines.append(f"  Related: {extra.chunk_content or ''}")
+
+        lines.append("---")
+
+    return "\n".join(lines)
+```
+
+```typescript TypeScript
+function buildContextString(result: any): string {
+  const lines: string[] = [];
+  const chunks = result?.chunks ?? [];
+  const additional = result?.additional_context ?? {};
+
+  chunks.forEach((chunk: any, i: number) => {
+    const title = chunk.source_title || "";
+    lines.push(`[Chunk ${i + 1}]${title ? ` Source: ${title}` : ""}`);
+    lines.push(chunk.chunk_content ?? "");
+
+    for (const id of chunk.extra_context_ids ?? []) {
+      const extra = additional[id];
+      if (extra) lines.push(`  Related: ${extra.chunk_content ?? ""}`);
+    }
+
+    lines.push("---");
+  });
+
+  return lines.join("\n");
+}
+```
+
+</CodeGroup>
+
+Then call your model with a grounded system prompt:
+
+<CodeGroup>
+
+```python Python
+from openai import OpenAI
+
+openai_client = OpenAI()
+context = build_context_string(result)
+
+completion = openai_client.chat.completions.create(
+    model="gpt-4o",
+    messages=[
+        {
+            "role": "system",
+            "content": (
+                "Answer the user's question using only the context below. "
+                "If the answer is not in the context, say you don't know."
+            ),
+        },
+        {
+            "role": "user",
+            "content": f"Context:\n{context}\n\nQuestion: {question}",
+        },
+    ],
+)
+```
+
+```typescript TypeScript
+import OpenAI from "openai";
+
+const openai = new OpenAI();
+const context = buildContextString(result);
+
+const completion = await openai.chat.completions.create({
+  model: "gpt-4o",
+  messages: [
+    {
+      role: "system",
+      content:
+        "Answer the user's question using only the context below. If the answer is not in the context, say you don't know.",
+    },
+    {
+      role: "user",
+      content: `Context:\n${context}\n\nQuestion: ${question}`,
+    },
+  ],
+});
+```
+
+</CodeGroup>
+
+## 4. Combining knowledge and memories
+
+For personalised answers, run `full_recall` and `recall_preferences` in parallel, format each result, and combine them into one prompt. There's no required ordering — the example below puts preferences before docs purely for readability.
+
+<CodeGroup>
+
+```python Python
+memory_ctx = build_context_string(memory_result)
+knowledge_ctx = build_context_string(knowledge_result)
+
+prompt = (
+    f"User preferences:\n{memory_ctx}\n\n"
+    f"Relevant docs:\n{knowledge_ctx}\n\n"
+    f"Question: {question}"
+)
+```
+
+```typescript TypeScript
+const memoryCtx = buildContextString(memoryResult);
+const knowledgeCtx = buildContextString(knowledgeResult);
+
+const prompt =
+  `User preferences:\n${memoryCtx}\n\n` +
+  `Relevant docs:\n${knowledgeCtx}\n\n` +
+  `Question: ${question}`;
+```
+
+</CodeGroup>
+
+If memory recall fails or times out, fall back to the knowledge-only prompt — personalisation is an enhancement, not a hard dependency.
+
+## 5. Practical guidance
+
+- **Preserve server order.** Don't re-sort chunks client-side.
+- **Start small on chunks.** `max_results: 10` is a reasonable default. Drop to 5 if you hit token limits, raise to 20 if you rerank downstream.
+- **Use graph context selectively.** It improves relational queries and bloats simple lookups. See [Context Graphs](/essentials/context-graphs).
+- **Always ground the model.** A system prompt like "answer only from the provided context" prevents the model from inventing answers when retrieval is thin.
+- **Format consistently.** Whatever section delimiters you choose (`[Chunk N]`, `Source:`, `---`), keep them stable across calls so the model learns the structure.
+
+## 6. Common mistakes
+
+| Mistake | What goes wrong | Fix |
+|---|---|---|
+| Passing the raw result object to the LLM | Wastes tokens on IDs and metadata; the model struggles to read the content | Format into a context string first. |
+| Ignoring memory when personalisation matters | Answers feel generic | Call `recall_preferences` and include it in the prompt. |
+| Including too many chunks | Token overflow or answer quality drops | Start at `max_results: 10`; reduce if needed. |
+| Re-sorting chunks client-side | Overrides HydraDB's ranking | Preserve the server-returned order. |
+| Missing a grounding instruction | The model invents answers when context is thin | System prompt: answer only from the provided context. |
+| Expecting graph fields without requesting them | Graph context will not be populated | Set `graph_context: true` on the recall call. |
+
+## Related
+
+- [Recall](/essentials/recall) — request parameters and response shape
+- [Memories](/essentials/memories) — what `recall_preferences` searches
+- [Context Graphs](/essentials/context-graphs) — what `graph_context` fields contain
