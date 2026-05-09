@@ -1,0 +1,139 @@
+---
+title: "Semantic Search & Retrieval"
+description: "How semantic, lexical, graph, and metadata signals work together in HydraDB recall."
+---
+
+Semantic search is useful because it retrieves by meaning instead of exact wording. It is also incomplete on its own: production agents need exact matches, freshness, scope, tenant isolation, metadata filters, and graph relationships. HydraDB recall combines those signals so you can retrieve context that is useful, not just similar.
+
+## Semantic Vs Lexical
+
+| Search Type | Finds | Best For |
+|---|---|---|
+| Semantic | Text with similar meaning | Natural-language questions, paraphrases, conceptual lookup |
+| Lexical | Text with matching tokens | Error codes, identifiers, names, SKUs, exact phrases |
+| Graph | Related entities and relationships | Multi-hop questions, dependencies, ownership, project context |
+
+`POST /recall/full_recall` is the default knowledge recall endpoint. It performs hybrid retrieval over indexed knowledge sources. `POST /recall/recall_preferences` uses the same recall model for user memories. `POST /recall/boolean_recall` gives you explicit lexical search with `or`, `and`, and `phrase` operators.
+
+## Why Pure Semantic Search Breaks
+
+Pure vector search can miss important production constraints:
+
+- Exact identifiers such as `E_AUTH_429` or `payments-worker-v4` may be generalized away.
+- A project name can collide with a normal word, like `strawberry` the project vs strawberry the fruit.
+- Old and new documents can look equally relevant without recency or metadata signals.
+- Different users can need different context for the same query.
+- Relationship questions need graph context, not only similar text chunks.
+
+That is why HydraDB exposes semantic retrieval as one part of recall rather than the whole system.
+
+## The `alpha` Parameter
+
+`alpha` controls the semantic-vs-lexical blend in recall. Higher values lean semantic. Lower values lean lexical.
+
+| `alpha` | Behavior | Use When |
+|---|---|---|
+| `1.0` | Semantic-heavy | Conceptual questions and paraphrases |
+| `0.8` | Default semantic-leaning hybrid | Most agent recall workflows |
+| `0.5` | Balanced | Mixed natural language and exact terms |
+| `0.2` | Lexical-leaning | Queries with product names, error strings, or IDs |
+| `0.0` | Lexical-heavy | Debugging exact-match behavior |
+
+Start with the API default (`0.8`) and tune from observed results. If users search for exact IDs and get loosely related content, lower `alpha`. If they ask broad conceptual questions and get sparse results, raise it.
+
+## Recall Request Example
+
+```bash
+curl -X POST 'https://api.hydradb.com/recall/full_recall' \
+  -H 'Authorization: Bearer <your_api_key>' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "tenant_id": "acme",
+    "sub_tenant_id": "team-mobile",
+    "query": "How do we rotate API keys?",
+    "max_results": 8,
+    "alpha": 0.8,
+    "recency_bias": 0.2,
+    "graph_context": true,
+    "metadata_filters": {
+      "project": "phoenix"
+    }
+  }'
+```
+
+`metadata_filters` run before ranking. Use them whenever the query has a scope that should not be violated.
+
+## Practical Recipes
+
+### General Retrieval
+
+Use the default semantic-leaning blend for natural-language questions over documents.
+
+```json
+{
+  "tenant_id": "acme",
+  "query": "How does onboarding work?",
+  "max_results": 8,
+  "alpha": 0.8
+}
+```
+
+### Technical Lookup
+
+Lower `alpha` when names, IDs, and literal strings matter.
+
+```json
+{
+  "tenant_id": "acme",
+  "query": "TimeoutError in payments-worker v4.2.1",
+  "max_results": 5,
+  "alpha": 0.3,
+  "recency_bias": 0.4
+}
+```
+
+### Scoped Retrieval
+
+Use metadata filters to keep retrieval inside a project, team, customer, data class, or source.
+
+```json
+{
+  "tenant_id": "acme",
+  "sub_tenant_id": "team-mobile",
+  "query": "What is the current sprint status?",
+  "metadata_filters": {
+    "project": "phoenix"
+  }
+}
+```
+
+### Exact Phrase Search
+
+Use `POST /recall/boolean_recall` when a literal match is the point of the query.
+
+```bash
+curl -X POST 'https://api.hydradb.com/recall/boolean_recall' \
+  -H 'Authorization: Bearer <your_api_key>' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "tenant_id": "acme",
+    "query": "mechanical engineer",
+    "operator": "phrase",
+    "max_results": 10
+  }'
+```
+
+## Reading The Response
+
+Recall returns ranked chunks and source metadata, not an answer. A typical application flow is:
+
+1. Call `full_recall` or `recall_preferences`.
+2. Keep the chunks that are relevant enough for your use case.
+3. Format `chunk_content`, source titles, and graph context into a prompt.
+4. Ask your LLM to answer using only that context.
+
+See [How to Use API Results](/essentials/use-api-results) for complete context-building examples.
+
+## Mental Model
+
+Semantic search finds text that means the same thing. Lexical search finds text that says the same thing. Graph context finds connected entities. Metadata filters decide what is allowed to be searched. HydraDB recall uses these together so your agents get context that is scoped, relevant, and explainable.
