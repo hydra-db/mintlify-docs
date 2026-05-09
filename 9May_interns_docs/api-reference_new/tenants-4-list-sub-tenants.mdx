@@ -1,0 +1,78 @@
+---
+title: "List Sub-Tenant IDs"
+description: "List all sub-tenants that have indexed data under a tenant."
+---
+
+## When to use it
+
+- **Audit** – confirm which sub-tenants exist for compliance or usage reporting
+- **Bulk operations** – iterate over sub-tenants to apply the same operation to each
+- **Dynamic UI** – populate dropdowns or selectors in admin dashboards
+
+A sub-tenant appears in this list only if it currently has indexed data (knowledge or memories).
+
+## Endpoint
+
+```
+GET /tenants/sub_tenant_ids
+```
+
+- **Auth:** Bearer token
+- **Idempotency:** Read-only
+- **Async:** No
+
+## Example
+
+<Tabs>
+  <Tab title="cURL">
+    ```bash
+    curl 'https://api.hydradb.com/tenants/sub_tenant_ids?tenant_id=my_first_tenant' \
+      -H "Authorization: Bearer <your_api_key>"
+    ```
+  </Tab>
+  <Tab title="TypeScript">
+    ```ts
+    const response = await client.tenant.getSubTenantIds({
+      tenantId: "my_first_tenant"
+    });
+    const subTenantIds = response.subTenantIds;
+    ```
+  </Tab>
+  <Tab title="Python (Sync)">
+    ```python
+    response = client.tenant.get_sub_tenant_ids(tenant_id="my_first_tenant")
+    sub_tenant_ids = response.sub_tenant_ids
+    ```
+  </Tab>
+</Tabs>
+
+## Query parameters
+
+| Name | Type | Required | Description |
+|---|---|---|---|
+| `tenant_id` | string | Yes | The tenant to list sub-tenants for. |
+
+## Response
+
+```json
+{
+  "sub_tenant_ids": ["engineering", "sales", "hr", "user_12345"],
+  "message": "Successfully retrieved sub-tenant IDs"
+}
+```
+
+| Field | Description |
+|---|---|
+| `sub_tenant_ids` | Array of unique sub-tenant IDs with indexed data. |
+| `message` | Human-readable status. |
+
+## Related endpoints
+
+- **Before this:** [Upload knowledge](/api-reference/endpoint/upload-knowledge) · [Add memory](/api-reference/endpoint/add-memory) – sub-tenants are created implicitly during ingestion
+- **Related:** [List data](/api-reference/endpoint/list-data) – browse content within a specific sub-tenant
+
+## Errors
+
+Common codes: `400 INVALID_PARAMETERS`, `404 TENANT_NOT_FOUND`. See [Error Responses](/api-reference/error-responses) for the full list.
+
+Read more: [Essentials → Multi-Tenant Support](/essentials/multi-tenant)

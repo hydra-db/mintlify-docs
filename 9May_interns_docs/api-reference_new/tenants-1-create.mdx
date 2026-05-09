@@ -1,0 +1,102 @@
+---
+
+## title: "Create Tenant"
+description: "Create an isolated workspace for your data."
+
+## When to use it
+
+Creating a new tenant is the first step before any ingestion or recall. A tenant is a fully isolated workspace – no tenant can read another tenant's data.
+
+In most cases, you create one tenant per organization. For per-user isolation (B2C), you use sub-tenants inside a single tenant.
+
+## Endpoint
+
+```
+POST /tenants/create
+```
+
+- **Auth:** Bearer token
+- **Idempotency:** Re-sending with the same `tenant_id` returns `409 CONFLICT`
+- **Async:** Yes – returns `status: accepted`. Poll `/tenants/infra/status` before use.
+
+## Example
+
+```bash curl -X POST 'https://api.hydradb.com/tenants/create' \ -H "Authorization: Bearer " \ -H "Content-Type: application/json" \ -d '{ "tenant_id": "my_first_tenant", "tenant_metadata_schema": [ { "name": "category", "data_type": "VARCHAR", "max_length": 256, "enable_match": true }, { "name": "product_description", "data_type": "VARCHAR", "max_length": 4096, "enable_dense_embedding": true, "enable_sparse_embedding": true } ] }' ``` ```ts const response = await client.tenant.create({ tenantId: "my_first_tenant", tenantMetadataSchema: [ { name: "category", dataType: "VARCHAR", maxLength: 256, enableMatch: true }, { name: "product_description", dataType: "VARCHAR", maxLength: 4096, enableDenseEmbedding: true, enableSparseEmbedding: true } ] }); ``` ```python response = client.tenant.create( tenant_id="my_first_tenant", tenant_metadata_schema=[ { "name": "category", "data_type": "VARCHAR", "max_length": 256, "enable_match": True, }, { "name": "product_description", "data_type": "VARCHAR", "max_length": 4096, "enable_dense_embedding": True, "enable_sparse_embedding": True, }, ], ) ```
+
+## Request parameters
+
+
+| Name                     | Type    | Required | Description                                                                                                                 |
+| ------------------------ | ------- | -------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `tenant_id`              | string  | Yes      | Unique identifier for the tenant.                                                                                           |
+| `tenant_metadata_schema` | array   | No       | Defines tenant-level metadata fields. See [Metadata schema](#metadata-schema) below.                                        |
+| `is_embeddings_tenant`   | boolean | No       | Default `false`. Set `true` only if you plan to upload pre-computed vectors. See [Embeddings tenants](#embeddings-tenants). |
+| `embeddings_dimension`   | integer | No       | Default `1536`. Only used when `is_embeddings_tenant: true`.                                                                |
+
+
+## Response
+
+```json
+{
+  "status": "accepted",
+  "tenant_id": "my_first_tenant",
+  "message": "Tenant creation started in the background. Use GET /tenants/infra/status?tenant_id=... to check progress."
+}
+```
+
+
+| Field       | Description                                             |
+| ----------- | ------------------------------------------------------- |
+| `status`    | Always `accepted`. Provisioning runs in the background. |
+| `tenant_id` | The tenant identifier provided in the request.          |
+| `message`   | Human-readable next-step hint.                          |
+
+
+## Metadata schema
+
+`tenant_metadata_schema` defines fields that all documents in the tenant inherit. Each entry has:
+
+
+| Field                     | Type    | Default   | Description                                                                                   |
+| ------------------------- | ------- | --------- | --------------------------------------------------------------------------------------------- |
+| `name`                    | string  | –         | The field name. Required.                                                                     |
+| `data_type`               | enum    | `VARCHAR` | Milvus data type. See list below.                                                             |
+| `max_length`              | integer | `1024`    | Max length for `VARCHAR` fields.                                                              |
+| `enable_analyzer`         | boolean | `false`   | Enable text analyzer for full-text search capabilities.                                       |
+| `enable_match`            | boolean | `false`   | Enable exact-match filtering on this field.                                                   |
+| `enable_dense_embedding`  | boolean | `false`   | Create a dense embedding for semantic similarity search. Only applicable to `VARCHAR` fields. |
+| `enable_sparse_embedding` | boolean | `false`   | Create a sparse embedding (BM25) for keyword search. Only applicable to `VARCHAR` fields.     |
+| `nullable`                | boolean | `true`    | Whether the field can be null.                                                                |
+
+
+**Valid `data_type` values:**
+
+`BOOL`, `INT8`, `INT16`, `INT32`, `INT64`, `FLOAT`, `DOUBLE`, `VARCHAR`, `JSON`, `ARRAY`, `FLOAT_VECTOR`, `SPARSE_FLOAT_VECTOR`.
+
+For text fields that need to be searchable, use `VARCHAR` and enable the appropriate embedding flag.
+
+Schema field names are **immutable** after tenant creation. You can add new `document_metadata` fields per document at ingestion time, but tenant-level fields cannot be renamed or removed. Plan the schema carefully before creating the tenant.
+
+## Behavior notes
+
+**Tenant creation is asynchronous.** Always poll `GET /tenants/infra/status?tenant_id=...` before your first ingestion call. Both values in `vectorstore_status` and `graph_status` must be `true` before the tenant is ready.
+
+**Default sub-tenant.** A default sub-tenant is auto-created with your tenant. Any API call that omits `sub_tenant_id` targets this default. See [Essentials → Multi-Tenant](/essentials/multi-tenant) for details.
+
+## Embeddings tenants
+
+If you plan to upload pre-computed vectors (fine-tuned embedding models, custom pipelines), create the tenant with `is_embeddings_tenant: true` and set `embeddings_dimension` to match your model's output dimension.
+
+Embeddings tenants use a separate endpoint family at `/embeddings/`*. See [Essentials → Custom Embeddings](/essentials/custom-embeddings.mdx).
+
+## Related endpoints
+
+- **Next:** [Check infra status](/api-reference/endpoint/infra-status) – poll until provisioning completes
+- **Next:** [Upload knowledge](/api-reference/endpoint/upload-knowledge) – start ingesting data
+- **Related:** [Delete tenant](/api-reference/endpoint/delete-tenant) – teardown
+
+## Errors
+
+Common codes: `400 INVALID_PARAMETERS`, `409 TENANT_ALREADY_EXISTS`, `422 VALIDATION_ERROR`. See [Error Responses](/api-reference/error-responses) for the full list.
+
+Read more: [Essentials → Multi-Tenant Support](/essentials/multi-tenant) · [Essentials → Metadata](/essentials/metadata)

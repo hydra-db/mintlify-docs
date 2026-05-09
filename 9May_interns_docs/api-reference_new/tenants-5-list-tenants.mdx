@@ -1,0 +1,79 @@
+---
+title: "List Tenant IDs"
+description: "List all tenants registered for your organization."
+---
+
+## When to use it
+
+- **Org-level admin dashboards** – show all tenants belonging to an organization
+- **Audit and compliance** – generate a complete tenant inventory
+- **Recovery** – identify tenants whose creation failed and may need to be re-created
+
+This endpoint is scoped to the organization associated with your API key. It does not require a `tenant_id` parameter.
+
+## Endpoint
+
+```
+GET /tenants/tenant_ids
+```
+
+- **Auth:** Bearer token
+- **Idempotency:** Read-only
+- **Async:** No
+
+## Example
+
+<Tabs>
+  <Tab title="cURL">
+    ```bash
+    curl 'https://api.hydradb.com/tenants/tenant_ids' \
+      -H "Authorization: Bearer <your_api_key>"
+    ```
+  </Tab>
+  <Tab title="TypeScript">
+    ```ts
+    const response = await client.tenant.getTenantIds();
+    const tenantIds = response.tenantIds;
+    ```
+  </Tab>
+  <Tab title="Python (Sync)">
+    ```python
+    response = client.tenant.get_tenant_ids()
+    tenant_ids = response.tenant_ids
+    ```
+  </Tab>
+</Tabs>
+
+## Query parameters
+
+None.
+
+## Response
+
+```json
+{
+  "tenant_ids": ["my_first_tenant", "acme_corp", "test_env"],
+  "failed_tenant_ids": [
+    {
+      "tenant_id": "broken_tenant",
+      "error": "Provisioning failed: vectorstore unreachable"
+    }
+  ],
+  "message": "Successfully retrieved tenant IDs"
+}
+```
+
+| Field | Description |
+|---|---|
+| `tenant_ids` | Array of tenant IDs that are active or currently provisioning. |
+| `failed_tenant_ids` | Array of tenants whose creation failed. Each entry contains `tenant_id` and `error`. To retry, re-create the tenant via [`POST /tenants/create`](/api-reference/endpoint/create-tenant). |
+| `message` | Human-readable status. |
+
+## Related endpoints
+
+- **Related:** [Create tenant](/api-reference/endpoint/create-tenant) – re-create a tenant whose creation failed
+- **Related:** [Check infra status](/api-reference/endpoint/infra-status) – inspect provisioning status for an individual tenant
+
+## Errors
+
+Common codes: `400 INVALID_PARAMETERS`, `401 UNAUTHORIZED`. See [Error Responses](/api-reference/error-responses) for the full list.

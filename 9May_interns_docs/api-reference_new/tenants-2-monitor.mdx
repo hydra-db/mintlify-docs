@@ -1,0 +1,83 @@
+---
+title: "Monitor Tenant"
+description: "Get usage statistics for a tenant – object counts and vector dimensions."
+---
+
+## When to use it
+
+- **Verify ingestion** – confirm data landed after upload (expect `row_count` to grow)
+- **Capacity planning** – track storage growth over time
+- **Billing reconciliation** – generate usage reports
+
+## Endpoint
+
+```
+GET /tenants/monitor
+```
+
+- **Auth:** Bearer token
+- **Idempotency:** Read-only
+- **Async:** No
+
+## Example
+
+<Tabs>
+  <Tab title="cURL">
+    ```bash
+    curl 'https://api.hydradb.com/tenants/monitor?tenant_id=my_first_tenant' \
+      -H "Authorization: Bearer <your_api_key>"
+    ```
+  </Tab>
+  <Tab title="TypeScript">
+    ```ts
+    const stats = await client.tenant.monitor({
+      tenantId: "my_first_tenant"
+    });
+    ```
+  </Tab>
+  <Tab title="Python (Sync)">
+    ```python
+    stats = client.tenant.monitor(tenant_id="my_first_tenant")
+    ```
+  </Tab>
+</Tabs>
+
+## Query parameters
+
+| Name | Type | Required | Description |
+|---|---|---|---|
+| `tenant_id` | string | Yes | The tenant to inspect. |
+
+## Response
+
+```json
+{
+  "tenant_id": "my_first_tenant",
+  "normal_collection": {
+    "row_count": 1243,
+    "dimensions": 1536
+  },
+  "memory_collection": {
+    "row_count": 87,
+    "dimensions": 1536
+  },
+  "message": "Successfully retrieved tenant collection statistics"
+}
+```
+
+| Field | Description |
+|---|---|
+| `tenant_id` | The tenant that was queried. |
+| `normal_collection.row_count` | Number of chunks in the knowledge collection. |
+| `normal_collection.dimensions` | Embedding vector dimensions for the knowledge collection. |
+| `memory_collection.row_count` | Number of chunks in the memory collection. |
+| `memory_collection.dimensions` | Embedding vector dimensions for the memory collection. |
+
+## Related endpoints
+
+- **Before this:** [Check infra status](/api-reference/endpoint/infra-status) – confirm the tenant is provisioned
+- **Related:** [List data](/api-reference/endpoint/list-data) – browse stored content
+
+## Errors
+
+Common codes: `400 INVALID_PARAMETERS`, `404 TENANT_NOT_FOUND`. See [Error Responses](/api-reference/error-responses) for the full list.
