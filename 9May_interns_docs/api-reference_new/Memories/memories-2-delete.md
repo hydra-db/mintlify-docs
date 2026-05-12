@@ -17,7 +17,7 @@ To remove documents (knowledge) instead of user memories, use [`POST /knowledge/
 
 ## Endpoint
 
-```
+```text
 DELETE /memories/delete_memory
 ```
 
@@ -27,30 +27,28 @@ DELETE /memories/delete_memory
 
 ## Example
 
-<Tabs>
-  <Tab title="cURL">
-    ```bash
-    curl -X DELETE 'https://api.hydradb.com/memories/delete_memory?tenant_id=my_first_tenant&memory_id=1d50e5cd7c196a2bbcc1a59b037b3a44' \
-      -H "Authorization: Bearer <your_api_key>"
-    ```
-  </Tab>
-  <Tab title="TypeScript">
-    ```ts
-    const response = await client.memories.delete({
-      tenantId: "my_first_tenant",
-      memoryId: "1d50e5cd7c196a2bbcc1a59b037b3a44"
-    });
-    ```
-  </Tab>
-  <Tab title="Python (Sync)">
-    ```python
-    response = client.memories.delete(
-        tenant_id="my_first_tenant",
-        memory_id="1d50e5cd7c196a2bbcc1a59b037b3a44",
-    )
-    ```
-  </Tab>
-</Tabs>
+<CodeGroup>
+
+```bash cURL
+curl -X DELETE 'https://api.hydradb.com/memories/delete_memory?tenant_id=my_first_tenant&memory_id=1d50e5cd7c196a2bbcc1a59b037b3a44' \
+  -H "Authorization: Bearer <your_api_key>"
+```
+
+```typescript TypeScript
+const response = await client.memories.delete({
+  tenantId: "my_first_tenant",
+  memoryId: "1d50e5cd7c196a2bbcc1a59b037b3a44"
+});
+```
+
+```python Python (Sync)
+response = client.memories.delete(
+    tenant_id="my_first_tenant",
+    memory_id="1d50e5cd7c196a2bbcc1a59b037b3a44",
+)
+```
+
+</CodeGroup>
 
 ## Query parameters
 

@@ -11,7 +11,7 @@ This endpoint requires an **embeddings tenant**. See [Embeddings overview](/api-
 
 ## Endpoint
 
-```
+```text
 POST /embeddings/insert_raw_embeddings
 ```
 
@@ -21,65 +21,63 @@ POST /embeddings/insert_raw_embeddings
 
 ## Example
 
-<Tabs>
-  <Tab title="cURL">
-    ```bash
-    curl -X POST 'https://api.hydradb.com/embeddings/insert_raw_embeddings' \
-      -H "Authorization: Bearer <your_api_key>" \
-      -H "Content-Type: application/json" \
-      -d '{
-        "tenant_id": "my_embeddings_tenant",
+<CodeGroup>
+
+```bash cURL
+curl -X POST 'https://api.hydradb.com/embeddings/insert_raw_embeddings' \
+  -H "Authorization: Bearer <your_api_key>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "tenant_id": "my_embeddings_tenant",
+    "embeddings": [
+      {
+        "source_id": "doc_001",
+        "metadata": { "category": "engineering" },
         "embeddings": [
-          {
-            "source_id": "doc_001",
-            "metadata": { "category": "engineering" },
-            "embeddings": [
-              { "chunk_id": "doc_001_chunk_0", "embedding": [0.123, -0.045, 0.789] },
-              { "chunk_id": "doc_001_chunk_1", "embedding": [0.234, -0.056, 0.890] }
-            ]
-          }
-        ],
-        "upsert": false
-      }'
-    ```
-  </Tab>
-  <Tab title="TypeScript">
-    ```ts
-    const result = await client.embeddings.insert({
-      tenantId: "my_embeddings_tenant",
+          { "chunk_id": "doc_001_chunk_0", "embedding": [0.123, -0.045, 0.789] },
+          { "chunk_id": "doc_001_chunk_1", "embedding": [0.234, -0.056, 0.890] }
+        ]
+      }
+    ],
+    "upsert": false
+  }'
+```
+
+```typescript TypeScript
+const result = await client.embeddings.insert({
+  tenantId: "my_embeddings_tenant",
+  embeddings: [
+    {
+      sourceId: "doc_001",
+      metadata: { category: "engineering" },
       embeddings: [
+        { chunkId: "doc_001_chunk_0", embedding: [0.123, -0.045, 0.789] },
+        { chunkId: "doc_001_chunk_1", embedding: [0.234, -0.056, 0.890] }
+      ]
+    }
+  ],
+  upsert: false
+});
+```
+
+```python Python (Sync)
+result = client.embeddings.insert(
+    tenant_id="my_embeddings_tenant",
+    embeddings=[
         {
-          sourceId: "doc_001",
-          metadata: { category: "engineering" },
-          embeddings: [
-            { chunkId: "doc_001_chunk_0", embedding: [0.123, -0.045, 0.789] },
-            { chunkId: "doc_001_chunk_1", embedding: [0.234, -0.056, 0.890] }
-          ]
+            "source_id": "doc_001",
+            "metadata": {"category": "engineering"},
+            "embeddings": [
+                {"chunk_id": "doc_001_chunk_0", "embedding": [0.123, -0.045, 0.789]},
+                {"chunk_id": "doc_001_chunk_1", "embedding": [0.234, -0.056, 0.890]},
+            ],
         }
-      ],
-      upsert: false
-    });
-    ```
-  </Tab>
-  <Tab title="Python (Sync)">
-    ```python
-    result = client.embeddings.insert(
-        tenant_id="my_embeddings_tenant",
-        embeddings=[
-            {
-                "source_id": "doc_001",
-                "metadata": {"category": "engineering"},
-                "embeddings": [
-                    {"chunk_id": "doc_001_chunk_0", "embedding": [0.123, -0.045, 0.789]},
-                    {"chunk_id": "doc_001_chunk_1", "embedding": [0.234, -0.056, 0.890]},
-                ],
-            }
-        ],
-        upsert=False,
-    )
-    ```
-  </Tab>
-</Tabs>
+    ],
+    upsert=False,
+)
+```
+
+</CodeGroup>
 
 ## Request parameters
 

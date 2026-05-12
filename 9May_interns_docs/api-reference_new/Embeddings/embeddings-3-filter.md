@@ -15,7 +15,7 @@ For similarity search by query vector, use [`POST /embeddings/search_raw_embeddi
 
 ## Endpoint
 
-```
+```text
 POST /embeddings/filter_raw_embeddings
 ```
 
@@ -25,76 +25,72 @@ POST /embeddings/filter_raw_embeddings
 
 ## Example: Filter by source ID
 
-<Tabs>
-  <Tab title="cURL">
-    ```bash
-    curl -X POST 'https://api.hydradb.com/embeddings/filter_raw_embeddings' \
-      -H "Authorization: Bearer <your_api_key>" \
-      -H "Content-Type: application/json" \
-      -d '{
-        "tenant_id": "my_embeddings_tenant",
-        "sub_tenant_id": "default",
-        "source_id": "doc_001",
-        "limit": 100
-      }'
-    ```
-  </Tab>
-  <Tab title="TypeScript">
-    ```ts
-    const results = await client.embeddings.filter({
-      tenantId: "my_embeddings_tenant",
-      subTenantId: "default",
-      sourceId: "doc_001",
-      limit: 100
-    });
-    ```
-  </Tab>
-  <Tab title="Python (Sync)">
-    ```python
-    results = client.embeddings.filter(
-        tenant_id="my_embeddings_tenant",
-        sub_tenant_id="default",
-        source_id="doc_001",
-        limit=100,
-    )
-    ```
-  </Tab>
-</Tabs>
+<CodeGroup>
+
+```bash cURL
+curl -X POST 'https://api.hydradb.com/embeddings/filter_raw_embeddings' \
+  -H "Authorization: Bearer <your_api_key>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "tenant_id": "my_embeddings_tenant",
+    "sub_tenant_id": "default",
+    "source_id": "doc_001",
+    "limit": 100
+  }'
+```
+
+```typescript TypeScript
+const results = await client.embeddings.filter({
+  tenantId: "my_embeddings_tenant",
+  subTenantId: "default",
+  sourceId: "doc_001",
+  limit: 100
+});
+```
+
+```python Python (Sync)
+results = client.embeddings.filter(
+    tenant_id="my_embeddings_tenant",
+    sub_tenant_id="default",
+    source_id="doc_001",
+    limit=100,
+)
+```
+
+</CodeGroup>
 
 ## Example: Filter by chunk IDs
 
-<Tabs>
-  <Tab title="cURL">
-    ```bash
-    curl -X POST 'https://api.hydradb.com/embeddings/filter_raw_embeddings' \
-      -H "Authorization: Bearer <your_api_key>" \
-      -H "Content-Type: application/json" \
-      -d '{
-        "tenant_id": "my_embeddings_tenant",
-        "sub_tenant_id": "default",
-        "chunk_ids": ["doc_001_chunk_0", "doc_002_chunk_3"]
-      }'
-    ```
-  </Tab>
-  <Tab title="TypeScript">
-    ```ts
-    const results = await client.embeddings.filter({
-      tenantId: "my_embeddings_tenant",
-      subTenantId: "default",
-      chunkIds: ["doc_001_chunk_0", "doc_002_chunk_3"]
-    });
-    ```
-  </Tab>
-  <Tab title="Python (Sync)">
-    ```python
-    results = client.embeddings.filter(
-        tenant_id="my_embeddings_tenant",
-        sub_tenant_id="default",
-        chunk_ids=["doc_001_chunk_0", "doc_002_chunk_3"],
-    )
-    ```
-  </Tab>
-</Tabs>
+<CodeGroup>
+
+```bash cURL
+curl -X POST 'https://api.hydradb.com/embeddings/filter_raw_embeddings' \
+  -H "Authorization: Bearer <your_api_key>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "tenant_id": "my_embeddings_tenant",
+    "sub_tenant_id": "default",
+    "chunk_ids": ["doc_001_chunk_0", "doc_002_chunk_3"]
+  }'
+```
+
+```typescript TypeScript
+const results = await client.embeddings.filter({
+  tenantId: "my_embeddings_tenant",
+  subTenantId: "default",
+  chunkIds: ["doc_001_chunk_0", "doc_002_chunk_3"]
+});
+```
+
+```python Python (Sync)
+results = client.embeddings.filter(
+    tenant_id="my_embeddings_tenant",
+    sub_tenant_id="default",
+    chunk_ids=["doc_001_chunk_0", "doc_002_chunk_3"],
+)
+```
+
+</CodeGroup>
 
 ## Request parameters
 

@@ -17,7 +17,7 @@ For deleting an entire embeddings tenant, use [`DELETE /tenants/delete`](/api-re
 
 ## Endpoint
 
-```
+```text
 DELETE /embeddings/delete_raw_embeddings
 ```
 
@@ -27,57 +27,53 @@ DELETE /embeddings/delete_raw_embeddings
 
 ## Example: Delete by source ID
 
-<Tabs>
-  <Tab title="cURL">
-    ```bash
-    curl -X DELETE 'https://api.hydradb.com/embeddings/delete_raw_embeddings?tenant_id=my_embeddings_tenant&source_id=doc_001' \
-      -H "Authorization: Bearer <your_api_key>"
-    ```
-  </Tab>
-  <Tab title="TypeScript">
-    ```ts
-    const response = await client.embeddings.delete({
-      tenantId: "my_embeddings_tenant",
-      sourceId: "doc_001"
-    });
-    ```
-  </Tab>
-  <Tab title="Python (Sync)">
-    ```python
-    response = client.embeddings.delete(
-        tenant_id="my_embeddings_tenant",
-        source_id="doc_001",
-    )
-    ```
-  </Tab>
-</Tabs>
+<CodeGroup>
+
+```bash cURL
+curl -X DELETE 'https://api.hydradb.com/embeddings/delete_raw_embeddings?tenant_id=my_embeddings_tenant&source_id=doc_001' \
+  -H "Authorization: Bearer <your_api_key>"
+```
+
+```typescript TypeScript
+const response = await client.embeddings.delete({
+  tenantId: "my_embeddings_tenant",
+  sourceId: "doc_001"
+});
+```
+
+```python Python (Sync)
+response = client.embeddings.delete(
+    tenant_id="my_embeddings_tenant",
+    source_id="doc_001",
+)
+```
+
+</CodeGroup>
 
 ## Example: Delete by chunk IDs
 
-<Tabs>
-  <Tab title="cURL">
-    ```bash
-    curl -X DELETE 'https://api.hydradb.com/embeddings/delete_raw_embeddings?tenant_id=my_embeddings_tenant&chunk_ids=doc_001_chunk_0&chunk_ids=doc_002_chunk_3' \
-      -H "Authorization: Bearer <your_api_key>"
-    ```
-  </Tab>
-  <Tab title="TypeScript">
-    ```ts
-    const response = await client.embeddings.delete({
-      tenantId: "my_embeddings_tenant",
-      chunkIds: ["doc_001_chunk_0", "doc_002_chunk_3"]
-    });
-    ```
-  </Tab>
-  <Tab title="Python (Sync)">
-    ```python
-    response = client.embeddings.delete(
-        tenant_id="my_embeddings_tenant",
-        chunk_ids=["doc_001_chunk_0", "doc_002_chunk_3"],
-    )
-    ```
-  </Tab>
-</Tabs>
+<CodeGroup>
+
+```bash cURL
+curl -X DELETE 'https://api.hydradb.com/embeddings/delete_raw_embeddings?tenant_id=my_embeddings_tenant&chunk_ids=doc_001_chunk_0&chunk_ids=doc_002_chunk_3' \
+  -H "Authorization: Bearer <your_api_key>"
+```
+
+```typescript TypeScript
+const response = await client.embeddings.delete({
+  tenantId: "my_embeddings_tenant",
+  chunkIds: ["doc_001_chunk_0", "doc_002_chunk_3"]
+});
+```
+
+```python Python (Sync)
+response = client.embeddings.delete(
+    tenant_id="my_embeddings_tenant",
+    chunk_ids=["doc_001_chunk_0", "doc_002_chunk_3"],
+)
+```
+
+</CodeGroup>
 
 ## Query parameters
 

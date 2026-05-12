@@ -15,7 +15,7 @@ Common patterns:
 
 ## Endpoint
 
-```
+```text
 POST /ingestion/verify_processing
 ```
 
@@ -25,36 +25,34 @@ POST /ingestion/verify_processing
 
 ## Example
 
-<Tabs>
-  <Tab title="cURL">
-    ```bash
-    curl -X POST 'https://api.hydradb.com/ingestion/verify_processing?file_ids=ef3ea754019855e2b39e9ab5c2d26096&file_ids=9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d&tenant_id=my_first_tenant' \
-      -H "Authorization: Bearer <your_api_key>"
-    ```
-  </Tab>
-  <Tab title="TypeScript">
-    ```ts
-    const response = await client.upload.verifyProcessing({
-      tenantId: "my_first_tenant",
-      fileIds: [
+<CodeGroup>
+
+```bash cURL
+curl -X POST 'https://api.hydradb.com/ingestion/verify_processing?file_ids=ef3ea754019855e2b39e9ab5c2d26096&file_ids=9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d&tenant_id=my_first_tenant' \
+  -H "Authorization: Bearer <your_api_key>"
+```
+
+```typescript TypeScript
+const response = await client.upload.verifyProcessing({
+  tenantId: "my_first_tenant",
+  fileIds: [
+    "ef3ea754019855e2b39e9ab5c2d26096",
+    "9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d",
+  ],
+});
+```
+
+```python Python (Sync)
+response = client.upload.verify_processing(
+    tenant_id="my_first_tenant",
+    file_ids=[
         "ef3ea754019855e2b39e9ab5c2d26096",
         "9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d",
-      ],
-    });
-    ```
-  </Tab>
-  <Tab title="Python (Sync)">
-    ```python
-    response = client.upload.verify_processing(
-        tenant_id="my_first_tenant",
-        file_ids=[
-            "ef3ea754019855e2b39e9ab5c2d26096",
-            "9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d",
-        ],
-    )
-    ```
-  </Tab>
-</Tabs>
+    ],
+)
+```
+
+</CodeGroup>
 
 ## Query parameters
 

@@ -11,7 +11,7 @@ This endpoint requires an **embeddings tenant**.
 
 ## Endpoint
 
-```
+```text
 POST /embeddings/search_raw_embeddings
 ```
 
@@ -21,44 +21,42 @@ POST /embeddings/search_raw_embeddings
 
 ## Example
 
-<Tabs>
-  <Tab title="cURL">
-    ```bash
-    curl -X POST 'https://api.hydradb.com/embeddings/search_raw_embeddings' \
-      -H "Authorization: Bearer <your_api_key>" \
-      -H "Content-Type: application/json" \
-      -d '{
-        "tenant_id": "my_embeddings_tenant",
-        "sub_tenant_id": "default",
-        "query_embedding": [0.123, -0.045, 0.789, 0.234, -0.056],
-        "limit": 10,
-        "filter_expr": "metadata[\"category\"] == \"engineering\""
-      }'
-    ```
-  </Tab>
-  <Tab title="TypeScript">
-    ```ts
-    const results = await client.embeddings.search({
-      tenantId: "my_embeddings_tenant",
-      subTenantId: "default",
-      queryEmbedding: [0.123, -0.045, 0.789, 0.234, -0.056],
-      limit: 10,
-      filterExpr: 'metadata["category"] == "engineering"'
-    });
-    ```
-  </Tab>
-  <Tab title="Python (Sync)">
-    ```python
-    results = client.embeddings.search(
-        tenant_id="my_embeddings_tenant",
-        sub_tenant_id="default",
-        query_embedding=[0.123, -0.045, 0.789, 0.234, -0.056],
-        limit=10,
-        filter_expr='metadata["category"] == "engineering"',
-    )
-    ```
-  </Tab>
-</Tabs>
+<CodeGroup>
+
+```bash cURL
+curl -X POST 'https://api.hydradb.com/embeddings/search_raw_embeddings' \
+  -H "Authorization: Bearer <your_api_key>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "tenant_id": "my_embeddings_tenant",
+    "sub_tenant_id": "default",
+    "query_embedding": [0.123, -0.045, 0.789, 0.234, -0.056],
+    "limit": 10,
+    "filter_expr": "metadata[\"category\"] == \"engineering\""
+  }'
+```
+
+```typescript TypeScript
+const results = await client.embeddings.search({
+  tenantId: "my_embeddings_tenant",
+  subTenantId: "default",
+  queryEmbedding: [0.123, -0.045, 0.789, 0.234, -0.056],
+  limit: 10,
+  filterExpr: 'metadata["category"] == "engineering"'
+});
+```
+
+```python Python (Sync)
+results = client.embeddings.search(
+    tenant_id="my_embeddings_tenant",
+    sub_tenant_id="default",
+    query_embedding=[0.123, -0.045, 0.789, 0.234, -0.056],
+    limit=10,
+    filter_expr='metadata["category"] == "engineering"',
+)
+```
+
+</CodeGroup>
 
 ## Request parameters
 

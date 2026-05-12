@@ -51,7 +51,7 @@ For user memories, see [`POST /memories/add_memory`](/api-reference/endpoint/add
 
 ## Typical call sequence
 
-```
+```text
 1. POST /ingestion/upload_knowledge   → returns source_ids, status: queued
 2. POST /ingestion/verify_processing  → poll until status: completed
 3. POST /recall/full_recall           → content is now retrievable
@@ -59,7 +59,7 @@ For user memories, see [`POST /memories/add_memory`](/api-reference/endpoint/add
 
 For batched uploads with mixed content:
 
-```
+```text
 1. POST /ingestion/upload_knowledge with files=[...] AND app_sources=[...]
    → single request, multiple source_ids in response
 2. POST /ingestion/verify_processing with all source_ids

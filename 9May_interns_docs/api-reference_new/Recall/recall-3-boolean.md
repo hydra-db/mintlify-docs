@@ -15,7 +15,7 @@ Use this instead of `full_recall` when the query is a literal lookup, not a sema
 
 ## Endpoint
 
-```
+```text
 POST /recall/boolean_recall
 ```
 
@@ -25,44 +25,42 @@ POST /recall/boolean_recall
 
 ## Example
 
-<Tabs>
-  <Tab title="cURL">
-    ```bash
-    curl -X POST 'https://api.hydradb.com/recall/boolean_recall' \
-      -H "Authorization: Bearer <your_api_key>" \
-      -H "Content-Type: application/json" \
-      -d '{
-        "tenant_id": "my_first_tenant",
-        "query": "ERROR_429 rate limit",
-        "operator": "and",
-        "max_results": 10,
-        "search_mode": "sources"
-      }'
-    ```
-  </Tab>
-  <Tab title="TypeScript">
-    ```ts
-    const result = await client.recall.booleanRecall({
-      tenantId: "my_first_tenant",
-      query: "ERROR_429 rate limit",
-      operator: "and",
-      maxResults: 10,
-      searchMode: "sources"
-    });
-    ```
-  </Tab>
-  <Tab title="Python (Sync)">
-    ```python
-    result = client.recall.boolean_recall(
-        tenant_id="my_first_tenant",
-        query="ERROR_429 rate limit",
-        operator="and",
-        max_results=10,
-        search_mode="sources",
-    )
-    ```
-  </Tab>
-</Tabs>
+<CodeGroup>
+
+```bash cURL
+curl -X POST 'https://api.hydradb.com/recall/boolean_recall' \
+  -H "Authorization: Bearer <your_api_key>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "tenant_id": "my_first_tenant",
+    "query": "ERROR_429 rate limit",
+    "operator": "and",
+    "max_results": 10,
+    "search_mode": "sources"
+  }'
+```
+
+```typescript TypeScript
+const result = await client.recall.booleanRecall({
+  tenantId: "my_first_tenant",
+  query: "ERROR_429 rate limit",
+  operator: "and",
+  maxResults: 10,
+  searchMode: "sources"
+});
+```
+
+```python Python (Sync)
+result = client.recall.boolean_recall(
+    tenant_id="my_first_tenant",
+    query="ERROR_429 rate limit",
+    operator="and",
+    max_results=10,
+    search_mode="sources",
+)
+```
+
+</CodeGroup>
 
 ## Request parameters
 

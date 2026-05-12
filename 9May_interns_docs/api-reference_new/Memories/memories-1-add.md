@@ -15,7 +15,7 @@ For documents, files, and app-generated content, use [`POST /ingestion/upload_kn
 
 ## Endpoint
 
-```
+```text
 POST /memories/add_memory
 ```
 
@@ -25,59 +25,57 @@ POST /memories/add_memory
 
 ## Example
 
-<Tabs>
-  <Tab title="cURL">
-    ```bash
-    curl -X POST 'https://api.hydradb.com/memories/add_memory' \
-      -H "Authorization: Bearer <your_api_key>" \
-      -H "Content-Type: application/json" \
-      -d '{
-        "tenant_id": "my_first_tenant",
-        "memories": [
-          {
-            "text": "User prefers detailed technical explanations and dark mode",
-            "infer": true,
-            "user_name": "Alex",
-            "metadata": { "team": "engineering" },
-            "additional_metadata": { "source": "onboarding" }
-          }
-        ]
-      }'
-    ```
-  </Tab>
-  <Tab title="TypeScript">
-    ```ts
-    const response = await client.memories.add({
-      tenantId: "my_first_tenant",
-      memories: [
+<CodeGroup>
+
+```bash cURL
+curl -X POST 'https://api.hydradb.com/memories/add_memory' \
+  -H "Authorization: Bearer <your_api_key>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "tenant_id": "my_first_tenant",
+    "memories": [
+      {
+        "text": "User prefers detailed technical explanations and dark mode",
+        "infer": true,
+        "user_name": "Alex",
+        "metadata": { "team": "engineering" },
+        "additional_metadata": { "source": "onboarding" }
+      }
+    ]
+  }'
+```
+
+```typescript TypeScript
+const response = await client.memories.add({
+  tenantId: "my_first_tenant",
+  memories: [
+    {
+      text: "User prefers detailed technical explanations and dark mode",
+      infer: true,
+      userName: "Alex",
+      metadata: { team: "engineering" },
+      additionalMetadata: { source: "onboarding" }
+    }
+  ]
+});
+```
+
+```python Python (Sync)
+response = client.memories.add(
+    tenant_id="my_first_tenant",
+    memories=[
         {
-          text: "User prefers detailed technical explanations and dark mode",
-          infer: true,
-          userName: "Alex",
-          metadata: { team: "engineering" },
-          additionalMetadata: { source: "onboarding" }
+            "text": "User prefers detailed technical explanations and dark mode",
+            "infer": True,
+            "user_name": "Alex",
+            "metadata": {"team": "engineering"},
+            "additional_metadata": {"source": "onboarding"},
         }
-      ]
-    });
-    ```
-  </Tab>
-  <Tab title="Python (Sync)">
-    ```python
-    response = client.memories.add(
-        tenant_id="my_first_tenant",
-        memories=[
-            {
-                "text": "User prefers detailed technical explanations and dark mode",
-                "infer": True,
-                "user_name": "Alex",
-                "metadata": {"team": "engineering"},
-                "additional_metadata": {"source": "onboarding"},
-            }
-        ],
-    )
-    ```
-  </Tab>
-</Tabs>
+    ],
+)
+```
+
+</CodeGroup>
 
 ## Request parameters
 

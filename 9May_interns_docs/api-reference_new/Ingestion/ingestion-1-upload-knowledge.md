@@ -14,7 +14,7 @@ For user-specific context (preferences, conversations), use [`POST /memories/add
 
 ## Endpoint
 
-```
+```text
 POST /ingestion/upload_knowledge
 ```
 
@@ -34,118 +34,114 @@ This endpoint accepts two content formats in one request. Send either or both:
 
 ## Example: Upload files
 
-<Tabs>
-  <Tab title="cURL">
-    ```bash
-    curl -X POST 'https://api.hydradb.com/ingestion/upload_knowledge' \
-      -H "Authorization: Bearer <your_api_key>" \
-      -F "tenant_id=my_first_tenant" \
-      -F "files=@/path/to/contract.pdf" \
-      -F "files=@/path/to/policy.pdf" \
-      -F 'file_metadata=[
-        { "file_id": "contract_q4", "metadata": { "category": "legal" } },
-        { "file_id": "policy_2025", "metadata": { "category": "legal" } }
-      ]'
-    ```
-  </Tab>
-  <Tab title="TypeScript">
-    ```ts
-    import { createReadStream } from "fs";
+<CodeGroup>
 
-    const response = await client.upload.knowledge({
-      tenantId: "my_first_tenant",
-      files: [
-        createReadStream("/path/to/contract.pdf"),
-        createReadStream("/path/to/policy.pdf"),
-      ],
-      fileMetadata: JSON.stringify([
-        { file_id: "contract_q4", metadata: { category: "legal" } },
-        { file_id: "policy_2025", metadata: { category: "legal" } },
-      ]),
-    });
-    ```
-  </Tab>
-  <Tab title="Python (Sync)">
-    ```python
-    import json
+```bash cURL
+curl -X POST 'https://api.hydradb.com/ingestion/upload_knowledge' \
+  -H "Authorization: Bearer <your_api_key>" \
+  -F "tenant_id=my_first_tenant" \
+  -F "files=@/path/to/contract.pdf" \
+  -F "files=@/path/to/policy.pdf" \
+  -F 'file_metadata=[
+    { "file_id": "contract_q4", "metadata": { "category": "legal" } },
+    { "file_id": "policy_2025", "metadata": { "category": "legal" } }
+  ]'
+```
 
-    with open("/path/to/contract.pdf", "rb") as f1, \
-         open("/path/to/policy.pdf", "rb") as f2:
-        response = client.upload.knowledge(
-            tenant_id="my_first_tenant",
-            files=[f1, f2],
-            file_metadata=json.dumps([
-                {"file_id": "contract_q4", "metadata": {"category": "legal"}},
-                {"file_id": "policy_2025", "metadata": {"category": "legal"}},
-            ]),
-        )
-    ```
-  </Tab>
-</Tabs>
+```typescript TypeScript
+import { createReadStream } from "fs";
+
+const response = await client.upload.knowledge({
+  tenantId: "my_first_tenant",
+  files: [
+    createReadStream("/path/to/contract.pdf"),
+    createReadStream("/path/to/policy.pdf"),
+  ],
+  fileMetadata: JSON.stringify([
+    { file_id: "contract_q4", metadata: { category: "legal" } },
+    { file_id: "policy_2025", metadata: { category: "legal" } },
+  ]),
+});
+```
+
+```python Python (Sync)
+import json
+
+with open("/path/to/contract.pdf", "rb") as f1, \
+     open("/path/to/policy.pdf", "rb") as f2:
+    response = client.upload.knowledge(
+        tenant_id="my_first_tenant",
+        files=[f1, f2],
+        file_metadata=json.dumps([
+            {"file_id": "contract_q4", "metadata": {"category": "legal"}},
+            {"file_id": "policy_2025", "metadata": {"category": "legal"}},
+        ]),
+    )
+```
+
+</CodeGroup>
 
 ## Example: Upload app sources
 
-<Tabs>
-  <Tab title="cURL">
-    ```bash
-    curl -X POST 'https://api.hydradb.com/ingestion/upload_knowledge' \
-      -H "Authorization: Bearer <your_api_key>" \
-      -F "tenant_id=my_first_tenant" \
-      -F 'app_sources=[
-        {
-          "id": "slack_msg_12345",
-          "title": "Q4 planning standup notes",
-          "type": "slack",
-          "url": "https://acme.slack.com/archives/C01/p1234567890",
-          "timestamp": "2025-10-15T14:30:00Z",
-          "content": { "text": "Today we discussed the Q4 roadmap..." },
-          "tenant_metadata": { "category": "engineering" },
-          "document_metadata": { "channel": "#planning", "author": "alex" }
-        }
-      ]'
-    ```
-  </Tab>
-  <Tab title="TypeScript">
-    ```ts
-    const response = await client.upload.knowledge({
-      tenantId: "my_first_tenant",
-      appSources: JSON.stringify([
-        {
-          id: "slack_msg_12345",
-          title: "Q4 planning standup notes",
-          type: "slack",
-          url: "https://acme.slack.com/archives/C01/p1234567890",
-          timestamp: "2025-10-15T14:30:00Z",
-          content: { text: "Today we discussed the Q4 roadmap..." },
-          tenant_metadata: { category: "engineering" },
-          document_metadata: { channel: "#planning", author: "alex" },
-        },
-      ]),
-    });
-    ```
-  </Tab>
-  <Tab title="Python (Sync)">
-    ```python
-    import json
+<CodeGroup>
 
-    response = client.upload.knowledge(
-        tenant_id="my_first_tenant",
-        app_sources=json.dumps([
-            {
-                "id": "slack_msg_12345",
-                "title": "Q4 planning standup notes",
-                "type": "slack",
-                "url": "https://acme.slack.com/archives/C01/p1234567890",
-                "timestamp": "2025-10-15T14:30:00Z",
-                "content": {"text": "Today we discussed the Q4 roadmap..."},
-                "tenant_metadata": {"category": "engineering"},
-                "document_metadata": {"channel": "#planning", "author": "alex"},
-            }
-        ]),
-    )
-    ```
-  </Tab>
-</Tabs>
+```bash cURL
+curl -X POST 'https://api.hydradb.com/ingestion/upload_knowledge' \
+  -H "Authorization: Bearer <your_api_key>" \
+  -F "tenant_id=my_first_tenant" \
+  -F 'app_sources=[
+    {
+      "id": "slack_msg_12345",
+      "title": "Q4 planning standup notes",
+      "type": "slack",
+      "url": "https://acme.slack.com/archives/C01/p1234567890",
+      "timestamp": "2025-10-15T14:30:00Z",
+      "content": { "text": "Today we discussed the Q4 roadmap..." },
+      "tenant_metadata": { "category": "engineering" },
+      "document_metadata": { "channel": "#planning", "author": "alex" }
+    }
+  ]'
+```
+
+```typescript TypeScript
+const response = await client.upload.knowledge({
+  tenantId: "my_first_tenant",
+  appSources: JSON.stringify([
+    {
+      id: "slack_msg_12345",
+      title: "Q4 planning standup notes",
+      type: "slack",
+      url: "https://acme.slack.com/archives/C01/p1234567890",
+      timestamp: "2025-10-15T14:30:00Z",
+      content: { text: "Today we discussed the Q4 roadmap..." },
+      tenant_metadata: { category: "engineering" },
+      document_metadata: { channel: "#planning", author: "alex" },
+    },
+  ]),
+});
+```
+
+```python Python (Sync)
+import json
+
+response = client.upload.knowledge(
+    tenant_id="my_first_tenant",
+    app_sources=json.dumps([
+        {
+            "id": "slack_msg_12345",
+            "title": "Q4 planning standup notes",
+            "type": "slack",
+            "url": "https://acme.slack.com/archives/C01/p1234567890",
+            "timestamp": "2025-10-15T14:30:00Z",
+            "content": {"text": "Today we discussed the Q4 roadmap..."},
+            "tenant_metadata": {"category": "engineering"},
+            "document_metadata": {"channel": "#planning", "author": "alex"},
+        }
+    ]),
+)
+```
+
+</CodeGroup>
 
 ## Form fields
 

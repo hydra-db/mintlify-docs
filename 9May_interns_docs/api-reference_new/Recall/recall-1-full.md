@@ -18,7 +18,7 @@ For user-specific memories (preferences, conversation history), use [`POST /reca
 
 ## Endpoint
 
-```
+```text
 POST /recall/full_recall
 ```
 
@@ -28,47 +28,45 @@ POST /recall/full_recall
 
 ## Example
 
-<Tabs>
-  <Tab title="cURL">
-    ```bash
-    curl -X POST 'https://api.hydradb.com/recall/full_recall' \
-      -H "Authorization: Bearer <your_api_key>" \
-      -H "Content-Type: application/json" \
-      -d '{
-        "tenant_id": "my_first_tenant",
-        "query": "What are the pricing tiers?",
-        "max_results": 5,
-        "mode": "thinking",
-        "graph_context": true,
-        "metadata_filters": { "category": "pricing" }
-      }'
-    ```
-  </Tab>
-  <Tab title="TypeScript">
-    ```ts
-    const result = await client.recall.fullRecall({
-      tenantId: "my_first_tenant",
-      query: "What are the pricing tiers?",
-      maxResults: 5,
-      mode: "thinking",
-      graphContext: true,
-      metadataFilters: { category: "pricing" }
-    });
-    ```
-  </Tab>
-  <Tab title="Python (Sync)">
-    ```python
-    result = client.recall.full_recall(
-        tenant_id="my_first_tenant",
-        query="What are the pricing tiers?",
-        max_results=5,
-        mode="thinking",
-        graph_context=True,
-        metadata_filters={"category": "pricing"},
-    )
-    ```
-  </Tab>
-</Tabs>
+<CodeGroup>
+
+```bash cURL
+curl -X POST 'https://api.hydradb.com/recall/full_recall' \
+  -H "Authorization: Bearer <your_api_key>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "tenant_id": "my_first_tenant",
+    "query": "What are the pricing tiers?",
+    "max_results": 5,
+    "mode": "thinking",
+    "graph_context": true,
+    "metadata_filters": { "category": "pricing" }
+  }'
+```
+
+```typescript TypeScript
+const result = await client.recall.fullRecall({
+  tenantId: "my_first_tenant",
+  query: "What are the pricing tiers?",
+  maxResults: 5,
+  mode: "thinking",
+  graphContext: true,
+  metadataFilters: { category: "pricing" }
+});
+```
+
+```python Python (Sync)
+result = client.recall.full_recall(
+    tenant_id="my_first_tenant",
+    query="What are the pricing tiers?",
+    max_results=5,
+    mode="thinking",
+    graph_context=True,
+    metadata_filters={"category": "pricing"},
+)
+```
+
+</CodeGroup>
 
 ## Request parameters
 

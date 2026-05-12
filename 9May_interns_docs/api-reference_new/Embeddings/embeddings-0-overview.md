@@ -45,7 +45,7 @@ See [Create tenant](/api-reference/endpoint/create-tenant) for full options.
 
 The embeddings track uses a different structure from the standard ingestion path:
 
-```
+```text
 Source (source_id)
 └── Embeddings
     ├── Chunk (chunk_id) → embedding vector
@@ -57,7 +57,7 @@ Each **source** groups one or more **chunks**. Each chunk has its own `chunk_id`
 
 ## Typical lifecycle
 
-```
+```text
 1. POST /tenants/create with is_embeddings_tenant: true     → create embeddings tenant
 2. POST /embeddings/insert_raw_embeddings                   → upload vectors
 3. POST /embeddings/search_raw_embeddings                   → similarity search

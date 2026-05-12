@@ -38,7 +38,7 @@ For retrieving memories, see [`POST /recall/recall_preferences`](/api-reference/
 
 For storing a new memory:
 
-```
+```text
 1. POST   /memories/add_memory          → returns source_id, status: queued
 2. POST   /ingestion/verify_processing  → poll until status: completed
 3. POST   /recall/recall_preferences    → memory is now retrievable
@@ -46,7 +46,7 @@ For storing a new memory:
 
 For removing a memory:
 
-```
+```text
 DELETE /memories/delete_memory?memory_id=... → permanent removal
 ```
 

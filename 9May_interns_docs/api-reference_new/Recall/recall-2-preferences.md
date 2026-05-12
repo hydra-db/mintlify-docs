@@ -15,7 +15,7 @@ The request and response shapes are **identical to [`POST /recall/full_recall`](
 
 ## Endpoint
 
-```
+```text
 POST /recall/recall_preferences
 ```
 
@@ -25,44 +25,42 @@ POST /recall/recall_preferences
 
 ## Example
 
-<Tabs>
-  <Tab title="cURL">
-    ```bash
-    curl -X POST 'https://api.hydradb.com/recall/recall_preferences' \
-      -H "Authorization: Bearer <your_api_key>" \
-      -H "Content-Type: application/json" \
-      -d '{
-        "tenant_id": "my_first_tenant",
-        "sub_tenant_id": "user_alex",
-        "query": "What are my display preferences?",
-        "max_results": 3,
-        "mode": "thinking"
-      }'
-    ```
-  </Tab>
-  <Tab title="TypeScript">
-    ```ts
-    const result = await client.recall.recallPreferences({
-      tenantId: "my_first_tenant",
-      subTenantId: "user_alex",
-      query: "What are my display preferences?",
-      maxResults: 3,
-      mode: "thinking"
-    });
-    ```
-  </Tab>
-  <Tab title="Python (Sync)">
-    ```python
-    result = client.recall.recall_preferences(
-        tenant_id="my_first_tenant",
-        sub_tenant_id="user_alex",
-        query="What are my display preferences?",
-        max_results=3,
-        mode="thinking",
-    )
-    ```
-  </Tab>
-</Tabs>
+<CodeGroup>
+
+```bash cURL
+curl -X POST 'https://api.hydradb.com/recall/recall_preferences' \
+  -H "Authorization: Bearer <your_api_key>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "tenant_id": "my_first_tenant",
+    "sub_tenant_id": "user_alex",
+    "query": "What are my display preferences?",
+    "max_results": 3,
+    "mode": "thinking"
+  }'
+```
+
+```typescript TypeScript
+const result = await client.recall.recallPreferences({
+  tenantId: "my_first_tenant",
+  subTenantId: "user_alex",
+  query: "What are my display preferences?",
+  maxResults: 3,
+  mode: "thinking"
+});
+```
+
+```python Python (Sync)
+result = client.recall.recall_preferences(
+    tenant_id="my_first_tenant",
+    sub_tenant_id="user_alex",
+    query="What are my display preferences?",
+    max_results=3,
+    mode="thinking",
+)
+```
+
+</CodeGroup>
 
 ## Request parameters
 
