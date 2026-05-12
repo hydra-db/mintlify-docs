@@ -1,0 +1,126 @@
+---
+title: "Fetch Content"
+description: "Retrieve the original content of an ingested source."
+---
+
+## When to use it
+
+- **Download original files** – PDFs, DOCX, etc. that you uploaded
+- **Generate temporary share links** – presigned URLs for client-side access
+- **Re-extract content** – rebuild downstream caches from the source of truth
+- **Preview** – display original content alongside recall results
+
+## Endpoint
+
+```
+POST /fetch/content
+```
+
+- **Auth:** Bearer token
+- **Idempotency:** Read-only
+- **Async:** No
+
+## Example
+
+<Tabs>
+  <Tab title="cURL">
+    ```bash
+    curl -X POST 'https://api.hydradb.com/fetch/content' \
+      -H "Authorization: Bearer <your_api_key>" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "tenant_id": "my_first_tenant",
+        "source_id": "doc_12345",
+        "mode": "url",
+        "expiry_seconds": 3600
+      }'
+    ```
+  </Tab>
+  <Tab title="TypeScript">
+    ```ts
+    const result = await client.fetch.content({
+      tenantId: "my_first_tenant",
+      sourceId: "doc_12345",
+      mode: "url",
+      expirySeconds: 3600
+    });
+    ```
+  </Tab>
+  <Tab title="Python (Sync)">
+    ```python
+    result = client.fetch.content(
+        tenant_id="my_first_tenant",
+        source_id="doc_12345",
+        mode="url",
+        expiry_seconds=3600,
+    )
+    ```
+  </Tab>
+</Tabs>
+
+## Request parameters
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `tenant_id` | string | Yes | – | The tenant the source belongs to. |
+| `source_id` | string | Yes | – | The source to fetch. |
+| `sub_tenant_id` | string | No | default | Sub-tenant scope. |
+| `mode` | enum | No | `content` | What to return. See [Modes](#modes). |
+| `expiry_seconds` | integer | No | `3600` | Presigned URL expiry (60–604800, i.e., 1 minute to 7 days). Only relevant when `mode` includes `url`. |
+
+## Modes
+
+| Mode | Returns |
+|---|---|
+| `content` (default) | File content as text, or base64 for binary files |
+| `url` | Presigned URL only |
+| `both` | Content **and** presigned URL |
+
+Use `url` for client-side downloads where you don't want to proxy bytes through your backend.
+
+Use `content` when you need to process the file inline.
+
+## Response
+
+```json
+{
+  "success": true,
+  "source_id": "doc_12345",
+  "content": "Q4 Pricing Strategy\n\nThis document outlines...",
+  "content_base64": null,
+  "presigned_url": "https://storage.hydradb.com/presigned/...",
+  "content_type": "application/pdf",
+  "size_bytes": 245760,
+  "message": "File fetched successfully"
+}
+```
+
+| Field | Description |
+|---|---|
+| `success` | `true` on a successful fetch. |
+| `source_id` | The source that was fetched. |
+| `content` | Text content (when `mode` is `content` or `both` and the file is text). |
+| `content_base64` | Base64-encoded content for binary files. |
+| `presigned_url` | Time-limited download URL (when `mode` is `url` or `both`). |
+| `content_type` | MIME type of the source. |
+| `size_bytes` | Size of the original file. |
+| `error` | Error message if fetch failed. |
+
+## Behavior notes
+
+<Info>
+**Binary vs text.** For PDFs and other binaries, `content` is empty and the data is in `content_base64`. For markdown, plain text, or extracted text, `content` is populated directly.
+</Info>
+
+<Info>
+**Presigned URLs are time-limited.** Once `expiry_seconds` elapses, the URL stops working. Generate a fresh URL for each long-lived integration rather than caching them.
+</Info>
+
+## Related endpoints
+
+- **Find sources first:** [List data](/api-reference/endpoint/list-data) – browse to find a `source_id`
+- **Inspect relationships:** [Graph relations by source ID](/api-reference/endpoint/graph-relations) – see entities extracted from this source
+
+## Errors
+
+Common codes: `400 INVALID_PARAMETERS`, `404 SOURCE_NOT_FOUND`, `422 VALIDATION_ERROR`. See [Error Responses](/api-reference/error-responses) for the full list.

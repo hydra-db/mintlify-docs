@@ -8,12 +8,12 @@ description: "Official TypeScript/Node.js and Python SDKs for the HydraDB platfo
 <Tabs>
   <Tab title="TypeScript / Node.js">
     ```bash
-    npm install @hydradb/sdk
+    npm i @hydra_db/node
     ```
   </Tab>
   <Tab title="Python">
     ```bash
-    pip install hydradb-sdk
+    pip install hydra-db-python
     ```
   </Tab>
 </Tabs>
@@ -23,7 +23,7 @@ description: "Official TypeScript/Node.js and Python SDKs for the HydraDB platfo
 <Tabs>
   <Tab title="TypeScript">
     ```ts
-    import { HydraDBClient } from "@hydradb/sdk";
+    import { HydraDBClient } from "@hydra_db/node";
 
     const client = new HydraDBClient({
       token: process.env.HYDRADB_API_KEY,

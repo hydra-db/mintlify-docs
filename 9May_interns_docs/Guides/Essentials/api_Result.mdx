@@ -1,7 +1,6 @@
 ---
 title: "How to Use API Results"
 description: "Turn a recall response into a grounded LLM answer."
-category: Essentials
 ---
 
 # How to Use API Results
@@ -23,69 +22,282 @@ The retrieval endpoints (`full_recall` and `recall_preferences`) return the same
 }
 ```
 
-Three things matter for prompt construction:
+Four things matter for prompt construction:
 
 - **`chunks`** — the primary retrieval output. Ranked by relevance; preserve the order HydraDB returns.
-- **`graph_context`** — returned when `graph_context: true` is requested and relevant graph data is available. Useful for relational reasoning. See [Context Graphs](/essentials/context-graphs).
+- **`graph_context.query_paths`** — entity traversal paths derived from your query. Useful for relational reasoning. See [Context Graphs](/essentials/context-graphs).
+- **`graph_context.chunk_relations`** + **`chunk_id_to_group_ids`** — per-chunk graph relations grouped by `group_id`, so you can attach the right triplets to each chunk.
 - **`additional_context`** — a map keyed by `chunk_uuid`. When a chunk includes `extra_context_ids`, use those IDs to look up related chunks here.
 
 Don't pass the raw object to the LLM. Convert it into a structured context string first.
 
-## 2. From response to prompt
+## 2. Transforming the response into LLM context
 
-Three steps:
+The helper below takes a `RetrievalResult` and produces a single string with:
 
-1. Iterate `chunks` in the order returned. Pull `source_title` and `chunk_content` for each.
-2. For any chunk with `extra_context_ids`, look up each ID in `additional_context` and append the related text under the chunk.
-3. (Optional) If `graph_context.query_paths` is non-empty, include a short relations block for queries that benefit from it.
+1. **Entity paths** from `graph_context.query_paths` (when present)
+2. **Ranked chunks** in server order, each preceded by `Source: <title>`
+3. **Graph relations per chunk**, matched via `chunk_id_to_group_ids` → `chunk_relations`
+4. **Extra context** for any `extra_context_ids` attached to a chunk
 
-Concatenate the result into a single string and pass it to the LLM alongside the user's question, with a system prompt that grounds the model in the provided context.
-
-## 3. Minimal working example
-
-A compact helper that handles chunks and `additional_context`. Extend it with graph-relation formatting when your queries need it.
+The output is delimited by `=== ENTITY PATHS ===` and `=== CONTEXT ===` blocks so the LLM can read it cleanly.
 
 <CodeGroup>
 
 ```python Python
-def build_context_string(result) -> str:
+from __future__ import annotations
+
+from typing import Any
+
+
+def _format_path_chain(path: Any) -> str:
+    """Format a ScoredPathResponse into a readable chain string.
+
+    Each triplet becomes: [src] -> predicate -> [tgt]: context [Time: ...]
+    Multiple triplets are joined with ↳ to show traversal direction.
+    """
+    if not isinstance(path, dict):
+        return str(path)
+
+    triplets = path.get("triplets") or []
+    parts = []
+    for t in triplets:
+        src  = (t.get("source") or {}).get("name", "")
+        tgt  = (t.get("target") or {}).get("name", "")
+        rel  = t.get("relation") or {}
+        pred = rel.get("canonical_predicate", "")
+        line = f"[{src}] -> {pred} -> [{tgt}]"
+        ctx  = rel.get("context")
+        if ctx:
+            line += f": {ctx}"
+        temporal = rel.get("temporal_details")
+        if temporal:
+            line += f" [Time: {temporal}]"
+        parts.append(line)
+
+    return "\n  ↳ ".join(parts)
+
+
+def build_context_string(result: dict[str, Any]) -> str:
+    """
+    Build a formatted context string from a HydraDB full_recall response dict.
+
+    Combines entity paths, chunk content, graph relations, and extra context
+    into a single readable string ready to pass into an LLM prompt.
+    """
     lines: list[str] = []
-    chunks = result.chunks or []
-    additional = result.additional_context or {}
+    gc: dict[str, Any] = result.get("graph_context") or {}
 
-    for i, chunk in enumerate(chunks, 1):
-        title = chunk.source_title or ""
-        lines.append(f"[Chunk {i}]" + (f" Source: {title}" if title else ""))
-        lines.append(chunk.chunk_content or "")
+    # --- Entity paths -----------------------------------------------------------
+    query_paths = gc.get("query_paths") or []
+    if query_paths:
+        lines.append("=== ENTITY PATHS ===")
+        for path in query_paths:
+            lines.append(_format_path_chain(path))
+        lines.append("")
 
-        for extra_id in chunk.extra_context_ids or []:
-            extra = additional.get(extra_id)
-            if extra is not None:
-                lines.append(f"  Related: {extra.chunk_content or ''}")
+    # --- Chunks -----------------------------------------------------------------
+    chunks: list[dict[str, Any]] = result.get("chunks") or []
+    additional_context: dict[str, Any] = result.get("additional_context") or {}
+    chunk_id_to_group_ids: dict[str, list[str]] = gc.get("chunk_id_to_group_ids") or {}
+    chunk_relations: list[dict[str, Any]] = gc.get("chunk_relations") or []
 
-        lines.append("---")
+    if chunks:
+        lines.append("=== CONTEXT ===")
+        for i, chunk in enumerate(chunks):
+            lines.append(f"Chunk {i + 1}")
+            source = chunk.get("source_title") or chunk.get("source") or ""
+            if source:
+                lines.append(f"Source: {source}")
+            lines.append(chunk.get("chunk_content") or chunk.get("content") or "")
+
+            # Graph relations for this chunk
+            chunk_uuid = chunk.get("chunk_uuid") or chunk.get("id") or ""
+            if chunk_uuid and chunk_id_to_group_ids and chunk_relations:
+                group_ids = chunk_id_to_group_ids.get(chunk_uuid, [])
+                relevant_relations = [
+                    r for r in chunk_relations
+                    if r.get("group_id") in group_ids
+                ]
+                if relevant_relations:
+                    lines.append("Graph Relations:")
+                    for rel in relevant_relations:
+                        for triplet in rel.get("triplets") or []:
+                            src  = (triplet.get("source") or {}).get("name", "")
+                            tgt  = (triplet.get("target") or {}).get("name", "")
+                            rel_ = triplet.get("relation") or {}
+                            pred = rel_.get("canonical_predicate", "")
+                            ctx  = rel_.get("context", "")
+                            line = f"  [{src}] -> {pred} -> [{tgt}]: {ctx}"
+                            temporal = rel_.get("temporal_details")
+                            if temporal:
+                                line += f" [Time: {temporal}]"
+                            lines.append(line)
+
+            # Extra context
+            extra_ids = chunk.get("extra_context_ids") or []
+            if extra_ids and additional_context:
+                extras = [
+                    additional_context[eid]
+                    for eid in extra_ids
+                    if eid in additional_context
+                ]
+                if extras:
+                    lines.append("Extra Context:")
+                    for extra in extras:
+                        extra_source = extra.get("source_title", "")
+                        extra_content = extra.get("chunk_content") or extra.get("content", "")
+                        lines.append(f"  Related Context ({extra_source}): {extra_content}")
+
+            lines.append("---")
+            lines.append("")
 
     return "\n".join(lines)
 ```
 
 ```typescript TypeScript
-function buildContextString(result: any): string {
+export interface VectorStoreChunk {
+  chunk_uuid: string;
+  source_id: string;
+  chunk_content: string;
+  source_type: string;
+  source_upload_time: string;
+  source_title: string;
+  source_last_updated_time: string;
+  layout: string | null;
+  relevancy_score: number | null;
+  additional_metadata: Record<string, unknown> | null;
+  metadata: Record<string, unknown> | null;
+  extra_context_ids: string[] | null;
+}
+
+export interface Entity {
+  name: string;
+  type: string;
+  namespace: string;
+  entity_id: string;
+  identifier: string | null;
+}
+
+export interface RelationEvidence {
+  canonical_predicate: string;
+  raw_predicate: string;
+  context: string;
+  confidence: number;
+  temporal_details: string | null;
+  timestamp: string;
+  relationship_id: string;
+  chunk_id: string | null;
+  source_entity_id: string | null;
+  target_entity_id: string | null;
+}
+
+export interface PathTriplet {
+  source: Entity;
+  relation: RelationEvidence;
+  target: Entity;
+}
+
+export interface ScoredPathResponse {
+  triplets: PathTriplet[];
+  relevancy_score: number;
+  combined_context: string | null;
+  group_id: string | null;
+  source_chunk_ids: string[] | null;
+}
+
+export interface GraphContext {
+  query_paths: ScoredPathResponse[];
+  chunk_relations: ScoredPathResponse[];
+  chunk_id_to_group_ids: Record<string, string[]>;
+}
+
+export interface SourceInfo {
+  id: string;
+  title: string;
+  type: string;
+  description: string;
+  url: string;
+  timestamp: string;
+  metadata: Record<string, unknown>;
+  additional_metadata: Record<string, unknown>;
+}
+
+export interface RetrievalResult {
+  chunks: VectorStoreChunk[];
+  sources: SourceInfo[];
+  graph_context: GraphContext;
+  additional_context: Record<string, VectorStoreChunk>;
+}
+
+function formatPathChain(path: ScoredPathResponse): string {
+  return path.triplets
+    .map((t) => {
+      let str = `[${t.source.name}] -> ${t.relation.canonical_predicate} -> [${t.target.name}]`;
+      if (t.relation.context) str += `: ${t.relation.context}`;
+      if (t.relation.temporal_details) str += ` [Time: ${t.relation.temporal_details}]`;
+      return str;
+    })
+    .join("\n  ↳ ");
+}
+
+export function buildContextString(result: RetrievalResult): string {
   const lines: string[] = [];
-  const chunks = result?.chunks ?? [];
-  const additional = result?.additional_context ?? {};
+  const gc = result.graph_context;
 
-  chunks.forEach((chunk: any, i: number) => {
-    const title = chunk.source_title || "";
-    lines.push(`[Chunk ${i + 1}]${title ? ` Source: ${title}` : ""}`);
-    lines.push(chunk.chunk_content ?? "");
-
-    for (const id of chunk.extra_context_ids ?? []) {
-      const extra = additional[id];
-      if (extra) lines.push(`  Related: ${extra.chunk_content ?? ""}`);
+  // --- Entity paths -----------------------------------------------------------
+  if (gc?.query_paths?.length) {
+    lines.push("=== ENTITY PATHS ===");
+    for (const path of gc.query_paths) {
+      lines.push(formatPathChain(path));
     }
+    lines.push("");
+  }
 
-    lines.push("---");
-  });
+  // --- Chunks -----------------------------------------------------------------
+  if (result.chunks?.length) {
+    lines.push("=== CONTEXT ===");
+    for (let i = 0; i < result.chunks.length; i++) {
+      const chunk = result.chunks[i];
+      lines.push(`Chunk ${i + 1}`);
+      lines.push(`Source: ${chunk.source_title}`);
+      lines.push(chunk.chunk_content);
+
+      // Graph relations for this chunk
+      if (gc?.chunk_id_to_group_ids && gc.chunk_relations) {
+        const groupIds = gc.chunk_id_to_group_ids[chunk.chunk_uuid] || [];
+        const relations = gc.chunk_relations.filter(
+          (r) => r.group_id && groupIds.includes(r.group_id)
+        );
+        if (relations.length) {
+          lines.push("Graph Relations:");
+          for (const rel of relations) {
+            for (const t of rel.triplets) {
+              let line = `  [${t.source.name}] -> ${t.relation.canonical_predicate} -> [${t.target.name}]: ${t.relation.context}`;
+              if (t.relation.temporal_details) line += ` [Time: ${t.relation.temporal_details}]`;
+              lines.push(line);
+            }
+          }
+        }
+      }
+
+      // Extra context
+      if (chunk.extra_context_ids?.length && result.additional_context) {
+        const extras = chunk.extra_context_ids
+          .map((id) => result.additional_context[id])
+          .filter(Boolean);
+        if (extras.length) {
+          lines.push("Extra Context:");
+          for (const extra of extras) {
+            lines.push(`  Related Context (${extra.source_title}): ${extra.chunk_content}`);
+          }
+        }
+      }
+
+      lines.push("---");
+      lines.push("");
+    }
+  }
 
   return lines.join("\n");
 }
@@ -93,7 +305,9 @@ function buildContextString(result: any): string {
 
 </CodeGroup>
 
-Then call your model with a grounded system prompt:
+## 3. Feeding the context into your LLM
+
+Once you have a context string, call your model with a grounded system prompt:
 
 <CodeGroup>
 
@@ -182,7 +396,7 @@ If memory recall fails or times out, fall back to the knowledge-only prompt — 
 - **Start small on chunks.** `max_results: 10` is a reasonable default. Drop to 5 if you hit token limits, raise to 20 if you rerank downstream.
 - **Use graph context selectively.** It improves relational queries and bloats simple lookups. See [Context Graphs](/essentials/context-graphs).
 - **Always ground the model.** A system prompt like "answer only from the provided context" prevents the model from inventing answers when retrieval is thin.
-- **Format consistently.** Whatever section delimiters you choose (`[Chunk N]`, `Source:`, `---`), keep them stable across calls so the model learns the structure.
+- **Format consistently.** Whatever section delimiters you choose (`=== CONTEXT ===`, `Chunk N`, `Source:`), keep them stable across calls so the model learns the structure.
 
 ## 6. Common mistakes
 
@@ -194,6 +408,7 @@ If memory recall fails or times out, fall back to the knowledge-only prompt — 
 | Re-sorting chunks client-side | Overrides HydraDB's ranking | Preserve the server-returned order. |
 | Missing a grounding instruction | The model invents answers when context is thin | System prompt: answer only from the provided context. |
 | Expecting graph fields without requesting them | Graph context will not be populated | Set `graph_context: true` on the recall call. |
+| Looking up `chunk_relations` without `chunk_id_to_group_ids` | The right relations don't attach to the right chunk | Use `chunk_id_to_group_ids[chunk_uuid]` to find the `group_id`s, then filter `chunk_relations` by them. |
 
 ## Related
 

@@ -1,0 +1,121 @@
+---
+title: "Delete Knowledge"
+description: "Permanently delete one or more knowledge sources by ID."
+---
+
+## When to use it
+
+- **Cleanup** – remove outdated documents
+- **Right-to-deletion** – fulfill GDPR/privacy requests for specific items
+- **Reprocessing** – delete then re-ingest after changing metadata schema or content
+
+For removing user memories, use [`DELETE /memories/delete_memory`](/api-reference/endpoint/delete-memory). To remove an entire tenant, use [`DELETE /tenants/delete`](/api-reference/endpoint/delete-tenant).
+
+<Warning>
+**This operation is irreversible.** Deleted sources cannot be recovered.
+</Warning>
+
+## Endpoint
+
+```
+POST /knowledge/delete_knowledge
+```
+
+- **Auth:** Bearer token
+- **Idempotency:** Re-sending a previously-deleted ID returns `deleted: false` for that item, but the request as a whole still returns `200`.
+- **Async:** No
+
+<Info>
+**Why POST and not DELETE?** This endpoint accepts a JSON body with an array of IDs. Some HTTP infrastructure strips bodies from `DELETE` requests, so HydraDB uses `POST` to ensure the bulk payload is reliably transmitted.
+</Info>
+
+## Example
+
+<Tabs>
+  <Tab title="cURL">
+    ```bash
+    curl -X POST 'https://api.hydradb.com/knowledge/delete_knowledge' \
+      -H "Authorization: Bearer <your_api_key>" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "tenant_id": "my_first_tenant",
+        "ids": ["doc_12345", "doc_67890"]
+      }'
+    ```
+  </Tab>
+  <Tab title="TypeScript">
+    ```ts
+    const response = await client.data.delete({
+      tenantId: "my_first_tenant",
+      ids: ["doc_12345", "doc_67890"]
+    });
+    ```
+  </Tab>
+  <Tab title="Python (Sync)">
+    ```python
+    response = client.data.delete(
+        tenant_id="my_first_tenant",
+        ids=["doc_12345", "doc_67890"],
+    )
+    ```
+  </Tab>
+</Tabs>
+
+## Request parameters
+
+| Name | Type | Required | Description |
+|---|---|---|---|
+| `tenant_id` | string | Yes | The tenant the sources belong to. |
+| `ids` | string[] | Yes | One or more `source_id` values to delete (minimum 1). |
+| `sub_tenant_id` | string | No | Sub-tenant scope. If omitted, the default sub-tenant is used. |
+
+## Response
+
+```json
+{
+  "success": true,
+  "message": "Delete completed",
+  "results": [
+    {
+      "id": "doc_12345",
+      "deleted": true,
+      "error": null
+    },
+    {
+      "id": "doc_67890",
+      "deleted": false,
+      "error": "Source not found"
+    }
+  ],
+  "deleted_count": 1
+}
+```
+
+| Field | Description |
+|---|---|
+| `success` | `true` if the request was processed (regardless of per-item outcomes). |
+| `results[]` | One entry per requested ID. |
+| `results[].id` | The source ID that was processed. |
+| `results[].deleted` | `true` if the source was found and deleted, `false` otherwise. |
+| `results[].error` | Error message if `deleted: false`. |
+| `deleted_count` | Total number of sources successfully deleted. |
+
+## Behavior notes
+
+<Info>
+**Partial success is possible.** A request can return `success: true` while some individual items fail. Always inspect `results[]` to confirm each deletion outcome – don't rely on the top-level `success` flag alone.
+</Info>
+
+<Info>
+**Cascade scope.** Deleting a knowledge source removes its chunks, embeddings, and any graph entities/relations exclusively associated with it. Entities shared with other sources are retained.
+</Info>
+
+## Related endpoints
+
+- **Browse before deleting:** [List data](/api-reference/endpoint/list-data) – confirm what you're about to remove
+- **Delete a single memory:** [Delete memory](/api-reference/endpoint/delete-memory)
+- **Delete an entire tenant:** [Delete tenant](/api-reference/endpoint/delete-tenant)
+
+## Errors
+
+Common codes: `400 INVALID_PARAMETERS`, `404 TENANT_NOT_FOUND`, `422 VALIDATION_ERROR`. See [Error Responses](/api-reference/error-responses) for the full list.

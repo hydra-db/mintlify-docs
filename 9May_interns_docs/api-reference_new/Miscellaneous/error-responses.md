@@ -1,0 +1,489 @@
+---
+title: "Error Responses"
+description: "HTTP error codes, response shapes, and handling patterns across all HydraDB endpoints."
+---
+
+## Standard error response format
+
+Every error response follows this structure:
+
+```json
+{
+  "detail": {
+    "success": false,
+    "message": "Error description",
+    "error_code": "SPECIFIC_ERROR_CODE"
+  }
+}
+```
+
+| Field | Description |
+|---|---|
+| `detail.success` | Always `false` for errors. |
+| `detail.message` | Human-readable description of the error. |
+| `detail.error_code` | Machine-readable code. Use this for programmatic handling. May be `null` for generic errors. |
+
+<Info>
+Always read `detail.message` and `detail.error_code` for the actual error context. The HTTP status alone is not specific enough to handle errors well.
+</Info>
+
+## HTTP status codes
+
+| Code | Name | When |
+|---|---|---|
+| `200` | OK | Success |
+| `202` | Accepted | Async operation queued (tenant creation, ingestion) |
+| `400` | Bad Request | Invalid input parameters |
+| `401` | Unauthorized | Missing or invalid API key |
+| `403` | Forbidden | Authenticated, but lacks permission |
+| `404` | Not Found | Resource does not exist |
+| `409` | Conflict | Resource already exists |
+| `422` | Unprocessable Entity | Well-formed request, semantic validation failed |
+| `429` | Too Many Requests | Rate limit exceeded |
+| `500` | Internal Server Error | Unexpected server-side failure |
+| `503` | Service Unavailable | Temporary service unavailability |
+
+---
+
+### 400 Bad Request
+
+Invalid input parameters or malformed requests.
+
+```json
+{
+  "detail": {
+    "success": false,
+    "message": "Invalid request parameters",
+    "error_code": "INVALID_PARAMETERS"
+  }
+}
+```
+
+**Common scenarios:**
+
+- Missing required parameters (`tenant_id`, `query`, etc.)
+- Invalid parameter formats
+- Malformed JSON in request body
+- Mutually exclusive parameters both provided (e.g., both `source_id` and `chunk_ids` on `/embeddings/filter_raw_embeddings`)
+
+---
+
+### 401 Unauthorized
+
+Authentication required or invalid.
+
+```json
+{
+  "detail": {
+    "success": false,
+    "message": "Authentication required",
+    "error_code": "UNAUTHORIZED"
+  }
+}
+```
+
+**Common scenarios:**
+
+- Missing `Authorization: Bearer <api_key>` header
+- Invalid API key
+- Expired API key
+
+---
+
+### 403 Forbidden
+
+Authenticated, but the request is not permitted.
+
+```json
+{
+  "detail": {
+    "success": false,
+    "message": "Access denied",
+    "error_code": "FORBIDDEN"
+  }
+}
+```
+
+**Common scenarios:**
+
+- API key lacks required scopes
+- Tenant access restrictions
+- Cross-organization access attempts
+
+---
+
+### 404 Not Found
+
+Requested resource does not exist.
+
+```json
+{
+  "detail": {
+    "success": false,
+    "message": "Tenant not found",
+    "error_code": "TENANT_NOT_FOUND"
+  }
+}
+```
+
+**Common scenarios:**
+
+- `TENANT_NOT_FOUND` – tenant ID does not exist
+- `SOURCE_NOT_FOUND` – source/document not found
+- `MEMORY_NOT_FOUND` – memory ID does not exist
+- `FILE_NOT_FOUND` – file ID does not exist
+
+---
+
+### 409 Conflict
+
+Resource already exists or conflicts with existing data.
+
+```json
+{
+  "detail": {
+    "success": false,
+    "message": "Tenant already exists",
+    "error_code": "TENANT_ALREADY_EXISTS"
+  }
+}
+```
+
+**Common scenarios:**
+
+- `TENANT_ALREADY_EXISTS` – attempting to create a tenant with an in-use ID
+
+---
+
+### 422 Unprocessable Entity
+
+Request is well-formed, but contains semantic errors.
+
+```json
+{
+  "detail": {
+    "success": false,
+    "message": "Validation failed",
+    "error_code": "VALIDATION_ERROR"
+  }
+}
+```
+
+**Common scenarios:**
+
+- Embedding vector dimension doesn't match tenant configuration
+- Invalid `tenant_metadata_schema` field type
+- `MemoryItem` content fields all empty (no `text` and no `user_assistant_pairs`)
+- File metadata array length doesn't match files array length
+
+---
+
+### 429 Too Many Requests
+
+Rate limit exceeded.
+
+```json
+{
+  "detail": {
+    "success": false,
+    "message": "Rate limit exceeded",
+    "error_code": "RATE_LIMITED"
+  }
+}
+```
+
+**When it occurs:**
+
+Currently documented on recall endpoints (`/recall/full_recall`, `/recall/recall_preferences`, `/recall/boolean_recall`). Other endpoints may also return 429 under sustained load.
+
+**How to handle:**
+
+Implement exponential backoff. See [Retry pattern](#retry-pattern) below.
+
+For current rate limit values, contact [founders@hydradb.com](mailto:founders@hydradb.com).
+
+---
+
+### 500 Internal Server Error
+
+Unexpected server-side failure.
+
+```json
+{
+  "detail": {
+    "success": false,
+    "message": "Internal server error",
+    "error_code": "INTERNAL_ERROR"
+  }
+}
+```
+
+**How to handle:** Retry with exponential backoff. If the error persists, contact support with the response payload.
+
+---
+
+### 503 Service Unavailable
+
+Service temporarily unavailable, often during deployments or under high load.
+
+```json
+{
+  "detail": {
+    "success": false,
+    "message": "Service unavailable",
+    "error_code": "SERVICE_UNAVAILABLE"
+  }
+}
+```
+
+**How to handle:** Retry with exponential backoff. Most 503s resolve within seconds.
+
+---
+
+## Endpoint-specific error codes
+
+These error codes are returned in the `detail.error_code` field of error responses. The list is non-exhaustive; new codes may be added.
+
+### Tenants
+
+| Code | Status | When |
+|---|---|---|
+| `TENANT_ALREADY_EXISTS` | 409 | Creating a tenant with an existing ID |
+| `TENANT_NOT_FOUND` | 404 | Tenant does not exist or has been deleted |
+| `INVALID_TENANT_ID` | 400 | Tenant ID format is invalid |
+
+### Ingestion
+
+| Code | Status | When |
+|---|---|---|
+| `INVALID_FILE_FORMAT` | 400 | Unsupported file format |
+| `FILE_TOO_LARGE` | 400 | File exceeds size limits |
+| `PROCESSING_FAILED` | – | Returned in `verify_processing` response with `indexing_status: errored` |
+
+### Memories
+
+| Code | Status | When |
+|---|---|---|
+| `MEMORY_NOT_FOUND` | 404 | Memory ID does not exist |
+| `INVALID_MEMORY_FORMAT` | 422 | Memory content format is invalid |
+
+### Recall
+
+| Code | Status | When |
+|---|---|---|
+| `INVALID_SEARCH_PARAMETERS` | 400 | Search query parameters are invalid |
+| `RATE_LIMITED` | 429 | Rate limit exceeded |
+
+### Embeddings
+
+| Code | Status | When |
+|---|---|---|
+| `INVALID_EMBEDDING_FORMAT` | 422 | Embedding data format is invalid |
+| `INVALID_PARAMETERS` | 400 | Both or neither of `source_id`/`chunk_ids` provided when one is required |
+
+---
+
+## Retry pattern
+
+For transient errors (`429`, `500`, `503`), implement exponential backoff:
+
+<Tabs>
+  <Tab title="TypeScript (SDK)">
+    ```ts
+    async function withRetry<T>(
+      operation: () => Promise<T>,
+      maxRetries = 3
+    ): Promise<T> {
+      for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+          return await operation();
+        } catch (error: any) {
+          const status = error.status || error.statusCode;
+          const isRetryable = [429, 500, 503].includes(status);
+
+          if (!isRetryable || attempt === maxRetries) {
+            throw error;
+          }
+
+          const delay = Math.pow(2, attempt) * 1000;
+          await new Promise(resolve => setTimeout(resolve, delay));
+        }
+      }
+      throw new Error("unreachable");
+    }
+
+    // Usage:
+    const result = await withRetry(() =>
+      client.recall.fullRecall({
+        tenantId: "my_tenant",
+        query: "..."
+      })
+    );
+    ```
+  </Tab>
+  <Tab title="Python (SDK)">
+    ```python
+    import time
+
+    def with_retry(operation, max_retries=3):
+        for attempt in range(1, max_retries + 1):
+            try:
+                return operation()
+            except Exception as e:
+                status = getattr(e, "status_code", None) or getattr(e, "status", None)
+                is_retryable = status in (429, 500, 503)
+
+                if not is_retryable or attempt == max_retries:
+                    raise
+
+                delay = 2 ** attempt
+                time.sleep(delay)
+
+    # Usage:
+    result = with_retry(lambda: client.recall.full_recall(
+        tenant_id="my_tenant",
+        query="...",
+    ))
+    ```
+  </Tab>
+  <Tab title="Raw HTTP (cURL/fetch)">
+    ```javascript
+    async function retryRequest(url, options, maxRetries = 3) {
+      for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        const response = await fetch(url, options);
+
+        // Success or non-retryable error
+        if (response.ok || ![429, 500, 503].includes(response.status)) {
+          return response;
+        }
+
+        if (attempt === maxRetries) {
+          throw new Error(`Request failed after ${maxRetries} attempts`);
+        }
+
+        // Exponential backoff
+        const delay = Math.pow(2, attempt) * 1000;
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+    }
+    ```
+  </Tab>
+</Tabs>
+
+## Error handling patterns
+
+### Catching specific errors
+
+<Tabs>
+  <Tab title="TypeScript (SDK)">
+    ```ts
+    try {
+      const result = await client.recall.fullRecall({
+        tenantId: "my_tenant",
+        query: "What's our refund policy?"
+      });
+    } catch (error: any) {
+      const code = error.body?.detail?.error_code;
+
+      switch (code) {
+        case "TENANT_NOT_FOUND":
+          // Tenant doesn't exist - prompt user to create it
+          break;
+        case "RATE_LIMITED":
+          // Back off and retry
+          break;
+        case "UNAUTHORIZED":
+          // Refresh API key
+          break;
+        default:
+          // Generic error handling
+          throw error;
+      }
+    }
+    ```
+  </Tab>
+  <Tab title="Python (SDK)">
+    ```python
+    try:
+        result = client.recall.full_recall(
+            tenant_id="my_tenant",
+            query="What's our refund policy?",
+        )
+    except Exception as e:
+        body = getattr(e, "body", {}) or {}
+        code = body.get("detail", {}).get("error_code")
+
+        if code == "TENANT_NOT_FOUND":
+            # Tenant doesn't exist - prompt user to create it
+            pass
+        elif code == "RATE_LIMITED":
+            # Back off and retry
+            pass
+        elif code == "UNAUTHORIZED":
+            # Refresh API key
+            pass
+        else:
+            raise
+    ```
+  </Tab>
+</Tabs>
+
+### Inspecting partial successes
+
+Some bulk endpoints (e.g., `POST /knowledge/delete_knowledge`, `POST /memories/add_memory`) can return `200 OK` with partial successes inside the response. Always inspect per-item results:
+
+```python
+response = client.data.delete(
+    tenant_id="my_tenant",
+    ids=["doc_1", "doc_2", "doc_3"],
+)
+
+# response.success is True even if some IDs weren't found
+for item in response.results:
+    if not item.deleted:
+        log.warning(f"Failed to delete {item.id}: {item.error}")
+```
+
+## Troubleshooting common issues
+
+### Authentication failures
+
+1. **Header format:** `Authorization: Bearer <api_key>` – note the space after `Bearer`
+2. **Key validity:** Verify in [app.hydradb.com](https://app.hydradb.com)
+3. **Key permissions:** Confirm scopes match your operation
+
+### Tenant not found after creation
+
+Tenant creation is asynchronous. Poll [`GET /tenants/infra/status`](/api-reference/endpoint/infra-status) until both `vectorstore_status` values and `graph_status` are `true` before ingesting.
+
+### 422 Validation Error on ingestion
+
+Common causes:
+
+- `file_metadata` array length doesn't match `files` array length on `/ingestion/upload_knowledge`
+- Sending `app_sources` as a JSON object instead of a JSON-encoded string in multipart form data
+- `MemoryItem` with no `text` and no `user_assistant_pairs`
+- Embedding vector length doesn't match the tenant's `embeddings_dimension`
+
+### Empty results from recall
+
+Not an error, but a common confusion:
+
+- Content may still be in `processing` or `graph_creation` state. Check via [`POST /ingestion/verify_processing`](/api-reference/endpoint/verify-processing).
+- `metadata_filters` may be too restrictive. Try without filters first.
+- Wrong endpoint: use `/recall/recall_preferences` for memories, `/recall/full_recall` for knowledge.
+- Wrong sub-tenant: pass `sub_tenant_id` explicitly if you stored under a non-default sub-tenant.
+
+### Rate limiting
+
+For high-throughput workloads:
+
+1. **Use bulk endpoints** when possible (e.g., delete by array of IDs rather than one at a time)
+2. **Implement exponential backoff** for `429` responses
+3. **Cache recall results** when query patterns repeat
+4. Contact [founders@hydradb.com](mailto:founders@hydradb.com) for current limits
+
+## Related sections
+
+- [API Reference](/api-reference) – endpoint-specific error codes are listed in each reference page
+- [Quickstart](/quickstart) – first-time setup guide

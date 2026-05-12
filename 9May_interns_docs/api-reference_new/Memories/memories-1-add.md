@@ -1,0 +1,207 @@
+---
+title: "Add Memory"
+description: "Ingest user memories – preferences, conversation history, or inline text."
+---
+
+## When to use it
+
+Use this endpoint to store user-specific context that personalizes recall:
+
+- **Preferences** – "User prefers dark mode and detailed technical explanations"
+- **Conversation history** – chat messages between the user and your agent
+- **User notes** – markdown snippets, settings, profile data
+
+For documents, files, and app-generated content, use [`POST /ingestion/upload_knowledge`](/api-reference/endpoint/upload-knowledge) instead.
+
+## Endpoint
+
+```
+POST /memories/add_memory
+```
+
+- **Auth:** Bearer token
+- **Idempotency:** Controlled by `upsert` (default `true` – overwrites existing items with the same `source_id`)
+- **Async:** Yes – memories are queued for processing. Use [`POST /ingestion/verify_processing`](/api-reference/endpoint/verify-processing) to check status.
+
+## Example
+
+<Tabs>
+  <Tab title="cURL">
+    ```bash
+    curl -X POST 'https://api.hydradb.com/memories/add_memory' \
+      -H "Authorization: Bearer <your_api_key>" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "tenant_id": "my_first_tenant",
+        "memories": [
+          {
+            "text": "User prefers detailed technical explanations and dark mode",
+            "infer": true,
+            "user_name": "Alex",
+            "metadata": { "team": "engineering" },
+            "additional_metadata": { "source": "onboarding" }
+          }
+        ]
+      }'
+    ```
+  </Tab>
+  <Tab title="TypeScript">
+    ```ts
+    const response = await client.memories.add({
+      tenantId: "my_first_tenant",
+      memories: [
+        {
+          text: "User prefers detailed technical explanations and dark mode",
+          infer: true,
+          userName: "Alex",
+          metadata: { team: "engineering" },
+          additionalMetadata: { source: "onboarding" }
+        }
+      ]
+    });
+    ```
+  </Tab>
+  <Tab title="Python (Sync)">
+    ```python
+    response = client.memories.add(
+        tenant_id="my_first_tenant",
+        memories=[
+            {
+                "text": "User prefers detailed technical explanations and dark mode",
+                "infer": True,
+                "user_name": "Alex",
+                "metadata": {"team": "engineering"},
+                "additional_metadata": {"source": "onboarding"},
+            }
+        ],
+    )
+    ```
+  </Tab>
+</Tabs>
+
+## Request parameters
+
+| Name | Type | Required | Description |
+|---|---|---|---|
+| `tenant_id` | string | Yes | The tenant to ingest into. |
+| `memories` | array | Yes | One or more `MemoryItem` objects. See [Memory item](#memory-item) below. |
+| `sub_tenant_id` | string | No | Sub-tenant scope. If omitted, the default sub-tenant is used. |
+| `upsert` | boolean | No | Default `true`. If `true`, existing memories with the same `source_id` are overwritten. |
+
+## Memory item
+
+Each entry in the `memories` array supports three content formats. Pick one:
+
+### Format 1 – Plain text
+
+```json
+{
+  "text": "User prefers dark mode",
+  "infer": true
+}
+```
+
+### Format 2 – Markdown
+
+```json
+{
+  "text": "# Notes\n\n- Prefers dark mode\n- Likes detailed explanations",
+  "is_markdown": true,
+  "infer": true
+}
+```
+
+### Format 3 – Conversation pairs
+
+```json
+{
+  "user_assistant_pairs": [
+    { "user": "I work mostly at night", "assistant": "Got it, I'll remember that." },
+    { "user": "And I prefer concise answers", "assistant": "Understood." }
+  ],
+  "infer": true,
+  "user_name": "Alex"
+}
+```
+
+## All MemoryItem fields
+
+| Name | Type | Default | Description |
+|---|---|---|---|
+| `text` | string | – | Raw text or markdown content. Use with Formats 1 or 2. |
+| `user_assistant_pairs` | array | – | Conversation pairs. Use with Format 3. |
+| `is_markdown` | boolean | `false` | Set `true` if `text` is markdown. |
+| `infer` | boolean | `false` | If `true`, HydraDB extracts implicit insights from the content. See [Inference modes](#inference-modes). |
+| `source_id` | string | auto | Unique identifier. Auto-generated if omitted. |
+| `title` | string | – | Display title for this memory. |
+| `user_name` | string | `"User"` | User's name. Useful for personalizing conversation pairs. |
+| `expiry_time` | integer | – | Optional TTL in seconds. The memory is deleted after this duration. |
+| `custom_instructions` | string | – | Custom instructions to guide inference processing. |
+| `metadata` | object | `{}` | Tenant-level metadata. Filterable in recall queries. |
+| `additional_metadata` | object | `{}` | Document-level metadata. Filterable in recall queries. |
+| `relations` | object | – | Forcefully connect this memory to other sources. See [Forceful relations](/essentials/forceful-relations). |
+
+## Inference modes
+
+The `infer` flag controls how HydraDB processes content:
+
+- **`infer: true`** – HydraDB extracts implicit preferences, insights, and entities from the text. Best for conversation history and free-form user notes where you want HydraDB to derive structured signals.
+- **`infer: false`** (default) – Content is chunked and indexed as-is. Best for content that should be stored verbatim, like preset profile fields or raw notes.
+
+<Info>
+**Always set `infer` explicitly.** The default is `false`. If you're storing conversational content and expect HydraDB to extract preferences, you must set `infer: true`.
+</Info>
+
+## Response
+
+```json
+{
+  "success": true,
+  "message": "Memories queued for ingestion successfully",
+  "results": [
+    {
+      "source_id": "1d50e5cd7c196a2bbcc1a59b037b3a44",
+      "title": null,
+      "status": "queued",
+      "infer": true,
+      "error": null
+    }
+  ],
+  "success_count": 1,
+  "failed_count": 0
+}
+```
+
+| Field | Description |
+|---|---|
+| `success` | `true` if at least one memory was queued. |
+| `message` | Human-readable status. |
+| `results` | Per-memory ingestion result. |
+| `results[].source_id` | The ID assigned to this memory. Use this to track processing or delete later. |
+| `results[].status` | Initial status. One of `queued`, `processing`, `completed`, `failed`. |
+| `results[].infer` | Whether inference was requested for this memory. |
+| `success_count` | Number of memories successfully queued. |
+| `failed_count` | Number of memories that failed to queue. |
+
+## Behavior notes
+
+<Info>
+**Processing is asynchronous.** This endpoint returns immediately after queuing. To verify a memory is fully indexed, poll [`POST /ingestion/verify_processing`](/api-reference/endpoint/verify-processing) with the returned `source_id` until status is `completed`.
+</Info>
+
+<Info>
+**Sub-tenants are created implicitly.** If you pass a `sub_tenant_id` that doesn't exist, HydraDB creates it automatically on first use. There is no separate sub-tenant creation endpoint.
+</Info>
+
+## Related endpoints
+
+- **Next:** [Verify processing](/api-reference/endpoint/verify-processing) – check ingestion status
+- **Next:** [Recall preferences](/api-reference/endpoint/recall-preferences) – retrieve memories
+- **Related:** [Delete memory](/api-reference/endpoint/delete-memory) – remove individual memories
+- **Alternative:** [Upload knowledge](/api-reference/endpoint/upload-knowledge) – for documents and app sources instead of user memories
+
+## Errors
+
+Common codes: `400 INVALID_PARAMETERS`, `404 TENANT_NOT_FOUND`, `422 VALIDATION_ERROR`. See [Error Responses](/api-reference/error-responses) for the full list.
+
+Read more: [Essentials → Memories](/essentials/memories) · [Essentials → Metadata](/essentials/metadata)

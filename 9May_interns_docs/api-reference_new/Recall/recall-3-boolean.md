@@ -1,0 +1,134 @@
+---
+title: "Boolean Recall"
+description: "Deterministic full-text search – exact term matching, no embeddings."
+---
+
+## When to use it
+
+`/recall/boolean_recall` runs a BM25-style full-text search. It's the right tool when:
+
+- **Exact terms matter** – product codes, error codes, legal terms, regulatory IDs
+- **Auditability matters** – compliance searches need provable matches, not "semantically similar"
+- **Speed matters** – no embedding inference, no graph traversal, no reranking
+
+Use this instead of `full_recall` when the query is a literal lookup, not a semantic question.
+
+## Endpoint
+
+```
+POST /recall/boolean_recall
+```
+
+- **Auth:** Bearer token
+- **Idempotency:** Read-only
+- **Async:** No
+
+## Example
+
+<Tabs>
+  <Tab title="cURL">
+    ```bash
+    curl -X POST 'https://api.hydradb.com/recall/boolean_recall' \
+      -H "Authorization: Bearer <your_api_key>" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "tenant_id": "my_first_tenant",
+        "query": "ERROR_429 rate limit",
+        "operator": "and",
+        "max_results": 10,
+        "search_mode": "sources"
+      }'
+    ```
+  </Tab>
+  <Tab title="TypeScript">
+    ```ts
+    const result = await client.recall.booleanRecall({
+      tenantId: "my_first_tenant",
+      query: "ERROR_429 rate limit",
+      operator: "and",
+      maxResults: 10,
+      searchMode: "sources"
+    });
+    ```
+  </Tab>
+  <Tab title="Python (Sync)">
+    ```python
+    result = client.recall.boolean_recall(
+        tenant_id="my_first_tenant",
+        query="ERROR_429 rate limit",
+        operator="and",
+        max_results=10,
+        search_mode="sources",
+    )
+    ```
+  </Tab>
+</Tabs>
+
+## Request parameters
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `tenant_id` | string | Yes | – | The tenant to search. |
+| `query` | string | Yes | – | Search terms. Tokenized for matching. |
+| `sub_tenant_id` | string | No | default | Sub-tenant scope. |
+| `operator` | enum | No | `or` | `or` (any term), `and` (all terms), `phrase` (exact phrase in order). |
+| `max_results` | integer | No | `10` | Maximum number of chunks to return. |
+| `search_mode` | enum | No | `sources` | `sources` (knowledge) or `memories` (user memories). |
+
+## Operators
+
+| Operator | Behavior | Example |
+|---|---|---|
+| `or` (default) | Match chunks containing **any** of the search terms | Query `"refund cancel"` matches chunks with either "refund" or "cancel" |
+| `and` | Match chunks containing **all** of the search terms | Query `"refund cancel"` matches chunks with both terms |
+| `phrase` | Match chunks containing the **exact phrase in order** | Query `"refund within 30 days"` matches that exact wording |
+
+## Response
+
+Same shape as [`POST /recall/full_recall`](/api-reference/endpoint/full-recall#response).
+
+```json
+{
+  "chunks": [
+    {
+      "chunk_uuid": "...",
+      "source_id": "doc_67890",
+      "chunk_content": "If you encounter ERROR_429, you've exceeded the rate limit. Wait and retry.",
+      "source_title": "API Error Codes",
+      "relevancy_score": 1.0,
+      "document_metadata": { "category": "errors" }
+    }
+  ],
+  "sources": [...]
+}
+```
+
+`relevancy_score` reflects BM25 scoring rather than semantic similarity.
+
+## Boolean vs full recall
+
+| | `boolean_recall` | `full_recall` |
+|---|---|---|
+| **Match type** | Exact term/phrase | Semantic similarity |
+| **Embeddings** | No | Yes |
+| **Graph traversal** | No | Optional |
+| **Reranking** | No | Yes (in `thinking` mode) |
+| **Best for** | Lookups, audits, compliance | Q&A, exploration, RAG |
+| **Latency** | Lowest | Higher (especially `thinking` mode) |
+
+## Behavior notes
+
+<Info>
+**`phrase` operator is order-sensitive.** "30 days refund" will not match "refund within 30 days." Use `and` if you want all terms regardless of order.
+</Info>
+
+## Related endpoints
+
+- **For semantic search:** [Full recall](/api-reference/endpoint/full-recall) – embeddings + graph
+- **For pure vector search:** [Search raw embeddings](/api-reference/endpoint/search-raw-embeddings) – embeddings tenants only
+
+## Errors
+
+Common codes: `400 INVALID_PARAMETERS`, `404 TENANT_NOT_FOUND`, `422 VALIDATION_ERROR`, `429 RATE_LIMITED`. See [Error Responses](/api-reference/error-responses) for the full list.
+
+Read more: [Essentials → Recall](/essentials/recall)

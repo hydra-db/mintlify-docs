@@ -1,0 +1,207 @@
+---
+title: "List Data"
+description: "Paginated listing of stored knowledge or memories with optional filters."
+---
+
+## When to use it
+
+- **Admin dashboards** – browse what's been ingested into a tenant
+- **Audit and exports** – paginate through all sources for reporting
+- **Debugging** – verify metadata was attached correctly at ingestion
+- **Bulk operations** – iterate over sources for cleanup or reprocessing
+
+## Endpoint
+
+```
+POST /list/data
+```
+
+- **Auth:** Bearer token
+- **Idempotency:** Read-only
+- **Async:** No
+
+## Example
+
+<Tabs>
+  <Tab title="cURL">
+    ```bash
+    curl -X POST 'https://api.hydradb.com/list/data' \
+      -H "Authorization: Bearer <your_api_key>" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "tenant_id": "my_first_tenant",
+        "kind": "knowledge",
+        "page": 1,
+        "page_size": 25,
+        "filters": {
+          "tenant_metadata": { "category": "engineering" },
+          "document_metadata": { "author": "Alice Smith" }
+        },
+        "include_fields": ["title", "type", "url", "timestamp"]
+      }'
+    ```
+  </Tab>
+  <Tab title="TypeScript">
+    ```ts
+    const result = await client.fetch.listData({
+      tenantId: "my_first_tenant",
+      kind: "knowledge",
+      page: 1,
+      pageSize: 25,
+      filters: {
+        tenantMetadata: { category: "engineering" },
+        documentMetadata: { author: "Alice Smith" }
+      },
+      includeFields: ["title", "type", "url", "timestamp"]
+    });
+    ```
+  </Tab>
+  <Tab title="Python (Sync)">
+    ```python
+    result = client.fetch.list_data(
+        tenant_id="my_first_tenant",
+        kind="knowledge",
+        page=1,
+        page_size=25,
+        filters={
+            "tenant_metadata": {"category": "engineering"},
+            "document_metadata": {"author": "Alice Smith"},
+        },
+        include_fields=["title", "type", "url", "timestamp"],
+    )
+    ```
+  </Tab>
+</Tabs>
+
+## Request parameters
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `tenant_id` | string | Yes | – | The tenant to list from. |
+| `sub_tenant_id` | string | No | default | Sub-tenant scope. |
+| `kind` | enum | No | `knowledge` | `knowledge` to list sources, `memories` to list user memories. |
+| `page` | integer | No | `1` | Page number (1-indexed). |
+| `page_size` | integer | No | `50` | Items per page (1–100). |
+| `source_ids` | string[] | No | – | If non-empty, only items with these IDs are returned (max 100). Filters and pagination still apply. |
+| `filters` | object | No | – | Optional filters. See [Filters](#filters). |
+| `include_fields` | string[] | No | – | Project specific source fields to reduce payload size. Knowledge only – ignored for memories. |
+
+## Filters
+
+Filters narrow results using **AND logic** – every key-value pair must match.
+
+| Filter category | Targets | Example |
+|---|---|---|
+| `tenant_metadata` | Fields defined in `tenant_metadata_schema` at tenant creation | `{"category": "engineering"}` |
+| `document_metadata` | Fields attached per-document at ingestion | `{"author": "Alice Smith", "year": 2023}` |
+| `source_fields` | Top-level source fields | See below |
+
+**Allowed `source_fields` keys:** `description`, `timestamp`, `title`, `type`, `url`.
+
+```json
+{
+  "filters": {
+    "tenant_metadata":   { "department": "Finance" },
+    "document_metadata": { "author": "Alice Smith" },
+    "source_fields":     { "type": "slack", "title": "standup notes" }
+  }
+}
+```
+
+## Field projection (knowledge only)
+
+For large knowledge bases, response payloads can grow significantly. Use `include_fields` to return only the fields you need:
+
+| Allowed values |
+|---|
+| `attachments`, `content`, `description`, `document_metadata`, `note`, `relations`, `tenant_metadata`, `timestamp`, `title`, `type`, `url` |
+
+When `include_fields` is set, only the listed fields plus `id`, `tenant_id`, and `sub_tenant_id` are populated. Other fields return their default/empty values.
+
+## Response
+
+The response shape depends on `kind`.
+
+### `kind: "knowledge"` (default)
+
+```json
+{
+  "sources": [
+    {
+      "id": "doc_12345",
+      "title": "Q4 Pricing Strategy",
+      "type": "file",
+      "url": "https://...",
+      "timestamp": "2025-09-15T10:00:00Z",
+      "tenant_metadata": { "category": "engineering" },
+      "document_metadata": { "author": "Alice Smith" }
+    }
+  ],
+  "pagination": {
+    "page": 1,
+    "page_size": 25,
+    "total": 143,
+    "total_pages": 6,
+    "has_next": true,
+    "has_previous": false
+  }
+}
+```
+
+### `kind: "memories"`
+
+```json
+{
+  "success": true,
+  "user_memories": [
+    {
+      "memory_id": "1d50e5cd7c196a2bbcc1a59b037b3a44",
+      "memory_content": "User prefers detailed technical explanations and dark mode"
+    }
+  ],
+  "total": 12,
+  "pagination": {
+    "page": 1,
+    "page_size": 25,
+    "total": 12,
+    "total_pages": 1,
+    "has_next": false,
+    "has_previous": false
+  }
+}
+```
+
+## Pagination
+
+The `pagination` object on every response includes:
+
+| Field | Description |
+|---|---|
+| `page` | Current page (1-indexed). |
+| `page_size` | Items per page. |
+| `total` | Total items matching the query. |
+| `total_pages` | Total pages available. |
+| `has_next` | Whether a next page exists. |
+| `has_previous` | Whether a previous page exists. |
+
+## Behavior notes
+
+<Info>
+**Filter logic is AND.** Every key in `tenant_metadata`, `document_metadata`, and `source_fields` must match for an item to be included.
+</Info>
+
+<Info>
+**`source_ids` does not bypass filters.** When `source_ids` is provided, returned items are restricted to those IDs **and** must still match any active filters.
+</Info>
+
+## Related endpoints
+
+- **Inspect a single source:** [Fetch content](/api-reference/endpoint/fetch-content) – retrieve original file or presigned URL
+- **Inspect graph relationships:** [Graph relations by source ID](/api-reference/endpoint/graph-relations) – see entity links for a source
+- **Remove items:** [Delete knowledge](/api-reference/endpoint/delete-knowledge) · [Delete memory](/api-reference/endpoint/delete-memory)
+
+## Errors
+
+Common codes: `400 INVALID_PARAMETERS`, `404 TENANT_NOT_FOUND`, `422 VALIDATION_ERROR`. See [Error Responses](/api-reference/error-responses) for the full list.
+
+Read more: [Essentials → Metadata](/essentials/metadata)
