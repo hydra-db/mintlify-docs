@@ -93,7 +93,7 @@ def _poll_until_ready(timeout=180, interval=4):
     deadline = time.time() + timeout
     while time.time() < deadline:
         status = client.tenant.get_infra_status(tenant_id=TENANT_ID)
-        s = status.get("status", "")
+        s = getattr(status, "infra_status", None) or getattr(status, "status", "") or ""
         if   s == "ready":  print("✓ Tenant ready."); return
         elif s == "failed": raise RuntimeError(f"Provisioning failed: {status}")
         print(f"  status={s} - retrying in {interval}s")
@@ -214,9 +214,9 @@ def verify_file(file_id: str, timeout: int = 120, interval: int = 3):
         )
         print("STATUS:", status)
 
-        statuses = status.get("statuses", [])
+        statuses = status.statuses
         if statuses:
-            s = statuses[0].get("indexing_status")
+            s = statuses[0].indexing_status
             if   s == "completed": print(f"✓ '{file_id}' ready."); return
             elif s == "errored":   print("Indexing errored."); return
             print(f"  indexing_status: {s} - waiting...")
@@ -281,17 +281,17 @@ def recall(query: str, max_results: int = 10) -> dict:
 
 if __name__ == "__main__":
     data   = recall("internal IP auth skip logic")
-    chunks  = data.get("chunks", [])     # iterate the "chunks" array
-    sources = data.get("sources", [])    # sources list for citations
+    chunks  = data.chunks or []          # iterate the chunks list
+    sources = data.sources or []         # sources list for citations
 
     print(f"\nChunks returned: {len(chunks)}")
     for i, chunk in enumerate(chunks, 1):
-        chunk_content = chunk.get("chunk_content", "")  # always use chunk_content
-        score         = chunk.get("relevancy_score", "?")
+        chunk_content = chunk.chunk_content   # always use chunk_content
+        score         = chunk.relevancy_score
         print(f"\n[{i}] relevancy_score={score}")
         print(f"     {chunk_content[:300]}")
 
-    print(f"\nSources: {[s.get('title') for s in sources]}")
+    print(f"\nSources: {[getattr(s, 'title', '') for s in sources]}")
 ```
 
 **Expected output:**
@@ -396,7 +396,7 @@ def upload_batch(batch: list) -> list:
         tenant_id=TENANT_ID,
         app_knowledge=json.dumps(batch),
     )
-    ids = result.get("ids", [])
+    ids = [r.source_id for r in (result.results or [])]
     print(f"  Uploaded {len(ids)} items")
     return ids
 
@@ -499,17 +499,17 @@ def build_context(chunks: list, min_score: float = 0.5) -> tuple[str, list]:
     """
     parts, sources, seen = [], [], set()
     for chunk in chunks:
-        if chunk.get("relevancy_score", 1) < min_score: continue
-        chunk_content = chunk.get("chunk_content", "")  # canonical field
-        uid           = chunk.get("chunk_uuid", chunk_content[:40])
+        if (chunk.relevancy_score or 1) < min_score: continue
+        chunk_content = chunk.chunk_content or ""
+        uid           = chunk.chunk_uuid or chunk_content[:40]
         if not chunk_content or uid in seen: continue
         seen.add(uid)
-        doc_type = chunk.get("additional_metadata", {}).get("doc_type", "doc")
-        title    = chunk.get("title", "untitled")
+        doc_type = (chunk.additional_metadata or {}).get("doc_type", "doc")
+        title    = chunk.source_title or "untitled"
         parts.append(f"[{doc_type.upper()}] {title}\n{chunk_content}")
-        sources.append({"title": title, "url": chunk.get("url"),
-                         "relevancy_score": chunk.get("relevancy_score"),
-                         "chunk_uuid": chunk.get("chunk_uuid")})
+        sources.append({"title": title,
+                         "relevancy_score": chunk.relevancy_score,
+                         "chunk_uuid": chunk.chunk_uuid})
     return "\n\n---\n\n".join(parts), sources
 ```
 
@@ -775,9 +775,9 @@ def multi_source_recall(question: str) -> dict:
 if __name__ == "__main__":
     result = multi_source_recall(
         "Why does the auth middleware skip token validation for internal IPs?")
-    for chunk in result.get("chunks", [])[:5]:
-        print(f"[{chunk.get('relevancy_score', 0):.2f}] {chunk.get('source_title', '')}")
-        print(chunk.get("chunk_content", "")[:240])
+    for chunk in (result.chunks or [])[:5]:
+        print(f"[{chunk.relevancy_score or 0:.2f}] {chunk.source_title or ''}")
+        print((chunk.chunk_content or "")[:240])
 ```
 
 **Expected output:**
@@ -934,15 +934,20 @@ def recall_context(query: str, max_results: int = 10) -> dict:
     """
     Call full_recall() with sensible defaults for the first backend.
     scope=None means HydraDB searches all sub-tenants automatically.
-    Returns the raw recall payload dict with "chunks" and "sources" keys.
+    Returns a plain dict with "chunks", "sources", and "graph_context" keys.
     """
-    return full_recall(
+    raw = full_recall(
         query=query,
         max_results=max_results,
         scope=None,            # no sub_tenant_id needed - HydraDB handles scope
         graph_context=True,
         recency_bias=0.2,
     )
+    return {
+        "chunks":        raw.chunks or [],
+        "sources":       raw.sources or [],
+        "graph_context": raw.graph_context,
+    }
 
 
 def build_context_block(recall_payload: dict) -> str:
@@ -960,7 +965,7 @@ def build_context_block(recall_payload: dict) -> str:
 
     context_parts = []
     for chunk in chunks:
-        text = chunk.get("chunk_content", "").strip()
+        text = (chunk.chunk_content or "").strip()
         if text:
             context_parts.append(text)
 
@@ -968,8 +973,8 @@ def build_context_block(recall_payload: dict) -> str:
 
     source_lines = []
     for source in sources:
-        title     = source.get("title", "Untitled")
-        source_id = source.get("id", "")
+        title     = getattr(source, "source_title", None) or "Untitled"
+        source_id = getattr(source, "source_id", "") or ""
         source_lines.append(f"- {title} ({source_id})")
 
     sources_text = "\n".join(source_lines)
@@ -1104,7 +1109,11 @@ async def chat(body: dict):
 
     async def stream():
         # Emit sources first so the client can render citations immediately
-        yield json.dumps({"sources": recall_payload.get("sources", [])}) + "\n"
+        serialized_sources = [
+            {"title": getattr(s, "source_title", "") or "", "source_id": getattr(s, "source_id", "") or ""}
+            for s in recall_payload.get("sources", [])
+        ]
+        yield json.dumps({"sources": serialized_sources}) + "\n"
         for token in stream_answer(question, context_block):
             yield json.dumps({"text": token}) + "\n"
 
@@ -1127,10 +1136,16 @@ def ask(body: dict):
     full_answer    = "".join(stream_answer(question, context_block))
 
     return {
-        "answer":        full_answer,
-        "sources":       recall_payload.get("sources", []),
-        "chunks":        recall_payload.get("chunks", []),
-        "graph_context": recall_payload.get("graph_context", {}),
+        "answer":  full_answer,
+        "sources": [
+            {"title": getattr(s, "source_title", "") or "", "source_id": getattr(s, "source_id", "") or ""}
+            for s in recall_payload.get("sources", [])
+        ],
+        "chunks": [
+            {"chunk_content": c.chunk_content or "", "relevancy_score": c.relevancy_score or 0}
+            for c in recall_payload.get("chunks", [])
+        ],
+        "graph_context": recall_payload.get("graph_context"),
     }
 ```
 
@@ -1143,7 +1158,7 @@ Understanding the exact data path prevents debugging confusion. `build_context_b
 1. **Read the `chunks` array** from the recall payload. `/recall/full_recall` returns `{"chunks": [...], "sources": [...]}` - always iterate `chunks`, never `results`.
 2. **Extract `chunk_content`** from each chunk object. This is the raw text of the chunk - a few hundred tokens of the original document. It is the only required field. Skip any chunk where `chunk_content` is absent or empty.
 3. **Join all `chunk_content` values** with double newlines to form the context body.
-4. **Append the sources list** from `recall_payload.get("sources", [])` in `- title (id)` format so the model can cite them.
+4. **Append the sources list** from `recall_payload.get("sources", [])` — typed SDK source objects accessed via `getattr` — in `- title (id)` format so the model can cite them.
 5. **Return the assembled string** to `stream_answer()`. This becomes the user message body inside the OpenAI prompt.
 
 The assembled context block that GPT-4o receives looks like this:
