@@ -440,7 +440,6 @@ import time, os
 from hydra_db import HydraDB
 
 TENANT_ID = "financial-analyst"
-client = HydraDB(token=os.environ["HYDRA_DB_API_KEY"])
 
 def verify_all_indexed(file_ids: list[str], poll_interval: int = 3, max_polls: int = 20) -> bool:
     """
@@ -458,16 +457,16 @@ def verify_all_indexed(file_ids: list[str], poll_interval: int = 3, max_polls: i
                 tenant_id=TENANT_ID,
                 file_ids=[fid],
             )
-            statuses = status.get("statuses", [])
-            s = statuses[0].get("indexing_status", "unknown") if statuses else "unknown"
+            statuses = data.statuses
+            status = statuses[0].indexing_status if statuses else "unknown"
 
-            if s == "completed":
+            if status == "completed":
                 pending.discard(fid)
                 print(f"  ✓ {fid} - indexed")
             elif s == "failed":
                 raise RuntimeError(f"Indexing failed for {fid}: {status}")
             else:
-                print(f"  … {fid} - {s}")
+                print(f"  … {fid} - {status}")
 
         if pending:
             time.sleep(poll_interval)
@@ -612,9 +611,9 @@ result = query_point_in_time(
     fiscal_year=2023,
     fiscal_quarter=2,
 )
-for chunk in result.get("chunks", [])[:3]:
-    print(f"[{chunk.get('relevancy_score', 0):.2f}] {chunk.get('source_title', '')}")
-    print(chunk.get("chunk_content", "")[:240])
+for chunk in (result.chunks or [])[:3]:
+    print(f"[{chunk.relevancy_score:.2f}] {chunk.source_title}")
+    print(chunk.chunk_content[:240])
 # Output:
 # [0.75] Financial Metrics -- Q2 2023
 # revenue_usd: 9100000  arr_usd: 37200000  gross_margin_pct: 72.8
@@ -666,9 +665,9 @@ def query_trend(
         metadata_filters=filters,
     )
 
-    chunks      = recall.get("chunks", [])
-    graph_ctx   = recall.get("graph_context", {})
-    query_paths = graph_ctx.get("query_paths", [])
+    chunks      = recall.chunks or []
+    graph_ctx   = recall.graph_context
+    query_paths = graph_ctx.query_paths if graph_ctx else []
 
     if not chunks:
         return "No relevant context found - verify documents are uploaded and indexed."
@@ -676,18 +675,18 @@ def query_trend(
     # Sort chunks by timestamp so LLM sees them in chronological order
     chunks_sorted = sorted(
         chunks,
-        key=lambda c: c.get("source_upload_time", "") or "",
+        key=lambda c: (c.source_upload_time or "") if hasattr(c, "source_upload_time") else "",
     )
 
     # Build context with explicit period labels and source attribution
     context_parts = []
     for c in chunks_sorted:
-        meta        = c.get("additional_metadata", {})
+        meta        = c.additional_metadata or {}
         period      = meta.get("period_label", "unknown period")
         doc_type    = meta.get("doc_type", "unknown source")
-        score       = c.get("relevancy_score", 0)
+        score       = c.relevancy_score or 0
         context_parts.append(
-            f"[{period} | {doc_type} | relevance:{score:.2f}]\n{c['chunk_content']}"
+            f"[{period} | {doc_type} | relevance:{score:.2f}]\n{c.chunk_content}"
         )
 
     # Append graph paths - temporal entity relationships
@@ -695,12 +694,15 @@ def query_trend(
         context_parts.append(f"[Graph path - temporal]: {str(path)}")
 
     # Retrieve analyst profile for answer personalization
-    analyst_prefs = client.recall.recall_preferences(
+    prefs_result  = client.recall.recall_preferences(
         tenant_id=TENANT_ID,
         sub_tenant_id=f"analyst-{user_id}",
         mode="thinking",
         query="focus area metrics preferences output format",
     )
+    analyst_prefs = "\n".join(
+        c.chunk_content for c in (prefs_result.chunks or [])
+    ) or "No analyst profile available."
 
     context_text = "\n\n".join(context_parts)
 
@@ -786,7 +788,7 @@ def cross_source_reconciliation(
     Uses three separate recall calls, one per sub-tenant, then merges context.
     """
 
-    def recall(sub_tenant_id: str, doc_type_filter: str) -> list[dict]:
+    def recall(sub_tenant_id: str, doc_type_filter: str) -> list:
         resp = client.recall.full_recall(
             tenant_id=TENANT_ID,
             query=f"{ticker} {period_label} financial performance",
@@ -802,7 +804,7 @@ def cross_source_reconciliation(
                 "doc_type":       doc_type_filter,
             },
         )
-        return resp.get("chunks", [])
+        return resp.chunks or []
 
     transcript_chunks = recall(f"earnings-{ticker.lower()}", "earnings_transcript")
     metrics_chunks    = recall("internal-metrics",            "internal_metrics")
@@ -926,15 +928,15 @@ def track_narrative_shift(
     )
 
     chunks = sorted(
-        recall.get("chunks", []),
-        key=lambda c: c.get("additional_metadata", {}).get("period_end_date", ""),
+        recall.chunks or [],
+        key=lambda c: (c.additional_metadata or {}).get("period_end_date", ""),
     )
 
     if not chunks:
         return f"No earnings transcripts found for {ticker}. Verify ingestion."
 
     context_text = "\n\n".join(
-        f"[{c['additional_metadata'].get('period_label', '?')}]\n{c['chunk_content']}"
+        f"[{(c.additional_metadata or {}).get('period_label', '?')}]\n{c.chunk_content}"
         for c in chunks
     )
 
@@ -1045,14 +1047,18 @@ def financial_recall(
     if filters:
         payload["metadata_filters"] = filters
 
-    result = client.recall.full_recall(**payload)
-    result["session_id"] = analyst_sessions[user_id]
-    return result
+    raw = client.recall.full_recall(**payload)
+    return {
+        "chunks":        raw.chunks or [],
+        "sources":       getattr(raw, "sources", []),
+        "graph_context": raw.graph_context,
+        "session_id":    analyst_sessions[user_id],
+    }
 
 
 def context_for_llm(result: dict) -> str:
     return "\n\n".join(
-        chunk.get("chunk_content", "")
+        chunk.chunk_content
         for chunk in result.get("chunks", [])
     )
 
@@ -1078,7 +1084,7 @@ r2 = financial_recall(
     fiscal_year=2023,
     recency_bias=0.3,   # spread across all quarters
 )
-print(f"Chunks: {len(r2.get('chunks', []))}")
+print(f"Chunks: {len(r2.get('chunks', []))}")  # r2 is a dict returned by financial_recall()
 
 # Cross-doc question - no source filter, let HydraDB find relevant sources
 r3 = financial_recall(
@@ -1170,7 +1176,7 @@ def generate_quarterly_briefing(
             "fiscal_quarter": fiscal_quarter,
         },
     )
-    current_chunks = current_q.get("chunks", [])
+    current_chunks = current_q.chunks or []
 
     # ── 2. Prior quarters for trend context ──────────────────────────────
     print("[2/4] Recalling trend data...")
@@ -1194,18 +1200,21 @@ def generate_quarterly_briefing(
     # ── 4. Synthesize briefing ────────────────────────────────────────────
     print("[4/4] Synthesizing briefing...")
     current_context = "\n\n".join(
-        f"[{c.get('additional_metadata', {}).get('period_label','?')} | "
-        f"{c.get('additional_metadata', {}).get('doc_type','?')}]\n{c['chunk_content']}"
+        f"[{(c.additional_metadata or {}).get('period_label','?')} | "
+        f"{(c.additional_metadata or {}).get('doc_type','?')}]\n{c.chunk_content}"
         for c in current_chunks
     )
 
     # Recall analyst profile
-    analyst_prefs = client.recall.recall_preferences(
+    prefs_result  = client.recall.recall_preferences(
         tenant_id=TENANT_ID,
         sub_tenant_id=f"analyst-{analyst_user_id}",
         mode="thinking",
         query="coverage focus metrics preferences format",
     )
+    analyst_prefs = "\n".join(
+        c.chunk_content for c in (prefs_result.chunks or [])
+    ) or "No analyst profile available."
 
     resp = openai_client.chat.completions.create(
         model="gpt-4o",
