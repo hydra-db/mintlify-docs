@@ -9,7 +9,7 @@ Go from zero to a production AI assistant that answers "why was this built this 
 
 > **How this guide is structured.** Each phase ends with something that works. Phase 0 is a complete minimal system in under 10 minutes. Phases 1–3 are progressive upgrades. You never need to redo what came before.
 
-> **All code in this cookbook is real.** Base URL is `https://api.hydradb.com`. Get your API key at [hydradb.com](https://hydradb.com) or email [hello@hydradb.com](mailto:hello@hydradb.com).
+> **All code in this cookbook is real.** Base URL is `https://api.hydradb.com`. Get your API key at [hydradb.com](https://hydradb.com) or email [founders@hydradb.com](mailto:founders@hydradb.com).
 
 ---
 
@@ -25,9 +25,9 @@ The only goal is to see a real recall response from a real file you uploaded. No
 
 You need three things before writing any code:
 
-1. **A HydraDB API key.** Email [hello@hydradb.com](mailto:hello@hydradb.com) or book a demo at [hydradb.com](https://hydradb.com). You'll receive a key that starts with `hdb_`.
+1. **A HydraDB API key.** Email [founders@hydradb.com](mailto:founders@hydradb.com) or book a demo at [hydradb.com](https://hydradb.com). You'll receive a key that starts with `hdb_`.
 2. **Python 3.10+.** Run `python3 --version` to check.
-3. **The requests library.** Run `pip install requests python-dotenv`.
+3. **The HydraDB SDK.** Run `pip install hydradb-sdk python-dotenv`.
 
 ```bash
 mkdir cursor-for-docs && cd cursor-for-docs
@@ -39,18 +39,15 @@ Create `config.py` in the project root. This is the canonical configuration used
 ```python
 import os
 from dotenv import load_dotenv
+from hydra_db import HydraDB
 
 load_dotenv()
 
 # HydraDB
 HYDRA_DB_API_KEY = os.environ["HYDRA_DB_API_KEY"]
 TENANT_ID     = os.environ.get("HYDRADB_TENANT_ID", "engineering-docs")
-BASE_URL      = "https://api.hydradb.com"
 
-HEADERS = {
-    "Authorization": f"Bearer {HYDRA_DB_API_KEY}",  # format is strict - Bearer + space + key
-    "Content-Type":  "application/json",
-}
+client = HydraDB(token=HYDRA_DB_API_KEY)
 
 # OpenAI
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
@@ -73,33 +70,24 @@ RECALL_ALPHA       = 0.75
 **Endpoint:** `POST /tenants/create` - Async, poll `/tenants/infra/status` before ingesting
 
 ```python
-import sys, os, time, requests
+import sys, os, time
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-from config import BASE_URL, TENANT_ID, HEADERS
+from config import client, TENANT_ID
 
 def create_tenant():
-    resp = requests.post(
-        f"{BASE_URL}/tenants/create",
-        headers=HEADERS,
-        json={"tenant_id": TENANT_ID},
-    )
-    resp.raise_for_status()
-    print(f"Accepted: {resp.json()}")
+    client.tenant.create(tenant_id=TENANT_ID)
+    print("Accepted")
     _poll_until_ready()
 
 def _poll_until_ready(timeout=180, interval=4):
     print("Polling for readiness...")
     deadline = time.time() + timeout
     while time.time() < deadline:
-        r = requests.get(
-            f"{BASE_URL}/tenants/infra/status",
-            headers=HEADERS, params={"tenant_id": TENANT_ID}, timeout=10,
-        )
-        if r.ok:
-            status = r.json().get("status", "")
-            if   status == "ready":  print("✓ Tenant ready."); return
-            elif status == "failed": raise RuntimeError(f"Provisioning failed: {r.json()}")
-            print(f"  status={status} - retrying in {interval}s")
+        status = client.tenant.get_infra_status(tenant_id=TENANT_ID)
+        s = status.get("status", "")
+        if   s == "ready":  print("✓ Tenant ready."); return
+        elif s == "failed": raise RuntimeError(f"Provisioning failed: {status}")
+        print(f"  status={s} - retrying in {interval}s")
         time.sleep(interval)
     raise TimeoutError("Tenant not ready within 180s")
 
@@ -151,28 +139,21 @@ EOF
 ```
 
 ```python
-import sys, os, requests
+import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-from config import BASE_URL, TENANT_ID, HEADERS
+from config import client, TENANT_ID
 
 def upload_file(filepath: str):
-    # Strip Content-Type so requests sets the multipart boundary automatically
-    upload_headers = {k: v for k, v in HEADERS.items() if k != "Content-Type"}
     filename = os.path.basename(filepath)
 
     with open(filepath, "rb") as f:
-        resp = requests.post(
-            f"{BASE_URL}/ingestion/upload_knowledge",
-            headers=upload_headers,
-            files={"files": (filename, f, "text/markdown")},  # field name is "files"
-            data={"tenant_id": TENANT_ID},                    # tenant_id as form field
-            timeout=60,
+        result = client.upload.knowledge(
+            tenant_id=TENANT_ID,
+            files=[(filename, f, "text/markdown")],
         )
 
-    print("STATUS CODE:", resp.status_code)
-    print("RESPONSE:", resp.text)
-    resp.raise_for_status()
-    return resp.json()
+    print("RESULT:", result)
+    return result
 
 if __name__ == "__main__":
     result = upload_file("phase0/sample_docs/auth_middleware.md")
@@ -204,9 +185,9 @@ The exact value of `source_id` depends on HydraDB's internal file registration. 
 Replace `YOUR_FILE_ID_HERE` with the `source_id` from Step 2:
 
 ```python
-import sys, os, time, requests
+import sys, os, time
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-from config import BASE_URL, TENANT_ID, HEADERS
+from config import client, TENANT_ID
 
 # Replace with the source_id returned by upload_file.py in Step 2
 FILE_ID = "YOUR_FILE_ID_HERE"
@@ -214,31 +195,22 @@ FILE_ID = "YOUR_FILE_ID_HERE"
 def verify_file(file_id: str, timeout: int = 120, interval: int = 3):
     """
     Polls verify_processing until indexing_status is "completed" or "errored".
-    HydraDB returns a "statuses" array - read statuses[0].indexing_status.
-    sub_tenant_id is NOT required for this working flow.
     """
     print(f"Verifying '{file_id}'...")
     deadline = time.time() + timeout
     while time.time() < deadline:
-        resp = requests.post(
-            f"{BASE_URL}/ingestion/verify_processing",
-            headers=HEADERS,
-            params={"file_ids": file_id, "tenant_id": TENANT_ID},
-            timeout=30,
+        status = client.upload.verify_processing(
+            tenant_id=TENANT_ID,
+            file_ids=[file_id],
         )
-        print("STATUS CODE:", resp.status_code)
-        print("RESPONSE:", resp.text)
+        print("STATUS:", status)
 
-        try:
-            data     = resp.json()
-            statuses = data.get("statuses", [])
-            if statuses:
-                status = statuses[0].get("indexing_status")
-                if   status == "completed": print(f"✓ '{file_id}' ready."); return
-                elif status == "errored":   print("Indexing errored."); return
-                print(f"  indexing_status: {status} - waiting...")
-        except Exception:
-            pass
+        statuses = status.get("statuses", [])
+        if statuses:
+            s = statuses[0].get("indexing_status")
+            if   s == "completed": print(f"✓ '{file_id}' ready."); return
+            elif s == "errored":   print("Indexing errored."); return
+            print(f"  indexing_status: {s} - waiting...")
 
         time.sleep(interval)
     raise TimeoutError("Indexing timed out")
@@ -280,9 +252,9 @@ RESPONSE: {"statuses": [{"file_id": "YOUR_FILE_ID_HERE", "indexing_status": "com
 ```
 
 ```python
-import sys, os, json, requests
+import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-from config import BASE_URL, TENANT_ID, HEADERS
+from config import client, TENANT_ID
 
 def recall(query: str, max_results: int = 10) -> dict:
     """
@@ -291,15 +263,12 @@ def recall(query: str, max_results: int = 10) -> dict:
     sub_tenant_id is NOT required - HydraDB handles scope internally.
     Response: {"chunks": [...], "sources": [...]}
     """
-    resp = requests.post(
-        f"{BASE_URL}/recall/full_recall",
-        headers=HEADERS,
-        json={"tenant_id": TENANT_ID, "query": query, "max_results": max_results},
-        timeout=30,
+    data = client.recall.full_recall(
+        tenant_id=TENANT_ID,
+        query=query,
+        max_results=max_results,
     )
-    print("STATUS CODE:", resp.status_code)
-    resp.raise_for_status()
-    return resp.json()
+    return data
 
 if __name__ == "__main__":
     data   = recall("internal IP auth skip logic")
@@ -373,7 +342,7 @@ The response also includes a `sources` array - a deduplicated list of the origin
 | `title` | optional | Human-readable label from the source document. Use for `[Source: ...]` citation references in your final answer. |
 | `chunk_uuid` | optional | Unique identifier for this chunk. Useful for deduplication when fan-out recall across sub-tenants returns the same chunk more than once. |
 | `url` | optional | The URL you set at ingestion time. Present only if supplied. Use for deep-links in citation UI. |
-| `meta` | optional | The metadata object from ingestion. May include `doc_type`, `repo`, `pr_number`, etc. |
+| `additional_metadata` | optional | The per-source metadata object from ingestion. May include `doc_type`, `repo`, `pr_number`, etc. |
 
 **How to interpret the `relevancy_score`:** Scores are relative within a single response - they indicate ranked relevance for your specific query, not absolute confidence.
 
@@ -397,9 +366,9 @@ The response also includes a `sources` array - a deduplicated list of the origin
 > ⚠️ **Advanced path - stricter validation.** JSON ingestion requires well-formed payloads with `id`, `type`, and `content.text` on every item. Malformed requests are rejected outright. Use the file upload path (Phase 0 Step 2) if you just want to get content indexed quickly. Use JSON ingestion when you need stable IDs and graph relations.
 
 ```python
-import sys, os, json, time, subprocess, pathlib, requests
+import sys, os, json, time, subprocess, pathlib
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-from config import BASE_URL, TENANT_ID, HEADERS
+from config import client, TENANT_ID
 from phase0.verify import verify_file
 
 TEXT_EXTS = {".py",".ts",".js",".go",".rs",".java",".md",".yaml",".toml",".txt"}
@@ -414,14 +383,11 @@ def git_timestamp(repo_path: str, rel_path: str) -> str:
     except: return "2020-01-01T00:00:00Z"
 
 def upload_batch(batch: list) -> list:
-    resp = requests.post(
-        f"{BASE_URL}/ingestion/upload_knowledge",
-        headers=HEADERS,
-        json={"app_knowledge": json.dumps(batch), "tenant_id": TENANT_ID},
-        timeout=30,
+    result = client.upload.knowledge(
+        tenant_id=TENANT_ID,
+        app_knowledge=json.dumps(batch),
     )
-    resp.raise_for_status()
-    ids = resp.json().get("ids", [])
+    ids = result.get("ids", [])
     print(f"  Uploaded {len(ids)} items")
     return ids
 
@@ -444,7 +410,7 @@ def ingest_directory(repo_path: str, repo_name: str) -> list:
             "timestamp":   git_timestamp(str(root), rel),
             "content":     {"text": content},
             "collections": ["codebase", repo_name, f.suffix.lstrip(".")],
-            "meta": {"doc_type":"source_file","repo":repo_name,
+            "metadata": {"doc_type":"source_file","repo":repo_name,
                       "language":f.suffix.lstrip("."),"tags":["codebase",repo_name]},
         })
         if len(batch) == 20:
@@ -473,7 +439,7 @@ Verifying 54 files...
 
 ### P1 · Step 2 - Metadata and Collections
 
-**What:** `collections` are labels you define for scoping recall. `meta` fields are arbitrary key-value pairs used for filtering and citation labels. No extra API calls needed - these fields go in the ingestion payload.
+**What:** `collections` are labels you define for scoping recall. `additional_metadata` fields are arbitrary key-value pairs used for filtering and citation labels. No extra API calls needed - these fields go in the ingestion payload.
 
 ```json
 {
@@ -482,7 +448,7 @@ Verifying 54 files...
   // [1] repo/channel: "myrepo" | "eng-architecture"
   // [2] sub-category: extension, doc_type, etc.
 
-  "meta": {
+  "metadata": {
     "doc_type": "source_file",
     // Recommended values:
     // source_file | pull_request | slack_thread | rfc | adr | wiki | runbook
@@ -498,27 +464,23 @@ Verifying 54 files...
 ### P1 · Step 3 - Tuned Recall with Graph Context
 
 ```python
-import sys, os, requests
+import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-from config import BASE_URL, TENANT_ID, HEADERS
+from config import client, TENANT_ID
 
 def tuned_recall(query: str, scope: str = None, max_results: int = 15) -> dict:
     """scope: optional sub_tenant_id. Omit to search all sub-tenants automatically."""
-    body = {
+    kwargs = {
         "tenant_id":     TENANT_ID,
         "query":         query,
         "max_results":   max_results,
-        "mode":          "thinking",   # deeper semantic ranking
-        "graph_context": True,          # walk edges to linked PRs, wikis, Slack
-        "alpha":         0.75,           # 0=keyword, 1=semantic
-        "recency_bias":  0.2,            # 0=ignore recency, 1=newest wins
+        "mode":          "thinking",
+        "graph_context": True,
+        "alpha":         0.75,
+        "recency_bias":  0.2,
     }
-    if scope: body["sub_tenant_id"] = scope
-    resp = requests.post(
-        f"{BASE_URL}/recall/full_recall",
-        headers=HEADERS, json=body, timeout=20)
-    resp.raise_for_status()
-    return resp.json()
+    if scope: kwargs["sub_tenant_id"] = scope
+    return client.recall.full_recall(**kwargs)
 
 def build_context(chunks: list, min_score: float = 0.5) -> tuple[str, list]:
     """
@@ -533,7 +495,7 @@ def build_context(chunks: list, min_score: float = 0.5) -> tuple[str, list]:
         uid           = chunk.get("chunk_uuid", chunk_content[:40])
         if not chunk_content or uid in seen: continue
         seen.add(uid)
-        doc_type = chunk.get("meta", {}).get("doc_type", "doc")
+        doc_type = chunk.get("additional_metadata", {}).get("doc_type", "doc")
         title    = chunk.get("title", "untitled")
         parts.append(f"[{doc_type.upper()}] {title}\n{chunk_content}")
         sources.append({"title": title, "url": chunk.get("url"),
@@ -603,7 +565,7 @@ ingest_directory('/path/to/your/repo', 'myrepo')
 ```python
 import sys, os, time, requests
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-from config import BASE_URL, TENANT_ID, HEADERS
+from config import client, TENANT_ID
 from phase1.batch_upload import upload_batch, verify_batch
 
 GH_TOKEN = os.environ.get("GITHUB_TOKEN", "")
@@ -658,7 +620,7 @@ def ingest_pull_requests(prs: list, repo_name: str) -> list:
             "content":     {"text": content},
             "collections": ["pull-requests"],
             "relations":   {"hydradb_source_ids": source_ids},
-            "meta": {"doc_type":"pull_request","pr_number":pr["number"],
+            "metadata": {"doc_type":"pull_request","pr_number":pr["number"],
                       "author":pr["user"]["login"],"changed_files":changed},
         })
         if len(batch)==20: all_ids+=upload_batch(batch); batch=[]; time.sleep(1)
@@ -714,7 +676,7 @@ def ingest_slack_export(export_dir: str, channels: list[str]) -> list:
                 "timestamp":   ts_dt,
                 "content":     {"text": f"Channel: #{channel}\n\n{text}"},
                 "collections": ["slack", channel],
-                "meta": {"doc_type":"slack_thread","channel":channel,
+                "metadata": {"doc_type":"slack_thread","channel":channel,
                           "message_count":len(msgs)},
             })
             if len(batch)==20: all_ids+=upload_batch(batch); batch=[]; time.sleep(1)
@@ -759,7 +721,7 @@ def ingest_wikis(pages: list) -> list:
             "content":     {"text": page["content"]},
             "url":         page.get("url", ""),
             "collections": ["wikis", page["doc_type"]],
-            "meta": {"doc_type":page["doc_type"],"author":page.get("author","")},
+            "metadata": {"doc_type":page["doc_type"],"author":page.get("author","")},
         })
         if len(batch)==20: all_ids+=upload_batch(batch); batch=[]; time.sleep(1)
     if batch: all_ids+=upload_batch(batch)
@@ -786,25 +748,20 @@ def ingest_markdown_folder(folder: str) -> list:
 ### P2 · Step 5 - Run a Multi-source Graph Query
 
 ```python
-import sys, os, requests
+import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-from config import BASE_URL, TENANT_ID, HEADERS
+from config import client, TENANT_ID
 
 def multi_source_recall(question: str) -> dict:
-    resp = requests.post(
-        f"{BASE_URL}/recall/full_recall",
-        headers=HEADERS,
-        json={
-            "tenant_id":     TENANT_ID,
-            "query":         question,
-            "max_results":   15,
-            "mode":          "thinking",
-            "graph_context": True,
-            "alpha":         0.65,
-            "recency_bias":  0.15,
-        }, timeout=60)
-    resp.raise_for_status()
-    return resp.json()
+    return client.recall.full_recall(
+        tenant_id=TENANT_ID,
+        query=question,
+        max_results=15,
+        mode="thinking",
+        graph_context=True,
+        alpha=0.65,
+        recency_bias=0.15,
+    )
 
 if __name__ == "__main__":
     result = multi_source_recall(
@@ -852,7 +809,7 @@ The flow through the backend is:
 ```
 backend/
 ├── __init__.py       - makes backend a package so imports work
-├── config.py         - env vars, HYDRA_DB_API_KEY, HEADERS, OpenAI keys, recall defaults
+├── config.py         - env vars, HYDRA_DB_API_KEY, HydraDB client, OpenAI keys, recall defaults
 ├── hydra_client.py   - full_recall() wrapper for HydraDB retrieval
 ├── recall.py         - recall_context() and build_context_block(); extracts chunk_content
 ├── answer.py         - prompt formatter, GPT-4o streaming call, anti-hallucination rules
@@ -861,7 +818,7 @@ backend/
 
 **Architecture summary:**
 
-- **`config.py`** - Loads `.env`, exposes `HYDRA_DB_API_KEY`, `TENANT_ID`, `HEADERS`, `OPENAI_API_KEY`, and recall defaults. Every other file imports from here only.
+- **`config.py`** - Loads `.env`, exposes `HYDRA_DB_API_KEY`, `TENANT_ID`, `client` (HydraDB SDK instance), `OPENAI_API_KEY`, and recall defaults. Every other file imports from here only.
 - **`hydra_client.py`** - `full_recall()` is the HydraDB retrieval path. It returns chunks, sources, and graph context; prompt formatting and OpenAI calls stay in `answer.py`. Imported by → `recall.py`, `app.py`.
 - **`recall.py`** - `recall_context()` calls `full_recall()` and returns the raw payload. `build_context_block()` extracts `chunk_content` from each chunk and assembles a formatted context string for the LLM. Imported by → `app.py`.
 - **`answer.py`** - Takes the context block from `recall.py`, formats the system + user prompt, and calls the OpenAI streaming API. Contains all anti-hallucination rules. Never calls HydraDB. Imported by → `app.py`.
@@ -870,7 +827,7 @@ backend/
 **Install dependencies for Phase 3:**
 
 ```bash
-pip install fastapi uvicorn[standard] openai python-dotenv requests
+pip install fastapi uvicorn[standard] openai python-dotenv hydradb-sdk
 ```
 
 Add to `.env`:
@@ -894,17 +851,15 @@ Centralises all credentials. Use `HYDRA_DB_API_KEY` as the variable name for you
 ```python
 import os
 from dotenv import load_dotenv
+from hydra_db import HydraDB
 
 load_dotenv()
 
 # HydraDB
 HYDRA_DB_API_KEY = os.environ["HYDRA_DB_API_KEY"]
 TENANT_ID     = os.environ.get("HYDRADB_TENANT_ID", "engineering-docs")
-BASE_URL      = "https://api.hydradb.com"
-HEADERS       = {
-    "Authorization": f"Bearer {HYDRA_DB_API_KEY}",
-    "Content-Type":  "application/json",
-}
+
+client = HydraDB(token=HYDRA_DB_API_KEY)
 
 # OpenAI
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
@@ -923,15 +878,7 @@ RECALL_ALPHA       = 0.75  # semantic vs keyword balance
 `full_recall()` is the HydraDB retrieval path. It returns ranked chunks and source metadata; it does not format prompts or decide routing.
 
 ```python
-import requests
-
-from backend.config import (
-    BASE_URL,
-    TENANT_ID,
-    HEADERS,
-    RECALL_MAX_RESULTS,
-    RECALL_ALPHA,
-)
+from backend.config import client, TENANT_ID, RECALL_MAX_RESULTS, RECALL_ALPHA
 
 
 def full_recall(
@@ -949,7 +896,7 @@ def full_recall(
       "chunks"  - iterate this array; read chunk_content from each item for LLM context
       "sources" - deduplicated source list; use for citations
     """
-    body = {
+    kwargs = {
         "tenant_id":     TENANT_ID,
         "query":         query,
         "max_results":   max_results,
@@ -959,13 +906,8 @@ def full_recall(
         "recency_bias":  recency_bias,
     }
     if scope:
-        body["sub_tenant_id"] = scope
-    resp = requests.post(
-        f"{BASE_URL}/recall/full_recall",
-        headers=HEADERS, json=body, timeout=30,
-    )
-    resp.raise_for_status()
-    return resp.json()
+        kwargs["sub_tenant_id"] = scope
+    return client.recall.full_recall(**kwargs)
 
 ```
 
@@ -1393,11 +1335,9 @@ GET /tenants/infra/status?tenant_id=engineering-docs
 
 ```python
 # Correct multipart file upload
-requests.post(
-    f"{BASE_URL}/ingestion/upload_knowledge",
-    headers=upload_headers,             # no Content-Type - let requests set boundary
-    files={"files": (filename, f, "text/markdown")},  # field name is "files"
-    data={"tenant_id": TENANT_ID},         # tenant_id as form data, not query param
+client.upload.knowledge(
+    tenant_id=TENANT_ID,
+    files=[(filename, f, "text/markdown")],
 )
 
 # Response:
@@ -1418,24 +1358,20 @@ requests.post(
 **POST** `/ingestion/upload_knowledge` - Max 20 items · body field `app_knowledge` (JSON string) · supports relations
 
 ```python
-import json, requests
+import json
 
-requests.post(
-    f"{BASE_URL}/ingestion/upload_knowledge",
-    headers=HEADERS,
-    json={
-        "app_knowledge": json.dumps([{
-            "id":          "myrepo/auth/middleware.py",
-            "title":       "auth/middleware.py",
-            "type":        "document",
-            "timestamp":   "2025-11-14T10:22:00Z",
-            "content":     {"text": "full content here"},
-            "collections": ["codebase", "myrepo"],
-            "relations":   {"hydradb_source_ids": ["pr-42"]},
-            "meta":        {"doc_type": "source_file", "repo": "myrepo"},
-        }]),
-        "tenant_id": "engineering-docs",
-    },
+client.upload.knowledge(
+    tenant_id="engineering-docs",
+    app_knowledge=json.dumps([{
+        "id":          "myrepo/auth/middleware.py",
+        "title":       "auth/middleware.py",
+        "type":        "document",
+        "timestamp":   "2025-11-14T10:22:00Z",
+        "content":     {"text": "full content here"},
+        "collections": ["codebase", "myrepo"],
+        "relations":   {"hydradb_source_ids": ["pr-42"]},
+        "metadata":   {"doc_type": "source_file", "repo": "myrepo"},
+    }]),
 )
 
 # Response: { "ids": ["myrepo/auth/middleware.py"] }

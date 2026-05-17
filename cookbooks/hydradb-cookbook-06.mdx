@@ -67,7 +67,19 @@ Four HydraDB capabilities make a Chief of Staff possible:
 One HydraDB tenant. Functions registered as knowledge objects. An Action Orchestrator that translates HydraDB suggestions into real API calls. Per-user memories that personalize every suggestion.
 
 
-> **Architecture Diagram** - see original HTML for SVG rendering.
+```mermaid
+flowchart LR
+    A["User / Agent<br/>(natural-language task)"] --> B["Action Orchestrator"]
+    B --> C["HydraDB<br/>(semantic function matching)"]
+    C --> D["Ranked function suggestions"]
+    D --> E["Policy Engine<br/>(authorization)"]
+    E --> F["Auth Vault<br/>(OAuth tokens)"]
+    F --> G["External API<br/>(function execution)"]
+    G --> H["Execution result"]
+    H --> C
+    H --> I["Per-user memories"]
+    I --> C
+```
 
 
 The flow: a user or agent sends a natural-language task to the Action Orchestrator. The Orchestrator queries HydraDB, which matches the task semantically against registered function knowledge objects and returns a ranked suggestion. The Orchestrator executes the function via the real API, logs the result back to HydraDB as a memory, and the loop closes. Each execution makes the next suggestion smarter.
@@ -96,24 +108,17 @@ export OPENAI_API_KEY="your_openai_key"
 HydraDB handles retrieval and memory. The OpenAI SDK is used only in the app layer for turning retrieved function schemas into executable parameters and multi-step plans; you can replace it with any LLM provider.
 
 ```python title="setup.py"
-import requests, os
+import os
+from hydra_db import HydraDB
 
 API_KEY   = os.environ["HYDRA_DB_API_KEY"]
 TENANT_ID = "chief-of-staff"
-BASE_URL  = "https://api.hydradb.com"
-HEADERS   = {
-    "Authorization": f"Bearer {API_KEY}",
-    "Content-Type": "application/json",
-}
+
+client = HydraDB(token=API_KEY)
 
 def create_tenant():
     """Create the main tenant. Idempotent - safe to call multiple times."""
-    resp = requests.post(
-        f"{BASE_URL}/tenants/create",
-        headers=HEADERS,
-        json={"tenant_id": TENANT_ID},
-    )
-    resp.raise_for_status()
+    client.tenant.create(tenant_id=TENANT_ID)
     print(f"Tenant '{TENANT_ID}' ready.")
 
 # Sub-tenants scope functions per team. Created automatically on first write.
@@ -217,7 +222,8 @@ Upload functions using the same `POST /ingestion/upload_knowledge` endpoint used
 
 
 ```python title="register/upload_functions.py"
-import json, time
+import json, time, os
+from hydra_db import HydraDB
 
 # All functions in the workspace. Each schema loaded from its own file.
 FUNCTION_SCHEMAS = [
@@ -232,6 +238,10 @@ FUNCTION_SCHEMAS = [
     "schemas/generate_report.json",
     "schemas/add_to_notion.json",
 ]
+
+client = HydraDB(token=os.environ["HYDRA_DB_API_KEY"])
+TENANT_ID = "chief-of-staff"
+
 
 def load_schema(path: str) -> dict:
     with open(path) as f:
@@ -280,17 +290,11 @@ def upload_functions(schema_paths: list, sub_tenant_id: str = "functions") -> li
 
 
 def _upload_batch(batch: list, sub_tenant_id: str) -> list:
-    resp = requests.post(
-        f"{BASE_URL}/ingestion/upload_knowledge",
-        headers={**HEADERS, "Content-Type": "application/json"},
-        params={
-            "tenant_id":     TENANT_ID,
-            "sub_tenant_id": sub_tenant_id,
-        },
-        json=batch,
+    data = client.upload.knowledge(
+        tenant_id=TENANT_ID,
+        sub_tenant_id=sub_tenant_id,
+        app_knowledge=json.dumps(batch),
     )
-    resp.raise_for_status()
-    data = resp.json()
     return [item.get("id") for item in data.get("items", [])]
 
 
@@ -312,33 +316,35 @@ As functions evolve, use a `_v2` suffix on the ID for new versions. Mark depreca
 
 
 ```python title="register/versioning.py"
+import json, os
+from hydra_db import HydraDB
+
+client = HydraDB(token=os.environ["HYDRA_DB_API_KEY"])
+TENANT_ID = "chief-of-staff"
+
+
 def deprecate_function(fn_id: str, sub_tenant_id: str, reason: str):
     """
     Mark a function as deprecated so HydraDB stops suggesting it.
     Never delete - old executions reference this ID for audit and provenance.
     Use 'deprecated: true' in metadata + upload new version as fn_id_v2.
     """
-    resp = requests.post(
-        f"{BASE_URL}/ingestion/upload_knowledge",
-        headers={**HEADERS, "Content-Type": "application/json"},
-        params={
-            "tenant_id":     TENANT_ID,
-            "sub_tenant_id": sub_tenant_id,
-        },
-        json=[{
+    client.upload.knowledge(
+        tenant_id=TENANT_ID,
+        sub_tenant_id=sub_tenant_id,
+        app_knowledge=json.dumps([{
             "id":        fn_id,
             "title":     f"[DEPRECATED] {fn_id}",
             "type":      "function",
             "timestamp": "2025-01-01T00:00:00Z",
             "content":   {"text": f"DEPRECATED: {reason}. Use {fn_id}_v2 instead."},
             "metadata": {
-                "deprecated":         True,   # HydraDB avoids suggesting deprecated functions
+                "deprecated":         True,
                 "deprecated_reason":  reason,
                 "successor_id":       f"{fn_id}_v2",
             },
-        }],
+        }]),
     )
-    resp.raise_for_status()
     print(f"Deprecated {fn_id}. Successor: {fn_id}_v2")
 
 
@@ -365,8 +371,12 @@ The Orchestrator is the runtime layer between HydraDB suggestions and real API c
 
 
 ```python title="orchestrator/core.py"
-import uuid, json, requests as req_lib
+import uuid, json, os
 from openai import OpenAI
+from hydra_db import HydraDB
+
+client = HydraDB(token=os.environ["HYDRA_DB_API_KEY"])
+TENANT_ID = "chief-of-staff"
 
 class ChiefOfStaffOrchestrator:
     """
@@ -404,18 +414,14 @@ class ChiefOfStaffOrchestrator:
         session_id = session_id or str(uuid.uuid4())
 
         # Step 1 - Ask HydraDB for the best function
-        recall = req_lib.post(
-            f"{BASE_URL}/recall/full_recall",
-            headers=HEADERS,
-            json={
-                "tenant_id":     TENANT_ID,
-                "sub_tenant_id": sub_tenant,
-                "query":         task,
-                "max_results":   5,
-                "mode":          "thinking",  # multi-query rerank + personalised recall
-                "metadata_filters": {"deprecated": False},
-            },
-        ).json()
+        recall = client.recall.full_recall(
+            tenant_id=TENANT_ID,
+            sub_tenant_id=sub_tenant,
+            query=task,
+            max_results=5,
+            mode="thinking",
+            metadata_filters={"deprecated": False},
+        )
 
         chunks = recall.get("chunks", [])
         if not chunks:
@@ -480,39 +486,32 @@ class ChiefOfStaffOrchestrator:
         """Log execution outcome back to HydraDB. Closes the learning loop."""
         success = result.get("success", True)
         outcome = "success" if success else "failure"
-        req_lib.post(
-            f"{BASE_URL}/memories/add_memory",
-            headers=HEADERS,
-            json={
-                "tenant_id":     TENANT_ID,
-                "sub_tenant_id": f"user-{user_id}",
-                "memories": [{
-                    "text": (
-                        f"Task: {task}\n"
-                        f"Function used: {function_id}\n"
-                        f"Outcome: {outcome}\n"
-                        f"Summary: {str(result.get('summary',''))[:300]}"
-                    ),
-                    "user_name": user_id,
-                    "infer": True,    # HydraDB extracts function preference signals
-                }],
-                "upsert": True,
-            },
+        client.upload.add_memory(
+            tenant_id=TENANT_ID,
+            sub_tenant_id=f"user-{user_id}",
+            upsert=True,
+            memories=[{
+                "text": (
+                    f"Task: {task}\n"
+                    f"Function used: {function_id}\n"
+                    f"Outcome: {outcome}\n"
+                    f"Summary: {str(result.get('summary',''))[:300]}"
+                ),
+                "user_name": user_id,
+                "infer": True,
+            }],
         )
 
     def _log_blocked(self, user_id, task, function_id):
         """Log a blocked attempt for audit trail."""
-        req_lib.post(
-            f"{BASE_URL}/memories/add_memory", headers=HEADERS,
-            json={
-                "tenant_id": TENANT_ID,
-                "memories": [{
-                    "text": f"BLOCKED: User {user_id} attempted {function_id} for task: {task}. Policy denied.",
-                    "user_name": "audit-log",
-                    "infer": False,   # store verbatim for compliance
-                }],
-                "upsert": True,
-            },
+        client.upload.add_memory(
+            tenant_id=TENANT_ID,
+            upsert=True,
+            memories=[{
+                "text": f"BLOCKED: User {user_id} attempted {function_id} for task: {task}. Policy denied.",
+                "user_name": "audit-log",
+                "infer": False,
+            }],
         )
 ```
 
@@ -590,6 +589,13 @@ The feedback loop is what separates a static function router from a learning sys
 
 
 ```python title="orchestrator/feedback.py"
+import os
+from hydra_db import HydraDB
+
+client = HydraDB(token=os.environ["HYDRA_DB_API_KEY"])
+TENANT_ID = "chief-of-staff"
+
+
 def log_function_feedback(
     user_id:     str,
     function_id: str,
@@ -616,19 +622,15 @@ def log_function_feedback(
     if details:
         text += f"Details: {details}"
 
-    requests.post(
-        f"{BASE_URL}/memories/add_memory",
-        headers=HEADERS,
-        json={
-            "tenant_id":     TENANT_ID,
-            "sub_tenant_id": f"user-{user_id}",
-            "memories": [{
-                "text":      text,
-                "user_name": user_id,
-                "infer":     True,   # extracts preference + success signals
-            }],
-            "upsert": True,
-        },
+    client.upload.add_memory(
+        tenant_id=TENANT_ID,
+        sub_tenant_id=f"user-{user_id}",
+        upsert=True,
+        memories=[{
+            "text":      text,
+            "user_name": user_id,
+            "infer":     True,
+        }],
     )
 
 
@@ -661,6 +663,13 @@ Write explicit preference profiles during onboarding and update them whenever a 
 
 
 ```python title="memory/user_preferences.py"
+import os
+from hydra_db import HydraDB
+
+client = HydraDB(token=os.environ["HYDRA_DB_API_KEY"])
+TENANT_ID = "chief-of-staff"
+
+
 def store_user_preferences(user_id: str, profile: str):
     """
     Store a user's working preferences so HydraDB personalizes function
@@ -670,19 +679,15 @@ def store_user_preferences(user_id: str, profile: str):
     Call during onboarding and whenever preferences change.
     Use the same user_id consistently across all memory writes for this user.
     """
-    requests.post(
-        f"{BASE_URL}/memories/add_memory",
-        headers=HEADERS,
-        json={
-            "tenant_id":     TENANT_ID,
-            "sub_tenant_id": f"user-{user_id}",
-            "memories": [{
-                "text":      profile,
-                "user_name": user_id,
-                "infer":     True,
-            }],
-            "upsert": True,
-        },
+    client.upload.add_memory(
+        tenant_id=TENANT_ID,
+        sub_tenant_id=f"user-{user_id}",
+        upsert=True,
+        memories=[{
+            "text":      profile,
+            "user_name": user_id,
+            "infer":     True,
+        }],
     )
 
 
@@ -720,6 +725,11 @@ Beyond preferences, HydraDB needs to know what actually happened. Store each exe
 
 ```python title="memory/outcomes.py"
 from datetime import datetime, timezone
+from hydra_db import HydraDB
+import os
+
+client = HydraDB(token=os.environ["HYDRA_DB_API_KEY"])
+TENANT_ID = "chief-of-staff"
 
 def log_execution_outcome(
     user_id:     str,
@@ -740,24 +750,21 @@ def log_execution_outcome(
     ts = datetime.now(timezone.utc).isoformat()
 
     # Write 1: exact record
-    requests.post(
-        f"{BASE_URL}/memories/add_memory", headers=HEADERS,
-        json={
-            "tenant_id":     TENANT_ID,
-            "sub_tenant_id": "execution-log",  # shared log sub-tenant
-            "memories": [{
-                "text": (
-                    f"[{ts}] user={user_id} fn={function_id} "
-                    f"outcome={outcome} latency={latency_ms}ms\n"
-                    f"task={task}\n"
-                    f"chained={chained_fns or []}\n"
-                    f"error={error_msg or 'none'}"
-                ),
-                "user_name": "system",
-                "infer":     False,   # verbatim audit record
-            }],
-            "upsert": True,
-        },
+    client.upload.add_memory(
+        tenant_id=TENANT_ID,
+        sub_tenant_id="execution-log",
+        upsert=True,
+        memories=[{
+            "text": (
+                f"[{ts}] user={user_id} fn={function_id} "
+                f"outcome={outcome} latency={latency_ms}ms\n"
+                f"task={task}\n"
+                f"chained={chained_fns or []}\n"
+                f"error={error_msg or 'none'}"
+            ),
+            "user_name": "system",
+            "infer":     False,
+        }],
     )
 
     # Write 2: synthesized pattern (only for notable events)
@@ -772,18 +779,15 @@ def log_execution_outcome(
         if outcome == "user_rejected":
             summary += f"User manually overrode this suggestion for user_id={user_id}."
 
-        requests.post(
-            f"{BASE_URL}/memories/add_memory", headers=HEADERS,
-            json={
-                "tenant_id":     TENANT_ID,
-                "sub_tenant_id": f"user-{user_id}",
-                "memories": [{
-                    "text":      summary,
-                    "user_name": user_id,
-                    "infer":     True,   # HydraDB extracts the failure pattern signal
-                }],
-                "upsert": True,
-            },
+        client.upload.add_memory(
+            tenant_id=TENANT_ID,
+            sub_tenant_id=f"user-{user_id}",
+            upsert=True,
+            memories=[{
+                "text":      summary,
+                "user_name": user_id,
+                "infer":     True,
+            }],
         )
 ```
 
@@ -805,8 +809,13 @@ Many real-world tasks require more than one function call. "Onboard the new hire
 
 
 ```python title="planning/generate_plan.py"
+import json, os
 from openai import OpenAI
+from hydra_db import HydraDB
+
 openai_client = OpenAI()
+client = HydraDB(token=os.environ["HYDRA_DB_API_KEY"])
+TENANT_ID = "chief-of-staff"
 
 def generate_execution_plan(
     task:       str,
@@ -823,19 +832,15 @@ def generate_execution_plan(
     max_steps: cap the plan length to avoid runaway chains.
     """
     # Step 1: recall candidate functions with thinking mode
-    recall = requests.post(
-        f"{BASE_URL}/recall/full_recall",
-        headers=HEADERS,
-        json={
-            "tenant_id":     TENANT_ID,
-            "sub_tenant_id": sub_tenant,
-            "query":         task,
-            "max_results":   12,
-            "mode":          "thinking",   # multi-query decomposition
-            "graph_context": True,          # surfaces composed function chains
-            "metadata_filters": {"deprecated": False},
-        },
-    ).json()
+    recall = client.recall.full_recall(
+        tenant_id=TENANT_ID,
+        sub_tenant_id=sub_tenant,
+        query=task,
+        max_results=12,
+        mode="thinking",
+        graph_context=True,
+        metadata_filters={"deprecated": False},
+    )
 
     chunks = recall.get("chunks", [])
     if not chunks:
@@ -848,16 +853,12 @@ def generate_execution_plan(
     )
 
     # Recall user preferences to personalise the plan
-    user_prefs = requests.post(
-        f"{BASE_URL}/recall/recall_preferences",
-        headers=HEADERS,
-        json={
-            "tenant_id":     TENANT_ID,
-            "sub_tenant_id": f"user-{user_id}",
-            "query":         "channel preferences urgency communication style",
-            "mode":          "thinking",
-        },
-    ).json()
+    user_prefs = client.recall.recall_preferences(
+        tenant_id=TENANT_ID,
+        sub_tenant_id=f"user-{user_id}",
+        query="channel preferences urgency communication style",
+        mode="thinking",
+    )
 
     # Step 2: use LLM to sequence the plan
     resp = openai_client.chat.completions.create(
@@ -1310,6 +1311,13 @@ When `policy.requires_approval()` returns `True`, route the action through a Sla
 
 
 ```python title="security/approval.py"
+import json, os
+from hydra_db import HydraDB
+
+client = HydraDB(token=os.environ["HYDRA_DB_API_KEY"])
+TENANT_ID = "chief-of-staff"
+
+
 def request_approval(
     user_id:     str,
     function_id: str,
@@ -1324,25 +1332,22 @@ def request_approval(
     approval_id = str(uuid.uuid4())[:8]
 
     # Store the pending action in HydraDB so it can be resumed after approval
-    requests.post(
-        f"{BASE_URL}/memories/add_memory", headers=HEADERS,
-        json={
-            "tenant_id":     TENANT_ID,
-            "sub_tenant_id": "approvals",
-            "memories": [{
-                "text": json.dumps({
-                    "approval_id": approval_id,
-                    "user_id":     user_id,
-                    "function_id": function_id,
-                    "params":      params,
-                    "task":        task,
-                    "status":      "pending",
-                }),
-                "user_name": "approval-system",
-                "infer":     False,   # verbatim - exact pending action
-            }],
-            "upsert": True,
-        },
+    client.upload.add_memory(
+        tenant_id=TENANT_ID,
+        sub_tenant_id="approvals",
+        upsert=True,
+        memories=[{
+            "text": json.dumps({
+                "approval_id": approval_id,
+                "user_id":     user_id,
+                "function_id": function_id,
+                "params":      params,
+                "task":        task,
+                "status":      "pending",
+            }),
+            "user_name": "approval-system",
+            "infer":     False,
+        }],
     )
 
     # Send the Slack approval request to the approver
@@ -1390,6 +1395,14 @@ Every execution metric is a signal HydraDB can learn from. A consistent `slow_re
 
 
 ```python title="observability/metrics.py"
+from datetime import datetime, timezone
+import json, os
+from hydra_db import HydraDB
+
+client = HydraDB(token=os.environ["HYDRA_DB_API_KEY"])
+TENANT_ID = "chief-of-staff"
+
+
 def report_function_performance(
     function_id: str,
     signal:      str,    # "slow_response" | "frequent_failure" | "high_rejection"
@@ -1406,18 +1419,15 @@ def report_function_performance(
         f"Details: {json.dumps(details)}\n"
         f"Observed: {datetime.now(timezone.utc).isoformat()}"
     )
-    requests.post(
-        f"{BASE_URL}/memories/add_memory", headers=HEADERS,
-        json={
-            "tenant_id":     TENANT_ID,
-            "sub_tenant_id": "function-performance",
-            "memories": [{
-                "text":      text,
-                "user_name": "observability-system",
-                "infer":     True,   # HydraDB extracts and links the performance signal
-            }],
-            "upsert": True,
-        },
+    client.upload.add_memory(
+        tenant_id=TENANT_ID,
+        sub_tenant_id="function-performance",
+        upsert=True,
+        memories=[{
+            "text":      text,
+            "user_name": "observability-system",
+            "infer":     True,
+        }],
     )
 
 

@@ -1,0 +1,2382 @@
+# HydraDB Complete Reference for LLMs
+
+> **Graph-first, unified state infrastructure for AI.** HydraDB replaces Neo4j + VectorDB + Redis with a single API that combines graph traversal, semantic search, and recency scoring to find what's useful, not just what's similar.
+
+**Base URL:** `https://api.hydradb.com`  
+**Authentication:** `Authorization: Bearer <your_api_key>` on every request  
+**SDKs:** TypeScript `npm install @hydradb/sdk` | Python `pip install hydradb-sdk`
+
+**Current SDK Versions:**
+- TypeScript: Check npm for `@hydradb/sdk` latest version
+- Python: Check PyPI for `hydradb-sdk` latest version
+- MCP Server: `@hydradb/mcp@0.0.1` (verify latest on npm)
+- CLI: `hydradb-cli` on PyPI
+- **Always verify breaking changes at https://hydradb.com/changelog before upgrading**
+
+---
+
+## Critical Rules for LLMs
+
+1. **Always poll status endpoints** — Tenant creation and ingestion are async operations
+2. **Vectorstore index mapping** — Index `[0]` = Memories (recall_preferences), Index `[1]` = Knowledge (full_recall)
+3. **Endpoint selection** — Use `recall_preferences` for user state, `full_recall` for documents
+4. **Scope consistency** — Write and read must use the same `sub_tenant_id`
+5. **Schema immutability** — Tenant metadata schema cannot be changed after creation
+6. **Check package versions** — Don't assume SDK versions; always verify npm/PyPI for latest
+
+---
+
+## Quick Endpoint Selector
+
+| You Want To... | Use This Endpoint | Index Used |
+|----------------|-------------------|------------|
+| Store user preferences/traits | `POST /memories/add_memory` (infer: true) | [0] Memories |
+| Store conversation history | `POST /memories/add_memory` with user_assistant_pairs | [0] Memories |
+| Upload PDFs/DOCX/files | `POST /ingestion/upload_knowledge` (files) | [1] Knowledge |
+| Ingest Slack/Notion/Gmail | `POST /ingestion/upload_knowledge` (app_knowledge) | [1] Knowledge |
+| Search user memories | `POST /recall/recall_preferences` | [0] Memories |
+| Search documents | `POST /recall/full_recall` | [1] Knowledge |
+| Find exact phrase | `POST /recall/boolean_recall` (operator: phrase) | [1] Knowledge |
+| Check tenant ready | `GET /tenants/infra/status` | N/A |
+| Verify processing done | `POST /ingestion/verify_processing` | N/A |
+| List all sources | `POST /knowledge/fetch_sources` | N/A |
+| Get source content | `POST /knowledge/fetch_content` | N/A |
+| Delete memories | `POST /memories/delete_memory` | [0] Memories |
+| Delete knowledge | `POST /knowledge/delete_knowledge` | [1] Knowledge |
+
+---
+
+## HTTP Status Codes & Error Handling
+
+| Code | Meaning | Common Causes | Fix |
+|------|---------|---------------|-----|
+| **200** | Success | Request completed | Check response body for partial failures in bulk operations |
+| **401** | Unauthorized | Missing/invalid API key | Verify `Authorization: Bearer <key>` header format |
+| **404** | Not Found | Tenant doesn't exist or still provisioning | Poll `/tenants/infra/status` until ready |
+| **422** | Validation Error | Invalid request body | Check: file_metadata array length, app_knowledge stringified, metadata schema match |
+| **429** | Rate Limited | Too many requests | Use bulk endpoints, implement exponential backoff, cache repeated queries |
+| **500** | Internal Error | Server-side issue | Retry with backoff, check status.hydradb.com |
+
+**Common 422 Causes:**
+- `file_metadata` array length doesn't match `files` count
+- `app_knowledge` sent as JSON object instead of JSON-encoded string
+- Metadata field not declared in tenant schema
+- `MemoryItem` with no `text` and no `user_assistant_pairs`
+- Boolean_recall called with `alpha`, `mode`, or `graph_context` params
+
+---
+
+## Philosophy & Differentiators
+
+**Graph-first, not graph-optional** — The graph is the primary substrate; vectors are entry points for traversal
+
+**Memories vs Knowledge as distinct primitives:**
+- **Memories** = Dynamic, per-user state (preferences, conversation history, behavioral traits)
+- **Knowledge** = Static, tenant-wide documents (PDFs, Slack, Notion, CSV, emails)
+- Separate indices, separate endpoints, one unified API
+
+**Composable & unopinionated:**
+- Control embeddings model and dimensions
+- Define graph schema and relationship types
+- Parameterize retrieval (recency, alpha, forced relations, metadata)
+- Use custom chunking strategies
+
+**One endpoint replaces:** Neo4j + Pinecone/Weaviate + Redis
+
+**Key metrics:**
+- 90% on LongMemEvals
+- Sub-200ms p95 retrieval latency
+- In-memory graph traversal
+- Multi-tenant isolation enforced at API layer
+
+---
+
+## Core Primitives
+
+### Tenants & Sub-Tenants
+
+**Tenant** — Top-level isolated workspace. No cross-tenant data access. `tenant_id` required on every API call.
+
+**Sub-Tenant** — Logical partition within tenant (user, team, workspace, project). Pass `sub_tenant_id` to scope operations. If omitted, defaults to tenant's default sub-tenant.
+
+**Design patterns:**
+
+| Pattern | Configuration |
+|---------|---------------|
+| B2B SaaS | One tenant per customer; sub-tenants for teams/workspaces/users |
+| B2C app | One tenant for app; sub-tenants per end user |
+| Internal tools | One tenant per company; sub-tenants per department/project |
+| Separate environments | Different `tenant_id` per env (prod/staging/dev) — NEVER share across envs |
+
+### Knowledge
+
+Shared, tenant-wide context from documents and app sources.
+
+- **Sources:** PDF, DOCX, PPTX, Markdown, CSV, TXT, HTML, Slack, Notion, Gmail, Linear, GitHub
+- **Processing:** Parsed → Chunked → Embedded → Graph-linked at write time
+- **Mutability:** Versioned — replaced or deleted explicitly
+- **Recall endpoint:** `POST /recall/full_recall`
+- **Vectorstore index:** `[1]`
+
+### Memories
+
+User-scoped context — preferences, conversation history, inferred traits. Each memory scoped to `sub_tenant_id`.
+
+- **Mutability:** Dynamic — evolves with every interaction
+- **Recall endpoint:** `POST /recall/recall_preferences`
+- **Vectorstore index:** `[0]`
+- **Inference:** Set `infer: true` to extract implicit preferences from raw input
+- **Upsert:** Set `upsert: true` to update existing memories by text match
+
+### Recall Pipeline
+
+Multi-stage retrieval combining:
+
+1. **Metadata filtering** — Deterministic narrowing by tenant schema fields
+2. **Hybrid retrieval** — Semantic (vector) + Keyword (BM25)
+3. **Graph traversal** — Follow entity relationships
+4. **Personalized ranking** — Recency, frequency, relevance scoring
+
+### Metadata
+
+**`metadata`** — Filterable fields defined in tenant schema at creation. Use `metadata_filters` at recall time. Schema is immutable after tenant creation.
+
+**`additional_metadata`** — Free-form fields per document. Stored but NOT filterable at recall time. Use for flexible, unstructured context.
+
+---
+
+## API Reference
+
+### Tenants
+
+#### POST /tenants/create
+
+Create isolated workspace (async operation).
+
+**Request:**
+```json
+{
+  "tenant_id": "acme_corp",
+  "tenant_metadata_schema": {
+    "category": {
+      "enabled": true,
+      "type": "str",
+      "enable_match": true,
+      "enable_embed": false
+    },
+    "timestamp": {
+      "enabled": true,
+      "type": "str",
+      "enable_match": true,
+      "enable_embed": false
+    }
+  }
+}
+```
+
+**Optional fields:**
+- `is_embeddings_tenant: true` — Bring your own embeddings (requires `embeddings_dimension`)
+- `embeddings_dimension: 1536` — Vector dimension for BYO embeddings tenants
+
+**Response:**
+```json
+{
+  "status": "accepted",
+  "tenant_id": "acme_corp",
+  "message": "Tenant creation started in the background..."
+}
+```
+
+**Critical:** Always poll `/tenants/infra/status` before ingesting data.
+
+#### GET /tenants/infra/status
+
+Poll tenant provisioning status until ready.
+
+**Request:**
+```
+GET /tenants/infra/status?tenant_id=acme_corp
+```
+
+**Response:**
+```json
+{
+  "tenant_id": "acme_corp",
+  "graph_status": true,
+  "vectorstore_status": [true, true],
+  "infra_status": "ready"
+}
+```
+
+**Wait for:**
+- `graph_status: true`
+- `vectorstore_status: [true, true]` (both indices ready)
+- `infra_status: "ready"`
+
+#### GET /tenants/monitor
+
+Get object counts and vector dimensions.
+
+**Request:**
+```
+GET /tenants/monitor?tenant_id=acme_corp
+```
+
+**Response:**
+```json
+{
+  "tenant_id": "acme_corp",
+  "total_chunks": 12847,
+  "total_sources": 432,
+  "total_memories": 1523,
+  "embedding_dimension": 1024,
+  "graph_nodes": 8934,
+  "graph_relationships": 15672
+}
+```
+
+#### GET /tenants/sub_tenant_ids
+
+List sub-tenants with indexed data.
+
+**Request:**
+```
+GET /tenants/sub_tenant_ids?tenant_id=acme_corp
+```
+
+**Response:**
+```json
+{
+  "tenant_id": "acme_corp",
+  "sub_tenant_ids": ["user_alice", "user_bob", "team_eng"]
+}
+```
+
+#### DELETE /tenants/delete
+
+Permanently delete tenant (async operation).
+
+**Request:**
+```json
+{
+  "tenant_id": "acme_corp"
+}
+```
+
+**Response:**
+```json
+{
+  "status": "accepted",
+  "tenant_id": "acme_corp",
+  "message": "Tenant deletion started..."
+}
+```
+
+**Note:** Cannot re-create tenant with same ID until deletion completes.
+
+---
+
+### Ingestion
+
+#### POST /ingestion/upload_knowledge
+
+Ingest files or app sources (async, multipart/form-data).
+
+**Endpoints used:** `POST /ingestion/upload_knowledge`, `POST /ingestion/verify_processing`
+
+**Request (files):**
+```bash
+curl -X POST https://api.hydradb.com/ingestion/upload_knowledge \
+  -H "Authorization: Bearer $API_KEY" \
+  -F "tenant_id=acme_corp" \
+  -F "sub_tenant_id=team_eng" \
+  -F "files=@/path/to/doc.pdf" \
+  -F "files=@/path/to/report.docx" \
+  -F 'file_metadata=[
+    {
+      "file_id": "doc_001",
+      "metadata": { "category": "legal", "timestamp": "2024-01-15" }
+    },
+    {
+      "file_id": "doc_002",
+      "metadata": { "category": "finance", "timestamp": "2024-02-20" }
+    }
+  ]'
+```
+
+**Request (app sources):**
+```bash
+curl -X POST https://api.hydradb.com/ingestion/upload_knowledge \
+  -H "Authorization: Bearer $API_KEY" \
+  -F "tenant_id=acme_corp" \
+  -F 'app_knowledge=[
+    {
+      "source_id": "slack_001",
+      "source_name": "Slack: #engineering",
+      "knowledge_items": [
+        {
+          "text": "Deployment completed successfully for v2.3.1",
+          "metadata": { "category": "deployment", "timestamp": "2024-03-10" },
+          "additional_metadata": {
+            "channel": "engineering",
+            "author": "alice@acme.com",
+            "thread_ts": "1710086400"
+          }
+        }
+      ]
+    }
+  ]'
+```
+
+**Critical rules:**
+- `file_metadata` array length MUST match `files` count
+- `app_knowledge` must be JSON-encoded STRING in multipart form
+- `metadata` fields must match tenant schema
+- `additional_metadata` is stored but NOT filterable
+
+**Response:**
+```json
+{
+  "status": "success",
+  "message": "Processing started",
+  "source_ids": ["doc_001", "doc_002"]
+}
+```
+
+#### POST /ingestion/verify_processing
+
+Poll indexing status until completed.
+
+**Request:**
+```json
+{
+  "tenant_id": "acme_corp",
+  "file_ids": ["doc_001", "doc_002"]
+}
+```
+
+**Response:**
+```json
+{
+  "results": [
+    {
+      "file_id": "doc_001",
+      "indexing_status": "completed",
+      "chunks_created": 47
+    },
+    {
+      "file_id": "doc_002",
+      "indexing_status": "processing",
+      "chunks_created": 0
+    }
+  ]
+}
+```
+
+**Status values:**
+- `queued` — Waiting to process
+- `processing` — Currently parsing/chunking/embedding
+- `completed` — Ready for recall
+- `errored` — Processing failed
+
+**Typical indexing time:** 30-90 seconds per document
+
+---
+
+### Memories
+
+#### POST /memories/add_memory
+
+Store user preferences, conversation history, behavioral traits.
+
+**Request:**
+```json
+{
+  "tenant_id": "acme_corp",
+  "sub_tenant_id": "user_alice",
+  "memories": [
+    {
+      "text": "Prefers dark mode",
+      "infer": true,
+      "user_name": "Alice",
+      "metadata": { "category": "preference", "timestamp": "2024-03-15" }
+    },
+    {
+      "user_assistant_pairs": [
+        {
+          "user_message": "What's my coffee order?",
+          "assistant_message": "Large oat milk latte with one shot of vanilla"
+        }
+      ],
+      "infer": true,
+      "upsert": true
+    }
+  ]
+}
+```
+
+**Memory formats:**
+
+1. **Text-based:** `{ "text": "...", "infer": true/false }`
+2. **Conversation-based:** `{ "user_assistant_pairs": [...], "infer": true/false }`
+
+**Parameters:**
+- `infer: true` — Extract implicit preferences from raw input (e.g., "I like dark mode" → "User prefers dark mode UI setting")
+- `infer: false` — Store exactly as written
+- `upsert: true` — Update existing memory if similar text found
+- `upsert: false` — Always create new memory
+
+**Response:**
+```json
+{
+  "status": "success",
+  "message": "Memories added successfully",
+  "memory_ids": ["mem_001", "mem_002"]
+}
+```
+
+#### POST /memories/list_memories
+
+List all memories for sub-tenant.
+
+**Request:**
+```json
+{
+  "tenant_id": "acme_corp",
+  "sub_tenant_id": "user_alice"
+}
+```
+
+**Response:**
+```json
+{
+  "memories": [
+    {
+      "id": "mem_001",
+      "text": "User prefers dark mode UI setting",
+      "timestamp": "2024-03-15T10:30:00Z",
+      "metadata": { "category": "preference" }
+    }
+  ]
+}
+```
+
+#### POST /memories/delete_memory
+
+Delete specific memories by ID.
+
+**Request:**
+```json
+{
+  "tenant_id": "acme_corp",
+  "sub_tenant_id": "user_alice",
+  "memory_ids": ["mem_001", "mem_002"]
+}
+```
+
+**Response:**
+```json
+{
+  "results": [
+    { "id": "mem_001", "deleted": true },
+    { "id": "mem_002", "deleted": false, "error": "Memory not found" }
+  ]
+}
+```
+
+**Critical:** Always inspect `results[].deleted` per item — bulk operations can have partial failures.
+
+---
+
+### Recall
+
+#### POST /recall/full_recall
+
+Retrieve knowledge (documents) with hybrid semantic + graph + keyword.
+
+**Request:**
+```json
+{
+  "tenant_id": "acme_corp",
+  "sub_tenant_id": "team_eng",
+  "query": "What are the Q4 deployment procedures?",
+  "max_results": 10,
+  "alpha": 0.8,
+  "recency_bias": 0.3,
+  "mode": "fast",
+  "graph_context": true,
+  "metadata_filters": {
+    "category": "deployment"
+  }
+}
+```
+
+**Parameters:**
+
+- `query` (required) — Natural language query
+- `max_results` (default: 5) — Number of chunks to return
+- `alpha` (default: 0.8, range: 0-1) — Semantic vs keyword balance (1.0 = pure semantic, 0.0 = pure keyword)
+- `recency_bias` (default: 0.0, range: 0-1) — Boost recent content (0 = no bias, 1.0 = heavy recency)
+- `mode` (default: "fast") — `"fast"` for speed, `"thinking"` for graph context + forceful relations
+- `graph_context` (default: false) — Include entity relationships in response
+- `metadata_filters` — Deterministic filtering by tenant schema fields
+- `forceful_relations` — Array of entity names to explicitly include (requires `mode: "thinking"`)
+
+**Response:**
+```json
+{
+  "results": [
+    {
+      "chunk_uuid": "chunk_001",
+      "text": "Q4 deployment requires approval from tech lead and security review...",
+      "source_id": "doc_deployment_guide",
+      "source_name": "Q4 Deployment Guide.pdf",
+      "score": 0.94,
+      "metadata": {
+        "category": "deployment",
+        "timestamp": "2024-10-01"
+      },
+      "additional_metadata": {
+        "author": "alice@acme.com",
+        "version": "2.1"
+      },
+      "graph_context": {
+        "entities": ["Tech Lead", "Security Review"],
+        "relationships": [
+          {
+            "source": "Deployment",
+            "target": "Security Review",
+            "type": "REQUIRES"
+          }
+        ]
+      }
+    }
+  ]
+}
+```
+
+#### POST /recall/recall_preferences
+
+Retrieve memories (user state) with personalization.
+
+**Request:**
+```json
+{
+  "tenant_id": "acme_corp",
+  "sub_tenant_id": "user_alice",
+  "query": "What are my communication preferences?",
+  "max_results": 5,
+  "mode": "fast"
+}
+```
+
+**Response:**
+```json
+{
+  "results": [
+    {
+      "memory_id": "mem_001",
+      "text": "User prefers concise email updates over long reports",
+      "score": 0.91,
+      "timestamp": "2024-03-15T10:30:00Z"
+    }
+  ]
+}
+```
+
+**Note:** `recall_preferences` queries vectorstore index `[0]` (memories), while `full_recall` queries index `[1]` (knowledge).
+
+#### POST /recall/boolean_recall
+
+Exact phrase or boolean keyword search.
+
+**Request:**
+```json
+{
+  "tenant_id": "acme_corp",
+  "query": "mechanical engineer",
+  "operator": "phrase",
+  "max_results": 10
+}
+```
+
+**Operators:**
+- `"phrase"` — Exact phrase match
+- `"and"` — All terms must appear
+- `"or"` — Any term can appear
+
+**Critical:** Do NOT send `alpha`, `mode`, or `graph_context` to boolean_recall — these parameters are invalid for this endpoint.
+
+**Response:**
+```json
+{
+  "results": [
+    {
+      "chunk_uuid": "chunk_123",
+      "text": "Senior mechanical engineer with 10 years of experience...",
+      "source_id": "resume_001",
+      "score": 1.0
+    }
+  ]
+}
+```
+
+---
+
+### Knowledge Management
+
+#### POST /knowledge/fetch_sources
+
+List all ingested sources with metadata.
+
+**Request:**
+```json
+{
+  "tenant_id": "acme_corp",
+  "sub_tenant_id": "team_eng"
+}
+```
+
+**Response:**
+```json
+{
+  "sources": [
+    {
+      "source_id": "doc_001",
+      "source_name": "Deployment Guide.pdf",
+      "chunks_count": 47,
+      "metadata": { "category": "deployment" },
+      "created_at": "2024-03-15T10:30:00Z"
+    }
+  ]
+}
+```
+
+#### POST /knowledge/fetch_content
+
+Retrieve raw text chunks from a source.
+
+**Request:**
+```json
+{
+  "tenant_id": "acme_corp",
+  "source_ids": ["doc_001"]
+}
+```
+
+**Response:**
+```json
+{
+  "results": [
+    {
+      "source_id": "doc_001",
+      "chunks": [
+        {
+          "chunk_uuid": "chunk_001",
+          "text": "Q4 deployment requires approval...",
+          "metadata": { "category": "deployment" }
+        }
+      ]
+    }
+  ]
+}
+```
+
+#### POST /knowledge/fetch_relations
+
+Get graph relationships for entities.
+
+**Request:**
+```json
+{
+  "tenant_id": "acme_corp",
+  "entity_names": ["Security Review", "Tech Lead"]
+}
+```
+
+**Response:**
+```json
+{
+  "relationships": [
+    {
+      "source": "Deployment",
+      "target": "Security Review",
+      "type": "REQUIRES",
+      "chunk_uuids": ["chunk_001", "chunk_002"]
+    }
+  ]
+}
+```
+
+#### POST /knowledge/delete_knowledge
+
+Delete sources by ID.
+
+**Request:**
+```json
+{
+  "tenant_id": "acme_corp",
+  "ids": ["doc_001", "doc_002"]
+}
+```
+
+**Response:**
+```json
+{
+  "results": [
+    { "id": "doc_001", "deleted": true },
+    { "id": "doc_002", "deleted": false, "error": "Source not found" }
+  ]
+}
+```
+
+**Critical:** Always inspect `results[].deleted` per item.
+
+#### POST /knowledge/update_source_metadata
+
+Update metadata for existing sources.
+
+**Request:**
+```json
+{
+  "tenant_id": "acme_corp",
+  "updates": [
+    {
+      "source_id": "doc_001",
+      "metadata": { "category": "security", "timestamp": "2024-03-20" }
+    }
+  ]
+}
+```
+
+**Response:**
+```json
+{
+  "results": [
+    { "source_id": "doc_001", "updated": true }
+  ]
+}
+```
+
+**Note:** Only updates metadata, does NOT reprocess content.
+
+---
+
+## SDK Reference
+
+### TypeScript SDK
+
+**Installation:**
+```bash
+npm install @hydradb/sdk
+```
+
+**Initialization:**
+```typescript
+import { HydraDBClient } from '@hydradb/sdk';
+
+const client = new HydraDBClient({
+  apiKey: process.env.HYDRA_DB_API_KEY,
+  baseURL: 'https://api.hydradb.com' // optional
+});
+```
+
+**Tenants:**
+```typescript
+// Create tenant
+await client.tenants.create({
+  tenant_id: 'acme_corp',
+  tenant_metadata_schema: {
+    category: { enabled: true, type: 'str', enable_match: true }
+  }
+});
+
+// Poll status
+const status = await client.tenants.status({ tenant_id: 'acme_corp' });
+
+// Monitor
+const stats = await client.tenants.monitor({ tenant_id: 'acme_corp' });
+
+// Delete
+await client.tenants.delete({ tenant_id: 'acme_corp' });
+```
+
+**Ingestion:**
+```typescript
+// Upload files
+await client.data.ingest({
+  tenant_id: 'acme_corp',
+  files: [fs.createReadStream('./doc.pdf')],
+  file_metadata: [
+    { file_id: 'doc_001', metadata: { category: 'legal' } }
+  ]
+});
+
+// Upload app sources
+await client.data.ingest({
+  tenant_id: 'acme_corp',
+  app_knowledge: [
+    {
+      source_id: 'slack_001',
+      source_name: 'Slack: #engineering',
+      knowledge_items: [
+        { text: 'Deployment completed', metadata: { category: 'deployment' } }
+      ]
+    }
+  ]
+});
+
+// Verify processing
+const status = await client.data.verifyProcessing({
+  tenant_id: 'acme_corp',
+  file_ids: ['doc_001']
+});
+```
+
+**Memories:**
+```typescript
+// Add memories
+await client.memory.add({
+  tenant_id: 'acme_corp',
+  sub_tenant_id: 'user_alice',
+  memories: [
+    { text: 'Prefers dark mode', infer: true }
+  ]
+});
+
+// List memories
+const memories = await client.memory.list({
+  tenant_id: 'acme_corp',
+  sub_tenant_id: 'user_alice'
+});
+
+// Delete memories
+await client.memory.delete({
+  tenant_id: 'acme_corp',
+  sub_tenant_id: 'user_alice',
+  memory_ids: ['mem_001']
+});
+```
+
+**Recall:**
+```typescript
+// Full recall (knowledge)
+const results = await client.recall.fullRecall({
+  tenant_id: 'acme_corp',
+  query: 'deployment procedures',
+  max_results: 10,
+  alpha: 0.8,
+  recency_bias: 0.3,
+  mode: 'fast',
+  graph_context: true,
+  metadata_filters: { category: 'deployment' }
+});
+
+// Preferences recall (memories)
+const prefs = await client.recall.preferences({
+  tenant_id: 'acme_corp',
+  sub_tenant_id: 'user_alice',
+  query: 'communication preferences',
+  max_results: 5
+});
+
+// Boolean recall
+const exact = await client.recall.boolean({
+  tenant_id: 'acme_corp',
+  query: 'mechanical engineer',
+  operator: 'phrase',
+  max_results: 10
+});
+```
+
+**Knowledge:**
+```typescript
+// Fetch sources
+const sources = await client.data.sources({
+  tenant_id: 'acme_corp',
+  sub_tenant_id: 'team_eng'
+});
+
+// Fetch content
+const content = await client.data.content({
+  tenant_id: 'acme_corp',
+  source_ids: ['doc_001']
+});
+
+// Delete knowledge
+const result = await client.data.delete({
+  tenant_id: 'acme_corp',
+  ids: ['doc_001', 'doc_002']
+});
+```
+
+### Python SDK
+
+**Installation:**
+```bash
+pip install hydradb-sdk
+```
+
+**Initialization:**
+```python
+from hydradb import HydraDBClient
+
+client = HydraDBClient(
+    api_key=os.environ['HYDRA_DB_API_KEY'],
+    base_url='https://api.hydradb.com'  # optional
+)
+```
+
+**Tenants:**
+```python
+# Create tenant
+client.tenants.create(
+    tenant_id='acme_corp',
+    tenant_metadata_schema={
+        'category': {'enabled': True, 'type': 'str', 'enable_match': True}
+    }
+)
+
+# Poll status
+status = client.tenants.status(tenant_id='acme_corp')
+
+# Monitor
+stats = client.tenants.monitor(tenant_id='acme_corp')
+
+# Delete
+client.tenants.delete(tenant_id='acme_corp')
+```
+
+**Ingestion:**
+```python
+# Upload files
+with open('doc.pdf', 'rb') as f:
+    client.data.ingest(
+        tenant_id='acme_corp',
+        files=[f],
+        file_metadata=[
+            {'file_id': 'doc_001', 'metadata': {'category': 'legal'}}
+        ]
+    )
+
+# Upload app sources
+client.data.ingest(
+    tenant_id='acme_corp',
+    app_knowledge=[
+        {
+            'source_id': 'slack_001',
+            'source_name': 'Slack: #engineering',
+            'knowledge_items': [
+                {'text': 'Deployment completed', 'metadata': {'category': 'deployment'}}
+            ]
+        }
+    ]
+)
+
+# Verify processing
+status = client.data.verify_processing(
+    tenant_id='acme_corp',
+    file_ids=['doc_001']
+)
+```
+
+**Memories:**
+```python
+# Add memories
+client.memory.add(
+    tenant_id='acme_corp',
+    sub_tenant_id='user_alice',
+    memories=[
+        {'text': 'Prefers dark mode', 'infer': True}
+    ]
+)
+
+# List memories
+memories = client.memory.list(
+    tenant_id='acme_corp',
+    sub_tenant_id='user_alice'
+)
+
+# Delete memories
+client.memory.delete(
+    tenant_id='acme_corp',
+    sub_tenant_id='user_alice',
+    memory_ids=['mem_001']
+)
+```
+
+**Recall:**
+```python
+# Full recall (knowledge)
+results = client.recall.full_recall(
+    tenant_id='acme_corp',
+    query='deployment procedures',
+    max_results=10,
+    alpha=0.8,
+    recency_bias=0.3,
+    mode='fast',
+    graph_context=True,
+    metadata_filters={'category': 'deployment'}
+)
+
+# Preferences recall (memories)
+prefs = client.recall.preferences(
+    tenant_id='acme_corp',
+    sub_tenant_id='user_alice',
+    query='communication preferences',
+    max_results=5
+)
+
+# Boolean recall
+exact = client.recall.boolean(
+    tenant_id='acme_corp',
+    query='mechanical engineer',
+    operator='phrase',
+    max_results=10
+)
+```
+
+**Knowledge:**
+```python
+# Fetch sources
+sources = client.data.sources(
+    tenant_id='acme_corp',
+    sub_tenant_id='team_eng'
+)
+
+# Fetch content
+content = client.data.content(
+    tenant_id='acme_corp',
+    source_ids=['doc_001']
+)
+
+# Delete knowledge
+result = client.data.delete(
+    tenant_id='acme_corp',
+    ids=['doc_001', 'doc_002']
+)
+```
+
+---
+
+## Plugins
+
+### HydraDB CLI
+
+**Installation:**
+```bash
+pip install hydradb-cli  # Requires Python 3.10+
+```
+
+**Authentication:**
+```bash
+# Interactive login (saves to ~/.hydradb/config.json with perms 0600)
+hydradb login
+
+# Or use environment variables
+export HYDRA_DB_API_KEY="your_api_key"
+export HYDRADB_TENANT_ID="your_tenant_id"
+```
+
+#### CLI Quick Reference
+
+| Task | Command |
+|------|---------|
+| Create tenant | `hydradb tenant create --tenant-id acme` |
+| Monitor tenant | `hydradb tenant monitor --tenant-id acme` |
+| List sub-tenants | `hydradb tenant list-sub-tenants --tenant-id acme` |
+| Add memory (inferred) | `hydradb memories add --text "Prefers dark mode" --infer` |
+| Add memory (exact) | `hydradb memories add --text "User ID: 12345"` |
+| List memories | `hydradb memories list --sub-tenant-id user_alice` |
+| Delete memory | `hydradb memories delete --memory-ids mem_001` |
+| Upload files | `hydradb knowledge upload --files doc.pdf report.docx` |
+| Upload text | `hydradb knowledge upload-text --source-id slack_001 --text "..."` |
+| Verify processing | `hydradb knowledge verify --file-ids doc_001` |
+| Search knowledge | `hydradb recall full --query "deployment procedures"` |
+| Search memories | `hydradb recall preferences --query "communication prefs"` |
+| Keyword search | `hydradb recall keyword --query "mechanical engineer" --operator phrase` |
+| List sources | `hydradb fetch sources` |
+| Get source content | `hydradb fetch content --source-ids doc_001` |
+| Delete knowledge | `hydradb knowledge delete --ids doc_001` |
+
+**Output formats:**
+```bash
+# Human-readable (default, Rich tables)
+hydradb memories list --output human
+
+# JSON (for scripting)
+hydradb memories list --output json
+```
+
+**Full command examples:**
+
+**Tenants:**
+```bash
+# Create tenant
+hydradb tenant create --tenant-id acme_corp
+
+# Monitor tenant
+hydradb tenant monitor --tenant-id acme_corp
+
+# List sub-tenants
+hydradb tenant list-sub-tenants --tenant-id acme_corp
+
+# Delete tenant
+hydradb tenant delete --tenant-id acme_corp
+```
+
+**Memories:**
+```bash
+# Add memory
+hydradb memories add --tenant-id acme_corp --sub-tenant-id user_alice \
+  --text "Prefers dark mode" --infer
+
+# List memories
+hydradb memories list --tenant-id acme_corp --sub-tenant-id user_alice
+
+# Delete memory
+hydradb memories delete --tenant-id acme_corp --sub-tenant-id user_alice \
+  --memory-ids mem_001
+```
+
+**Knowledge:**
+```bash
+# Upload files
+hydradb knowledge upload --tenant-id acme_corp \
+  --files doc.pdf report.docx \
+  --metadata '{"category": "legal"}'
+
+# Upload text
+hydradb knowledge upload-text --tenant-id acme_corp \
+  --source-id "slack_001" \
+  --source-name "Slack: #engineering" \
+  --text "Deployment completed successfully"
+
+# Verify processing
+hydradb knowledge verify --tenant-id acme_corp --file-ids doc_001
+
+# Delete knowledge
+hydradb knowledge delete --tenant-id acme_corp --ids doc_001
+```
+
+**Recall:**
+```bash
+# Full recall (knowledge)
+hydradb recall full --tenant-id acme_corp \
+  --query "deployment procedures" \
+  --max-results 10
+
+# Preferences recall (memories)
+hydradb recall preferences --tenant-id acme_corp \
+  --sub-tenant-id user_alice \
+  --query "communication preferences"
+
+# Boolean recall
+hydradb recall keyword --tenant-id acme_corp \
+  --query "mechanical engineer" \
+  --operator phrase
+```
+
+---
+
+### Claude Code Plugin
+
+**Installation:**
+```bash
+# In Claude Code terminal
+/plugin marketplace add usecortex/hydradb-claude-code
+/plugin install hydradb@hydradb
+/reload-plugins
+```
+
+**Environment variables:**
+```bash
+export HYDRA_DB_API_KEY="your_api_key"
+export HYDRADB_TENANT_ID="your_tenant_id"
+export HYDRADB_SUB_TENANT_ID=""  # Empty string for default
+```
+
+#### Plugin Quick Reference
+
+| Command | Purpose |
+|---------|---------|
+| `/hydradb:setup` | Initialize plugin with credentials |
+| `/hydradb:status` | Check connection and configuration |
+| `/hydradb:search <query>` | Query memories or knowledge |
+| `/hydradb:remember <note>` | Explicitly store context |
+| `/hydradb:save-session` | Manually trigger session capture |
+| `/hydradb:sync-workspace` | Ingest project files (incremental) |
+| `/hydradb:sync-workspace --force` | Full workspace re-sync |
+
+**Configuration modes:**
+
+**captureMode:**
+- `"session-upsert"` — Save entire session on demand
+- `"turn"` — Save after every AI turn
+- `"both"` — Both session and turn capture
+- `"off"` — No auto-capture
+
+**searchMode:**
+- `"memory"` — Search memories only
+- `"knowledge"` — Search knowledge only
+- `"both"` — Search both (default)
+
+**ingestionMode:**
+- `"memory"` — Store as memory
+- `"knowledge"` — Store as knowledge
+- `"auto"` — Auto-detect based on content
+
+**recallMode:**
+- `"fast"` — Speed priority (default)
+- `"thinking"` — Graph context + forceful relations
+
+**Config file hierarchy (lowest → highest priority):**
+1. Built-in defaults
+2. `HYDRADB_PLUGIN_CONFIG` env var
+3. `${CLAUDE_PLUGIN_DATA}/config.json`
+4. `.hydradb-plugin-data/config.json`
+5. `.hydradb-plugin.json` (workspace-shared, git-safe)
+6. `.hydradb-plugin.local.json` (workspace-local, add to .gitignore)
+7. Environment variable overrides
+
+**Key limits:**
+- `maxContextChars: 7000`
+- `maxMemoryResults: 6`
+- `maxKnowledgeResults: 4`
+- `maxFileSizeBytes: 50MB`
+
+---
+
+### MCP Server
+
+**Installation:**
+```bash
+npx -y @hydradb/mcp@0.0.1  # Requires Node 18+
+```
+
+**Configuration:**
+
+**Claude Desktop (`~/Library/Application Support/Claude/claude_desktop_config.json`):**
+```json
+{
+  "mcpServers": {
+    "hydradb": {
+      "command": "npx",
+      "args": ["-y", "@hydradb/mcp@0.0.1"],
+      "env": {
+        "HYDRA_DB_API_KEY": "your_api_key",
+        "HYDRA_DB_TENANT_ID": "your_tenant_id",
+        "HYDRA_DB_SUB_TENANT_ID": "user_alice"
+      }
+    }
+  }
+}
+```
+
+**Cursor (`~/.cursor/mcp.json`):**
+```json
+{
+  "mcpServers": {
+    "hydradb": {
+      "command": "npx",
+      "args": ["-y", "@hydradb/mcp@0.0.1"],
+      "env": {
+        "HYDRA_DB_API_KEY": "your_api_key",
+        "HYDRA_DB_TENANT_ID": "your_tenant_id"
+      }
+    }
+  }
+}
+```
+
+#### MCP Tools Quick Reference
+
+| Tool | Purpose | Endpoint Called |
+|------|---------|-----------------|
+| `hydra_db_search` | Query memories | `POST /recall/recall_preferences` |
+| `hydra_db_store` | Add memory with inference/upsert | `POST /memories/add_memory` |
+| `hydra_db_ingest_conversation` | Store user-assistant pairs | `POST /memories/add_memory` |
+| `hydra_db_list_memories` | List all memories | `POST /memories/list_memories` |
+| `hydra_db_list_sources` | List knowledge sources | `POST /knowledge/fetch_sources` |
+| `hydra_db_delete_memory` | Delete memory by ID | `POST /memories/delete_memory` |
+| `hydra_db_fetch_content` | Get source content | `POST /knowledge/fetch_content` |
+
+**Environment Variables:**
+- `HYDRA_DB_API_KEY` (required)
+- `HYDRA_DB_TENANT_ID` (required)
+- `HYDRA_DB_SUB_TENANT_ID` (optional, defaults to tenant default)
+
+---
+
+### OpenClaw Plugin
+
+**Installation:**
+```bash
+# Requires OpenClaw 2026.1.29+
+openclaw plugins install @hydradb/openclaw
+```
+
+**Onboarding:**
+```bash
+# Simple onboarding
+openclaw hydra onboard
+
+# Advanced configuration
+openclaw hydra onboard --advanced
+
+# Restart gateway
+openclaw gateway restart
+```
+
+#### OpenClaw Commands Quick Reference
+
+| Command | Purpose |
+|---------|---------|
+| `/hydra-onboard` | (Re)configure credentials and settings |
+| `/hydra-remember <text>` | Explicitly store context |
+| `/hydra-recall <query>` | Query memories or knowledge |
+| `/hydra-list` | List all memories for sub-tenant |
+| `/hydra-delete <id>` | Delete specific memory |
+| `/hydra-get <source_id>` | Fetch full source content |
+
+**Configuration:**
+
+- `subTenantId: "hydra-openclaw-plugin"` (default)
+- `autoRecall: true` — Auto-inject context before AI turns
+- `autoCapture: true` — Auto-save context after AI turns
+- `maxRecallResults: 10`
+- `recallMode: "fast"` or `"thinking"`
+- `graphContext: true` — Include entity relationships
+
+**Graph context injection:**
+
+OpenClaw wraps recalled context in `<hydra-context>` tags:
+
+```xml
+<hydra-context>
+<chunk id="chunk_001" score="0.94" source="Deployment Guide.pdf">
+Q4 deployment requires approval from tech lead and security review...
+
+Graph relationships:
+- Deployment REQUIRES Security Review
+- Security Review PERFORMED_BY Security Team
+</chunk>
+</hydra-context>
+```
+
+---
+
+## Retrieval Recipes
+
+### General Retrieval (default blend)
+```json
+{
+  "tenant_id": "acme_corp",
+  "query": "How does onboarding work?",
+  "max_results": 8,
+  "alpha": 0.8
+}
+```
+
+**Use when:** Balanced semantic + keyword search for natural language queries
+
+### Technical Lookup (exact terms)
+```json
+{
+  "tenant_id": "acme_corp",
+  "query": "TimeoutError in payments-worker v4.2.1",
+  "max_results": 5,
+  "alpha": 0.3,
+  "recency_bias": 0.4
+}
+```
+
+**Use when:** Searching for IDs, error codes, version numbers, technical identifiers
+
+### Scoped Retrieval (metadata filters)
+```json
+{
+  "tenant_id": "acme_corp",
+  "sub_tenant_id": "team_mobile",
+  "query": "What is the current sprint status?",
+  "metadata_filters": { "project": "phoenix" }
+}
+```
+
+**Use when:** Need deterministic narrowing by category, project, department, etc.
+
+### Exact Phrase Search (boolean_recall)
+```json
+{
+  "tenant_id": "acme_corp",
+  "query": "mechanical engineer",
+  "operator": "phrase",
+  "max_results": 10
+}
+```
+
+**Use when:** Need exact phrase match (e.g., job titles, technical terms)
+
+### Hybrid Boolean + Semantic
+```python
+# Run both in parallel
+boolean_results = client.recall.boolean(
+    tenant_id='acme_corp',
+    query='senior software engineer',
+    operator='phrase'
+)
+
+semantic_results = client.recall.full_recall(
+    tenant_id='acme_corp',
+    query='senior software engineer',
+    alpha=0.8
+)
+
+# Dedupe by chunk_uuid
+seen = set()
+combined = []
+for result in boolean_results + semantic_results:
+    if result['chunk_uuid'] not in seen:
+        seen.add(result['chunk_uuid'])
+        combined.append(result)
+```
+
+**Use when:** Query mixes literal tokens with natural language intent
+
+### Recall-then-Rerank
+```python
+# Request more chunks
+results = client.recall.full_recall(
+    tenant_id='acme_corp',
+    query='deployment procedures',
+    max_results=20
+)
+
+# Apply custom reranker
+def custom_rerank(results):
+    # Your logic: recency windows, compliance filters, business rules
+    return sorted(results, key=lambda x: your_scoring_function(x))
+
+top_results = custom_rerank(results)[:5]
+```
+
+**Use when:** Need domain-specific ranking beyond HydraDB's scoring
+
+### Time-Windowed Search
+```json
+{
+  "tenant_id": "acme_corp",
+  "query": "incident reports",
+  "recency_bias": 0.8,
+  "metadata_filters": {
+    "timestamp": "2024-03-01"
+  }
+}
+```
+
+**Use when:** Recent content matters (news, incidents, time-sensitive data)
+
+### Entity-Anchored Search
+```json
+{
+  "tenant_id": "acme_corp",
+  "query": "security review process",
+  "mode": "thinking",
+  "graph_context": true,
+  "forceful_relations": ["Security Team", "Compliance"]
+}
+```
+
+**Use when:** Need complete context around specific entities and their relationships
+
+---
+
+## Cookbook Patterns
+
+### Glean Clone — Unified Enterprise Search
+
+**Goal:** Search across Slack, Notion, Gmail, Linear, GitHub with cited answers
+
+**Endpoints used:** `POST /ingestion/upload_knowledge`, `POST /recall/full_recall`
+
+**Pattern:**
+1. Ingest all app sources into single tenant
+2. Use metadata for source type, timestamp, author
+3. Recall with high alpha (0.9) for semantic understanding
+4. Present results with source citations and links
+
+**Implementation:**
+```python
+# Ingest from multiple sources
+sources = {
+    'slack': slack_channels,
+    'notion': notion_pages,
+    'gmail': emails,
+    'linear': issues
+}
+
+for source_type, items in sources.items():
+    client.data.ingest(
+        tenant_id='enterprise',
+        app_knowledge=[{
+            'source_id': f'{source_type}_{item.id}',
+            'source_name': item.title,
+            'knowledge_items': [{
+                'text': item.content,
+                'metadata': {
+                    'source_type': source_type,
+                    'timestamp': item.created_at,
+                    'author': item.author
+                },
+                'additional_metadata': {
+                    'url': item.url
+                }
+            }]
+        } for item in items]
+    )
+
+# Search across all sources
+results = client.recall.full_recall(
+    tenant_id='enterprise',
+    query='Q4 OKRs',
+    max_results=10,
+    alpha=0.9,
+    graph_context=True
+)
+
+# Format with citations
+for result in results:
+    print(f"[{result['metadata']['source_type']}] {result['source_name']}")
+    print(f"{result['text']}")
+    print(f"Link: {result['additional_metadata']['url']}\n")
+```
+
+### AI LinkedIn Recruiter
+
+**Goal:** Search candidates by skills, experience, cultural fit
+
+**Endpoints used:** `POST /ingestion/upload_knowledge`, `POST /recall/full_recall`
+
+**Pattern:**
+1. Ingest resumes and profiles as knowledge
+2. Use metadata for skills, years_experience, location
+3. Recall with moderate alpha (0.7) for balanced semantic + keyword
+4. Filter by required skills in metadata_filters
+
+**Implementation:**
+```python
+# Ingest candidate profiles
+for candidate in candidates:
+    client.data.ingest(
+        tenant_id='recruiting',
+        app_knowledge=[{
+            'source_id': f'candidate_{candidate.id}',
+            'source_name': candidate.name,
+            'knowledge_items': [{
+                'text': f"{candidate.summary}\n{candidate.experience}",
+                'metadata': {
+                    'skills': ','.join(candidate.skills),
+                    'years_experience': str(candidate.years),
+                    'location': candidate.location
+                }
+            }]
+        }]
+    )
+
+# Search for senior React engineers in SF
+results = client.recall.full_recall(
+    tenant_id='recruiting',
+    query='senior frontend engineer React TypeScript',
+    max_results=20,
+    alpha=0.7,
+    metadata_filters={
+        'location': 'San Francisco'
+    }
+)
+
+# Filter by years of experience in post-processing
+qualified = [r for r in results if int(r['metadata']['years_experience']) >= 5]
+```
+
+### Customer Support Agent
+
+**Goal:** Per-user memory of plan, history, past failures
+
+**Endpoints used:** `POST /memories/add_memory`, `POST /recall/recall_preferences`, `POST /recall/full_recall`
+
+**Pattern:**
+1. Store user plan, preferences as memories
+2. Store conversation history as memories with inference
+3. Ingest knowledge base as shared knowledge
+4. Recall both memories and knowledge, prioritize memories
+
+**Implementation:**
+```python
+# Store user context
+client.memory.add(
+    tenant_id='support',
+    sub_tenant_id=f'user_{user.id}',
+    memories=[
+        {'text': f'User is on {user.plan} plan'},
+        {'text': f'User timezone: {user.timezone}'},
+        {'text': 'Past issue: Payment failed on 2024-02-15, resolved with card update'}
+    ]
+)
+
+# Store conversation with inference
+client.memory.add(
+    tenant_id='support',
+    sub_tenant_id=f'user_{user.id}',
+    memories=[{
+        'user_assistant_pairs': [{
+            'user_message': user_message,
+            'assistant_message': assistant_response
+        }],
+        'infer': True
+    }]
+)
+
+# Recall user context + knowledge base
+user_context = client.recall.preferences(
+    tenant_id='support',
+    sub_tenant_id=f'user_{user.id}',
+    query=user_message,
+    max_results=5
+)
+
+knowledge = client.recall.full_recall(
+    tenant_id='support',
+    query=user_message,
+    max_results=5
+)
+
+# Combine and prioritize user context
+context = user_context['results'] + knowledge['results']
+```
+
+### Cursor for Docs
+
+**Goal:** Answer "why was this built this way?" from codebase, PRs, Slack, RFCs
+
+**Endpoints used:** `POST /ingestion/upload_knowledge`, `POST /recall/full_recall` (mode: thinking)
+
+**Pattern:**
+1. Ingest codebase files with file paths in metadata
+2. Ingest PR descriptions and comments
+3. Ingest Slack engineering discussions
+4. Ingest architecture decision records (ADRs)
+5. Use graph context to follow relationships between code → PRs → discussions
+
+**Implementation:**
+```python
+# Ingest codebase
+for file_path in codebase_files:
+    with open(file_path, 'r') as f:
+        client.data.ingest(
+            tenant_id='codebase',
+            app_knowledge=[{
+                'source_id': file_path,
+                'source_name': os.path.basename(file_path),
+                'knowledge_items': [{
+                    'text': f.read(),
+                    'metadata': {
+                        'type': 'code',
+                        'language': detect_language(file_path),
+                        'path': file_path
+                    }
+                }]
+            }]
+        )
+
+# Ingest PRs
+for pr in pull_requests:
+    client.data.ingest(
+        tenant_id='codebase',
+        app_knowledge=[{
+            'source_id': f'pr_{pr.number}',
+            'source_name': pr.title,
+            'knowledge_items': [{
+                'text': f"{pr.description}\n\nComments:\n{pr.comments}",
+                'metadata': {
+                    'type': 'pr',
+                    'files_changed': ','.join(pr.files),
+                    'timestamp': pr.created_at
+                },
+                'additional_metadata': {
+                    'url': pr.url
+                }
+            }]
+        }]
+    )
+
+# Query with graph context
+results = client.recall.full_recall(
+    tenant_id='codebase',
+    query='Why did we switch to event sourcing for user state?',
+    max_results=15,
+    mode='thinking',
+    graph_context=True,
+    recency_bias=0.3
+)
+
+# Graph context will link code files → PRs → discussions
+```
+
+### Financial Analyst
+
+**Goal:** Temporal reasoning over earnings transcripts, metrics, board memos
+
+**Endpoints used:** `POST /ingestion/upload_knowledge`, `POST /recall/full_recall`
+
+**Pattern:**
+1. Ingest documents with quarter/year in metadata
+2. Use high recency_bias for recent quarters
+3. Query with time references ("last quarter", "Q3")
+4. Compare across time periods
+
+**Implementation:**
+```python
+# Ingest quarterly reports
+for quarter in quarters:
+    client.data.ingest(
+        tenant_id='finance',
+        app_knowledge=[{
+            'source_id': f'earnings_{quarter.year}_q{quarter.quarter}',
+            'source_name': f'Earnings Call Q{quarter.quarter} {quarter.year}',
+            'knowledge_items': [{
+                'text': quarter.transcript,
+                'metadata': {
+                    'type': 'earnings',
+                    'quarter': f'{quarter.year}-Q{quarter.quarter}',
+                    'year': str(quarter.year)
+                }
+            }]
+        }]
+    )
+
+# Query recent performance
+recent = client.recall.full_recall(
+    tenant_id='finance',
+    query='revenue growth and margin trends',
+    max_results=10,
+    recency_bias=0.7,
+    alpha=0.8
+)
+
+# Query specific quarter
+q3_2024 = client.recall.full_recall(
+    tenant_id='finance',
+    query='revenue and margins',
+    max_results=5,
+    metadata_filters={'quarter': '2024-Q3'}
+)
+```
+
+---
+
+## Common Mistakes Checklist
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Empty recall results | Content not yet indexed | Poll `verify_processing` until `completed` |
+| Memories missing from `full_recall` | Wrong endpoint for store | Use `recall_preferences` for memories, `full_recall` for knowledge |
+| `metadata_filters` ignored | Field not declared with `enable_match: true` | Declare in `tenant_metadata_schema` before ingestion |
+| `graph_context` empty | Not set to `true` | Set `graph_context: true` on recall request |
+| Recency doesn't matter | `recency_bias` defaults to 0 | Set explicitly between 0.1 and 1.0 |
+| Wrong data surfaces | Wrong `sub_tenant_id` on recall | Match the scope used at write time |
+| Forceful relations not fetching | Not in `thinking` mode | Set `mode: "thinking"` |
+| 422 on upload | `file_metadata` array length mismatch | Match array length to files count |
+| Schema field can't be changed | Tenant metadata schema is immutable | Plan before creation, use `additional_metadata` for flexible fields |
+| 422 on app_knowledge | Sent as JSON object instead of JSON-encoded string | Stringify `app_knowledge` before sending in multipart form |
+| boolean_recall returning 400 | Sent `alpha`, `mode`, or `graph_context` params | Drop those params — boolean_recall doesn't accept them |
+| Tenant creation failure on re-create | Previous deletion still in progress | Use a different `tenant_id` or wait for cleanup |
+| Data not scoped correctly | `sub_tenant_id` omitted on per-user data | Always pass `sub_tenant_id` for user-specific writes and reads |
+| Inference not running | `infer` not set to `true` | Set `infer: true` explicitly for conversational/behavioral input |
+| Partial deletion unnoticed | Assumed `success: true` means all items deleted | Always inspect `results[].deleted` per item |
+
+---
+
+## Troubleshooting Guide
+
+### Authentication Failures
+
+**Symptom:** 401 Unauthorized
+
+**Check:**
+1. Header format: `Authorization: Bearer <key>` with space after "Bearer"
+2. Key validity in dashboard at app.hydradb.com
+3. Key permissions (read vs read-write)
+
+**Fix:**
+```bash
+# Correct header format
+curl -H "Authorization: Bearer $API_KEY" https://api.hydradb.com/tenants/monitor?tenant_id=test
+```
+
+### Tenant Not Found After Creation
+
+**Symptom:** 404 on ingestion/recall immediately after tenant creation
+
+**Cause:** Tenant creation is async
+
+**Fix:**
+```python
+# Create tenant
+client.tenants.create(tenant_id='acme_corp')
+
+# Poll until ready
+import time
+while True:
+    status = client.tenants.status(tenant_id='acme_corp')
+    if (status['graph_status'] and 
+        status['vectorstore_status'] == [True, True]):
+        break
+    time.sleep(2)
+
+# Now safe to ingest
+client.data.ingest(...)
+```
+
+### 422 on Ingestion
+
+**Common causes:**
+
+1. **file_metadata array mismatch:**
+```python
+# WRONG: 2 files, 1 metadata item
+files = [file1, file2]
+file_metadata = [{'file_id': 'doc_001'}]
+
+# CORRECT: 2 files, 2 metadata items
+files = [file1, file2]
+file_metadata = [
+    {'file_id': 'doc_001'},
+    {'file_id': 'doc_002'}
+]
+```
+
+2. **app_knowledge not stringified:**
+```python
+# WRONG: Sent as JSON object
+app_knowledge = [{'source_id': 'slack_001', ...}]
+
+# CORRECT: Stringify before sending
+app_knowledge = json.dumps([{'source_id': 'slack_001', ...}])
+```
+
+3. **MemoryItem with no content:**
+```python
+# WRONG: No text and no user_assistant_pairs
+{'infer': True}
+
+# CORRECT: At least one content field
+{'text': 'User prefers dark mode', 'infer': True}
+```
+
+### Empty Recall Results
+
+**Diagnostic checklist:**
+
+1. **Content still processing:**
+```python
+status = client.data.verify_processing(
+    tenant_id='acme_corp',
+    file_ids=['doc_001']
+)
+# Wait until indexing_status == 'completed'
+```
+
+2. **Wrong endpoint:**
+```python
+# WRONG: Using full_recall for memories
+client.recall.full_recall(sub_tenant_id='user_alice', query='preferences')
+
+# CORRECT: Use recall_preferences for memories
+client.recall.preferences(sub_tenant_id='user_alice', query='preferences')
+```
+
+3. **Wrong sub_tenant_id:**
+```python
+# Write with sub_tenant_id
+client.data.ingest(sub_tenant_id='team_eng', ...)
+
+# Read with SAME sub_tenant_id
+client.recall.full_recall(sub_tenant_id='team_eng', ...)
+```
+
+4. **Too restrictive filters:**
+```python
+# Try without filters first
+results = client.recall.full_recall(
+    tenant_id='acme_corp',
+    query='deployment'
+    # No metadata_filters
+)
+```
+
+### Rate Limiting
+
+**Symptoms:**
+- 429 status code
+- Throttling errors
+
+**Solutions:**
+
+1. **Use bulk endpoints:**
+```python
+# INEFFICIENT: Loop with individual calls
+for memory in memories:
+    client.memory.add(memories=[memory])
+
+# EFFICIENT: Single bulk call
+client.memory.add(memories=memories)
+```
+
+2. **Implement exponential backoff:**
+```python
+import time
+from tenacity import retry, stop_after_attempt, wait_exponential
+
+@retry(
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=1, min=2, max=60)
+)
+def recall_with_retry():
+    return client.recall.full_recall(...)
+```
+
+3. **Cache repeated patterns:**
+```python
+from functools import lru_cache
+
+@lru_cache(maxsize=100)
+def cached_recall(query):
+    return client.recall.full_recall(query=query)
+```
+
+---
+
+## Multi-Tenant Design Patterns
+
+### B2B SaaS Pattern
+
+**Configuration:**
+- One `tenant_id` per customer company
+- `sub_tenant_id` for teams, workspaces, or users within customer
+- Shared knowledge at tenant level (no sub_tenant_id)
+- User-specific memories at sub-tenant level
+
+**Example:**
+```python
+# Customer Acme Corp
+tenant_id = 'acme_corp'
+
+# Shared company knowledge (no sub_tenant_id)
+client.data.ingest(
+    tenant_id='acme_corp',
+    # sub_tenant_id omitted
+    files=[company_handbook]
+)
+
+# Team-specific data
+client.data.ingest(
+    tenant_id='acme_corp',
+    sub_tenant_id='team_engineering',
+    files=[tech_docs]
+)
+
+# User-specific memories
+client.memory.add(
+    tenant_id='acme_corp',
+    sub_tenant_id='user_alice',
+    memories=[{'text': 'Prefers TypeScript'}]
+)
+```
+
+### B2C App Pattern
+
+**Configuration:**
+- One `tenant_id` for entire app
+- `sub_tenant_id` for each end user
+- Shared knowledge at tenant level (FAQs, docs)
+- All user data at sub-tenant level
+
+**Example:**
+```python
+# Single tenant for app
+tenant_id = 'my_app'
+
+# Shared knowledge for all users
+client.data.ingest(
+    tenant_id='my_app',
+    app_knowledge=[{
+        'source_id': 'faq',
+        'source_name': 'FAQ',
+        'knowledge_items': [{'text': faq_content}]
+    }]
+)
+
+# User-specific memories
+for user in users:
+    client.memory.add(
+        tenant_id='my_app',
+        sub_tenant_id=f'user_{user.id}',
+        memories=[
+            {'text': f'User name: {user.name}'},
+            {'text': f'User preferences: {user.preferences}'}
+        ]
+    )
+```
+
+### Internal Tools Pattern
+
+**Configuration:**
+- One `tenant_id` per company
+- `sub_tenant_id` for departments or projects
+- Use metadata for finer-grained access control
+
+**Example:**
+```python
+# Company tenant
+tenant_id = 'internal'
+
+# Department-specific data
+client.data.ingest(
+    tenant_id='internal',
+    sub_tenant_id='dept_engineering',
+    files=[tech_specs]
+)
+
+client.data.ingest(
+    tenant_id='internal',
+    sub_tenant_id='dept_finance',
+    files=[financial_reports]
+)
+
+# Query scoped to department
+results = client.recall.full_recall(
+    tenant_id='internal',
+    sub_tenant_id='dept_engineering',
+    query='Q4 roadmap'
+)
+```
+
+### Environment Separation
+
+**CRITICAL: Never share tenant_id across prod/staging/dev**
+
+**Example:**
+```python
+# WRONG: Same tenant for all environments
+tenant_id = 'my_app'  # Used in prod, staging, dev
+
+# CORRECT: Separate tenants per environment
+prod_tenant = 'my_app_prod'
+staging_tenant = 'my_app_staging'
+dev_tenant = 'my_app_dev'
+```
+
+### Scoping Hierarchy
+
+**Order of operations:**
+1. `tenant_id` — Primary isolation boundary (customers, environments)
+2. `sub_tenant_id` — Logical partition inside tenant (users, teams, workspaces)
+3. `metadata` — Deterministic filters inside partition (category, project, department)
+
+**Example:**
+```python
+# Narrow from tenant → sub-tenant → metadata
+results = client.recall.full_recall(
+    tenant_id='acme_corp',           # Customer
+    sub_tenant_id='team_mobile',     # Team
+    query='sprint status',
+    metadata_filters={                # Project
+        'project': 'phoenix'
+    }
+)
+```
+
+---
+
+## Advanced Topics
+
+### BYO Embeddings
+
+**Use case:** Already have embeddings from another model, want to use HydraDB for graph + retrieval
+
+**Endpoints used:** `POST /tenants/create` (with is_embeddings_tenant), `POST /ingestion/upload_knowledge`
+
+**Setup:**
+```python
+# Create embeddings tenant
+client.tenants.create(
+    tenant_id='byo_embeddings',
+    is_embeddings_tenant=True,
+    embeddings_dimension=1536  # Match your model dimension
+)
+
+# Ingest with pre-computed vectors
+client.data.ingest(
+    tenant_id='byo_embeddings',
+    app_knowledge=[{
+        'source_id': 'doc_001',
+        'source_name': 'Document 1',
+        'knowledge_items': [{
+            'text': 'Original text',
+            'embedding': [0.1, 0.2, ...],  # 1536-dim vector
+            'metadata': {'category': 'docs'}
+        }]
+    }]
+)
+```
+
+### Custom Chunking
+
+**Use case:** Need control over chunk boundaries (e.g., section-level chunking)
+
+**Endpoints used:** `POST /ingestion/upload_knowledge` (with pre-chunked content)
+
+**Pattern:**
+```python
+# Pre-chunk before ingestion
+def custom_chunk(document):
+    # Your chunking logic
+    return [
+        {'text': section1, 'metadata': {'section': '1'}},
+        {'text': section2, 'metadata': {'section': '2'}}
+    ]
+
+chunks = custom_chunk(document)
+
+# Ingest pre-chunked content
+client.data.ingest(
+    tenant_id='custom_chunks',
+    app_knowledge=[{
+        'source_id': 'doc_001',
+        'source_name': 'Custom Chunked Doc',
+        'knowledge_items': chunks
+    }]
+)
+```
+
+### Multi-Index Retrieval
+
+**Use case:** Need to query both memories and knowledge, merge results
+
+**Endpoints used:** `POST /recall/recall_preferences`, `POST /recall/full_recall`
+
+**Pattern:**
+```python
+# Query both indices in parallel
+import asyncio
+
+async def multi_index_recall(tenant_id, sub_tenant_id, query):
+    memories = await client.recall.preferences(
+        tenant_id=tenant_id,
+        sub_tenant_id=sub_tenant_id,
+        query=query,
+        max_results=5
+    )
+    
+    knowledge = await client.recall.full_recall(
+        tenant_id=tenant_id,
+        query=query,
+        max_results=10
+    )
+    
+    # Merge and dedupe
+    combined = memories['results'] + knowledge['results']
+    return combined
+
+results = asyncio.run(multi_index_recall('acme', 'user_alice', 'preferences'))
+```
+
+### Batch Processing
+
+**Use case:** High-volume ingestion from data pipeline
+
+**Endpoints used:** `POST /ingestion/upload_knowledge`, `POST /ingestion/verify_processing`
+
+**Pattern:**
+```python
+# Batch files
+batch_size = 50
+for i in range(0, len(files), batch_size):
+    batch = files[i:i+batch_size]
+    
+    client.data.ingest(
+        tenant_id='batch_ingest',
+        files=batch,
+        file_metadata=[
+            {'file_id': f'doc_{j}', 'metadata': {'batch': str(i)}}
+            for j in range(len(batch))
+        ]
+    )
+    
+    # Verify batch completed before next
+    file_ids = [f'doc_{j}' for j in range(i, i+len(batch))]
+    wait_for_completion(tenant_id='batch_ingest', file_ids=file_ids)
+```
+
+### Temporal Reasoning
+
+**Use case:** Time-aware search (recent vs historical)
+
+**Endpoints used:** `POST /tenants/create` (with timestamp schema), `POST /recall/full_recall`
+
+**Pattern:**
+```python
+# Add timestamp to metadata schema
+client.tenants.create(
+    tenant_id='temporal',
+    tenant_metadata_schema={
+        'timestamp': {
+            'enabled': True,
+            'type': 'str',
+            'enable_match': True
+        }
+    }
+)
+
+# Query recent content
+recent = client.recall.full_recall(
+    tenant_id='temporal',
+    query='incidents',
+    recency_bias=0.8,
+    max_results=10
+)
+
+# Query historical content
+historical = client.recall.full_recall(
+    tenant_id='temporal',
+    query='incidents',
+    recency_bias=0.0,
+    metadata_filters={
+        'timestamp': '2023-01-01'  # Before this date
+    }
+)
+```
+
+### Hybrid Reranking
+
+**Use case:** Combine HydraDB recall with external reranker (Cohere, Jina)
+
+**Endpoints used:** `POST /recall/full_recall` + external reranker API
+
+**Pattern:**
+```python
+# Get more candidates from HydraDB
+candidates = client.recall.full_recall(
+    tenant_id='rerank',
+    query='deployment procedures',
+    max_results=50
+)
+
+# Rerank with Cohere
+import cohere
+co = cohere.Client(api_key=cohere_key)
+
+reranked = co.rerank(
+    query='deployment procedures',
+    documents=[c['text'] for c in candidates['results']],
+    top_n=10
+)
+
+# Map back to original results
+final = [candidates['results'][r.index] for r in reranked.results]
+```
+
+---
+
+## Performance Guidelines
+
+### Latency Benchmarks
+
+- **Recall (fast mode):** p50 ~80ms, p95 ~180ms, p99 ~250ms
+- **Recall (thinking mode):** p50 ~150ms, p95 ~300ms, p99 ~400ms
+- **Ingestion processing:** 30-90 seconds per document (typical)
+- **Tenant creation:** 10-30 seconds
+- **Memory add:** p50 ~50ms, p95 ~120ms
+
+### Scaling Guidelines
+
+**Per tenant:**
+- **Documents:** Tested up to 100K documents per tenant
+- **Chunks:** Tested up to 5M chunks per tenant
+- **Memories:** Tested up to 500K memories per sub-tenant
+- **Sub-tenants:** No hard limit, tested with 10K+ sub-tenants
+
+**Rate limits:**
+- **Recall:** 1000 requests/minute per tenant
+- **Ingestion:** 100 files/minute per tenant
+- **Memories:** 500 adds/minute per sub-tenant
+
+### Caching Strategies
+
+**When to cache:**
+- Repeated queries (e.g., FAQ, common patterns)
+- User preference lookups
+- Metadata-heavy filters
+
+**TTL recommendations:**
+- **User preferences:** 5-15 minutes
+- **Knowledge search:** 1-5 minutes
+- **Real-time data:** No cache
+
+**Example:**
+```python
+from functools import lru_cache
+import hashlib
+
+@lru_cache(maxsize=1000)
+def cached_recall(tenant_id, query, metadata_str):
+    return client.recall.full_recall(
+        tenant_id=tenant_id,
+        query=query,
+        metadata_filters=json.loads(metadata_str)
+    )
+
+# Use
+results = cached_recall(
+    'acme',
+    'deployment',
+    json.dumps({'category': 'ops'})
+)
+```
+
+---
+
+## Security & Compliance
+
+### Tenant Isolation
+
+- **API-level enforcement:** No cross-tenant data access at API layer
+- **Database isolation:** Separate graph and vector indices per tenant
+- **Sub-tenant isolation:** Enforced via query filters, not separate infrastructure
+
+### Data Encryption
+
+- **At rest:** AES-256 encryption for all stored data
+- **In transit:** TLS 1.3 for all API communication
+- **Keys:** Managed by HydraDB infrastructure
+
+### Audit Logging
+
+**Available events:**
+- Tenant creation/deletion
+- Data ingestion (files uploaded, sources added)
+- Recall queries (query text, results count)
+- Memory operations (add, delete)
+- Authentication events
+
+**Log retention:** 90 days
+
+### Compliance
+
+- **SOC 2 Type II:** In progress
+- **GDPR:** Compliant, supports right to deletion
+- **Data residency:** US-only currently, EU region coming Q3 2024
+
+---
+
+This completes the comprehensive HydraDB reference for LLMs. Use `llms.txt` for navigation and links, use this file (`llms-full.txt`) for complete embedded context when building without access to live docs.
