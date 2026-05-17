@@ -9,7 +9,7 @@ Notion's built-in AI keyword-searches. It returns the document you asked about a
 
 HydraDB is different. It doesn't just store vectors - it builds a **living context graph**. Every memory is parsed, enriched, and connected to other memories. When your agent calls `POST /recall/full_recall`, it doesn't just get semantically similar chunks. It gets the most useful context for that exact query - weighted by recency, relevance, relationships, and historical usage patterns.
 
-> **All code in this cookbook is real.** Base URL is `https://api.hydradb.com`. Get your API key at [hydradb.com](https://hydradb.com) or email [hello@hydradb.com](mailto:hello@hydradb.com).
+> **All code in this cookbook is real.** Base URL is `https://api.hydradb.com`. Get your API key at [hydradb.com](https://hydradb.com) or email [founders@hydradb.com](mailto:founders@hydradb.com).
 
 ---
 
@@ -55,25 +55,23 @@ curl -X POST 'https://api.hydradb.com/tenants/create' \
 ### Python
 
 ```python
-import requests, os, time, uuid
+import os, time, uuid
+from hydra_db import HydraDB
 
 API_KEY   = os.environ["HYDRA_DB_API_KEY"]
 TENANT_ID = "notion-ai-workspace"
-BASE_URL  = "https://api.hydradb.com"
 
-HEADERS = {
-    "Authorization": f"Bearer {API_KEY}",
-    "Content-Type": "application/json",
-}
+client = HydraDB(token=API_KEY)
 
 # Create tenant - idempotent, safe to re-run
-resp = requests.post(
-    f"{BASE_URL}/tenants/create",
-    headers=HEADERS,
-    json={"tenant_id": TENANT_ID},
+resp = client.tenant.create(
+    tenant_id=TENANT_ID,
+    tenant_metadata_schema={
+        "author": "string",
+        "tags":   "string",
+    },
 )
-resp.raise_for_status()
-print("Tenant:", resp.json())
+print("Tenant:", resp)
 ```
 
 > **Sub-tenants for teams:** Use `sub_tenant_id` to isolate data by department. Engineering, Sales, HR each get their own namespace within your tenant - no configuration needed, just pass the ID on upload.
@@ -91,7 +89,7 @@ Fetch pages from Notion, format them into HydraDB's app source structure, and ba
 > **Batch limit:** Max **20 sources per request**. Wait **1 second between batches** to respect rate limits.
 
 ```python
-import requests, time
+import json, time
 from notion_client import Client
 
 notion = Client(auth=os.environ["NOTION_TOKEN"])
@@ -109,17 +107,15 @@ def extract_text(page_id: str) -> str:
 
 
 def upload_batch(sources: list, sub_tenant_id: str = None) -> list:
-    """Upload up to 20 sources. Returns list of file IDs."""
+    """Upload up to 20 sources. Returns list of source IDs."""
     if sub_tenant_id:
         for s in sources:
             s["sub_tenant_id"] = sub_tenant_id
-    resp = requests.post(
-        f"{BASE_URL}/ingestion/upload_knowledge",
-        headers=HEADERS,
-        json={"app_knowledge": sources},  # FIX: single key, correct wrapper
+    result = client.upload.knowledge(
+        tenant_id=TENANT_ID,
+        app_knowledge=json.dumps(sources),
     )
-    resp.raise_for_status()
-    return resp.json().get("ids", [])  # FIX: "ids" not "results"
+    return [r.source_id for r in (result.results or [])]
 
 
 def ingest_notion_database(database_id: str, sub_tenant_id: str = None) -> list:
@@ -217,14 +213,12 @@ def verify_processing(file_id: str, timeout: int = 120, interval: int = 3):
     """Poll until indexed, errored, or timeout."""
     deadline = time.time() + timeout
     while time.time() < deadline:
-        resp = requests.post(
-            f"{BASE_URL}/ingestion/verify_processing",
-            headers=HEADERS,
-            params={"file_ids": file_id, "tenant_id": TENANT_ID},
+        result = client.upload.verify_processing(
+            tenant_id=TENANT_ID,
+            file_ids=[file_id],
         )
-        resp.raise_for_status()
-        statuses = resp.json().get("statuses", [])
-        status   = statuses[0].get("indexing_status") if statuses else None
+        statuses = result.statuses
+        status   = statuses[0].indexing_status if statuses else None
         if status == "completed":
             return True
         if status == "errored":
@@ -288,13 +282,7 @@ def add_user_memory(
     if sub_tenant_id:
         payload["sub_tenant_id"] = sub_tenant_id
 
-    resp = requests.post(
-        f"{BASE_URL}/memories/add_memory",
-        headers=HEADERS,
-        json=payload,
-    )
-    resp.raise_for_status()
-    return resp.json()
+    return client.upload.add_memory(**payload)
 
 
 # Example usage
@@ -344,16 +332,10 @@ def recall_context(
     if sub_tenant_id:
         payload["sub_tenant_id"] = sub_tenant_id
 
-    resp = requests.post(
-        f"{BASE_URL}/recall/full_recall",
-        headers=HEADERS,
-        json=payload,
-    )
-    resp.raise_for_status()
-    return resp.json()
+    return client.recall.full_recall(**payload)
     # Response shape:
-    # data["chunks"]        - ranked context chunks with relevancy_score
-    # data["graph_context"] - entity paths and chunk_relations
+    # result.chunks        - ranked context chunks with relevancy_score
+    # result.graph_context - entity paths and chunk_relations
 
 
 # Example
@@ -361,9 +343,9 @@ context = recall_context(
     "Why did we migrate from MySQL to Postgres?",
     sub_tenant_id="workspace",
 )
-for chunk in context["chunks"]:
-    print(f"[{chunk['relevancy_score']:.2f}] {chunk['source_title']}")
-    print(chunk["chunk_content"][:200])
+for chunk in (context.chunks or []):
+    print(f"[{chunk.relevancy_score:.2f}] {chunk.source_title}")
+    print(chunk.chunk_content[:200])
 ```
 
 ---
@@ -401,19 +383,13 @@ def ask_workspace(
     if source_filter:
         payload["metadata_filters"] = {"source_type": source_filter}
 
-    resp = requests.post(
-        f"{BASE_URL}/recall/full_recall",
-        headers=HEADERS,
-        json=payload,
-    )
-    resp.raise_for_status()
-    return resp.json()
+    return client.recall.full_recall(**payload)
 
 
-def build_context(result: dict) -> str:
+def build_context(result) -> str:
     return "\n\n".join(
-        chunk.get("chunk_content", "")
-        for chunk in result.get("chunks", [])
+        chunk.chunk_content
+        for chunk in (result.chunks or [])
     )
 
 
@@ -467,12 +443,12 @@ def handle_mention(event, client):
     session_id = get_session(slack_user)
     result     = ask_workspace(question)
 
-    chunks = result.get("chunks", [])
-    answer = "\n\n".join(c.get("chunk_content", "") for c in chunks[:3]) or "No results found."
-    sources = result.get("sources", [])
+    chunks = result.chunks or []
+    answer = "\n\n".join(c.chunk_content for c in chunks[:3]) or "No results found."
+    sources = result.sources or []
 
     if sources:
-        links  = "\n".join(f"• {s.get('title','')}" for s in sources[:3])
+        links  = "\n".join(f"• {getattr(s, 'title', '')}" for s in sources[:3])
         answer += f"\n\n*Sources:*\n{links}"
 
     client.chat_update(
