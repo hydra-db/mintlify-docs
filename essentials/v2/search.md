@@ -1,0 +1,192 @@
+---
+title: "Search"
+description: "How HydraDB retrieves the right context for each query — Knowledge, Memories, and the context graph, all behind a single /search endpoint."
+---
+Search turns stored context into the *right* context for a specific query. One endpoint — `POST /search` — searches [Knowledge](/essentials/v2/knowledge) (documents, files, app sources), [Memories](/essentials/v2/memories) (user preferences, conversation history, inferred content), or both. Three signals drive this relevance up: dense-vector similarity, BM25 keyword matching, and [context-graph](/essentials/v2/context-graphs) traversal. The parameters below control all of it. This helps you tune the search results to get the best context for your query.
+
+For the full request and response schema, see [Search - API Reference](/api-reference/v2/endpoint/search-overview).
+
+---
+
+## 1. Use-case recipes
+
+Pick the row that matches your goal and use the parameters as a starting point:
+
+| I want to… | `source` | `search_by` | `mode` | Notes |
+| --- | --- | --- | --- | --- |
+| Document Q&A / RAG | `"sources"` | `"hybrid"` | `"thinking"` | Set `graph_context: true` for richer context-graph as a part of api response |
+| Exact keyword match | `"sources"` | `"text"` | — | optionally, add `operator: "and"/ "or" for metadata filtering for scoped search` |
+| Personalized response | `"memories"` | `"hybrid"` | `"thinking"` |  |
+| Personalized + grounded | `"all"` | `"hybrid"` | `"thinking"` | One call merges both stores |
+
+---
+
+## 2. Parameter reference
+
+[Follow this for when to use tenant_id and subtenant_id](./multi-tenant#2-when-to-use-each)
+
+### Graph
+
+| Parameter | Type / values | Purpose |
+| --- | --- | --- |
+| `graph_context` | boolean | When `true`, includes the entity/relation graph slice in the response. Requires `mode: "thinking"` to produce meaningful traversals. See [Context Graphs](/essentials/v2/context-graphs). Default: `false`. |
+| `search_forceful_relations` | boolean | Whether to fetch author-declared related sources (see `relations`[ on ingest](/api-reference/v2/endpoint/ingest-content)) into `additional_context`. **Only takes effect in** `mode: "thinking"`**.** Default: `true`. |
+
+### Shaping results
+
+| Parameter | Type / values | Purpose |
+| --- | --- | --- |
+| `max_results` | integer | null |
+| `recency_bias` | float `0.0`–`1.0` | Boost for newer content. Default: `0.0` (no boost). |
+| `additional_context` | string | null |
+| `metadata_filters` | object | null |
+
+---
+
+## 3. Tuning heuristics
+
+Most of the time the defaults are right. When they aren't, here's where to start:
+
+- `alpha` — Start at `0.8`. Lower toward `0.3–0.5` when the query contains literal tokens (error codes, SKUs, product names). Raise toward `0.9` for conceptual questions. Use `"auto"` when query shape varies across calls.
+- `max_results` — Start at `10`. Drop to `5` for tight context windows; raise to `20` if you rerank downstream.
+- `additional_context` — Use it when the query alone is ambiguous. Keep it short and factual.
+- `graph_context` — Set to `true` when answers benefit from entity relationships (multi-hop questions, "how does X relate to Y"). Pair with `mode: "thinking"` — in `"fast"` mode the graph slice is shallow.
+
+---
+
+## 4. Minimal working example
+
+The canonical personalized-answer flow takes a single call: `POST /search` with `source: "all"` returns merged knowledge and per-user memory in one ranked result set.
+
+### Setup
+
+```bash
+# Set your key as an environment variable - used in every request below
+export HYDRA_DB_API_KEY="your_api_key"
+# All requests: -H "Authorization: Bearer $HYDRA_DB_API_KEY" -H "API-Version: 2"
+```
+
+```typescript
+import { HydraDBClient } from "@hydradb/sdk";
+
+const client = new HydraDBClient({
+  token: process.env.HYDRA_DB_API_KEY,
+});
+```
+
+```python
+import os
+from hydra_db import HydraDB
+
+client = HydraDB(token=os.environ["HYDRA_DB_API_KEY"])
+```
+
+### One call — Knowledge and Memories together
+
+```bash
+curl -X POST 'https://api.hydradb.com/search' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "tenant_id": "acme_corp",
+    "sub_tenant_id": "user_john_123",
+    "query": "How do I reset my password?",
+    "source": "all",
+    "search_by": "hybrid",
+    "mode": "thinking",
+    "max_results": 8,
+    "graph_context": true
+  }'
+```
+
+```typescript
+const result = await client.search.query({
+  tenant_id: "acme_corp",
+  sub_tenant_id: "user_john_123",
+  query: "How do I reset my password?",
+  source: "all",
+  search_by: "hybrid",
+  mode: "thinking",
+  max_results: 8,
+  graph_context: true,
+});
+```
+
+```python
+result = client.search.query(
+    tenant_id="acme_corp",
+    sub_tenant_id="user_john_123",
+    query="How do I reset my password?",
+    source="all",
+    search_by="hybrid",
+    mode="thinking",
+    max_results=8,
+    graph_context=True,
+)
+```
+
+### Merge into the LLM prompt
+
+The response is a single `RetrievalResult` containing `chunks[]`, `sources[]`, and — when applicable — `graph_context` and `additional_context`. Chunks from Knowledge and Memories are already interleaved and ranked by relevance, so no manual merging is required. Pass the result through the helper in [How to Use API Results](/essentials/v2/api-results) to turn it into a context string for your prompt:
+
+```typescript
+const context = buildContextString(result);
+
+const completion = await openai.chat.completions.create({
+  model: "gpt-4o",
+  messages: [
+    {
+      role: "system",
+      content: "Answer using only the provided context. Match the user's preferred style.",
+    },
+    {
+      role: "user",
+      content: `${context}\n\nQuestion: How do I reset my password?`,
+    },
+  ],
+});
+```
+
+If you need to keep the two streams separate — for instance to format user preferences differently from documents in the prompt — call `/search` twice in parallel with `source: "sources"` and `source: "memories"`, then merge client-side.
+
+### Production checklist
+
+- **Default to** `source: "all"` for personalized answers — one call instead of two.
+- **Set per-call timeouts.** Generous for `thinking` (3–5 s), tight for `fast` (≤500 ms).
+- **Pass** `additional_context` with known session state (page, feature, role). It sharpens retrieval without extra calls.
+
+---
+
+## 5. Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Empty `query_paths` / `chunk_relations` | `graph_context` not set, or no relations exist for the result set | Set `graph_context: true`. Empty arrays are normal when there's nothing to return — see [Context Graphs](/essentials/v2/context-graphs). |
+| Recent uploads don't appear in results | Indexing not finished | Poll `GET /source/status/source_id (todo)` — chunks are invisible until processing reaches at least `graph_creation`. |
+| `metadata_filters` doesn't narrow results | Filter key is undeclared, not match-enabled, or in wrong shape | Declare filterable keys in `tenant_metadata_schema` with `enable_match: true` before ingestion. For free-form per-document fields, nest under `document_metadata`. |
+| Memories missing from a `source: "sources"` search | Wrong store selected | Use `source: "memories"` or `source: "all"`. |
+| Recency doesn't seem to matter | `recency_bias` defaults to `0` | Set it explicitly between `0.1` and `1.0`. |
+| `operator: "phrase"` ignored | `search_by` not set to `"text"` | `operator` only applies to BM25 text search — switch `search_by` to `"text"`. |
+| `search_forceful_relations` ignored | Request uses `mode: "fast"` | Forceful-relation context is fetched only in `mode: "thinking"`. |
+
+---
+
+## 6. Advanced patterns
+
+**Hybrid + text in two parallel calls.** When a query mixes a literal token (error code, SKU, function name) with natural-language intent, run `search_by: "hybrid"` and `search_by: "text"` in parallel, dedupe by chunk ID, and treat text hits as a "must include" floor.
+
+**Recall-then-rerank.** Ask for more chunks than you actually need (`max_results: 20`) and apply your own reranker — recency windows, compliance filters, business rules — before picking the final top-k for the prompt.
+
+**Cache the prompt context.** If the same query repeats inside a session, cache the `RetrievalResult` keyed by `(tenant_id, sub_tenant_id, query, source, search_by)`. Recall is fast, but skipping it entirely is faster.
+
+---
+
+## Related
+
+- [Knowledge](/essentials/v2/knowledge) — shared document context
+- [Memories](/essentials/v2/memories) — user-scoped dynamic context
+- [Metadata](/essentials/v2/metadata) — designing filterable fields
+- [Context Graphs](/essentials/v2/context-graphs) — how graph traversal enriches recall
+- [How to Use API Results](/essentials/v2/api-results) — turning `RetrievalResult` into an LLM prompt
+- [Search - API Reference](/api-reference/v2/endpoint/search) — full parameter and response schema
