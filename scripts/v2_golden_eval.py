@@ -6,12 +6,10 @@ coherent, fully-known corpus and asserts that the RIGHT knowledge actually comes
 AND that every documented /query parameter behaves as the docs promise.
 
 Design decisions:
-  * Most Knowledge recall targets are ingested as PARSED FILES (`files` +
-    `file_metadata`) so retrieval quality is not dominated by app-source behavior.
-  * App-source targets use the field-based app-source model (`kind`, `provider`,
-    `external_id`, `fields`, metadata, and `relations[]`) so app fidelity checks
-    exercise the real app-native ingestion path rather than the legacy generic
-    `content` payload.
+  * Most Knowledge recall targets are ingested as parsed documents (`documents` +
+    `document_metadata`) so retrieval quality is not dominated by app-source behavior.
+  * App-source targets use the current app_knowledge model (`content`, `metadata`,
+    `additional_metadata`, and optional `relations.ids`).
   * Content is rich and multi-paragraph (real policy/runbook prose), not one-liners.
   * The selector field is `query_apps` (renamed from `search_apps`).
 
@@ -22,15 +20,15 @@ What each golden query asserts (ground truth is known because we fabricated it):
   - max_chunks       : `max_results` is respected
   - rank_before      : `recency_bias` ranks the newer doc above the older one
   - expect_graph     : `graph_context=true` returns a populated graph slice
-  - expect_addl_ctx  : `search_forceful_relations=true` populates additional_context
+  - expect_addl_ctx  : `query_forceful_relations=true` populates additional_context
   - query_apps       : `query_apps=true` surfaces the app source
   - department filter : `metadata_filters` returns only the matching department
   - expect_empty     : a nonexistent code returns zero chunks
 
 Covers every /query parameter: type (knowledge/memory/all), query_by (hybrid/text),
 mode (fast/thinking), operator (or/and/phrase), max_results, alpha (numeric/auto),
-recency_bias, graph_context, search_forceful_relations, query_apps, metadata_filters
-(tenant + additional_metadata), additional_context.
+recency_bias, graph_context, query_forceful_relations, query_apps, metadata_filters
+(metadata + additional_metadata), additional_context.
 
 Reuses ApiClient / OpenApiContract / config (incl. the API key) from
 v2_e2e_contract_test so credentials live in one place.
@@ -59,6 +57,9 @@ FILE_BATCH = 8
 SOURCE_READY_TIMEOUT = int(os.getenv("GOLDEN_SOURCE_TIMEOUT", "1800"))
 GRAPH_TIMEOUT = int(os.getenv("GOLDEN_GRAPH_TIMEOUT", "900"))
 POLL = 8.0
+TRANSIENT_STATUSES = {429, 500, 502, 503, 504}
+REQUEST_RETRIES = int(os.getenv("GOLDEN_REQUEST_RETRIES", "4"))
+REQUEST_RETRY_SLEEP = float(os.getenv("GOLDEN_REQUEST_RETRY_SLEEP", "3"))
 
 # -----------------------------------------------------------------------------
 # Rich content helpers.
@@ -70,7 +71,7 @@ def doc(*paragraphs: str) -> str:
 
 
 # -----------------------------------------------------------------------------
-# Golden corpus — hero (targeted) knowledge documents, ingested as files.
+# Golden corpus — hero (targeted) knowledge documents, ingested as documents.
 # Each hero embeds a unique fact + unique code inside realistic surrounding prose.
 # -----------------------------------------------------------------------------
 
@@ -541,14 +542,7 @@ def distractor_docs() -> list[dict[str, Any]]:
 
 
 def app_sources() -> list[dict[str, Any]]:
-    """App sources (`app_knowledge`) using the field-based app-source model.
-
-    The previous eval used a generic `{content: {text: ...}}` top-level content
-    payload. That made the app-chunk fidelity finding ambiguous, because the eval
-    itself was not exercising the app-native parser. These items intentionally use
-    the v1/v2 app-source contract: `kind`, `provider`, `external_id`, `fields`,
-    app metadata, and `relations[]`.
-    """
+    """App sources (`app_knowledge`) using the current v2 content model."""
 
     def app(
         *,
@@ -560,47 +554,26 @@ def app_sources() -> list[dict[str, Any]]:
         body: str,
         dept: str,
         timestamp: str | None = None,
-        relations: list[dict[str, Any]] | None = None,
+        relations: list[str] | None = None,
     ) -> dict[str, Any]:
-        fields: dict[str, Any]
-        if kind == "message":
-            fields = {
-                "kind": "message",
-                "body": body,
-                "author": "priya",
-                "thread_id": external_id,
-                "created_at": timestamp or "2026-05-20T10:00:00Z",
-            }
-        elif kind == "knowledge_base":
-            fields = {
-                "kind": "knowledge_base",
-                "title": title,
-                "body": body,
-                "created_by": "golden-eval",
-                "updated_by": "golden-eval",
-                "created_at": timestamp or "2026-05-20T10:00:00Z",
-                "updated_at": timestamp or "2026-05-20T10:00:00Z",
-            }
-        else:
-            fields = {"kind": "custom", "data": {"title": title, "body": body}}
-
         item: dict[str, Any] = {
             "id": sid,
             "tenant_id": TENANT_ID,
             "sub_tenant_id": SUB_TENANT,
             "title": title,
             "type": provider,
-            "kind": kind,
-            "provider": provider,
-            "external_id": external_id,
-            "fields": fields,
-            "tenant_metadata": {"department": dept},
+            "content": {
+                "text": body,
+                "kind": kind,
+                "external_id": external_id,
+            },
+            "metadata": {"department": dept},
             "additional_metadata": {"golden_run": RUN_ID, "dept": dept},
         }
         if timestamp:
             item["timestamp"] = timestamp
         if relations:
-            item["relations"] = relations
+            item["relations"] = {"ids": relations}
         return item
 
     return [
@@ -706,13 +679,7 @@ def app_sources() -> list[dict[str, Any]]:
             dept="engineering",
             body="To set up the development environment, install the toolchain, clone the "
             "monorepo, and request access to the staging cluster.",
-            relations=[
-                {
-                    "predicate": "related_to",
-                    "target": {"source_id": "gold_app_handshake"},
-                    "properties": {"reason": "release setup prerequisite"},
-                }
-            ],
+            relations=["gold_app_handshake"],
         ),
         app(
             sid="gold_app_handshake",
@@ -788,7 +755,7 @@ def memory_items() -> list[dict[str, Any]]:
         ),
         ("gold_mem_fill_06", "Timezone", "This user is based in a UTC+1 timezone."),
     ]
-    return [{"source_id": sid, "title": t, "text": x} for sid, t, x in base + fillers]
+    return [{"id": sid, "title": t, "text": x} for sid, t, x in base + fillers]
 
 
 def golden_queries() -> list[dict[str, Any]]:
@@ -960,7 +927,7 @@ def golden_queries() -> list[dict[str, Any]]:
             "markers": ["ESC-ZENAT-88"],
             "top_k": K,
         },
-        # ---- metadata_filters: tenant_metadata department exclusivity (app sources) ----
+        # ---- metadata_filters: metadata department exclusivity (app sources) ----
         {
             "id": "mf01_dept_legal",
             "query": "process review agreement company policy",
@@ -981,7 +948,7 @@ def golden_queries() -> list[dict[str, Any]]:
             "mode": "fast",
             "metadata_filters": {"additional_metadata": {"dept": "finance"}},
             "top_k": K,
-            "filter_doc_meta": ("dept", "finance"),
+            "filter_additional_meta": ("dept", "finance"),
             "min_recall_count": 2,
         },
         # ---- additional_context hint (soft: must not break, expected still found) ----
@@ -1051,39 +1018,56 @@ def golden_queries() -> list[dict[str, Any]]:
 
 def safe(client: ct.ApiClient, *args: Any, **kwargs: Any) -> ct.ApiResponse | None:
     kwargs.setdefault("validate_contract", False)
-    try:
-        return client._perform_safe(*args, **kwargs)
-    except Exception as exc:  # noqa: BLE001
-        print(f"  ! request error: {exc}")
-        return None
+    attempts = max(1, REQUEST_RETRIES)
+    last: ct.ApiResponse | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            resp = client._perform_safe(*args, **kwargs)
+            last = resp
+            if resp.status not in TRANSIENT_STATUSES or attempt == attempts:
+                return resp
+            method = args[0] if args else kwargs.get("method", "?")
+            path = args[1] if len(args) > 1 else kwargs.get("path", "?")
+            print(
+                f"  ! transient HTTP {resp.status} for {method} {path}; "
+                f"retry {attempt}/{attempts - 1}"
+            )
+        except Exception as exc:  # noqa: BLE001
+            method = args[0] if args else kwargs.get("method", "?")
+            path = args[1] if len(args) > 1 else kwargs.get("path", "?")
+            print(f"  ! request error for {method} {path}: {exc}")
+            if attempt == attempts:
+                return last
+        time.sleep(REQUEST_RETRY_SLEEP * attempt)
+    return last
 
 
-def ingest_files(client: ct.ApiClient, docs: list[dict[str, Any]]) -> list[str]:
+def ingest_documents(client: ct.ApiClient, docs: list[dict[str, Any]]) -> list[str]:
     ids: list[str] = []
     for start in range(0, len(docs), FILE_BATCH):
         batch = docs[start : start + FILE_BATCH]
-        files = [
-            ("files", f"{d['id']}.md", d["text"].encode("utf-8"), "text/markdown")
+        documents = [
+            ("documents", f"{d['id']}.md", d["text"].encode("utf-8"), "text/markdown")
             for d in batch
         ]
         meta = []
         for d in batch:
             m = {
-                "source_id": d["id"],
+                "id": d["id"],
                 "title": d["title"],
                 "type": "md",
-                "tenant_metadata": {"department": d["dept"]},
-                "document_metadata": {"golden_run": RUN_ID, "dept": d["dept"]},
+                "metadata": {"department": d["dept"]},
+                "additional_metadata": {"golden_run": RUN_ID, "dept": d["dept"]},
             }
             if d.get("timestamp"):
                 m["timestamp"] = d["timestamp"]
             if d.get("relations"):
-                m["relations"] = {"source_ids": d["relations"]}
+                m["relations"] = {"ids": d["relations"]}
             meta.append(m)
         resp = safe(
             client,
             "POST",
-            "/source/ingest",
+            "/context/ingest",
             expected_statuses=(202,),
             multipart=(
                 {
@@ -1091,19 +1075,19 @@ def ingest_files(client: ct.ApiClient, docs: list[dict[str, Any]]) -> list[str]:
                     "tenant_id": TENANT_ID,
                     "sub_tenant_id": SUB_TENANT,
                     "upsert": "true",
-                    "file_metadata": json.dumps(meta),
+                    "document_metadata": json.dumps(meta),
                 },
-                files,
+                documents,
             ),
         )
         got: list[str] = []
         if isinstance(resp, ct.ApiResponse) and isinstance(resp.data, dict):
             for r in resp.data.get("results", []) or []:
-                if isinstance(r, dict) and isinstance(r.get("source_id"), str):
-                    got.append(r["source_id"])
+                if isinstance(r, dict) and isinstance(r.get("id"), str):
+                    got.append(r["id"])
         ids += got or [d["id"] for d in batch]
         st = resp.status if isinstance(resp, ct.ApiResponse) else "ERR"
-        print(f"  files batch {start // FILE_BATCH + 1}: {len(batch)} -> HTTP {st}")
+        print(f"  documents batch {start // FILE_BATCH + 1}: {len(batch)} -> HTTP {st}")
     return ids
 
 
@@ -1120,7 +1104,7 @@ def ingest_apps(client: ct.ApiClient, apps: list[dict[str, Any]]) -> list[str]:
     resp = safe(
         client,
         "POST",
-        "/source/ingest",
+        "/context/ingest",
         expected_statuses=(202,),
         multipart=(
             {
@@ -1143,7 +1127,7 @@ def ingest_memories(client: ct.ApiClient, mems: list[dict[str, Any]]) -> list[st
     resp = safe(
         client,
         "POST",
-        "/source/ingest",
+        "/context/ingest",
         expected_statuses=(202,),
         multipart=(
             {
@@ -1158,7 +1142,7 @@ def ingest_memories(client: ct.ApiClient, mems: list[dict[str, Any]]) -> list[st
     )
     st = resp.status if isinstance(resp, ct.ApiResponse) else "ERR"
     print(f"  memories: {len(items)} -> HTTP {st}")
-    return [m["source_id"] for m in mems]
+    return [m["id"] for m in mems]
 
 
 def status_map(client: ct.ApiClient, ids: list[str]) -> dict[str, str]:
@@ -1168,17 +1152,17 @@ def status_map(client: ct.ApiClient, ids: list[str]) -> dict[str, str]:
         resp = safe(
             client,
             "GET",
-            "/source/status",
+            "/context/status",
             query={
                 "tenant_id": TENANT_ID,
                 "sub_tenant_id": SUB_TENANT,
-                "source_ids": chunk,
+                "ids": chunk,
             },
         )
         if isinstance(resp, ct.ApiResponse) and isinstance(resp.data, dict):
             for s in resp.data.get("statuses", []) or []:
                 if isinstance(s, dict):
-                    sid = s.get("source_id")
+                    sid = s.get("id")
                     status = s.get("indexing_status")
                     if isinstance(sid, str) and isinstance(status, str):
                         out[sid] = status
@@ -1245,8 +1229,8 @@ def run_query(client: ct.ApiClient, spec: dict[str, Any]) -> ct.ApiResponse | No
             body[k] = spec[k]
     if spec.get("query_apps"):
         body["query_apps"] = True
-    if "search_forceful_relations" in spec:
-        body["search_forceful_relations"] = spec["search_forceful_relations"]
+    if "query_forceful_relations" in spec:
+        body["query_forceful_relations"] = spec["query_forceful_relations"]
     return safe(client, "POST", "/query", json_body=body, expected_statuses=(200,))
 
 
@@ -1256,13 +1240,23 @@ def score(spec: dict[str, Any], resp: ct.ApiResponse | None) -> dict[str, Any]:
         if isinstance(resp, ct.ApiResponse) and isinstance(resp.data, dict)
         else {}
     )
+    transport_error = None
+    if not isinstance(resp, ct.ApiResponse):
+        transport_error = "request failed before receiving an API response"
+    elif resp.status != 200:
+        body = (resp.body_text or "")[:500]
+        transport_error = f"HTTP {resp.status} from /query" + (f": {body}" if body else "")
+    elif not isinstance(resp.data, dict):
+        body = (resp.body_text or "")[:500]
+        transport_error = "invalid /query response data" + (f": {body}" if body else "")
+
     chunks = [c for c in (data.get("chunks") or []) if isinstance(c, dict)]
     top_k = spec.get("top_k", DEFAULT_TOP_K)
     top = chunks[:top_k]
 
     ordered_ids: list[str] = []
     for c in top:
-        sid = c.get("source_id")
+        sid = c.get("id")
         if sid and sid not in ordered_ids:
             ordered_ids.append(sid)
     blob = " ".join((c.get("chunk_content") or "") for c in top).lower()
@@ -1280,12 +1274,15 @@ def score(spec: dict[str, Any], resp: ct.ApiResponse | None) -> dict[str, Any]:
 
     reasons: list[str] = []
     passed = True
+    if transport_error:
+        passed = False
+        reasons.append(transport_error)
 
-    if spec.get("expect_empty"):
+    if not transport_error and spec.get("expect_empty"):
         if chunks:
             passed = False
             reasons.append(f"expected zero chunks, got {len(chunks)}")
-    else:
+    elif not transport_error:
         min_recall = spec.get("min_recall", 1.0 if expected else None)
         if (
             expected
@@ -1305,13 +1302,13 @@ def score(spec: dict[str, Any], resp: ct.ApiResponse | None) -> dict[str, Any]:
             passed = False
             reasons.append(f"rank {first_rank} > max_rank {spec['max_rank']}")
 
-    if spec.get("max_chunks") is not None and len(chunks) > spec["max_chunks"]:
+    if not transport_error and spec.get("max_chunks") is not None and len(chunks) > spec["max_chunks"]:
         passed = False
         reasons.append(
             f"max_results not respected: {len(chunks)} > {spec['max_chunks']}"
         )
 
-    if spec.get("rank_before"):
+    if not transport_error and spec.get("rank_before"):
         a, b = spec["rank_before"]
         ra = ordered_ids.index(a) if a in ordered_ids else None
         rb = ordered_ids.index(b) if b in ordered_ids else None
@@ -1320,7 +1317,7 @@ def score(spec: dict[str, Any], resp: ct.ApiResponse | None) -> dict[str, Any]:
             reasons.append(f"recency: expected {a} before {b} (positions {ra} vs {rb})")
 
     graph_populated = None
-    if spec.get("expect_graph"):
+    if not transport_error and spec.get("expect_graph"):
         gc = data.get("graph_context") or {}
         graph_populated = (
             bool(
@@ -1338,7 +1335,7 @@ def score(spec: dict[str, Any], resp: ct.ApiResponse | None) -> dict[str, Any]:
             reasons.append("graph_context empty (expected populated graph slice)")
 
     addl_ctx_keys = None
-    if spec.get("expect_addl_ctx"):
+    if not transport_error and spec.get("expect_addl_ctx"):
         ac = data.get("additional_context")
         addl_ctx_keys = list(ac.keys()) if isinstance(ac, dict) else []
         if not addl_ctx_keys:
@@ -1348,10 +1345,10 @@ def score(spec: dict[str, Any], resp: ct.ApiResponse | None) -> dict[str, Any]:
             )
 
     dept_violations = None
-    if spec.get("filter_department"):
+    if not transport_error and spec.get("filter_department"):
         want = spec["filter_department"]
         dept_violations = [
-            (c.get("source_id"), (c.get("metadata") or {}).get("department"))
+            (c.get("id"), (c.get("metadata") or {}).get("department"))
             for c in top
             if isinstance(c.get("metadata"), dict)
             and c["metadata"].get("department") not in (None, want)
@@ -1371,11 +1368,11 @@ def score(spec: dict[str, Any], resp: ct.ApiResponse | None) -> dict[str, Any]:
                 f"department filter returned {len(top)} chunks, expected >= {need}"
             )
 
-    doc_meta_violations = None
-    if spec.get("filter_doc_meta"):
-        key, want = spec["filter_doc_meta"]
-        doc_meta_violations = [
-            (c.get("source_id"), (c.get("additional_metadata") or {}).get(key))
+    additional_meta_violations = None
+    if not transport_error and spec.get("filter_additional_meta"):
+        key, want = spec["filter_additional_meta"]
+        additional_meta_violations = [
+            (c.get("id"), (c.get("additional_metadata") or {}).get(key))
             for c in top
             if isinstance(c.get("additional_metadata"), dict)
             and c["additional_metadata"].get(key) not in (None, want)
@@ -1384,10 +1381,10 @@ def score(spec: dict[str, Any], resp: ct.ApiResponse | None) -> dict[str, Any]:
         if not top:
             passed = False
             reasons.append("additional_metadata filter returned zero chunks")
-        elif doc_meta_violations:
+        elif additional_meta_violations:
             passed = False
             reasons.append(
-                f"additional_metadata filter leaked {key}!={want}: {doc_meta_violations[:4]}"
+                f"additional_metadata filter leaked {key}!={want}: {additional_meta_violations[:4]}"
             )
         elif len(top) < need:
             passed = False
@@ -1415,7 +1412,7 @@ def score(spec: dict[str, Any], resp: ct.ApiResponse | None) -> dict[str, Any]:
         "graph_populated": graph_populated,
         "additional_context_keys": addl_ctx_keys,
         "department_violations": dept_violations,
-        "doc_meta_violations": doc_meta_violations,
+        "additional_meta_violations": additional_meta_violations,
         "request_id": resp.request_id if isinstance(resp, ct.ApiResponse) else None,
         "http_status": resp.status if isinstance(resp, ct.ApiResponse) else None,
     }
@@ -1423,8 +1420,8 @@ def score(spec: dict[str, Any], resp: ct.ApiResponse | None) -> dict[str, Any]:
 
 # -----------------------------------------------------------------------------
 # Ingestion-fidelity checks — assert sources were stored as declared.
-# These document confirmed findings: file_metadata is dropped for files; relations
-# and timestamp are dropped/overwritten for app sources; app chunks index as JSON.
+# These checks document whether uploaded document metadata, relations, timestamps,
+# and app chunks are preserved end-to-end.
 # -----------------------------------------------------------------------------
 
 
@@ -1432,12 +1429,12 @@ def _get_source(client: ct.ApiClient, sid: str) -> dict[str, Any]:
     r = safe(
         client,
         "POST",
-        "/source/list",
+        "/context/list",
         json_body={
             "tenant_id": TENANT_ID,
             "sub_tenant_id": SUB_TENANT,
             "type": "knowledge",
-            "source_ids": [sid],
+            "ids": [sid],
             "page": 1,
             "page_size": 5,
         },
@@ -1476,7 +1473,7 @@ def fidelity_checks(client: ct.ApiClient) -> list[dict[str, Any]]:
                 "graph_populated": None,
                 "additional_context_keys": None,
                 "department_violations": None,
-                "doc_meta_violations": None,
+                "additional_meta_violations": None,
                 "request_id": None,
                 "http_status": None,
                 "detail": detail,
@@ -1484,39 +1481,60 @@ def fidelity_checks(client: ct.ApiClient) -> list[dict[str, Any]]:
             }
         )
 
-    # 1. File-uploaded source should retain file_metadata.title + tenant_metadata.
+    def metadata_of(src: dict[str, Any]) -> dict[str, Any]:
+        # /context/list currently returns legacy storage names even though query
+        # results expose canonical `metadata` / `additional_metadata`.
+        return src.get("metadata") or src.get("tenant_metadata") or {}
+
+    def additional_metadata_of(src: dict[str, Any]) -> dict[str, Any]:
+        return src.get("additional_metadata") or src.get("document_metadata") or {}
+
+    # 1. Uploaded document should retain the document_metadata payload.
     f = _get_source(client, "gold_sec_gdpr")
+    f_meta = metadata_of(f)
+    f_addl = additional_metadata_of(f)
     title_ok = f.get("title") == "GDPR Data Deletion Procedure"
-    meta_ok = bool(f.get("tenant_metadata"))
+    meta_ok = f_meta.get("department") == "security" and f_addl.get("dept") == "security"
     finding(
-        "fidelity_file_metadata_persisted",
-        title_ok and meta_ok,
-        f"file_metadata dropped for file uploads: title={f.get('title')!r} "
-        f"(expected 'GDPR Data Deletion Procedure'), tenant_metadata={f.get('tenant_metadata')}",
+        "fidelity_document_metadata_persisted",
+        meta_ok,
+        f"document_metadata payload persisted={meta_ok}; title override honored={title_ok} "
+        f"(title={f.get('title')!r}, expected 'GDPR Data Deletion Procedure')",
         {
             "title": f.get("title"),
+            "expected_title": "GDPR Data Deletion Procedure",
+            "title_override_honored": title_ok,
             "type": f.get("type"),
-            "tenant_metadata": f.get("tenant_metadata"),
-            "document_metadata": f.get("document_metadata"),
+            "metadata": f_meta,
+            "additional_metadata": f_addl,
+            "raw_metadata": f.get("metadata"),
+            "raw_additional_metadata": f.get("additional_metadata"),
+            "raw_tenant_metadata": f.get("tenant_metadata"),
+            "raw_document_metadata": f.get("document_metadata"),
         },
     )
 
-    # 2. App source should retain tenant_metadata (positive control).
+    # 2. App source should retain metadata (positive control).
     a = _get_source(client, "gold_app_legal_1")
+    a_meta = metadata_of(a)
+    a_addl = additional_metadata_of(a)
     finding(
         "fidelity_app_metadata_persisted",
-        (a.get("tenant_metadata") or {}).get("department") == "legal",
-        f"app tenant_metadata not persisted: {a.get('tenant_metadata')}",
+        a_meta.get("department") == "legal" and a_addl.get("dept") == "legal",
+        f"app metadata persisted={a_meta.get('department') == 'legal'}; metadata={a_meta}",
         {
-            "tenant_metadata": a.get("tenant_metadata"),
-            "additional_metadata": a.get("additional_metadata"),
-            "document_metadata": a.get("document_metadata"),
+            "metadata": a_meta,
+            "additional_metadata": a_addl,
+            "raw_metadata": a.get("metadata"),
+            "raw_additional_metadata": a.get("additional_metadata"),
+            "raw_tenant_metadata": a.get("tenant_metadata"),
+            "raw_document_metadata": a.get("document_metadata"),
         },
     )
 
-    # 3. File-based forceful relations → test end-to-end with thinking-mode query
-    #    and search_forceful_relations: true, query_apps: false.
-    #    (file_metadata.relations.source_ids is not part of the app-aware lane.)
+    # 3. Document-upload forceful relations → test end-to-end with thinking-mode query
+    #    and query_forceful_relations: true, query_apps: false.
+    #    (document_metadata.relations.ids is not part of the app-aware lane.)
     qr2 = safe(
         client,
         "POST",
@@ -1528,7 +1546,7 @@ def fidelity_checks(client: ct.ApiClient) -> list[dict[str, Any]]:
             "type": "knowledge",
             "query_by": "hybrid",
             "mode": "thinking",
-            "search_forceful_relations": True,
+            "query_forceful_relations": True,
             "max_results": 10,
             "graph_context": False,
         },
@@ -1540,9 +1558,9 @@ def fidelity_checks(client: ct.ApiClient) -> list[dict[str, Any]]:
     finding(
         "fidelity_relations_persisted",
         rels_work,
-        f"file-based relations declared at ingest did not surface in thinking-mode "
+        f"document-upload relations declared at ingest did not surface in thinking-mode "
         f"additional_context (addl_ctx={addl_ctx!r}) "
-        "-> search_forceful_relations is non-functional end-to-end",
+        "-> query_forceful_relations is non-functional end-to-end",
         {
             "additional_context_keys": list(addl_ctx.keys())
             if isinstance(addl_ctx, dict)
@@ -1583,7 +1601,7 @@ def fidelity_checks(client: ct.ApiClient) -> list[dict[str, Any]]:
     appchunk = ""
     if isinstance(qr, ct.ApiResponse) and isinstance(qr.data, dict):
         for c in qr.data.get("chunks", []) or []:
-            if c.get("source_id") == "gold_app_slack_escalation":
+            if c.get("id") == "gold_app_slack_escalation":
                 appchunk = c.get("chunk_content") or ""
                 break
     clean = bool(appchunk) and not appchunk.lstrip().startswith("{")
@@ -1621,7 +1639,7 @@ def main() -> int:
             {
                 "sub_tenant": SUB_TENANT,
                 "run_id": RUN_ID,
-                "knowledge_files": knowledge,
+                "knowledge_documents": knowledge,
                 "app_sources": apps,
                 "memories": mems,
                 "queries": queries,
@@ -1630,11 +1648,11 @@ def main() -> int:
         )
     )
 
-    print("=== HydraDB v2 golden-dataset retrieval eval (rich, file-based) ===")
+    print("=== HydraDB v2 golden-dataset retrieval eval (rich, document-based) ===")
     print(f"Base URL:   {ct.BASE_URL}")
     print(f"Sub-tenant: {SUB_TENANT}  (isolated)")
     print(
-        f"Corpus:     {len(knowledge)} file docs ({len(heroes)} hero / {len(fillers)} "
+        f"Corpus:     {len(knowledge)} document docs ({len(heroes)} hero / {len(fillers)} "
         f"distractor) + {len(apps)} app sources + {len(mems)} memories"
     )
     print(f"Queries:    {len(queries)} (covering every /query parameter)")
@@ -1643,8 +1661,8 @@ def main() -> int:
     file_ids = [d["id"] for d in knowledge]
     app_ids = [a["id"] for a in apps]
     if not REUSE:
-        print("\n--- Ingesting (files + app sources + memories) ---")
-        ingest_files(client, knowledge)
+        print("\n--- Ingesting (documents + app sources + memories) ---")
+        ingest_documents(client, knowledge)
         ingest_apps(client, apps)
         ingest_memories(client, mems)
         print("\n--- Waiting for searchable ---")
@@ -1675,6 +1693,9 @@ def main() -> int:
                     "spec": spec,
                     "score": r,
                     "response_body": resp.json_body
+                    if isinstance(resp, ct.ApiResponse)
+                    else None,
+                    "response_text": resp.body_text
                     if isinstance(resp, ct.ApiResponse)
                     else None,
                 },
@@ -1739,7 +1760,7 @@ def main() -> int:
 
     lines = [
         "# Golden-dataset retrieval eval (rich, two-lane)\n",
-        f"- Sub-tenant `{SUB_TENANT}` — {len(knowledge)} file docs + {len(apps)} app + "
+        f"- Sub-tenant `{SUB_TENANT}` — {len(knowledge)} document docs + {len(apps)} app + "
         f"{len(mems)} memories",
         f"- **Retrieval quality: {q_pass}/{len(results) - len(findings)} passed** | "
         f"mean recall@{DEFAULT_TOP_K} **{metrics['mean_recall_at_k']}** | "

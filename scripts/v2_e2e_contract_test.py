@@ -20,20 +20,20 @@ What this script checks:
        GET    /tenants/status          ready poll + snapshot
        GET    /tenants/sub-tenants      list
        GET    /tenants/stats           snapshot
-       POST   /source/ingest           knowledge file (single/multi), app_knowledge
-                                        (object/array), files+app mixed, upsert=false,
+       POST   /context/ingest          knowledge documents (single/multi), app_knowledge
+                                        (object/array), documents+app mixed, upsert=false,
                                         memory text (infer true/false), conversation
                                         pairs, memory with metadata
-       GET    /source/status           single id, multiple ids, memory id
-       GET    /source/fetch            mode content/url/both, memory, custom expiry
-       POST   /source/list             knowledge basic, filters (doc_meta/source_fields),
-                                        include_fields, source_ids, pagination, memory
-       DELETE /source                  knowledge, memory
-       GET    /source/relations        by source_id, sub-tenant-wide, limit, memory
+       GET    /context/status           single id, multiple ids, memory id
+       GET    /context/inspect         mode content/url/both, memory, custom expiry
+       POST   /context/list             knowledge basic, filters (additional_metadata/source_fields),
+                                        include_fields, ids, pagination, memory
+       DELETE /context                  knowledge, memory
+       GET    /context/relations        by id, sub-tenant-wide, limit, memory
        POST   /query                   type knowledge/memory/all x query_by hybrid/text
                                         x mode fast/thinking x operator or/and/phrase
                                         x alpha numeric/auto x recency_bias x graph_context
-                                        on/off x search_apps x metadata_filters x
+                                        on/off x query_apps x metadata_filters x
                                         additional_context x max_results x zero-results
                                         x empty-query negative
        GET/POST/DELETE /webhooks/indexing ... full webhook surface
@@ -69,7 +69,7 @@ from urllib.request import Request, urlopen
 BASE_URL = os.getenv("HYDRADB_BASE_URL", "https://api-v2.staging.hydradb.com/")
 API_KEY = "sk_test_dJuJD9XSODdb.8d5i_Y09VD6F9kc-kkcDk_9edIExoCM1v8siJ69_v8k"  #
 TENANT_ID = os.getenv("HYDRADB_TENANT_ID", "default-tenant")
-SUB_TENANT_ID = os.getenv("HYDRADB_SUB_TENANT_ID", "e2e_user_alex-2")
+SUB_TENANT_ID = os.getenv("HYDRADB_SUB_TENANT_ID", "e2e_user_alex-3")
 
 API_VERSION = "2"
 OPENAPI_PATH = (
@@ -145,7 +145,7 @@ class Context:
     known_delivery_id: str | None = None
 
     @property
-    def all_source_ids(self) -> list[str]:
+    def all_ids(self) -> list[str]:
         return self.knowledge_ids + self.app_ids + self.memory_ids
 
 
@@ -423,7 +423,7 @@ class OpenApiContract:
         ref = schema.get("$ref", "") if isinstance(schema, dict) else ""
         schema_name = ref.rsplit("/", 1)[-1]
         return schema_name.endswith("ApiResponse") or path.startswith(
-            ("/tenants", "/source", "/query")
+            ("/tenants", "/context", "/query")
         )
 
     def validate_envelope(self, payload: Any, label: str) -> None:
@@ -706,20 +706,20 @@ class ApiClient:
             data = json.dumps(json_body).encode("utf-8")
             headers["Content-Type"] = "application/json"
         elif multipart is not None:
-            fields, files = multipart
+            fields, documents = multipart
             boundary = "----hydradb-e2e-" + uuid.uuid4().hex
-            data = self._encode_multipart(boundary, fields, files)
+            data = self._encode_multipart(boundary, fields, documents)
             headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
             multipart_summary = {
                 "fields": dict(fields),
-                "files": [
+                "documents": [
                     {
                         "field": fname,
                         "filename": filename,
                         "content_type": ctype,
                         "size_bytes": len(content),
                     }
-                    for fname, filename, content, ctype in files
+                    for fname, filename, content, ctype in documents
                 ],
             }
 
@@ -1030,12 +1030,12 @@ def audit_endpoint_docs(contract: OpenApiContract, recorder: Recorder) -> None:
         ("GET", "/tenants/status"),
         ("GET", "/tenants/sub-tenants"),
         ("GET", "/tenants/stats"),
-        ("POST", "/source/ingest"),
-        ("GET", "/source/status"),
-        ("GET", "/source/fetch"),
-        ("POST", "/source/list"),
-        ("DELETE", "/source"),
-        ("GET", "/source/relations"),
+        ("POST", "/context/ingest"),
+        ("GET", "/context/status"),
+        ("GET", "/context/inspect"),
+        ("POST", "/context/list"),
+        ("DELETE", "/context"),
+        ("GET", "/context/relations"),
         ("POST", "/query"),
     }
     missing_docs = sorted(canonical_ops - documented_ops)
@@ -1075,6 +1075,36 @@ def audit_endpoint_docs(contract: OpenApiContract, recorder: Recorder) -> None:
         recorder.fail(
             "docs.rename query_by/type fields",
             f"QueryRequest field rename incomplete; keys={sorted(props)[:12]}",
+        )
+
+    if (
+        "query_apps" in props
+        and "query_forceful_relations" in props
+        and "search_apps" not in props
+        and "search_forceful_relations" not in props
+    ):
+        recorder.pass_(
+            "docs.rename query flags",
+            "QueryRequest uses `query_apps` + `query_forceful_relations`",
+        )
+    else:
+        recorder.fail(
+            "docs.rename query flags",
+            f"QueryRequest query flag rename incomplete; keys={sorted(props)}",
+        )
+
+    paths = contract.doc.get("paths", {})
+    if all(not p.startswith("/source") for p in paths) and any(
+        p.startswith("/context") for p in paths
+    ):
+        recorder.pass_(
+            "docs.rename /source->/context paths",
+            "OpenAPI exposes context-management paths only",
+        )
+    else:
+        recorder.fail(
+            "docs.rename /source->/context paths",
+            f"Expected /context paths and no /source paths; paths={sorted(paths)}",
         )
 
 
@@ -1194,25 +1224,25 @@ def wait_for_tenant_ready(
     return False
 
 
-def _collect_source_ids(resp: ApiResponse | None) -> list[str]:
+def _collect_ids(resp: ApiResponse | None) -> list[str]:
     ids: list[str] = []
     if isinstance(resp, ApiResponse) and isinstance(resp.data, dict):
         for item in resp.data.get("results", []) or []:
-            if isinstance(item, dict) and item.get("source_id"):
-                ids.append(item["source_id"])
+            if isinstance(item, dict) and item.get("id"):
+                ids.append(item["id"])
     return ids
 
 
 def ingest_all_variations(
     client: ApiClient, recorder: Recorder, writer: ResultWriter, ctx: Context
 ) -> None:
-    """Exercise POST /source/ingest across every documented variation."""
+    """Exercise POST /context/ingest across every documented variation."""
     run = ctx.run_id
     tmeta = {"department": "support", "workspace": "docs"}
     dmeta = {"source": "e2e_contract", "run_id": run}
 
     def txt(name: str, body: str) -> tuple[str, str, bytes, str]:
-        return ("files", name, body.encode("utf-8"), "text/plain")
+        return ("documents", name, body.encode("utf-8"), "text/plain")
 
     # 1. Knowledge: single text file.
     sid_file1 = f"e2e_kfile1_{run}"
@@ -1222,9 +1252,9 @@ def ingest_all_variations(
         writer,
         "source_ingest",
         "knowledge_file_single_txt",
-        "type=knowledge, one .txt file with file_metadata (tenant + document metadata)",
+        "type=knowledge, one .txt document with document_metadata (metadata + additional_metadata)",
         method="POST",
-        path="/source/ingest",
+        path="/context/ingest",
         expected_statuses=(202,),
         multipart=(
             {
@@ -1232,14 +1262,14 @@ def ingest_all_variations(
                 "tenant_id": TENANT_ID,
                 "sub_tenant_id": SUB_TENANT_ID,
                 "upsert": "true",
-                "file_metadata": json.dumps(
+                "document_metadata": json.dumps(
                     [
                         {
-                            "source_id": sid_file1,
+                            "id": sid_file1,
                             "title": "E2E Refund Policy",
                             "type": "txt",
-                            "tenant_metadata": tmeta,
-                            "document_metadata": dmeta,
+                            "metadata": tmeta,
+                            "additional_metadata": dmeta,
                         }
                     ]
                 ),
@@ -1253,9 +1283,9 @@ def ingest_all_variations(
             ],
         ),
     )
-    ctx.knowledge_ids += _collect_source_ids(r) or [sid_file1]
+    ctx.knowledge_ids += _collect_ids(r) or [sid_file1]
 
-    # 2. Knowledge: multiple text files in one request.
+    # 2. Knowledge: multiple text documents in one request.
     sid_file2a, sid_file2b = f"e2e_kfile2a_{run}", f"e2e_kfile2b_{run}"
     r = run_case(
         client,
@@ -1263,9 +1293,9 @@ def ingest_all_variations(
         writer,
         "source_ingest",
         "knowledge_file_multi_txt",
-        "type=knowledge, two .txt files with a parallel file_metadata array",
+        "type=knowledge, two .txt documents with a parallel document_metadata array",
         method="POST",
-        path="/source/ingest",
+        path="/context/ingest",
         expected_statuses=(202,),
         multipart=(
             {
@@ -1273,17 +1303,17 @@ def ingest_all_variations(
                 "tenant_id": TENANT_ID,
                 "sub_tenant_id": SUB_TENANT_ID,
                 "upsert": "true",
-                "file_metadata": json.dumps(
+                "document_metadata": json.dumps(
                     [
                         {
-                            "source_id": sid_file2a,
-                            "tenant_metadata": tmeta,
-                            "document_metadata": dmeta,
+                            "id": sid_file2a,
+                            "metadata": tmeta,
+                            "additional_metadata": dmeta,
                         },
                         {
-                            "source_id": sid_file2b,
-                            "tenant_metadata": {"department": "ops"},
-                            "document_metadata": dmeta,
+                            "id": sid_file2b,
+                            "metadata": {"department": "ops"},
+                            "additional_metadata": dmeta,
                         },
                     ]
                 ),
@@ -1300,7 +1330,7 @@ def ingest_all_variations(
             ],
         ),
     )
-    ctx.knowledge_ids += _collect_source_ids(r) or [sid_file2a, sid_file2b]
+    ctx.knowledge_ids += _collect_ids(r) or [sid_file2a, sid_file2b]
 
     # 3. Knowledge: app_knowledge as a single JSON object (not an array).
     sid_app1 = f"e2e_kapp1_{run}"
@@ -1312,7 +1342,7 @@ def ingest_all_variations(
         "knowledge_app_single_object",
         "type=knowledge, app_knowledge sent as a single JSON object",
         method="POST",
-        path="/source/ingest",
+        path="/context/ingest",
         expected_statuses=(202,),
         multipart=(
             {
@@ -1332,15 +1362,15 @@ def ingest_all_variations(
                         "content": {
                             "text": f"E2E {run}: Starter costs $29 per month and Pro costs $79 per month."
                         },
-                        "tenant_metadata": tmeta,
-                        "document_metadata": dmeta,
+                        "metadata": tmeta,
+                        "additional_metadata": dmeta,
                     }
                 ),
             },
             [],
         ),
     )
-    ctx.app_ids += _collect_source_ids(r) or [sid_app1]
+    ctx.app_ids += _collect_ids(r) or [sid_app1]
 
     # 4. Knowledge: app_knowledge as an array, with a forceful relation back to file1.
     sid_app2 = f"e2e_kapp2_{run}"
@@ -1350,9 +1380,9 @@ def ingest_all_variations(
         writer,
         "source_ingest",
         "knowledge_app_array_with_relations",
-        "type=knowledge, app_knowledge array item declaring relations.source_ids",
+        "type=knowledge, app_knowledge array item declaring relations.ids",
         method="POST",
-        path="/source/ingest",
+        path="/context/ingest",
         expected_statuses=(202,),
         multipart=(
             {
@@ -1371,10 +1401,10 @@ def ingest_all_variations(
                             "content": {
                                 "text": f"E2E {run}: The refund workflow links to the pricing tiers."
                             },
-                            "tenant_metadata": tmeta,
-                            "document_metadata": dmeta,
-                            # Docs shape is exactly {source_ids: [...]} — no extra keys.
-                            "relations": {"source_ids": [sid_file1]},
+                            "metadata": tmeta,
+                            "additional_metadata": dmeta,
+                            # Docs shape is exactly {ids: [...]} — no extra keys.
+                            "relations": {"ids": [sid_file1]},
                         }
                     ]
                 ),
@@ -1382,21 +1412,21 @@ def ingest_all_variations(
             [],
         ),
     )
-    ctx.app_ids += _collect_source_ids(r) or [sid_app2]
+    ctx.app_ids += _collect_ids(r) or [sid_app2]
     ctx.forceful_declaring_id = sid_app2
     ctx.forceful_target_id = sid_file1
 
-    # 5. Knowledge: files + app_knowledge mixed in one request.
+    # 5. Knowledge: documents + app_knowledge mixed in one request.
     sid_mixf, sid_mixa = f"e2e_kmixf_{run}", f"e2e_kmixa_{run}"
     r = run_case(
         client,
         recorder,
         writer,
         "source_ingest",
-        "knowledge_files_and_app_mixed",
-        "type=knowledge, files and app_knowledge in the same request",
+        "knowledge_documents_and_app_mixed",
+        "type=knowledge, documents and app_knowledge in the same request",
         method="POST",
-        path="/source/ingest",
+        path="/context/ingest",
         expected_statuses=(202,),
         multipart=(
             {
@@ -1404,12 +1434,12 @@ def ingest_all_variations(
                 "tenant_id": TENANT_ID,
                 "sub_tenant_id": SUB_TENANT_ID,
                 "upsert": "true",
-                "file_metadata": json.dumps(
+                "document_metadata": json.dumps(
                     [
                         {
-                            "source_id": sid_mixf,
-                            "tenant_metadata": tmeta,
-                            "document_metadata": dmeta,
+                            "id": sid_mixf,
+                            "metadata": tmeta,
+                            "additional_metadata": dmeta,
                         }
                     ]
                 ),
@@ -1424,8 +1454,8 @@ def ingest_all_variations(
                             "content": {
                                 "text": f"E2E {run}: mixed-request app source content."
                             },
-                            "tenant_metadata": tmeta,
-                            "document_metadata": dmeta,
+                            "metadata": tmeta,
+                            "additional_metadata": dmeta,
                         }
                     ]
                 ),
@@ -1433,7 +1463,7 @@ def ingest_all_variations(
             [txt("e2e_mixed.txt", f"E2E {run}: mixed-request uploaded file content.")],
         ),
     )
-    ctx.knowledge_ids += [s for s in _collect_source_ids(r) if s] or [
+    ctx.knowledge_ids += [s for s in _collect_ids(r) if s] or [
         sid_mixf,
         sid_mixa,
     ]
@@ -1446,9 +1476,9 @@ def ingest_all_variations(
         writer,
         "source_ingest",
         "knowledge_upsert_false_new_id",
-        "type=knowledge, upsert=false with a new source_id (disposable, deleted later)",
+        "type=knowledge, upsert=false with a new id (disposable, deleted later)",
         method="POST",
-        path="/source/ingest",
+        path="/context/ingest",
         expected_statuses=(202,),
         multipart=(
             {
@@ -1456,12 +1486,12 @@ def ingest_all_variations(
                 "tenant_id": TENANT_ID,
                 "sub_tenant_id": SUB_TENANT_ID,
                 "upsert": "false",
-                "file_metadata": json.dumps(
+                "document_metadata": json.dumps(
                     [
                         {
-                            "source_id": sid_upsert,
-                            "tenant_metadata": tmeta,
-                            "document_metadata": dmeta,
+                            "id": sid_upsert,
+                            "metadata": tmeta,
+                            "additional_metadata": dmeta,
                         }
                     ]
                 ),
@@ -1474,15 +1504,12 @@ def ingest_all_variations(
             ],
         ),
     )
-    got = _collect_source_ids(r)
+    got = _collect_ids(r)
     ctx.disposable_knowledge_id = got[0] if got else sid_upsert
     ctx.knowledge_ids += got or [sid_upsert]
 
-    # Memory items: BOTH tenant_metadata AND document_metadata must be JSON-stringified
-    # strings when sent inside the `memories` multipart field. Knowledge items (file_metadata,
-    # app_knowledge) still use plain objects for both fields.
-    tmeta_str = json.dumps(tmeta)
-    dmeta_str = json.dumps(dmeta)
+    # Memory items are JSON-encoded as part of the top-level `memories` form field,
+    # but their metadata fields themselves are plain objects (not JSON strings).
 
     # 7. Memory: raw text with infer=true.
     sid_mem1 = f"e2e_mem1_{run}"
@@ -1494,7 +1521,7 @@ def ingest_all_variations(
         "memory_text_infer_true",
         "type=memory, text + infer=true (extract preference) + user_name",
         method="POST",
-        path="/source/ingest",
+        path="/context/ingest",
         expected_statuses=(202,),
         multipart=(
             {
@@ -1505,13 +1532,13 @@ def ingest_all_variations(
                 "memories": json.dumps(
                     [
                         {
-                            "source_id": sid_mem1,
+                            "id": sid_mem1,
                             "title": "Alex tone preference",
                             "text": f"E2E {run}: Alex prefers concise technical answers and dark mode.",
                             "infer": True,
                             "user_name": "Alex",
-                            "tenant_metadata": tmeta_str,
-                            "document_metadata": dmeta_str,
+                            "metadata": tmeta,
+                            "additional_metadata": dmeta,
                         }
                     ]
                 ),
@@ -1519,7 +1546,7 @@ def ingest_all_variations(
             [],
         ),
     )
-    ctx.memory_ids += _collect_source_ids(r) or [sid_mem1]
+    ctx.memory_ids += _collect_ids(r) or [sid_mem1]
 
     # 8. Memory: raw text stored verbatim (infer=false), with is_markdown.
     sid_mem2 = f"e2e_mem2_{run}"
@@ -1531,7 +1558,7 @@ def ingest_all_variations(
         "memory_text_infer_false_markdown",
         "type=memory, text + infer=false (verbatim) + is_markdown=true (disposable)",
         method="POST",
-        path="/source/ingest",
+        path="/context/ingest",
         expected_statuses=(202,),
         multipart=(
             {
@@ -1542,13 +1569,13 @@ def ingest_all_variations(
                 "memories": json.dumps(
                     [
                         {
-                            "source_id": sid_mem2,
+                            "id": sid_mem2,
                             "title": "Verbatim note",
                             "text": f"# E2E {run}\nStore this note verbatim without inference.",
                             "infer": False,
                             "is_markdown": True,
-                            "tenant_metadata": tmeta_str,
-                            "document_metadata": dmeta_str,
+                            "metadata": tmeta,
+                            "additional_metadata": dmeta,
                         }
                     ]
                 ),
@@ -1556,7 +1583,7 @@ def ingest_all_variations(
             [],
         ),
     )
-    got = _collect_source_ids(r)
+    got = _collect_ids(r)
     ctx.disposable_memory_id = got[0] if got else sid_mem2
     ctx.memory_ids += got or [sid_mem2]
 
@@ -1570,7 +1597,7 @@ def ingest_all_variations(
         "memory_conversation_pairs",
         "type=memory, user_assistant_pairs instead of text, infer=false",
         method="POST",
-        path="/source/ingest",
+        path="/context/ingest",
         expected_statuses=(202,),
         multipart=(
             {
@@ -1581,7 +1608,7 @@ def ingest_all_variations(
                 "memories": json.dumps(
                     [
                         {
-                            "source_id": sid_mem3,
+                            "id": sid_mem3,
                             "title": "Support conversation about refunds",
                             "user_assistant_pairs": [
                                 {
@@ -1590,7 +1617,7 @@ def ingest_all_variations(
                                 }
                             ],
                             "infer": False,
-                            "tenant_metadata": tmeta_str,
+                            "metadata": tmeta,
                         }
                     ]
                 ),
@@ -1598,7 +1625,7 @@ def ingest_all_variations(
             [],
         ),
     )
-    ctx.memory_ids += _collect_source_ids(r) or [sid_mem3]
+    ctx.memory_ids += _collect_ids(r) or [sid_mem3]
 
     # 10. Memory: infer=true with custom_instructions + expiry_time.
     sid_mem4 = f"e2e_mem4_{run}"
@@ -1610,7 +1637,7 @@ def ingest_all_variations(
         "memory_infer_custom_instructions_expiry",
         "type=memory, infer=true + custom_instructions + expiry_time TTL",
         method="POST",
-        path="/source/ingest",
+        path="/context/ingest",
         expected_statuses=(202,),
         multipart=(
             {
@@ -1621,15 +1648,15 @@ def ingest_all_variations(
                 "memories": json.dumps(
                     [
                         {
-                            "source_id": sid_mem4,
+                            "id": sid_mem4,
                             "title": "Channel preference",
                             "text": f"E2E {run}: Alex usually reaches out from the billing help center.",
                             "infer": True,
                             "custom_instructions": "Extract the preferred support channel.",
                             "user_name": "Alex",
                             "expiry_time": 86400,
-                            "tenant_metadata": tmeta_str,
-                            "document_metadata": dmeta_str,
+                            "metadata": tmeta,
+                            "additional_metadata": dmeta,
                         }
                     ]
                 ),
@@ -1637,11 +1664,11 @@ def ingest_all_variations(
             [],
         ),
     )
-    ctx.memory_ids += _collect_source_ids(r) or [sid_mem4]
+    ctx.memory_ids += _collect_ids(r) or [sid_mem4]
 
 
 def wait_for_sources_searchable(
-    client: ApiClient, recorder: Recorder, source_ids: list[str]
+    client: ApiClient, recorder: Recorder, ids: list[str]
 ) -> bool:
     deadline = time.time() + SOURCE_READY_TIMEOUT_SECONDS
     terminal_failures = {"errored", "failed"}
@@ -1652,14 +1679,14 @@ def wait_for_sources_searchable(
     while time.time() < deadline:
         resp = run_check(
             recorder,
-            "runtime GET /source/status poll",
+            "runtime GET /context/status poll",
             lambda: client.request(
                 "GET",
-                "/source/status",
+                "/context/status",
                 query={
                     "tenant_id": TENANT_ID,
                     "sub_tenant_id": SUB_TENANT_ID,
-                    "source_ids": source_ids,
+                    "ids": ids,
                 },
             ),
         )
@@ -1704,14 +1731,14 @@ def exercise_source_status(
         recorder,
         writer,
         "source_status",
-        "single_source_id",
-        "GET /source/status using the singular source_id param",
+        "single_id",
+        "GET /context/status using one id in the ids list",
         method="GET",
-        path="/source/status",
+        path="/context/status",
         query={
             "tenant_id": TENANT_ID,
             "sub_tenant_id": SUB_TENANT_ID,
-            "source_id": k_ids[0] if k_ids else None,
+            "ids": [k_ids[0]] if k_ids else None,
         },
     )
     run_case(
@@ -1719,14 +1746,14 @@ def exercise_source_status(
         recorder,
         writer,
         "source_status",
-        "multiple_source_ids",
-        "GET /source/status using the source_ids list param (repeated query key)",
+        "multiple_ids",
+        "GET /context/status using the ids list param (repeated query key)",
         method="GET",
-        path="/source/status",
+        path="/context/status",
         query={
             "tenant_id": TENANT_ID,
             "sub_tenant_id": SUB_TENANT_ID,
-            "source_ids": k_ids[:5],
+            "ids": k_ids[:5],
         },
     )
     if ctx.memory_ids:
@@ -1735,14 +1762,14 @@ def exercise_source_status(
             recorder,
             writer,
             "source_status",
-            "memory_source_id",
-            "GET /source/status for a memory source_id",
+            "memory_id",
+            "GET /context/status for a memory id",
             method="GET",
-            path="/source/status",
+            path="/context/status",
             query={
                 "tenant_id": TENANT_ID,
                 "sub_tenant_id": SUB_TENANT_ID,
-                "source_id": ctx.memory_ids[0],
+                "ids": [ctx.memory_ids[0]],
             },
         )
 
@@ -1758,13 +1785,13 @@ def exercise_source_fetch(
             writer,
             "source_fetch",
             f"knowledge_mode_{mode}",
-            f"GET /source/fetch knowledge source, mode={mode}",
+            f"GET /context/inspect knowledge source, mode={mode}",
             method="GET",
-            path="/source/fetch",
+            path="/context/inspect",
             query={
                 "tenant_id": TENANT_ID,
                 "sub_tenant_id": SUB_TENANT_ID,
-                "source_id": kid,
+                "id": kid,
                 "mode": mode,
             },
         )
@@ -1774,13 +1801,13 @@ def exercise_source_fetch(
         writer,
         "source_fetch",
         "knowledge_url_custom_expiry",
-        "GET /source/fetch mode=url with a custom expiry_seconds TTL",
+        "GET /context/inspect mode=url with a custom expiry_seconds TTL",
         method="GET",
-        path="/source/fetch",
+        path="/context/inspect",
         query={
             "tenant_id": TENANT_ID,
             "sub_tenant_id": SUB_TENANT_ID,
-            "source_id": kid,
+            "id": kid,
             "mode": "url",
             "expiry_seconds": 120,
         },
@@ -1792,16 +1819,16 @@ def exercise_source_fetch(
             writer,
             "source_fetch",
             "memory_mode_content",
-            "GET /source/fetch a memory source (returns raw text, no presigned URL)",
+            "GET /context/inspect a memory source (returns raw text, no presigned URL)",
             method="GET",
-            path="/source/fetch",
+            path="/context/inspect",
             query={
                 "tenant_id": TENANT_ID,
                 "sub_tenant_id": SUB_TENANT_ID,
-                "source_id": ctx.memory_ids[0],
+                "id": ctx.memory_ids[0],
                 "mode": "content",
             },
-            # Staging returns 404 for memory source_ids even though the docs say it should
+            # Staging returns 404 for memory ids even though the docs say it should
             # work — treat 404 as acceptable so the testcase captures the real response.
             expected_statuses=(200, 404),
             validate_contract=False,
@@ -1818,9 +1845,9 @@ def exercise_source_list(
         writer,
         "source_list",
         "knowledge_basic",
-        "POST /source/list type=knowledge, default paging",
+        "POST /context/list type=knowledge, default paging",
         method="POST",
-        path="/source/list",
+        path="/context/list",
         json_body={**base, "type": "knowledge", "page": 1, "page_size": 50},
     )
     run_case(
@@ -1828,16 +1855,16 @@ def exercise_source_list(
         recorder,
         writer,
         "source_list",
-        "knowledge_filters_document_metadata",
-        "POST /source/list with filters.document_metadata exact match",
+        "knowledge_filters_additional_metadata",
+        "POST /context/list with filters.additional_metadata exact match",
         method="POST",
-        path="/source/list",
+        path="/context/list",
         json_body={
             **base,
             "type": "knowledge",
             "page": 1,
             "page_size": 50,
-            "filters": {"document_metadata": {"source": "e2e_contract"}},
+            "filters": {"additional_metadata": {"source": "e2e_contract"}},
         },
     )
     run_case(
@@ -1846,9 +1873,9 @@ def exercise_source_list(
         writer,
         "source_list",
         "knowledge_filters_source_fields",
-        "POST /source/list with filters.source_fields (e.g. type=slack)",
+        "POST /context/list with filters.source_fields (e.g. type=slack)",
         method="POST",
-        path="/source/list",
+        path="/context/list",
         json_body={
             **base,
             "type": "knowledge",
@@ -1863,9 +1890,9 @@ def exercise_source_list(
         writer,
         "source_list",
         "knowledge_include_fields",
-        "POST /source/list with include_fields projection",
+        "POST /context/list with include_fields projection",
         method="POST",
-        path="/source/list",
+        path="/context/list",
         json_body={
             **base,
             "type": "knowledge",
@@ -1879,14 +1906,14 @@ def exercise_source_list(
         recorder,
         writer,
         "source_list",
-        "knowledge_source_ids",
-        "POST /source/list scoped to explicit source_ids",
+        "knowledge_ids",
+        "POST /context/list scoped to explicit ids",
         method="POST",
-        path="/source/list",
+        path="/context/list",
         json_body={
             **base,
             "type": "knowledge",
-            "source_ids": (ctx.knowledge_ids + ctx.app_ids)[:3],
+            "ids": (ctx.knowledge_ids + ctx.app_ids)[:3],
             "page": 1,
             "page_size": 10,
         },
@@ -1897,9 +1924,9 @@ def exercise_source_list(
         writer,
         "source_list",
         "knowledge_pagination_small_page",
-        "POST /source/list with page_size=5 to exercise pagination metadata",
+        "POST /context/list with page_size=5 to exercise pagination metadata",
         method="POST",
-        path="/source/list",
+        path="/context/list",
         json_body={**base, "type": "knowledge", "page": 1, "page_size": 5},
     )
     run_case(
@@ -1908,9 +1935,9 @@ def exercise_source_list(
         writer,
         "source_list",
         "memory_basic",
-        "POST /source/list type=memory (returns ListUserMemoriesResponse)",
+        "POST /context/list type=memory (returns ListUserMemoriesResponse)",
         method="POST",
-        path="/source/list",
+        path="/context/list",
         json_body={**base, "type": "memory", "page": 1, "page_size": 50},
     )
 
@@ -1924,14 +1951,14 @@ def exercise_source_relations(
         recorder,
         writer,
         "source_relations",
-        "knowledge_by_source_id",
-        "GET /source/relations scoped to a single knowledge source_id",
+        "knowledge_by_id",
+        "GET /context/relations scoped to a single knowledge id",
         method="GET",
-        path="/source/relations",
+        path="/context/relations",
         query={
             "tenant_id": TENANT_ID,
             "sub_tenant_id": SUB_TENANT_ID,
-            "source_id": app_id,
+            "id": app_id,
             "type": "knowledge",
             "limit": 500,
         },
@@ -1942,9 +1969,9 @@ def exercise_source_relations(
         writer,
         "source_relations",
         "knowledge_subtenant_wide",
-        "GET /source/relations across the whole sub-tenant (no source_id)",
+        "GET /context/relations across the whole sub-tenant (no id)",
         method="GET",
-        path="/source/relations",
+        path="/context/relations",
         query={
             "tenant_id": TENANT_ID,
             "sub_tenant_id": SUB_TENANT_ID,
@@ -1958,13 +1985,13 @@ def exercise_source_relations(
         writer,
         "source_relations",
         "knowledge_small_limit",
-        "GET /source/relations with a small limit to exercise truncation/cursor",
+        "GET /context/relations with a small limit to exercise truncation/cursor",
         method="GET",
-        path="/source/relations",
+        path="/context/relations",
         query={
             "tenant_id": TENANT_ID,
             "sub_tenant_id": SUB_TENANT_ID,
-            "source_id": app_id,
+            "id": app_id,
             "type": "knowledge",
             "limit": 1,
         },
@@ -1975,14 +2002,14 @@ def exercise_source_relations(
             recorder,
             writer,
             "source_relations",
-            "memory_by_source_id",
-            "GET /source/relations type=memory for a memory source",
+            "memory_by_id",
+            "GET /context/relations type=memory for a memory source",
             method="GET",
-            path="/source/relations",
+            path="/context/relations",
             query={
                 "tenant_id": TENANT_ID,
                 "sub_tenant_id": SUB_TENANT_ID,
-                "source_id": ctx.memory_ids[0],
+                "id": ctx.memory_ids[0],
                 "type": "memory",
                 "limit": 100,
             },
@@ -2013,12 +2040,12 @@ def exercise_query(
         ),
         (
             "knowledge_thinking_forceful_relations",
-            "thinking mode + search_forceful_relations=true + graph_context=true",
+            "thinking mode + query_forceful_relations=true + graph_context=true",
             {
                 "type": "knowledge",
                 "query_by": "hybrid",
                 "mode": "thinking",
-                "search_forceful_relations": True,
+                "query_forceful_relations": True,
                 "graph_context": True,
             },
         ),
@@ -2078,18 +2105,18 @@ def exercise_query(
             },
         ),
         (
-            "knowledge_search_apps",
-            "hybrid with search_apps=true (app-aware lane)",
+            "knowledge_query_apps",
+            "hybrid with query_apps=true (app-aware lane)",
             {
                 "type": "knowledge",
                 "query_by": "hybrid",
                 "mode": "fast",
-                "search_apps": True,
+                "query_apps": True,
             },
         ),
         (
-            "knowledge_filter_tenant_metadata",
-            "metadata_filters top-level key (tenant_metadata) — needs schema",
+            "knowledge_filter_metadata",
+            "metadata_filters top-level key (metadata) — needs schema",
             {
                 "type": "knowledge",
                 "query_by": "hybrid",
@@ -2098,13 +2125,13 @@ def exercise_query(
             },
         ),
         (
-            "knowledge_filter_document_metadata",
-            "metadata_filters nested under document_metadata (free-form)",
+            "knowledge_filter_additional_metadata",
+            "metadata_filters nested under additional_metadata (free-form)",
             {
                 "type": "knowledge",
                 "query_by": "hybrid",
                 "mode": "fast",
-                "metadata_filters": {"document_metadata": {"source": "e2e_contract"}},
+                "metadata_filters": {"additional_metadata": {"source": "e2e_contract"}},
             },
         ),
         (
@@ -2269,27 +2296,27 @@ def _list_call(
     if filters:
         body["filters"] = filters
     body.update(extra)
-    return _safe_request(client, "POST", "/source/list", json_body=body)
+    return _safe_request(client, "POST", "/context/list", json_body=body)
 
 
-def sem_filter_list_document_metadata(
+def sem_filter_list_additional_metadata(
     client: ApiClient, recorder: Recorder, writer: ResultWriter, ctx: Context
 ) -> None:
-    """Proof: a document_metadata filter that matches our run returns items, and a
+    """Proof: an additional_metadata filter that matches our run returns items, and a
     bogus value returns zero — so the filter is genuinely applied (not ignored)."""
     match = _list_call(
-        client, "knowledge", {"document_metadata": {"run_id": ctx.run_id}}
+        client, "knowledge", {"additional_metadata": {"run_id": ctx.run_id}}
     )
     bogus = _list_call(
-        client, "knowledge", {"document_metadata": {"run_id": "no_such_run_zzz999"}}
+        client, "knowledge", {"additional_metadata": {"run_id": "no_such_run_zzz999"}}
     )
     n_match, n_bogus = len(_list_items(match)), len(_list_items(bogus))
     passed = n_match > 0 and n_bogus == 0
     _record_semantic(
         recorder,
         writer,
-        "filter_list_document_metadata",
-        "POST /source/list document_metadata filter actually narrows results",
+        "filter_list_additional_metadata",
+        "POST /context/list additional_metadata filter actually narrows results",
         passed,
         f"match run_id={ctx.run_id} -> {n_match} sources; bogus run_id -> {n_bogus} "
         f"(expect match>0 and bogus==0)",
@@ -2325,7 +2352,7 @@ def sem_filter_list_source_fields(
             recorder,
             writer,
             "filter_list_source_fields",
-            "POST /source/list source_fields.type filter returns only matching type",
+            "POST /context/list source_fields.type filter returns only matching type",
             False,
             "no sources with a type value to probe",
             {"all_types": all_types},
@@ -2348,14 +2375,14 @@ def sem_filter_list_source_fields(
         if app_types_preserved
         else (
             " | FINDING: app-declared types (slack/notion) are normalized to 'document' "
-            "in /source/list — source_fields.type cannot select app sources by their app type."
+            "in /context/list — source_fields.type cannot select app sources by their app type."
         )
     )
     _record_semantic(
         recorder,
         writer,
         "filter_list_source_fields",
-        "POST /source/list source_fields.type filter returns only matching type",
+        "POST /context/list source_fields.type filter returns only matching type",
         passed,
         f"probe type='{probe_type}' -> {len(match_items)} sources (types: {match_types}); "
         f"bogus -> {n_bogus} (expect all=='{probe_type}' and bogus==0)." + note,
@@ -2370,18 +2397,16 @@ def sem_filter_list_source_fields(
     )
 
 
-def sem_filter_list_tenant_metadata(
+def sem_filter_list_metadata(
     client: ApiClient, recorder: Recorder, writer: ResultWriter, ctx: Context
 ) -> None:
-    """Informational: tenant_metadata filtering only works if the key is declared in
+    """Informational: metadata filtering only works if the key is declared in
     the tenant schema with enable_match. We report whether it is active or silently
     ignored rather than hard-failing (undeclared-key behavior is documented)."""
     no_filter = _list_call(client, "knowledge", None)
-    dept = _list_call(
-        client, "knowledge", {"tenant_metadata": {"department": "support"}}
-    )
+    dept = _list_call(client, "knowledge", {"metadata": {"department": "support"}})
     bogus = _list_call(
-        client, "knowledge", {"tenant_metadata": {"department": "no_such_dept_zzz"}}
+        client, "knowledge", {"metadata": {"department": "no_such_dept_zzz"}}
     )
     n_all, n_dept, n_bogus = (
         len(_list_items(no_filter)),
@@ -2392,7 +2417,7 @@ def sem_filter_list_tenant_metadata(
     active = n_bogus < n_all
     detail = (
         f"unfiltered={n_all}, department=support -> {n_dept}, bogus department -> "
-        f"{n_bogus}. tenant_metadata filtering appears "
+        f"{n_bogus}. metadata filtering appears "
         + (
             "ACTIVE (key declared with enable_match)"
             if active
@@ -2403,8 +2428,8 @@ def sem_filter_list_tenant_metadata(
     _record_semantic(
         recorder,
         writer,
-        "filter_list_tenant_metadata",
-        "POST /source/list tenant_metadata filter — active vs silently-ignored probe",
+        "filter_list_metadata",
+        "POST /context/list metadata filter — active vs silently-ignored probe",
         True,
         detail,
         {
@@ -2416,10 +2441,10 @@ def sem_filter_list_tenant_metadata(
     )
 
 
-def sem_filter_query_document_metadata(
+def sem_filter_query_additional_metadata(
     client: ApiClient, recorder: Recorder, writer: ResultWriter, ctx: Context
 ) -> None:
-    """Proof: a /query with a document_metadata filter returns only chunks from
+    """Proof: a /query with an additional_metadata filter returns only chunks from
     matching sources, and a bogus filter returns no chunks."""
     q = f"refund policy pricing tiers SLA runbook E2E {ctx.run_id}"
     base = {
@@ -2437,7 +2462,7 @@ def sem_filter_query_document_metadata(
         "/query",
         json_body={
             **base,
-            "metadata_filters": {"document_metadata": {"run_id": ctx.run_id}},
+            "metadata_filters": {"additional_metadata": {"run_id": ctx.run_id}},
         },
     )
     bogus = _safe_request(
@@ -2446,13 +2471,13 @@ def sem_filter_query_document_metadata(
         "/query",
         json_body={
             **base,
-            "metadata_filters": {"document_metadata": {"run_id": "no_such_run_zzz"}},
+            "metadata_filters": {"additional_metadata": {"run_id": "no_such_run_zzz"}},
         },
     )
     match_chunks, bogus_chunks = _query_chunks(match), _query_chunks(bogus)
     # Of the matched chunks that echo additional_metadata, confirm they belong to this run.
     mismatched = [
-        c.get("source_id")
+        c.get("id")
         for c in match_chunks
         if isinstance(c.get("additional_metadata"), dict)
         and c["additional_metadata"].get("run_id") not in (None, ctx.run_id)
@@ -2461,16 +2486,16 @@ def sem_filter_query_document_metadata(
     _record_semantic(
         recorder,
         writer,
-        "filter_query_document_metadata",
-        "POST /query document_metadata filter restricts chunks to matching sources",
+        "filter_query_additional_metadata",
+        "POST /query additional_metadata filter restricts chunks to matching sources",
         passed,
         f"match -> {len(match_chunks)} chunks; bogus -> {len(bogus_chunks)} chunks; "
         f"foreign-run chunks={len(mismatched)} (expect match>0, bogus==0, foreign==0)",
         {
             "match_chunks": len(match_chunks),
             "bogus_chunks": len(bogus_chunks),
-            "match_source_ids": sorted({c.get("source_id") for c in match_chunks}),
-            "foreign_run_source_ids": mismatched,
+            "match_ids": sorted({c.get("id") for c in match_chunks}),
+            "foreign_run_ids": mismatched,
         },
     )
 
@@ -2478,8 +2503,8 @@ def sem_filter_query_document_metadata(
 def sem_forceful_relations(
     client: ApiClient, recorder: Recorder, writer: ResultWriter, ctx: Context
 ) -> None:
-    """Proof: with mode=thinking + search_forceful_relations=true, querying content
-    from the app source that declared relations.source_ids surfaces the related
+    """Proof: with mode=thinking + query_forceful_relations=true, querying content
+    from the app source that declared relations.ids surfaces the related
     source into data.additional_context; with the flag off it does not.
 
     Forceful relations require the declaring source's graph to be built, so we first
@@ -2508,13 +2533,13 @@ def sem_forceful_relations(
         client,
         "POST",
         "/query",
-        json_body={**base, "mode": "thinking", "search_forceful_relations": True},
+        json_body={**base, "mode": "thinking", "query_forceful_relations": True},
     )
     off = _safe_request(
         client,
         "POST",
         "/query",
-        json_body={**base, "mode": "thinking", "search_forceful_relations": False},
+        json_body={**base, "mode": "thinking", "query_forceful_relations": False},
     )
 
     def _add_ctx_keys(resp: ApiResponse | None) -> list[str]:
@@ -2525,7 +2550,7 @@ def sem_forceful_relations(
         return []
 
     on_keys, off_keys = _add_ctx_keys(on), _add_ctx_keys(off)
-    retrieved = sorted({c.get("source_id") for c in _query_chunks(on)})
+    retrieved = sorted({c.get("id") for c in _query_chunks(on)})
     declaring_retrieved = ctx.forceful_declaring_id in retrieved
     graph_ready = declaring_status == "completed"
     surfaced = len(on_keys) > 0
@@ -2555,20 +2580,20 @@ def sem_forceful_relations(
         passed = False
         detail = (
             "FINDING: declaring source retrieved AND its graph completed, but "
-            "search_forceful_relations=true produced an empty additional_context. "
+            "query_forceful_relations=true produced an empty additional_context. "
             "Confirm forceful-relation surfacing with the API team."
         )
     _record_semantic(
         recorder,
         writer,
         "forceful_relations_surfacing",
-        "POST /query search_forceful_relations populates additional_context (thinking mode)",
+        "POST /query query_forceful_relations populates additional_context (thinking mode)",
         passed,
         detail,
         {
             "on_keys": on_keys,
             "off_keys": off_keys,
-            "retrieved_source_ids": retrieved,
+            "retrieved_ids": retrieved,
             "declaring_id": ctx.forceful_declaring_id,
             "declaring_retrieved": declaring_retrieved,
             "declaring_status": declaring_status,
@@ -2578,7 +2603,7 @@ def sem_forceful_relations(
 
 
 def _poll_status(
-    client: ApiClient, source_id: str, want: set[str], timeout: int
+    client: ApiClient, id: str, want: set[str], timeout: int
 ) -> str | None:
     deadline = time.time() + timeout
     last = None
@@ -2586,11 +2611,11 @@ def _poll_status(
         resp = _safe_request(
             client,
             "GET",
-            "/source/status",
+            "/context/status",
             query={
                 "tenant_id": TENANT_ID,
                 "sub_tenant_id": SUB_TENANT_ID,
-                "source_id": source_id,
+                "ids": [id],
             },
         )
         if isinstance(resp, ApiResponse) and isinstance(resp.data, dict):
@@ -2605,15 +2630,15 @@ def _poll_status(
     return last
 
 
-def _fetch_content(client: ApiClient, source_id: str) -> str:
+def _fetch_content(client: ApiClient, id: str) -> str:
     resp = _safe_request(
         client,
         "GET",
-        "/source/fetch",
+        "/context/inspect",
         query={
             "tenant_id": TENANT_ID,
             "sub_tenant_id": SUB_TENANT_ID,
-            "source_id": source_id,
+            "id": id,
             "mode": "content",
         },
     )
@@ -2625,7 +2650,7 @@ def _fetch_content(client: ApiClient, source_id: str) -> str:
 def sem_upsert_overwrite(
     client: ApiClient, recorder: Recorder, writer: ResultWriter, ctx: Context
 ) -> None:
-    """Proof: re-ingesting the same source_id with upsert=true replaces the stored
+    """Proof: re-ingesting the same id with upsert=true replaces the stored
     content; and upsert=false on an existing id does NOT silently succeed."""
     sid = f"e2e_ovr_{ctx.run_id}"
     marker_a = f"ALPHAMARK{ctx.run_id}aaa"
@@ -2635,7 +2660,7 @@ def sem_upsert_overwrite(
         return _safe_request(
             client,
             "POST",
-            "/source/ingest",
+            "/context/ingest",
             expected_statuses=(202, 400, 409),
             multipart=(
                 {
@@ -2643,9 +2668,9 @@ def sem_upsert_overwrite(
                     "tenant_id": TENANT_ID,
                     "sub_tenant_id": SUB_TENANT_ID,
                     "upsert": upsert,
-                    "file_metadata": json.dumps([{"source_id": sid}]),
+                    "document_metadata": json.dumps([{"id": sid}]),
                 },
-                [("files", "ovr.txt", text.encode(), "text/plain")],
+                [("documents", "ovr.txt", text.encode(), "text/plain")],
             ),
         )
 
@@ -2690,7 +2715,7 @@ def sem_upsert_overwrite(
         recorder,
         writer,
         "upsert_overwrite",
-        "POST /source/ingest upsert=true overwrites; upsert=false rejects existing id",
+        "POST /context/ingest upsert=true overwrites; upsert=false rejects existing id",
         passed,
         f"v1 content had ALPHA={marker_a in content_v1}; after upsert v2 has BETA & not "
         f"ALPHA={overwrote}; upsert=false rejected={upsert_false_rejected} "
@@ -2717,11 +2742,11 @@ def sem_presigned_url(
     resp = _safe_request(
         client,
         "GET",
-        "/source/fetch",
+        "/context/inspect",
         query={
             "tenant_id": TENANT_ID,
             "sub_tenant_id": SUB_TENANT_ID,
-            "source_id": kid,
+            "id": kid,
             "mode": "url",
         },
     )
@@ -2746,12 +2771,12 @@ def sem_presigned_url(
         recorder,
         writer,
         "presigned_url_downloadable",
-        "GET /source/fetch mode=url returns a working, downloadable presigned URL",
+        "GET /context/inspect mode=url returns a working, downloadable presigned URL",
         passed,
         f"url_present={bool(url)}, download_status={dl_status}, bytes={dl_bytes}"
         + (f", error={err}" if err else ""),
         {
-            "source_id": kid,
+            "id": kid,
             "url_present": bool(url),
             "download_status": dl_status,
             "downloaded_bytes": dl_bytes,
@@ -2763,7 +2788,7 @@ def sem_presigned_url(
 def sem_pagination_walk(
     client: ApiClient, recorder: Recorder, writer: ResultWriter, ctx: Context
 ) -> None:
-    """Proof: walking /source/list page-by-page (scoped to this run) yields exactly
+    """Proof: walking /context/list page-by-page (scoped to this run) yields exactly
     `total` distinct ids with no overlap, and total_pages matches."""
     page_size = 2
     seen: list[str] = []
@@ -2775,7 +2800,7 @@ def sem_pagination_walk(
         resp = _list_call(
             client,
             "knowledge",
-            {"document_metadata": {"run_id": ctx.run_id}},
+            {"additional_metadata": {"run_id": ctx.run_id}},
             page=page,
             page_size=page_size,
         )
@@ -2810,7 +2835,7 @@ def sem_pagination_walk(
         recorder,
         writer,
         "pagination_walk",
-        "POST /source/list page walk returns all distinct items matching `total`",
+        "POST /context/list page walk returns all distinct items matching `total`",
         passed,
         f"walked {pages} pages of size {page_size}; collected {len(seen)} ids "
         f"({distinct} distinct, dupes={not no_dupes}); reported total={reported_total}, "
@@ -2839,7 +2864,7 @@ def sem_graph_completeness(
             recorder,
             writer,
             "graph_completeness",
-            "GET /source/relations is populated after indexing_status=completed",
+            "GET /context/relations is populated after indexing_status=completed",
             False,
             "no knowledge source available",
             {},
@@ -2849,11 +2874,11 @@ def sem_graph_completeness(
     rel = _safe_request(
         client,
         "GET",
-        "/source/relations",
+        "/context/relations",
         query={
             "tenant_id": TENANT_ID,
             "sub_tenant_id": SUB_TENANT_ID,
-            "source_id": sid,
+            "id": sid,
             "type": "knowledge",
             "limit": 1000,
         },
@@ -2878,10 +2903,10 @@ def sem_graph_completeness(
         recorder,
         writer,
         "graph_completeness",
-        "GET /source/relations is populated after indexing_status=completed",
+        "GET /context/relations is populated after indexing_status=completed",
         passed,
         detail,
-        {"source_id": sid, "final_status": final, "relations_count": n_rel},
+        {"id": sid, "final_status": final, "relations_count": n_rel},
     )
 
 
@@ -2893,10 +2918,10 @@ def exercise_semantic_checks(
             "semantic skipped", "Set HYDRADB_RUN_SEMANTIC_CHECKS=1 to enable"
         )
         return
-    sem_filter_list_document_metadata(client, recorder, writer, ctx)
+    sem_filter_list_additional_metadata(client, recorder, writer, ctx)
     sem_filter_list_source_fields(client, recorder, writer, ctx)
-    sem_filter_list_tenant_metadata(client, recorder, writer, ctx)
-    sem_filter_query_document_metadata(client, recorder, writer, ctx)
+    sem_filter_list_metadata(client, recorder, writer, ctx)
+    sem_filter_query_additional_metadata(client, recorder, writer, ctx)
     sem_forceful_relations(client, recorder, writer, ctx)
     sem_presigned_url(client, recorder, writer, ctx)
     sem_pagination_walk(client, recorder, writer, ctx)
@@ -2909,7 +2934,7 @@ def exercise_source_delete(
 ) -> None:
     if not DELETE_CORE_TEST_DATA:
         recorder.pass_(
-            "runtime DELETE /source skipped",
+            "runtime DELETE /context skipped",
             "Set HYDRADB_DELETE_CORE_TEST_DATA=1 to delete disposable E2E sources",
         )
         return
@@ -2920,9 +2945,9 @@ def exercise_source_delete(
             writer,
             "source_delete",
             "knowledge",
-            "DELETE /source type=knowledge with request wrapper {tenant_id, sub_tenant_id, ids}",
+            "DELETE /context type=knowledge with request wrapper {tenant_id, sub_tenant_id, ids}",
             method="DELETE",
-            path="/source",
+            path="/context",
             json_body={
                 "type": "knowledge",
                 "request": {
@@ -2939,9 +2964,9 @@ def exercise_source_delete(
             writer,
             "source_delete",
             "memory",
-            "DELETE /source type=memory (aggregate user_memory_deleted response)",
+            "DELETE /context type=memory (aggregate user_memory_deleted response)",
             method="DELETE",
-            path="/source",
+            path="/context",
             json_body={
                 "type": "memory",
                 "request": {
@@ -3304,7 +3329,7 @@ def main() -> int:
         writer.flush_index()
 
     recorder.summary()
-    print(f"\nPer-testcase result files written under: {ctx.results_dir}")
+    print(f"\nPer-testcase result documents written under: {ctx.results_dir}")
     print(f"Coverage table: {ctx.results_dir / '_coverage.md'}")
     return 1 if recorder.failed else 0
 
