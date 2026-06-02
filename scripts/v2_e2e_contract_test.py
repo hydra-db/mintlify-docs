@@ -66,10 +66,13 @@ from urllib.request import Request, urlopen
 # -----------------------------------------------------------------------------
 # Top-level configuration: safe to edit locally.
 # -----------------------------------------------------------------------------
+# BASE_URL = os.getenv("HYDRADB_BASE_URL", "https://api.hydradb.com/")
+# API_KEY = "sk_live_yewMynb1YXVF.ze08z0m3bo1b7sim5BphKeeelKLWrpbE1sW73rThM0A"  #
+# TENANT_ID = os.getenv("HYDRADB_TENANT_ID", "default-tenant")
 BASE_URL = os.getenv("HYDRADB_BASE_URL", "https://api-v2.staging.hydradb.com/")
-API_KEY = "sk_test_dJuJD9XSODdb.8d5i_Y09VD6F9kc-kkcDk_9edIExoCM1v8siJ69_v8k"  #
+API_KEY = "sk_test_Iy3ujUqtq_Ka.AuSg1eB2MzmN5MVV5PvtVFzWsg9F3L2AANRMk75gItM"  #
 TENANT_ID = os.getenv("HYDRADB_TENANT_ID", "default-tenant")
-SUB_TENANT_ID = os.getenv("HYDRADB_SUB_TENANT_ID", "e2e_user_alex-3")
+SUB_TENANT_ID = os.getenv("HYDRADB_SUB_TENANT_ID", "e2e_user_alex-4")
 
 API_VERSION = "2"
 OPENAPI_PATH = (
@@ -1244,6 +1247,55 @@ def ingest_all_variations(
     def txt(name: str, body: str) -> tuple[str, str, bytes, str]:
         return ("documents", name, body.encode("utf-8"), "text/plain")
 
+    def app_source(
+        *,
+        id_: str,
+        title: str,
+        provider: str,
+        kind: str,
+        body: str,
+        external_id: str | None = None,
+        relations: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        external_id = external_id or id_
+        if kind == "message":
+            fields: dict[str, Any] = {
+                "kind": "message",
+                "body": body,
+                "author": "e2e-bot",
+                "thread_id": external_id,
+                "created_at": "2026-05-29T00:00:00Z",
+            }
+        elif kind == "knowledge_base":
+            fields = {
+                "kind": "knowledge_base",
+                "title": title,
+                "body": body,
+                "created_by": "e2e-contract",
+                "updated_by": "e2e-contract",
+                "created_at": "2026-05-29T00:00:00Z",
+                "updated_at": "2026-05-29T00:00:00Z",
+            }
+        else:
+            fields = {"kind": "custom", "data": {"title": title, "body": body}}
+        item: dict[str, Any] = {
+            "id": id_,
+            "tenant_id": TENANT_ID,
+            "sub_tenant_id": SUB_TENANT_ID,
+            "title": title,
+            "type": provider,
+            "kind": kind,
+            "provider": provider,
+            "external_id": external_id,
+            "timestamp": "2026-05-29T00:00:00Z",
+            "fields": fields,
+            "metadata": tmeta,
+            "additional_metadata": dmeta,
+        }
+        if relations:
+            item["relations"] = relations
+        return item
+
     # 1. Knowledge: single text file.
     sid_file1 = f"e2e_kfile1_{run}"
     r = run_case(
@@ -1351,20 +1403,14 @@ def ingest_all_variations(
                 "sub_tenant_id": SUB_TENANT_ID,
                 "upsert": "true",
                 "app_knowledge": json.dumps(
-                    {
-                        "id": sid_app1,
-                        "tenant_id": TENANT_ID,
-                        "sub_tenant_id": SUB_TENANT_ID,
-                        "title": "E2E pricing discussion",
-                        "type": "slack",
-                        "url": "https://example.com/e2e/pricing",
-                        "timestamp": "2026-05-29T00:00:00Z",
-                        "content": {
-                            "text": f"E2E {run}: Starter costs $29 per month and Pro costs $79 per month."
-                        },
-                        "metadata": tmeta,
-                        "additional_metadata": dmeta,
-                    }
+                    app_source(
+                        id_=sid_app1,
+                        title="E2E pricing discussion",
+                        provider="slack",
+                        kind="message",
+                        external_id=f"thread_{sid_app1}",
+                        body=f"E2E {run}: Starter costs $29 per month and Pro costs $79 per month.",
+                    )
                 ),
             },
             [],
@@ -1380,7 +1426,7 @@ def ingest_all_variations(
         writer,
         "source_ingest",
         "knowledge_app_array_with_relations",
-        "type=knowledge, app_knowledge array item declaring relations.ids",
+        "type=knowledge, app_knowledge array item declaring app-native relations[]",
         method="POST",
         path="/context/ingest",
         expected_statuses=(202,),
@@ -1392,20 +1438,21 @@ def ingest_all_variations(
                 "upsert": "true",
                 "app_knowledge": json.dumps(
                     [
-                        {
-                            "id": sid_app2,
-                            "tenant_id": TENANT_ID,
-                            "sub_tenant_id": SUB_TENANT_ID,
-                            "title": "E2E Notion plan",
-                            "type": "notion",
-                            "content": {
-                                "text": f"E2E {run}: The refund workflow links to the pricing tiers."
-                            },
-                            "metadata": tmeta,
-                            "additional_metadata": dmeta,
-                            # Docs shape is exactly {ids: [...]} — no extra keys.
-                            "relations": {"ids": [sid_file1]},
-                        }
+                        app_source(
+                            id_=sid_app2,
+                            title="E2E Notion plan",
+                            provider="notion",
+                            kind="knowledge_base",
+                            external_id=f"page_{sid_app2}",
+                            body=f"E2E {run}: The refund workflow links to the pricing tiers.",
+                            relations=[
+                                {
+                                    "predicate": "related_to",
+                                    "target": {"id": sid_file1},
+                                    "properties": {"reason": "e2e forceful relation"},
+                                }
+                            ],
+                        )
                     ]
                 ),
             },
@@ -1445,18 +1492,14 @@ def ingest_all_variations(
                 ),
                 "app_knowledge": json.dumps(
                     [
-                        {
-                            "id": sid_mixa,
-                            "tenant_id": TENANT_ID,
-                            "sub_tenant_id": SUB_TENANT_ID,
-                            "title": "E2E mixed app",
-                            "type": "webpage",
-                            "content": {
-                                "text": f"E2E {run}: mixed-request app source content."
-                            },
-                            "metadata": tmeta,
-                            "additional_metadata": dmeta,
-                        }
+                        app_source(
+                            id_=sid_mixa,
+                            title="E2E mixed app",
+                            provider="webpage",
+                            kind="knowledge_base",
+                            external_id=f"page_{sid_mixa}",
+                            body=f"E2E {run}: mixed-request app source content.",
+                        )
                     ]
                 ),
             },
@@ -2504,7 +2547,7 @@ def sem_forceful_relations(
     client: ApiClient, recorder: Recorder, writer: ResultWriter, ctx: Context
 ) -> None:
     """Proof: with mode=thinking + query_forceful_relations=true, querying content
-    from the app source that declared relations.ids surfaces the related
+    from the app source that declared app-native relations[] surfaces the related
     source into data.additional_context; with the flag off it does not.
 
     Forceful relations require the declaring source's graph to be built, so we first

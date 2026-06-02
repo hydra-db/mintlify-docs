@@ -8,8 +8,8 @@ AND that every documented /query parameter behaves as the docs promise.
 Design decisions:
   * Most Knowledge recall targets are ingested as parsed documents (`documents` +
     `document_metadata`) so retrieval quality is not dominated by app-source behavior.
-  * App-source targets use the current app_knowledge model (`content`, `metadata`,
-    `additional_metadata`, and optional `relations.ids`).
+  * App-source targets use the app-native model (`kind`, `provider`, `external_id`,
+    `fields`, `metadata`, `additional_metadata`, and optional `relations[]`).
   * Content is rich and multi-paragraph (real policy/runbook prose), not one-liners.
   * The selector field is `query_apps` (renamed from `search_apps`).
 
@@ -36,10 +36,13 @@ v2_e2e_contract_test so credentials live in one place.
 Run:   python3 v2_golden_eval.py
 Env:   GOLDEN_REUSE_SUB=<sub>  -> skip ingestion, eval an existing corpus
        GOLDEN_TOP_K=10
+       GOLDEN_INGEST_COPIES=3  -> ingest the same corpus under 3 distinct ID sets
+       GOLDEN_EVAL_COPY=1      -> run search/analysis against only this copy
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
@@ -51,6 +54,17 @@ TENANT_ID = ct.TENANT_ID
 RUN_ID = os.getenv("GOLDEN_RUN_ID", time.strftime("%Y%m%d%H%M%S"))
 SUB_TENANT = os.getenv("GOLDEN_REUSE_SUB") or f"golden_{RUN_ID}"
 REUSE = bool(os.getenv("GOLDEN_REUSE_SUB"))
+# The ingestion inbox currently dedupes by bare doc_id, not by sub_tenant_id.
+# Keep the human-readable golden IDs, but append a deterministic per-subtenant
+# suffix so repeated eval runs do not collide with old PENDING/DISPATCHED rows.
+ID_SUFFIX = os.getenv("GOLDEN_ID_SUFFIX")
+if ID_SUFFIX is None:
+    ID_SUFFIX = hashlib.sha1(SUB_TENANT.encode("utf-8")).hexdigest()[:8]
+INGEST_COPIES = max(
+    1,
+    int(os.getenv("GOLDEN_INGEST_COPIES") or os.getenv("GOLDEN_INGEST_N") or "1"),
+)
+EVAL_COPY_INDEX = max(1, int(os.getenv("GOLDEN_EVAL_COPY", "1")))
 DEFAULT_TOP_K = int(os.getenv("GOLDEN_TOP_K", "10"))
 RESULTS_DIR = ct.RESULTS_ROOT / f"golden_{RUN_ID}"
 FILE_BATCH = 8
@@ -68,6 +82,52 @@ REQUEST_RETRY_SLEEP = float(os.getenv("GOLDEN_REQUEST_RETRY_SLEEP", "3"))
 
 def doc(*paragraphs: str) -> str:
     return "\n\n".join(p.strip() for p in paragraphs)
+
+
+def copy_id_suffix(copy_index: int = 1) -> str:
+    """Return the runtime suffix for one ingestion/eval copy."""
+    base = ID_SUFFIX.strip()
+    if INGEST_COPIES > 1 or copy_index != 1:
+        return f"{base + '_' if base else ''}c{copy_index:02d}"
+    return base
+
+
+def gold_id(base_id: str, copy_index: int | None = None) -> str:
+    """Return the runtime source id for a stable golden fixture id."""
+    suffix = copy_id_suffix(copy_index or EVAL_COPY_INDEX)
+    return f"{base_id}_{suffix}" if suffix else base_id
+
+
+def _rewrite_exact_ids(value: Any, id_map: dict[str, str]) -> Any:
+    """Recursively rewrite fixture-id string values, preserving other content."""
+    if isinstance(value, str):
+        return id_map.get(value, value)
+    if isinstance(value, list):
+        return [_rewrite_exact_ids(v, id_map) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_rewrite_exact_ids(v, id_map) for v in value)
+    if isinstance(value, dict):
+        return {k: _rewrite_exact_ids(v, id_map) for k, v in value.items()}
+    return value
+
+
+def apply_id_suffix(
+    knowledge: list[dict[str, Any]],
+    apps: list[dict[str, Any]],
+    mems: list[dict[str, Any]],
+    queries: list[dict[str, Any]],
+    *,
+    copy_index: int | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    copy_index = copy_index or EVAL_COPY_INDEX
+    base_ids = [d["id"] for d in knowledge] + [a["id"] for a in apps] + [m["id"] for m in mems]
+    id_map = {base_id: gold_id(base_id, copy_index) for base_id in base_ids}
+    return (
+        _rewrite_exact_ids(knowledge, id_map),
+        _rewrite_exact_ids(apps, id_map),
+        _rewrite_exact_ids(mems, id_map),
+        _rewrite_exact_ids(queries, id_map),
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -542,7 +602,7 @@ def distractor_docs() -> list[dict[str, Any]]:
 
 
 def app_sources() -> list[dict[str, Any]]:
-    """App sources (`app_knowledge`) using the current v2 content model."""
+    """App sources (`app_knowledge`) using the field-based app-native model."""
 
     def app(
         *,
@@ -554,26 +614,47 @@ def app_sources() -> list[dict[str, Any]]:
         body: str,
         dept: str,
         timestamp: str | None = None,
-        relations: list[str] | None = None,
+        relations: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
+        created_at = timestamp or "2026-05-20T10:00:00Z"
+        if kind == "message":
+            fields: dict[str, Any] = {
+                "kind": "message",
+                "body": body,
+                "author": "priya",
+                "thread_id": external_id,
+                "created_at": created_at,
+            }
+        elif kind == "knowledge_base":
+            fields = {
+                "kind": "knowledge_base",
+                "title": title,
+                "body": body,
+                "created_by": "golden-eval",
+                "updated_by": "golden-eval",
+                "created_at": created_at,
+                "updated_at": created_at,
+            }
+        else:
+            fields = {"kind": "custom", "data": {"title": title, "body": body}}
+
         item: dict[str, Any] = {
             "id": sid,
             "tenant_id": TENANT_ID,
             "sub_tenant_id": SUB_TENANT,
             "title": title,
             "type": provider,
-            "content": {
-                "text": body,
-                "kind": kind,
-                "external_id": external_id,
-            },
+            "kind": kind,
+            "provider": provider,
+            "external_id": external_id,
+            "fields": fields,
             "metadata": {"department": dept},
             "additional_metadata": {"golden_run": RUN_ID, "dept": dept},
         }
         if timestamp:
             item["timestamp"] = timestamp
         if relations:
-            item["relations"] = {"ids": relations}
+            item["relations"] = relations
         return item
 
     return [
@@ -679,7 +760,13 @@ def app_sources() -> list[dict[str, Any]]:
             dept="engineering",
             body="To set up the development environment, install the toolchain, clone the "
             "monorepo, and request access to the staging cluster.",
-            relations=["gold_app_handshake"],
+            relations=[
+                {
+                    "predicate": "related_to",
+                    "target": {"id": "gold_app_handshake"},
+                    "properties": {"reason": "release setup prerequisite"},
+                }
+            ],
         ),
         app(
             sid="gold_app_handshake",
@@ -1490,7 +1577,7 @@ def fidelity_checks(client: ct.ApiClient) -> list[dict[str, Any]]:
         return src.get("additional_metadata") or src.get("document_metadata") or {}
 
     # 1. Uploaded document should retain the document_metadata payload.
-    f = _get_source(client, "gold_sec_gdpr")
+    f = _get_source(client, gold_id("gold_sec_gdpr"))
     f_meta = metadata_of(f)
     f_addl = additional_metadata_of(f)
     title_ok = f.get("title") == "GDPR Data Deletion Procedure"
@@ -1515,7 +1602,7 @@ def fidelity_checks(client: ct.ApiClient) -> list[dict[str, Any]]:
     )
 
     # 2. App source should retain metadata (positive control).
-    a = _get_source(client, "gold_app_legal_1")
+    a = _get_source(client, gold_id("gold_app_legal_1"))
     a_meta = metadata_of(a)
     a_addl = additional_metadata_of(a)
     finding(
@@ -1569,8 +1656,8 @@ def fidelity_checks(client: ct.ApiClient) -> list[dict[str, Any]]:
     )
 
     # 4. Provided timestamp should be honored (needed for recency_bias).
-    old = _get_source(client, "gold_app_price_old")
-    new = _get_source(client, "gold_app_price_new")
+    old = _get_source(client, gold_id("gold_app_price_old"))
+    new = _get_source(client, gold_id("gold_app_price_new"))
     ts_ok = old.get("timestamp", "").startswith("2023") and new.get(
         "timestamp", ""
     ).startswith("2026")
@@ -1582,7 +1669,9 @@ def fidelity_checks(client: ct.ApiClient) -> list[dict[str, Any]]:
         {"old_timestamp": old.get("timestamp"), "new_timestamp": new.get("timestamp")},
     )
 
-    # 5. App chunk_content should be clean text, not serialized JSON.
+    # 5. App chunk_content should be clean extracted text, not a serialized JSON
+    # source wrapper. If this fails while q01_query_apps passes, retrieval found the
+    # app source but the API returned the wrong chunk_content format.
     qr = safe(
         client,
         "POST",
@@ -1601,7 +1690,7 @@ def fidelity_checks(client: ct.ApiClient) -> list[dict[str, Any]]:
     appchunk = ""
     if isinstance(qr, ct.ApiResponse) and isinstance(qr.data, dict):
         for c in qr.data.get("chunks", []) or []:
-            if c.get("id") == "gold_app_slack_escalation":
+            if c.get("id") == gold_id("gold_app_slack_escalation"):
                 appchunk = c.get("chunk_content") or ""
                 break
     clean = bool(appchunk) and not appchunk.lstrip().startswith("{")
@@ -1627,18 +1716,38 @@ def main() -> int:
     contract = ct.OpenApiContract(ct.OPENAPI_PATH, strict_extra_keys=False)
     client = ct.ApiClient(ct.BASE_URL, ct.API_KEY, contract, ct.Recorder())
 
-    heroes = hero_docs()
-    fillers = distractor_docs()
-    knowledge = heroes + fillers
-    apps = app_sources()
-    mems = memory_items()
-    queries = golden_queries()
+    if not REUSE and EVAL_COPY_INDEX > INGEST_COPIES:
+        raise ValueError(
+            f"GOLDEN_EVAL_COPY={EVAL_COPY_INDEX} cannot exceed "
+            f"GOLDEN_INGEST_COPIES={INGEST_COPIES} when not reusing an existing corpus"
+        )
+
+    base_heroes = hero_docs()
+    base_fillers = distractor_docs()
+    base_knowledge = base_heroes + base_fillers
+    base_apps = app_sources()
+    base_mems = memory_items()
+    base_queries = golden_queries()
+
+    # Search/analysis is intentionally performed against one copy only.
+    knowledge, apps, mems, queries = apply_id_suffix(
+        base_knowledge,
+        base_apps,
+        base_mems,
+        base_queries,
+        copy_index=EVAL_COPY_INDEX,
+    )
 
     (RESULTS_DIR / "golden_dataset.json").write_text(
         json.dumps(
             {
                 "sub_tenant": SUB_TENANT,
                 "run_id": RUN_ID,
+                "id_suffix": ID_SUFFIX,
+                "ingest_copies": INGEST_COPIES,
+                "eval_copy_index": EVAL_COPY_INDEX,
+                "eval_id_suffix": copy_id_suffix(EVAL_COPY_INDEX),
+                "copy_id_suffixes": [copy_id_suffix(i) for i in range(1, INGEST_COPIES + 1)],
                 "knowledge_documents": knowledge,
                 "app_sources": apps,
                 "memories": mems,
@@ -1651,8 +1760,10 @@ def main() -> int:
     print("=== HydraDB v2 golden-dataset retrieval eval (rich, document-based) ===")
     print(f"Base URL:   {ct.BASE_URL}")
     print(f"Sub-tenant: {SUB_TENANT}  (isolated)")
+    print(f"ID suffix:  {ID_SUFFIX or '(disabled)'}")
+    print(f"Copies:     ingest={INGEST_COPIES}, eval={EVAL_COPY_INDEX} ({copy_id_suffix(EVAL_COPY_INDEX) or 'no suffix'})")
     print(
-        f"Corpus:     {len(knowledge)} document docs ({len(heroes)} hero / {len(fillers)} "
+        f"Corpus:     {len(knowledge)} document docs ({len(base_heroes)} hero / {len(base_fillers)} "
         f"distractor) + {len(apps)} app sources + {len(mems)} memories"
     )
     print(f"Queries:    {len(queries)} (covering every /query parameter)")
@@ -1662,13 +1773,28 @@ def main() -> int:
     app_ids = [a["id"] for a in apps]
     if not REUSE:
         print("\n--- Ingesting (documents + app sources + memories) ---")
-        ingest_documents(client, knowledge)
-        ingest_apps(client, apps)
-        ingest_memories(client, mems)
+        all_file_ids: list[str] = []
+        all_app_ids: list[str] = []
+        for copy_index in range(1, INGEST_COPIES + 1):
+            copy_knowledge, copy_apps, copy_mems, _ = apply_id_suffix(
+                base_knowledge,
+                base_apps,
+                base_mems,
+                [],
+                copy_index=copy_index,
+            )
+            copy_suffix = copy_id_suffix(copy_index) or "no suffix"
+            print(f"\n  copy {copy_index}/{INGEST_COPIES} ({copy_suffix})")
+            ingest_documents(client, copy_knowledge)
+            ingest_apps(client, copy_apps)
+            ingest_memories(client, copy_mems)
+            all_file_ids.extend(d["id"] for d in copy_knowledge)
+            all_app_ids.extend(a["id"] for a in copy_apps)
+
         print("\n--- Waiting for searchable ---")
-        wait_searchable(client, file_ids + app_ids)
-        # The graph_context query needs `completed`; wait on that source.
-        graph_ids = ["gold_graph_payments"]
+        wait_searchable(client, all_file_ids + all_app_ids)
+        # The graph_context query needs `completed`; wait on the eval copy only.
+        graph_ids = [gold_id("gold_graph_payments", EVAL_COPY_INDEX)]
         print(f"\n--- Waiting for graph completion on {graph_ids} ---")
         sm = wait_completed(client, graph_ids, GRAPH_TIMEOUT)
         print(f"  graph sources status: {sm}")
