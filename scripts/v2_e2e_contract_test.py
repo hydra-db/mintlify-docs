@@ -69,7 +69,7 @@ from urllib.request import Request, urlopen
 # BASE_URL = os.getenv("HYDRADB_BASE_URL", "https://api.hydradb.com/")
 # API_KEY = "sk_live_yewMynb1YXVF.ze08z0m3bo1b7sim5BphKeeelKLWrpbE1sW73rThM0A"  #
 # TENANT_ID = os.getenv("HYDRADB_TENANT_ID", "default-tenant")
-BASE_URL = os.getenv("HYDRADB_BASE_URL", "https://api-v2.staging.hydradb.com/")
+BASE_URL = os.getenv("HYDRADB_BASE_URL", "https://api-v2-go.staging.hydradb.com/")
 API_KEY = "sk_test_Iy3ujUqtq_Ka.AuSg1eB2MzmN5MVV5PvtVFzWsg9F3L2AANRMk75gItM"  #
 TENANT_ID = os.getenv("HYDRADB_TENANT_ID", "default-tenant")
 SUB_TENANT_ID = os.getenv("HYDRADB_SUB_TENANT_ID", "e2e_user_alex-4")
