@@ -1129,6 +1129,39 @@ def safe(client: ct.ApiClient, *args: Any, **kwargs: Any) -> ct.ApiResponse | No
     return last
 
 
+def api_error_reason(resp: ct.ApiResponse | None, *, limit: int = 2000) -> str:
+    """Return a compact, human-readable API error summary for console logs."""
+    if not isinstance(resp, ct.ApiResponse):
+        return "no API response received"
+
+    parts: list[str] = []
+    if resp.request_id:
+        parts.append(f"request_id={resp.request_id}")
+    if resp.status_error:
+        # status_error already includes a body preview from ApiClient._finalize().
+        parts.append(resp.status_error)
+    elif resp.contract_error:
+        parts.append(resp.contract_error)
+
+    body = resp.json_body
+    if isinstance(body, dict):
+        error = body.get("error")
+        if error is not None:
+            parts.append("error=" + json.dumps(error, default=str))
+        elif body:
+            parts.append("body=" + json.dumps(body, default=str))
+    elif resp.body_text:
+        parts.append("body=" + resp.body_text)
+
+    text = " | ".join(p for p in parts if p)
+    return text[:limit] + ("…" if len(text) > limit else "")
+
+
+def print_api_error_if_any(label: str, resp: ct.ApiResponse | None, expected_status: int = 202) -> None:
+    if not isinstance(resp, ct.ApiResponse) or resp.status != expected_status:
+        print(f"    {label} error reason: {api_error_reason(resp)}")
+
+
 def ingest_documents(client: ct.ApiClient, docs: list[dict[str, Any]]) -> list[str]:
     ids: list[str] = []
     for start in range(0, len(docs), FILE_BATCH):
@@ -1173,8 +1206,10 @@ def ingest_documents(client: ct.ApiClient, docs: list[dict[str, Any]]) -> list[s
                 if isinstance(r, dict) and isinstance(r.get("id"), str):
                     got.append(r["id"])
         ids += got or [d["id"] for d in batch]
+        batch_no = start // FILE_BATCH + 1
         st = resp.status if isinstance(resp, ct.ApiResponse) else "ERR"
-        print(f"  documents batch {start // FILE_BATCH + 1}: {len(batch)} -> HTTP {st}")
+        print(f"  documents batch {batch_no}: {len(batch)} -> HTTP {st}")
+        print_api_error_if_any(f"documents batch {batch_no}", resp)
     return ids
 
 
@@ -1206,6 +1241,7 @@ def ingest_apps(client: ct.ApiClient, apps: list[dict[str, Any]]) -> list[str]:
     )
     st = resp.status if isinstance(resp, ct.ApiResponse) else "ERR"
     print(f"  app_knowledge: {len(items)} -> HTTP {st}")
+    print_api_error_if_any("app_knowledge", resp)
     return [a["id"] for a in apps]
 
 
@@ -1229,6 +1265,7 @@ def ingest_memories(client: ct.ApiClient, mems: list[dict[str, Any]]) -> list[st
     )
     st = resp.status if isinstance(resp, ct.ApiResponse) else "ERR"
     print(f"  memories: {len(items)} -> HTTP {st}")
+    print_api_error_if_any("memories", resp)
     return [m["id"] for m in mems]
 
 
