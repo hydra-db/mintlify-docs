@@ -1,0 +1,205 @@
+---
+title: "Connectors"
+description: "Automatically pull data from Slack, Gmail, Notion, GitHub, and Linear into HydraDB on a recurring schedule."
+---
+
+Connectors poll external providers on a schedule and ingest the results as app sources. You configure credentials once, select which resources to sync, and HydraDB handles incremental fetching.
+
+All connector endpoints live under `/v2/connectors`.
+
+---
+
+## Supported providers
+
+| Provider | Resource types | What gets ingested |
+|---|---|---|
+| `slack` | `channel` | Messages and threads |
+| `gmail` | `gmail_label` | Emails and threads |
+| `notion` | `notion_database`, `notion_page` | Page content and attachments |
+| `github` | `repository` | Issues and pull requests |
+| `linear` | `linear_team`, `linear_project` | Issues |
+
+---
+
+## Lifecycle
+
+```
+1. POST /v2/connectors                          → create with credentials
+2. GET  /v2/connectors/:id/discover             → list available resources
+3. POST /v2/connectors/:id/configure            → add resources + set lookback
+4. POST /v2/connectors/:id/sync                 → trigger first sync (optional)
+5. POST /query with query_apps: true            → query synced data
+```
+
+---
+
+## 1. Create a connector
+
+```bash
+curl -X POST 'https://api.hydradb.com/v2/connectors' \
+  -H "Authorization: Bearer $HYDRADB_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "provider": "slack",
+    "tenant_id": "my_tenant",
+    "auth_type": "api_token",
+    "credentials": {
+      "api_token": "xoxb-..."
+    }
+  }'
+```
+
+**Response** — `201 Created`, returns the connector object including `connector_id`.
+
+### Provider credentials
+
+| Provider | Field | Format |
+|---|---|---|
+| Slack | `credentials.api_token` | `xoxb-...` (bot) or `xoxp-...` (user) |
+| Gmail | `credentials.access_token` | `you@gmail.com:app-password` |
+| Notion | `credentials.api_token` | `ntn_...` (internal integration secret) |
+| GitHub | `credentials.api_token` | `ghp_...` (personal access token) |
+| Linear | `credentials.api_token` | `lin_api_...` |
+
+<Note>
+Gmail App Passwords require 2-Step Verification on the Google account. Generate one at [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords). Concatenate the email and password with a colon: `you@gmail.com:abcdwxyzefghijkl`.
+</Note>
+
+**Optional fields on create**
+
+| Field | Default | Description |
+|---|---|---|
+| `sync_interval_seconds` | `3600` | How often HydraDB polls the provider |
+| `sub_tenant_id` | — | Sub-tenant for all resources on this connector |
+| `provider_account_scope` | — | Label for which workspace/account (cosmetic) |
+
+---
+
+## 2. Discover resources
+
+```bash
+curl 'https://api.hydradb.com/v2/connectors/<connector_id>/discover' \
+  -H "Authorization: Bearer $HYDRADB_API_KEY"
+```
+
+Returns available resources from the provider. The response shape varies by provider:
+
+| Provider | Top-level key(s) |
+|---|---|
+| Slack | `channels` |
+| GitHub | `repos` |
+| Linear | `teams`, `projects` |
+| Notion | `resources` |
+| Gmail | `resources` |
+
+Each item has `id`, `name`, `resource_type`, and optional `metadata`. Use `id` as `resource_id` in the next step.
+
+---
+
+## 3. Configure resources
+
+```bash
+curl -X POST 'https://api.hydradb.com/v2/connectors/<connector_id>/configure' \
+  -H "Authorization: Bearer $HYDRADB_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "lookback_days": 30,
+    "resources": [
+      {
+        "resource_id": "C01ABC123",
+        "resource_type": "channel",
+        "name": "general"
+      }
+    ]
+  }'
+```
+
+**Response**
+
+```json
+{
+  "connector_id": "...",
+  "configured": 1,
+  "backfill": false
+}
+```
+
+| Field | Default | Notes |
+|---|---|---|
+| `lookback_days` | `30` | How far back to fetch on initial sync |
+| `resources[].resource_id` | required | The `id` from discover |
+| `resources[].resource_type` | — | Optional; use the value from discover |
+| `resources[].sub_tenant_id` | — | Per-resource sub-tenant override |
+
+When `lookback_days > 30`, HydraDB automatically runs an async backfill in 30-day chunks in the background. The `backfill: true` flag in the response confirms this was triggered.
+
+---
+
+## 4. Trigger a sync
+
+Connectors sync on the `sync_interval_seconds` schedule automatically. To run one immediately:
+
+```bash
+curl -X POST 'https://api.hydradb.com/v2/connectors/<connector_id>/sync' \
+  -H "Authorization: Bearer $HYDRADB_API_KEY"
+```
+
+---
+
+## Managing connectors
+
+```bash
+# List all connectors
+curl 'https://api.hydradb.com/v2/connectors' \
+  -H "Authorization: Bearer $HYDRADB_API_KEY"
+
+# Get a connector
+curl 'https://api.hydradb.com/v2/connectors/<connector_id>' \
+  -H "Authorization: Bearer $HYDRADB_API_KEY"
+
+# List resources on a connector
+curl 'https://api.hydradb.com/v2/connectors/<connector_id>/resources' \
+  -H "Authorization: Bearer $HYDRADB_API_KEY"
+
+# Remove a resource
+curl -X DELETE 'https://api.hydradb.com/v2/connectors/<connector_id>/resources/<resource_id>' \
+  -H "Authorization: Bearer $HYDRADB_API_KEY"
+
+# Delete a connector (cascades to all its resources)
+curl -X DELETE 'https://api.hydradb.com/v2/connectors/<connector_id>' \
+  -H "Authorization: Bearer $HYDRADB_API_KEY"
+```
+
+---
+
+## Querying connector data
+
+Once synced, connector data is available via the standard query endpoint with `query_apps: true`:
+
+```bash
+curl -X POST 'https://api.hydradb.com/v2/query' \
+  -H "Authorization: Bearer $HYDRADB_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "tenant_id": "my_tenant",
+    "query": "auth rollback discussion",
+    "query_apps": true
+  }'
+```
+
+Results include a `provider` field. Ingested records use the following kinds:
+
+| Provider | `kind` | `provider` |
+|---|---|---|
+| Slack | `message` | `slack` |
+| Gmail | `email` | `gmail` |
+| Notion | `knowledge_base` | `notion` |
+| GitHub | `ticket` | `github` |
+| Linear | `ticket` | `linear` |
+
+---
+
+## Related
+
+- [App Sources](/essentials/v2/app-sources) — push data to HydraDB from your own backend
+- [Query](/essentials/v2/query) — querying ingested data
