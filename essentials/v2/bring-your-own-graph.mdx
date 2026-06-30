@@ -1,0 +1,328 @@
+---
+title: "Bring Your Own Graph"
+description: "Supply your own entities and relations for a document and skip LLM graph extraction."
+---
+
+## 1. What it is
+
+Bring Your Own Graph (BYOG) lets you attach a `graph_payload` - your own entities and relations - to a **source** (a document, an `app_knowledge` source, or a memory) on [`POST /context/ingest`](/api-reference/v2/endpoint/ingest-context). For that source, HydraDB **uses your graph instead of running LLM extraction**.
+
+Your graph is stored in exactly the same shape extraction produces (`source → relation → target` triplets), so it answers queries identically - it shows up in the `graph_context` slice and its relations point back at the source's chunks. No query-side changes are needed.
+
+---
+
+## 2. When to use it
+
+Use BYOG when you already know the relationships and want them used verbatim:
+
+- You maintain a curated knowledge graph, an ontology, or a database export and want those exact facts in HydraDB.
+- You need deterministic, reproducible relations rather than model-extracted ones.
+- You want faster ingestion - a BYOG document skips the extraction LLM call entirely.
+
+Pick the right tool:
+
+| You want… | Use |
+| --- | --- |
+| HydraDB to discover relationships for you | [Context Graphs](/essentials/v2/context-graphs) (auto-extraction, the default) |
+| To declare links **between whole sources** | [Forceful relations](/essentials/v2/knowledge) (`relations` on a document/app source) |
+| To supply the **full entity/relation graph for one source** | **Bring Your Own Graph** (this page) |
+
+---
+
+## 3. The `graph_payload` shape
+
+`graph_payload` is a JSON string: a **map keyed by source id** - a document's `document_metadata` `id`, an `app_knowledge` item's `id`, or a memory's `id` - where each value is that source's graph (an `entities` map + a `relations` list). Attach graphs to several sources in one request by adding more keys.
+
+```json
+{
+  "billing-policy-doc": {
+    "entities": {
+      "alice":   { "name": "Alice Carter",  "type": "PERSON", "namespace": "employees", "identifier": "alice@acme.com" },
+      "billing": { "name": "Billing Policy", "type": "POLICY", "namespace": "policies" }
+    },
+    "relations": [
+      {
+        "source": "alice",
+        "target": "billing",
+        "predicate": "OWNS",
+        "context": "Alice Carter owns the billing policy.",
+        "temporal_details": "since 2021"
+      }
+    ]
+  }
+}
+```
+
+- **Top-level key** - the id of the source this graph belongs to (a document's `document_metadata` `id`, an `app_knowledge` item's `id`, or a memory's `id`). A key matching no source in the request is rejected with `400`.
+- **`entities`** - a map keyed by a caller-local id. Each entity has a `name` (required), `type`, `namespace`, and optional `identifier` (an external id - display-only). The entity key is just a handle for relations to reference; it is not stored.
+- **`relations`** - a list of edges. `source` and `target` are entity-map keys; `predicate` is any plain string; `context` and `temporal_details` are optional per relation.
+- **No `chunk_id`** - you never supply or see chunk ids; HydraDB resolves them server-side when it links your relations to the source's chunks.
+- Entity names are **normalized (lowercased)** so they match at query time, just like extracted entities. Entities that no relation references are dropped.
+
+---
+
+## 4. How it behaves
+
+- **Replace mode.** A BYOG document's graph is your `graph_payload`; LLM extraction is skipped for it. The document is still chunked and embedded, so it stays fully vector-searchable.
+- **Chunk linking.** Each relation is linked to the source's most relevant chunk(s), so `graph_context` results hydrate the right passages. Linking is permissive (see [Limitations](#8-limitations)).
+- **Queryable like any graph.** Your relations appear in the `/query` `graph_context` slice (tagged `origin: "byog"` in metadata) and traverse exactly like extracted ones - see [Context Graphs](/essentials/v2/context-graphs).
+- **Durable across re-ingest.** Your graph is persisted server-side, so it outlives a single upload. Re-ingesting the same source **without** a `graph_payload` - a connector re-sync, or just iterating on the document's content - re-applies your stored graph: HydraDB does **not** fall back to LLM extraction and does **not** error. Your facts are never silently lost. To change the graph, re-ingest **with** a new `graph_payload`; it replaces the stored copy (replace mode).
+
+---
+
+## 5. Limits
+
+`graph_payload` is validated up front; oversized payloads are rejected with `400`.
+
+| Limit | Value |
+| --- | --- |
+| Entities | ≤ 5,000 |
+| Relations | ≤ 10,000 |
+| Relations per entity (degree) | ≤ 500 |
+| `context` length | ≤ 2,000 chars |
+| `name` / `predicate` length | ≤ 256 chars |
+
+<Note>
+`graph_payload` is **per-source**: each top-level key must match the `id` of a source in the same request - a document's `document_metadata` `id`, an `app_knowledge` item's `id`, or (when `type=memory`) a memory's `id`. Attach graphs to multiple sources at once. A source must carry an explicit `id` to be targeted (that `id` is the map key). Works for both `type=knowledge` and `type=memory` - a single request is one or the other, so its `graph_payload` keys target only that type's sources.
+</Note>
+
+---
+
+## 6. Example: multiple sources in one request
+
+`graph_payload` is a map, so one request can carry graphs for several sources at once - here **two documents and one app_knowledge source**, each keyed by its own id. Then query, and each source's triples surface.
+
+<CodeGroup>
+
+```bash cURL
+curl -X POST 'https://api.hydradb.com/context/ingest' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -F "type=knowledge" \
+  -F "tenant_id=acme_corp" \
+  -F "documents=@/path/to/billing-policy.pdf" \
+  -F "documents=@/path/to/deploy-runbook.pdf" \
+  -F 'document_metadata=[{ "id": "billing-policy-doc" }, { "id": "deploy-runbook-doc" }]' \
+  -F 'app_knowledge=[{ "id": "slack-incident-42", "kind": "message", "provider": "slack", "external_id": "slack-incident-42", "fields": { "kind": "message", "body": "Platform team paged for the payments outage." } }]' \
+  -F 'graph_payload={
+    "billing-policy-doc": {
+      "entities": {
+        "alice":   { "name": "Alice Carter",  "type": "PERSON", "namespace": "employees" },
+        "billing": { "name": "Billing Policy", "type": "POLICY", "namespace": "policies" }
+      },
+      "relations": [
+        { "source": "alice", "target": "billing", "predicate": "OWNS",
+          "context": "Alice Carter owns the billing policy.", "temporal_details": "since 2021" }
+      ]
+    },
+    "deploy-runbook-doc": {
+      "entities": {
+        "team": { "name": "Platform Team",    "type": "TEAM",    "namespace": "teams" },
+        "svc":  { "name": "Payments Service", "type": "SERVICE", "namespace": "services" }
+      },
+      "relations": [
+        { "source": "team", "target": "svc", "predicate": "OPERATES",
+          "context": "The platform team operates the payments service." }
+      ]
+    },
+    "slack-incident-42": {
+      "entities": {
+        "team": { "name": "Platform Team",   "type": "TEAM",     "namespace": "teams" },
+        "inc":  { "name": "Payments Outage", "type": "INCIDENT", "namespace": "incidents" }
+      },
+      "relations": [
+        { "source": "team", "target": "inc", "predicate": "RESPONDED_TO",
+          "context": "The platform team was paged for the payments outage." }
+      ]
+    }
+  }'
+```
+
+```python Python SDK
+import json
+
+graphs = {
+    "billing-policy-doc": {
+        "entities": {
+            "alice":   {"name": "Alice Carter",  "type": "PERSON", "namespace": "employees"},
+            "billing": {"name": "Billing Policy", "type": "POLICY", "namespace": "policies"},
+        },
+        "relations": [
+            {"source": "alice", "target": "billing", "predicate": "OWNS",
+             "context": "Alice Carter owns the billing policy.", "temporal_details": "since 2021"},
+        ],
+    },
+    "deploy-runbook-doc": {
+        "entities": {
+            "team": {"name": "Platform Team",    "type": "TEAM",    "namespace": "teams"},
+            "svc":  {"name": "Payments Service", "type": "SERVICE", "namespace": "services"},
+        },
+        "relations": [
+            {"source": "team", "target": "svc", "predicate": "OPERATES",
+             "context": "The platform team operates the payments service."},
+        ],
+    },
+    "slack-incident-42": {
+        "entities": {
+            "team": {"name": "Platform Team",   "type": "TEAM",     "namespace": "teams"},
+            "inc":  {"name": "Payments Outage", "type": "INCIDENT", "namespace": "incidents"},
+        },
+        "relations": [
+            {"source": "team", "target": "inc", "predicate": "RESPONDED_TO",
+             "context": "The platform team was paged for the payments outage."},
+        ],
+    },
+}
+
+with open("/path/to/billing-policy.pdf", "rb") as f1, open("/path/to/deploy-runbook.pdf", "rb") as f2:
+    client.context.ingest(
+        type="knowledge",
+        tenant_id="acme_corp",
+        documents=[
+            ("billing-policy.pdf", f1, "application/pdf"),
+            ("deploy-runbook.pdf", f2, "application/pdf"),
+        ],
+        document_metadata=json.dumps([{"id": "billing-policy-doc"}, {"id": "deploy-runbook-doc"}]),
+        app_knowledge=json.dumps([
+            {"id": "slack-incident-42", "kind": "message", "provider": "slack",
+             "external_id": "slack-incident-42",
+             "fields": {"kind": "message", "body": "Platform team paged for the payments outage."}},
+        ]),
+        graph_payload=json.dumps(graphs),
+    )
+```
+
+```typescript TypeScript SDK
+const graphs = {
+  "billing-policy-doc": {
+    entities: {
+      alice:   { name: "Alice Carter",  type: "PERSON", namespace: "employees" },
+      billing: { name: "Billing Policy", type: "POLICY", namespace: "policies" },
+    },
+    relations: [
+      { source: "alice", target: "billing", predicate: "OWNS",
+        context: "Alice Carter owns the billing policy.", temporal_details: "since 2021" },
+    ],
+  },
+  "deploy-runbook-doc": {
+    entities: {
+      team: { name: "Platform Team",    type: "TEAM",    namespace: "teams" },
+      svc:  { name: "Payments Service", type: "SERVICE", namespace: "services" },
+    },
+    relations: [
+      { source: "team", target: "svc", predicate: "OPERATES",
+        context: "The platform team operates the payments service." },
+    ],
+  },
+  "slack-incident-42": {
+    entities: {
+      team: { name: "Platform Team",   type: "TEAM",     namespace: "teams" },
+      inc:  { name: "Payments Outage", type: "INCIDENT", namespace: "incidents" },
+    },
+    relations: [
+      { source: "team", target: "inc", predicate: "RESPONDED_TO",
+        context: "The platform team was paged for the payments outage." },
+    ],
+  },
+};
+
+await client.context.ingest({
+  type: "knowledge",
+  tenantId: "acme_corp",
+  documents: [
+    { path: "/path/to/billing-policy.pdf", filename: "billing-policy.pdf", contentType: "application/pdf" },
+    { path: "/path/to/deploy-runbook.pdf", filename: "deploy-runbook.pdf", contentType: "application/pdf" },
+  ],
+  documentMetadata: JSON.stringify([{ id: "billing-policy-doc" }, { id: "deploy-runbook-doc" }]),
+  appKnowledge: JSON.stringify([
+    { id: "slack-incident-42", kind: "message", provider: "slack", external_id: "slack-incident-42",
+      fields: { kind: "message", body: "Platform team paged for the payments outage." } },
+  ]),
+  graphPayload: JSON.stringify(graphs),
+});
+```
+
+</CodeGroup>
+
+Poll [Ingestion Status](/api-reference/v2/endpoint/source-status) until the source is ready, then query with `graph_context: true`:
+
+```bash cURL
+curl -X POST 'https://api.hydradb.com/query' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "tenant_id": "acme_corp",
+    "query": "Who owns the billing policy?",
+    "type": "knowledge",
+    "query_by": "hybrid",
+    "mode": "thinking",
+    "graph_context": true
+  }'
+```
+
+Your triplet comes back in `graph_context` and traverses just like an extracted one - the `origin: "byog"` tag on the relation marks it as yours:
+
+```json
+{
+  "graph_context": {
+    "query_paths": [
+      {
+        "triplets": [
+          {
+            "source": { "name": "alice carter", "type": "PERSON" },
+            "relation": { "canonical_predicate": "OWNS", "context": "Alice Carter owns the billing policy.", "origin": "byog" },
+            "target": { "name": "billing policy", "type": "POLICY" }
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+---
+
+## 7. Memories
+
+Memories accept a `graph_payload` too - send `type=memory`, give each memory an `id`, and key the graph by that `id`. The graph shape is identical; relations link to the memory's chunks and surface in `/query` with `type=memory` and `graph_context: true`.
+
+```bash cURL
+curl -X POST 'https://api.hydradb.com/context/ingest' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -F "type=memory" \
+  -F "tenant_id=acme_corp" \
+  -F 'memories=[{ "id": "mem-oncall-1", "text": "Dana Kim owns the incident playbook and leads the on-call rotation." }]' \
+  -F 'graph_payload={
+    "mem-oncall-1": {
+      "entities": {
+        "dana": { "name": "Dana Kim",         "type": "PERSON",   "namespace": "employees" },
+        "pb":   { "name": "Incident Playbook", "type": "DOCUMENT", "namespace": "runbooks" }
+      },
+      "relations": [
+        { "source": "dana", "target": "pb", "predicate": "OWNS",
+          "context": "Dana Kim owns the incident playbook.", "temporal_details": "since 2024" }
+      ]
+    }
+  }'
+```
+
+A memory must carry an explicit `id` to receive a graph (an id-less memory gets a server-generated id and can't be targeted). The `memories` form field stays plural even though `type` is the singular `memory`.
+
+---
+
+## 8. Limitations
+
+- **Replace, not augment.** A BYOG source has no LLM-extracted facts - only the graph you supply (plus normal chunk search). Augment mode is a future enhancement.
+- **Permissive linking → possible false positives.** Every relation links to its best-matching chunk even if the match is weak; there is no reject floor yet. A linked relation is **sourced** (similar to a chunk), not necessarily **supported** (stated by the source).
+- **Bulk, one-shot.** You supply the whole graph with the source. Per-triple add/update/delete is not yet available.
+
+---
+
+## Related
+
+- [Context Graphs](/essentials/v2/context-graphs) - the auto-extracted graph BYOG replaces; HydraDB builds it for you, BYOG lets you supply it
+- [Knowledge](/essentials/v2/knowledge) - documents, and forceful relations between sources
+- [Ingest Context](/api-reference/v2/endpoint/ingest-context) - the `graph_payload` form field reference
+- [Query](/essentials/v2/query) - how chunks and graph context are retrieved together
