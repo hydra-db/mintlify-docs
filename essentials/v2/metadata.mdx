@@ -1,96 +1,74 @@
 ---
 title: "Scoping using metadata"
-description: "How HydraDB uses metadata to scope and rank query results deterministically — schema-aligned tenant fields, free-form per-document fields, and how they combine at query time."
+description: "How HydraDB uses metadata to scope query results with schema-backed fields, free-form additional metadata, source metadata edits, and exact metadata filters."
 ---
 
-Metadata is structured data attached to [Knowledge](/essentials/v2/knowledge) and [Memories](/essentials/v2/memories) so you can scope query to a known set **before** semantic retrieval runs. It bridges the gap between vector similarity (great for "things like X") and exact scoping (essential for "must be in environment=production, must be customer=acme, must be a runbook"). HydraDB exposes two metadata layers  -  one declared up front and fast, one free-form and slower  -  and lets you combine them in a single [`POST /query`](/api-reference/v2/endpoint/query) call.
+Metadata is structured data attached to [Knowledge](/essentials/v2/knowledge) and [Memories](/essentials/v2/memories). Use it when you already know a hard constraint before retrieval runs, such as `department=legal`, `region=us`, `status=published`, or `author=alice`.
 
-For the full request and response schema, see [Query  -  API Reference](/api-reference/v2/endpoint/query).
+HydraDB has two metadata layers:
 
----
-
-## 1. Use-case recipes
-
-Pick the row that matches your goal and use the parameters as a starting point:
-
-| I want to… | Put the value in… | Scope at query with… | Notes |
+| Layer | Sent at ingest as | Query filter shape | Best for |
 | --- | --- | --- | --- |
-| Scope by a field used on every query (department, region, plan) | `metadata` on ingest | Top-level key in `metadata_filters` | Fast path. Must declare in `tenant_metadata_schema` with `enable_match: true`. |
-| Scope by a one-off or per-document field (author, slack channel, doc ID) | `additional_metadata` on ingest | Nested under `additional_metadata` in `metadata_filters` | No schema change. ~3× over-fetch, slower than the fast path. |
-| Query inside a metadata field (semantic match on a description) | `metadata` with `enable_dense_embedding: true` | Just include the field's content in your `query` | Requires the schema field to be `VARCHAR`. |
-| Keyword match on a metadata field | `metadata` with `enable_sparse_embedding: true` | `query_by: "text"` on `/query` | BM25 over that field. |
-| Combine deterministic scoping with semantic search | Both metadata kinds | `metadata_filters` + your query | Scope runs before ranking  -  keeps query predictable. |
-| Keep draft / archived / region-specific content out of user answers | `metadata.status` (or similar) | `metadata_filters: { status: "published" }` | Classic published/unpublished pattern. |
+| Tenant metadata | `metadata` | Top-level keys in `metadata_filters` | Stable, high-cardinality fields you filter on often. Declare these in `tenant_metadata_schema`, usually with `enable_match: true`. |
+| Additional metadata | `additional_metadata` | Nested under `metadata_filters.additional_metadata` | Free-form per-source fields for display, citations, debugging, external IDs, or occasional filters. |
 
-If a field will be scoped on **every** query, it belongs in `metadata` and the [tenant schema](/api-reference/v2/endpoint/create-tenant). If it's ad-hoc or unique to one document, use `additional_metadata` instead.
+```json
+{
+  "metadata_filters": {
+    "department": "legal",
+    "additional_metadata": {
+      "author": "alice"
+    }
+  }
+}
+```
 
 ---
 
-## 2. Parameter reference
+## 1. Choose the right metadata layer
 
-[Follow this for when to use `tenant_id` and `sub_tenant_id`](./multi-tenant#2-when-to-use-each)
+| I want to… | Put it in… | Filter with… | Notes |
+| --- | --- | --- | --- |
+| Scope most queries by a field like department, region, plan, customer, or status | `metadata` | `metadata_filters: { "department": "legal" }` | Declare the field in `tenant_metadata_schema`; set `enable_match: true` for the intended filter path. |
+| Store source-specific fields like author, Slack timestamp, external ID, document version | `additional_metadata` | `metadata_filters: { "additional_metadata": { "author": "alice" } }` | No schema required. Better for occasional filters and display metadata. |
+| Combine hard scoping with semantic search | Both | `metadata_filters` plus your natural-language `query` | Filters narrow candidates; ranking still uses the query. |
+| Search semantically over a metadata text field | `metadata` with `enable_dense_embedding: true` | Put the desired concept in `query` | Only supported for `VARCHAR` fields. Do not put fuzzy concepts in `metadata_filters`. |
+| Search by keyword over a metadata text field | `metadata` with `enable_sparse_embedding: true` | Use normal `/query` text/BM25 behavior | Only supported for `VARCHAR` fields. |
+| Partition by user, workspace, or team | `sub_tenant_id` | Send `sub_tenant_id` on every request | Use metadata filters inside that partition, not as a replacement for it. |
 
-### Schema declaration (set at tenant creation)
+---
 
-Defined once in `tenant_metadata_schema` on [`POST /tenants`](/api-reference/v2/endpoint/create-tenant). Immutable after creation  -  plan your scope fields up front.
+## 2. How metadata filters run
 
-| Field | Type / values | Purpose |
-| --- | --- | --- |
-| `name` <sup style={{ color: "red" }}>*</sup> | string | Field key. Must start with a letter or `_`. Reserved system names are rejected. |
-| `data_type` | `"string"` \| `"integer"` \| `"float"` \| `"boolean"` \| `"array"` \| `"object"` \| `VARCHAR` \| `INT*` \| `JSON` … | Field type. Default: `VARCHAR`. Friendly names are coerced server-side. |
-| `enable_match` | boolean | Set `true` to use this field as a scope key in `metadata_filters`. Default: `false`. |
-| `enable_dense_embedding` | boolean | Index this `VARCHAR` field for semantic similarity search. Default: `false`. |
-| `enable_sparse_embedding` | boolean | Index this `VARCHAR` field for BM25 keyword search. Default: `false`. |
-| `max_length` | integer | Max length for string fields. Default: `1024`. Increase for long text. |
-| `searchable` *(shorthand)* | boolean | Equivalent to `enable_dense_embedding: true` + `enable_sparse_embedding: true`. |
-| `filterable` *(shorthand)* | boolean | Equivalent to `enable_match: true`. |
+For user-provided `metadata_filters`, HydraDB uses a correctness-first pipeline:
 
-### Ingest-time metadata (per source)
+1. **MongoDB source-id prefilter.** Safe scalar tenant/additional metadata filters are resolved to matching `source_id`s in MongoDB.
+2. **Scoped retrieval.** Vector/BM25 retrieval searches only those source IDs.
+3. **Post-filter correctness net.** Hydrated chunks are checked again against the requested metadata. This also protects graph expansion and fallback/retry paths from leaking excluded sources.
 
-Sent on each item in `app_knowledge[]`, `document_metadata[]`, or `memories[]` on [`POST /context/ingest`](/api-reference/v2/endpoint/ingest-context):
+That means a valid filter with no matching sources returns an empty result set; HydraDB does not silently widen it into an unfiltered search.
 
-| Field | Type | Purpose |
-| --- | --- | --- |
-| `metadata` | object for knowledge; JSON-encoded string for memory items | Tenant-schema fields. Keys must match `tenant_metadata_schema`. The fast scoping path. |
-| `additional_metadata` | object | Free-form per-document or per-memory fields. No schema. The flexible, slower path. |
+### Filter semantics
+
+| Behavior | Contract |
+| --- | --- |
+| Multiple keys | AND logic. Every provided key/value must match. |
+| Tenant + additional metadata | AND logic across both layers. |
+| Values | Exact equality for scalar values. |
+| Lists | Exact set equality for supported list-shaped comparisons, not OR/IN. For example, `tags: ["alpha", "beta"]` matches a stored `"alpha,beta"` set, but `tags: ["alpha"]` does not. |
+| Range / contains / fuzzy | Not supported in user `metadata_filters`. Put fuzzy concepts in `query`, use semantic metadata fields, or post-process client-side. |
+| OR | Run multiple queries and union client-side. |
+| Graph context | Respects metadata filters; graph paths from excluded sources are removed. |
 
 <Warning>
-For `type=memory`, the `memories` multipart field is already JSON-stringified, and each memory item's `metadata` is currently validated as a JSON-encoded string. Keep `additional_metadata` as an object. For knowledge ingestion (`document_metadata` and `app_knowledge`), `metadata` remains an object.
+  `metadata_filters` are hard constraints, not semantic hints. A filter like `{ "mood": "happy" }` requires an exact stored value; it does not expand to related values like "joyful" or "cheerful". To search metadata text semantically, declare a `VARCHAR` field with `enable_dense_embedding` and include the concept in the main `query`.
 </Warning>
 
-### Query-time scoping (in `metadata_filters`)
-
-Sent on [`POST /query`](/api-reference/v2/endpoint/query). Two scopes in the same object, mixed freely:
-
-| Where the key lives | What it scopes | Performance |
-| --- | --- | --- |
-| **Top level** of `metadata_filters` | `metadata` fields | Applied in the vector store before ranking. Fast. |
-| Nested under **`additional_metadata`** (canonical) or `additional_metadata` (deprecated alias) | `additional_metadata` fields | Post-retrieval, with the engine over-fetching ~3× to compensate. Slower. |
-
 ---
 
-## 3. Tuning heuristics
+## 3. Define tenant metadata schema
 
-Most of the time the defaults are right. When they aren't, here's where to start:
-
-- **Plan scoping fields before first ingest.** Schema is immutable, and undeclared scope keys are silently ignored at query time. If you'll scope on it more than once, declare it.
-- **Pick `metadata` for hot paths, `additional_metadata` for cold ones.** Tenant-level scopes are pre-applied in the vector store; document-level scopes force a post-retrieval pass with over-fetch.
-- **Use exact-equality only.** `metadata_filters` are equality constraints across all categories. Range, contains, or fuzzy matching belong in the query, query mode, or downstream reranking  -  not here.
-- **Keep keys stable.** Renaming a metadata key requires re-ingesting affected sources. Same goes for changing `enable_match` flags.
-- **Ingested metadata is immutable.** Once a source is indexed, its `metadata` and `additional_metadata` values are locked. To change them, re-ingest the source with the new values (use `upsert: true` and the same `id`).
-- **Don't substitute `metadata_filters` for `sub_tenant_id`.** `metadata_filters` scopes results *inside* a partition. For partitioning by user, team, or workspace, use [`sub_tenant_id`](/essentials/v2/multi-tenant).
-
----
-
-## 4. Minimal working example
-
-Two phases: **set up metadata** (declare the schema, then attach values at ingest), then **scope at query**.
-
-### Step 1  -  Create metadata
-
-The schema lives at the tenant level; values land on each source at ingest time. Both happen before any query.
-
-#### Step 1a  -  Declare the schema at tenant creation
+Declare stable tenant metadata fields with `tenant_metadata_schema` when creating a tenant:
 
 <CodeGroup>
 ```bash cURL
@@ -102,42 +80,94 @@ curl -X POST 'https://api.hydradb.com/tenants' \
     "tenant_id": "acme_corp",
     "tenant_metadata_schema": [
       {
-        "name": "compliance_framework",
+        "name": "department",
         "data_type": "VARCHAR",
         "enable_match": true
+      },
+      {
+        "name": "priority",
+        "data_type": "INT64",
+        "enable_match": true
+      },
+      {
+        "name": "summary_label",
+        "data_type": "VARCHAR",
+        "enable_dense_embedding": true,
+        "enable_sparse_embedding": true
       }
     ]
   }'
-```
-```typescript TypeScript SDK
-await client.tenants.create({
-  tenantId: "acme_corp",
-  tenantMetadataSchema: [
-    {
-      name: "compliance_framework",
-      dataType: "VARCHAR",
-      enableMatch: true,
-    },
-  ],
-});
 ```
 ```python Python SDK
 client.tenants.create(
     tenant_id="acme_corp",
     tenant_metadata_schema=[
+        {"name": "department", "data_type": "VARCHAR", "enable_match": True},
+        {"name": "priority", "data_type": "INT64", "enable_match": True},
         {
-            "name": "compliance_framework",
+            "name": "summary_label",
             "data_type": "VARCHAR",
-            "enable_match": True,
-        }
+            "enable_dense_embedding": True,
+            "enable_sparse_embedding": True,
+        },
     ],
 )
 ```
+```typescript TypeScript SDK
+await client.tenants.create({
+  tenantId: "acme_corp",
+  tenantMetadataSchema: [
+    { name: "department", dataType: "VARCHAR", enableMatch: true },
+    { name: "priority", dataType: "INT64", enableMatch: true },
+    {
+      name: "summary_label",
+      dataType: "VARCHAR",
+      enableDenseEmbedding: true,
+      enableSparseEmbedding: true,
+    },
+  ],
+});
+```
 </CodeGroup>
 
-#### Step 1b  -  Attach metadata at ingest
+### Schema field options
 
-Drop schema-aligned values into `metadata` and any free-form per-document values into `additional_metadata`:
+| Field | Type / values | Purpose |
+| --- | --- | --- |
+| `name` | string | Metadata key. Must start with a letter or `_`, contain only letters/numbers/underscores, and not use reserved system names such as `source_id`, `chunk_id`, or `metadata`. |
+| `data_type` | `VARCHAR`, `BOOL`, `INT8`, `INT16`, `INT32`, `INT64`, `FLOAT`, `DOUBLE`, `JSON`, `ARRAY` or friendly aliases `string`, `boolean`, `integer`, `float`, `object`, `array` | Defaults to `VARCHAR`. |
+| `max_length` | integer | Max length for `VARCHAR`. Default `1024`, maximum `65535`. |
+| `enable_match` | boolean | Creates the intended fast exact-match/filtering path for this field. Use this for top-level `metadata_filters` keys. |
+| `enable_dense_embedding` | boolean | Adds a dense semantic-search lane for a `VARCHAR` metadata field. |
+| `enable_sparse_embedding` | boolean | Adds a sparse/BM25 keyword-search lane for a `VARCHAR` metadata field. |
+| `filterable` | boolean | Backward-compatible shorthand for `enable_match: true`. Prefer `enable_match` in new docs/code. |
+| `searchable` | boolean | Backward-compatible input accepted by the API, but do not rely on it to replace explicit `enable_dense_embedding` / `enable_sparse_embedding`. Set those flags directly. |
+
+Limits and guardrails:
+
+- Up to 32 custom tenant metadata fields.
+- Field names are unique case-insensitively.
+- Dense/sparse embedding flags are only valid on `VARCHAR` fields.
+- Runtime `metadata` values must match the declared type when the tenant has a schema.
+- Unknown `metadata` keys are rejected on ingest/edit when a non-empty tenant schema exists.
+
+### Add schema fields later
+
+You can add tenant metadata fields after tenant creation with [`PATCH /tenants/{tenant_id}/metadata-schema`](/api-reference/v2/endpoint/update-metadata-schema). This is additive only:
+
+- add new fields: yes
+- delete fields: no
+- change type/flags of existing fields: no
+
+<Warning>
+  Adding fields updates the stored tenant schema and MongoDB filter indexes. Existing Milvus collections are not altered/backfilled for newly added dense/sparse metadata lanes yet. If you need a new metadata field to participate in semantic/BM25 metadata search for existing data, create a new tenant/schema and re-ingest, or confirm the current platform migration path with support.
+</Warning>
+
+---
+
+## 4. Attach metadata at ingest
+
+For knowledge ingestion, send `metadata` and `additional_metadata` on each `document_metadata[]` item or `app_knowledge[]` item.
 
 <CodeGroup>
 ```bash cURL
@@ -156,30 +186,17 @@ curl -X POST 'https://api.hydradb.com/context/ingest' \
         "title": "Authentication controls",
         "body": "Authentication controls are reviewed quarterly for SOC2."
       },
-      "metadata": { "compliance_framework": "SOC2" },
-      "additional_metadata": { "author": "alice", "doc_version": 3 }
+      "metadata": {
+        "department": "security",
+        "priority": 7,
+        "summary_label": "quarterly access control review"
+      },
+      "additional_metadata": {
+        "author": "alice",
+        "doc_version": 3
+      }
     }
   ]'
-```
-```typescript TypeScript SDK
-await client.context.ingest({
-  type: "knowledge",
-  tenantId: "acme_corp",
-  appKnowledge: JSON.stringify([
-    {
-      tenant_id: "acme_corp",
-      sub_tenant_id: "default",
-      id: "auth-controls-001",
-      kind: "knowledge_base",
-      fields: {
-        title: "Authentication controls",
-        body: "Authentication controls are reviewed quarterly for SOC2.",
-      },
-      metadata: { compliance_framework: "SOC2" },
-      additional_metadata: { author: "alice", doc_version: 3 },
-    },
-  ]),
-});
 ```
 ```python Python SDK
 import json
@@ -197,21 +214,51 @@ client.context.ingest(
                 "title": "Authentication controls",
                 "body": "Authentication controls are reviewed quarterly for SOC2.",
             },
-            "metadata": {"compliance_framework": "SOC2"},
+            "metadata": {
+                "department": "security",
+                "priority": 7,
+                "summary_label": "quarterly access control review",
+            },
             "additional_metadata": {"author": "alice", "doc_version": 3},
         }
     ]),
 )
 ```
+```typescript TypeScript SDK
+await client.context.ingest({
+  type: "knowledge",
+  tenantId: "acme_corp",
+  appKnowledge: JSON.stringify([
+    {
+      tenant_id: "acme_corp",
+      sub_tenant_id: "default",
+      id: "auth-controls-001",
+      kind: "knowledge_base",
+      fields: {
+        title: "Authentication controls",
+        body: "Authentication controls are reviewed quarterly for SOC2.",
+      },
+      metadata: {
+        department: "security",
+        priority: 7,
+        summary_label: "quarterly access control review",
+      },
+      additional_metadata: { author: "alice", doc_version: 3 },
+    },
+  ]),
+});
+```
 </CodeGroup>
 
 <Warning>
-**Ingested metadata is immutable.** Once a source is indexed, its `metadata` and `additional_metadata` values are locked. To change them, re-ingest the source with the new values using `upsert: true` and the same `id`.
+  For `type=memory`, the `memories` multipart field is already JSON-stringified, and each memory item's `metadata` is currently validated as a JSON-encoded string. Keep `additional_metadata` as an object. For knowledge ingestion (`document_metadata` and `app_knowledge`), `metadata` is an object.
 </Warning>
 
-### Step 2  -  Scope at query
+---
 
-Mix tenant-level (top-level) and document-level (nested) scopes in the same `metadata_filters` object:
+## 5. Query with metadata filters
+
+Mix tenant metadata and additional metadata filters in the same request:
 
 <CodeGroup>
 ```bash cURL
@@ -221,77 +268,135 @@ curl -X POST 'https://api.hydradb.com/query' \
   -H "Content-Type: application/json" \
   -d '{
     "tenant_id": "acme_corp",
-    "query": "How does authentication control review work?",
+    "sub_tenant_id": "default",
+    "query": "How do access control reviews work?",
     "type": "knowledge",
     "query_by": "hybrid",
     "metadata_filters": {
-      "compliance_framework": "SOC2",
-      "additional_metadata": { "author": "alice" }
+      "department": "security",
+      "priority": 7,
+      "additional_metadata": {
+        "author": "alice"
+      }
     }
   }'
-```
-```typescript TypeScript SDK
-const result = await client.query({
-  tenantId: "acme_corp",
-  query: "How does authentication control review work?",
-  type: "knowledge",
-  queryBy: "hybrid",
-  metadataFilters: {
-    compliance_framework: "SOC2",
-    additional_metadata: { author: "alice" },
-  },
-});
 ```
 ```python Python SDK
 result = client.query(
     tenant_id="acme_corp",
-    query="How does authentication control review work?",
+    sub_tenant_id="default",
+    query="How do access control reviews work?",
     type="knowledge",
     query_by="hybrid",
     metadata_filters={
-        "compliance_framework": "SOC2",
+        "department": "security",
+        "priority": 7,
         "additional_metadata": {"author": "alice"},
     },
 )
 ```
+```typescript TypeScript SDK
+const result = await client.query({
+  tenantId: "acme_corp",
+  subTenantId: "default",
+  query: "How do access control reviews work?",
+  type: "knowledge",
+  queryBy: "hybrid",
+  metadataFilters: {
+    department: "security",
+    priority: 7,
+    additional_metadata: { author: "alice" },
+  },
+});
+```
 </CodeGroup>
 
-Top-level `compliance_framework` is the fast scope, applied in the vector store before ranking. Nested `additional_metadata.author` is matched post-retrieval on the free-form field.
+Use the legacy alias only when maintaining older clients:
+
+```json
+{
+  "metadata_filters": {
+    "document_metadata": { "author": "alice" }
+  }
+}
+```
+
+If both aliases are present and both are objects, `additional_metadata` wins on conflicts.
 
 ---
 
-## 5. Common mistakes
+## 6. Update metadata without re-ingesting
+
+Use [`PATCH /context/sources/{source_id}/metadata`](/api-reference/v2/endpoint/update-source-metadata) when you know the source ID and need to update metadata in place.
+
+```json
+{
+  "tenant_id": "acme_corp",
+  "sub_tenant_id": "default",
+  "tenant_metadata": {
+    "department": "legal"
+  },
+  "additional_metadata": {
+    "author": "grace"
+  }
+}
+```
+
+Behavior:
+
+- The source must already exist.
+- `sub_tenant_id` is required.
+- At least one of `tenant_metadata` or `additional_metadata` is required.
+- The update is a merge/upsert: sent keys are inserted or overwritten; omitted keys are preserved.
+- `document_metadata` is not accepted on this endpoint; use `additional_metadata`.
+- `enable_match`-only tenant metadata updates are MongoDB-only and take effect for filters/listing.
+- If an edited tenant metadata field has `enable_dense_embedding` or `enable_sparse_embedding`, HydraDB synchronously syncs the relevant Milvus lane and reports `milvus_sync_required` / `milvus_synced` in the response.
+
+For full document/content replacement, re-ingest with `upsert: true` and the same source `id`. Upsert replaces the source payload and metadata supplied by ingestion.
+
+---
+
+## 7. Listing with metadata filters
+
+Use [`POST /context/list`](/api-reference/v2/endpoint/list-documents) when you want to browse or page sources rather than run semantic retrieval:
+
+```json
+{
+  "tenant_id": "acme_corp",
+  "sub_tenant_id": "default",
+  "type": "knowledge",
+  "filters": {
+    "metadata": { "department": "legal" },
+    "additional_metadata": { "author": "alice" },
+    "source_fields": { "type": "slack" }
+  }
+}
+```
+
+`/context/list` also accepts legacy aliases `tenant_metadata` for `metadata` and `document_metadata` for `additional_metadata`.
+
+---
+
+## 8. Common mistakes
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
-| `metadata_filters` doesn't scope results | Key isn't declared in `tenant_metadata_schema`, or `enable_match` is `false` | Re-create the tenant with the field declared (`enable_match: true`), or move the field to `additional_metadata` and nest the scope under `additional_metadata`. |
-| Scope on an `additional_metadata` key silently ignored | Scope passed as top-level key | Nest it: `metadata_filters: { additional_metadata: { author: "alice" } }`. |
-| Schema field changes don't take effect | Schema is immutable after tenant creation | Create a new tenant with the corrected schema. There's no in-place schema migration. |
-| Metadata values on a source don't update | Ingested metadata is immutable | Re-ingest the source with `upsert: true` and the same `id`. |
-| Query returns 0 results after adding a scope | Over-scoping  -  combined constraints exclude everything | Start with the minimum hard constraints; add scopes one at a time and re-check counts. |
-| Range / contains / fuzzy scope doesn't work | `metadata_filters` is equality-only | Move that constraint into the `query` text, use a different `query_by`, or apply it in your own post-scoping. |
-| Fields used in `metadata` but missing from response objects | Field declared as embedding-only without `enable_match` | Embedding-enabled doesn't imply scoping-enabled. Add `enable_match: true` to use it in `metadata_filters`. |
-| `additional_metadata` scope feels slow | It is  -  over-fetches ~3× to compensate for post-retrieval matching | Move the hot field into `metadata` and declare it in the schema. |
-
----
-
-## 6. Advanced patterns
-
-**Stacked scopes with sub-tenant partitioning.** Use `sub_tenant_id` for the partition (per-user, per-workspace), and use `metadata_filters` to scope *inside* that partition. They're complementary, not interchangeable. See [Multi-Tenant](/essentials/v2/multi-tenant).
-
-**Published vs draft.** Add a `status` field with `enable_match: true` to your schema; tag every source with `metadata.status = "draft" | "published"`; pass `metadata_filters: { status: "published" }` on user-facing queries. Keeps work-in-progress out of customer answers automatically.
-
-**Multi-language corpora.** Add a `language` field with `enable_match: true`; route each query to the right language by passing `metadata_filters: { language: detect_language(query) }`.
-
-**Schema-as-product.** Treat `tenant_metadata_schema` as part of your data contract  -  review it like a database migration. The cost of getting it wrong (immutability + re-ingest) is real; the cost of getting it right is one extra meeting.
+| Filter returns no results | Value doesn't match exactly, type doesn't match, or combined AND constraints exclude everything | Start with one filter, confirm the stored `metadata` / `additional_metadata`, then add constraints one at a time. |
+| Additional metadata filter has no effect | It was passed as a top-level key | Nest it under `additional_metadata`. |
+| Filter on a field is slow or inconsistent at scale | Hot field was not declared with `enable_match` | Put hot filters in `metadata`, declare the schema field, and set `enable_match: true` before ingesting production data. |
+| Fuzzy/range filter doesn't work | `metadata_filters` are exact constraints | Put fuzzy terms in `query`; run multiple queries for OR; use client-side logic for range/contains behavior. |
+| Metadata edit returns 400 | Unknown key, wrong type, over-size value, too-deep nesting, reserved key, or missing `sub_tenant_id` | Check schema and validation limits; send only `tenant_metadata` / `additional_metadata`. |
+| Dense/sparse metadata edit rejects `null` | Null would leave stale semantic metadata vectors | Set a non-null value or re-ingest with the desired metadata. |
+| New schema field does not participate in semantic metadata search | Additive schema update does not alter/backfill existing Milvus fields yet | Create the desired schema before ingesting, or migrate/re-ingest into a tenant with the final schema. |
 
 ---
 
 ## Related
 
-- [Knowledge](/essentials/v2/knowledge)  -  what attaches to knowledge sources
-- [Memories](/essentials/v2/memories)  -  metadata fields on memory items
-- [Multi-Tenant Support](/essentials/v2/multi-tenant)  -  partitioning vs scoping
-- [Query](/essentials/v2/query)  -  how `metadata_filters` interact with ranking
-- [Create Tenant  -  API Reference](/api-reference/v2/endpoint/create-tenant)  -  full `tenant_metadata_schema` reference
-- [Query  -  API Reference](/api-reference/v2/endpoint/query)  -  full `metadata_filters` reference
+- [Knowledge](/essentials/v2/knowledge) - attaching metadata to knowledge sources
+- [Memories](/essentials/v2/memories) - memory metadata encoding
+- [Multi-Tenant Support](/essentials/v2/multi-tenant) - partitioning vs scoping
+- [Query](/api-reference/v2/endpoint/query) - `metadata_filters` request reference
+- [List Context](/api-reference/v2/endpoint/list-documents) - source browsing filters
+- [Update Source Metadata](/api-reference/v2/endpoint/update-source-metadata) - point metadata edits
+- [Update Metadata Schema](/api-reference/v2/endpoint/update-metadata-schema) - additive tenant schema changes
