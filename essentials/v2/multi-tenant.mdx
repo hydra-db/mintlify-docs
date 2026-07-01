@@ -10,9 +10,9 @@ HydraDB scopes data using two identifiers:
 - **`tenant_id`** - the top-level scoping identifier. Use it for customers, environments, or other primary data boundaries.
 - **`sub_tenant_id`** - an optional scoping identifier within a tenant. Use it for users, workspaces, teams, or other logical partitions.
 
-HydraDB write and query operations are scoped by `tenant_id`. When `sub_tenant_id` is provided, it further narrows the scope for that operation. If you omit `sub_tenant_id`, HydraDB uses the tenant's default sub-tenant.
+HydraDB write and query operations are scoped by `tenant_id`. Writes use singular `sub_tenant_id`. Query uses preferred `sub_tenant_ids`, which can select one or many sub-tenants; legacy query calls may still send singular `sub_tenant_id`. If you omit both query selectors, HydraDB uses the tenant's default sub-tenant.
 
-Use the same scoping values consistently across writes and reads. If you write data with one `sub_tenant_id` and later query with a different one, that data may not appear in the query results.
+Use the same scoping values consistently across writes and reads. If you write data with one `sub_tenant_id` and later query without including that ID in `sub_tenant_ids`, that data may not appear in the query results.
 
 ---
 
@@ -51,7 +51,7 @@ Use this when each user has private Memories, preferences, or conversation histo
 Typical flow:
 
 - Write user Memories with `sub_tenant_id = user_id`.
-- Query user Memories with the same `sub_tenant_id`.
+- Query user Memories with `sub_tenant_ids: [user_id]`.
 - Keep shared Knowledge outside the user-specific scope.
 
 ### B2B SaaS
@@ -97,13 +97,13 @@ Examples:
 
 ### Reads
 
-Query requests include `tenant_id`, and may include `sub_tenant_id`. If `sub_tenant_id` is omitted, query uses the tenant's default sub-tenant.
+Query requests include `tenant_id`, and should use `sub_tenant_ids` for sub-tenant scope. Send a single-item list for one scope, a longer list to fan out across multiple scopes with equal normalized weights, or an object mapping sub-tenant IDs to positive relative ranking weights with at most one decimal place. If both `sub_tenant_ids` and legacy `sub_tenant_id` are omitted, query uses the tenant's default sub-tenant.
 
-Use the same scoping values on query that you used when writing the data. A query request with one `sub_tenant_id` should not be expected to retrieve data written under a different `sub_tenant_id`.
+Use the same scoping values on query that you used when writing the data. A query request should not be expected to retrieve data written under a sub-tenant unless that ID is included in `sub_tenant_ids`.
 
-If your application needs to combine data from multiple scopes, make separate query calls and merge the results in your application.
+If your application needs to combine data from multiple scopes, prefer one query call with `sub_tenant_ids` unless you need separate response formatting or client-side treatment per scope.
 
-Use `sub_tenant_id` for partitioning data. Use `metadata_filters` for narrowing results within that scope.
+Use sub-tenants for partitioning data. Use `metadata_filters` for narrowing results within that scope.
 
 ### Memories and Knowledge
 
@@ -113,18 +113,18 @@ Memories and Knowledge live in separate stores, both reached through `POST /quer
 - `type: "knowledge"` retrieves **Knowledge** (shared documents and app sources).
 - `type: "all"` retrieves both in one call.
 
-For a personalized answer, the common pattern is one `POST /query` with `type: "all"` and the user's `sub_tenant_id`. HydraDB runs both stores in parallel and merges results. Use two separate calls only when you need to format the two streams differently in your LLM prompt.
+For a personalized answer, the common pattern is one `POST /query` with `type: "all"` and `sub_tenant_ids: ["user_123"]`. HydraDB runs both stores in parallel and merges results. Use two separate calls only when you need to format the two streams differently in your LLM prompt.
 
 <Warning>
-  <strong>Use the same <code>sub_tenant_id</code> on writes and reads for the same logical scope.</strong>
-  <p>Data written under one sub-tenant should not be expected to appear when querying from another. Keep scope identifiers stable and consistent in your application.</p>
+  <strong>Use the same sub-tenant ID on writes and reads for the same logical scope.</strong>
+  <p>Writes use <code>sub_tenant_id</code>; query should include that value in <code>sub_tenant_ids</code>. Data written under one sub-tenant should not be expected to appear when querying from another.</p>
 </Warning>
 
 ---
 
 ## 5. Minimal working example
 
-The example below shows a common personalized-answer flow: write a user Memory, query that user's preferences, query shared Knowledge, and merge the two contexts in your application.
+The example below shows a common personalized-answer flow: write a user Memory with singular `sub_tenant_id`, then query Knowledge and Memories together with `sub_tenant_ids`.
 
 <CodeGroup>
 
@@ -152,7 +152,7 @@ curl -X POST 'https://api.hydradb.com/query' \
   -H "Content-Type: application/json" \
   -d '{
     "tenant_id": "acme_corp",
-    "sub_tenant_id": "user_123",
+    "sub_tenant_ids": ["user_123"],
     "query": "refund policy",
     "type": "all",
     "query_by": "hybrid",
@@ -185,7 +185,7 @@ await client.context.ingest({
 // 2. Search Knowledge + Memories together with type: "all".
 const result = await client.query({
   tenantId: "acme_corp",
-  subTenantId: "user_123",
+  subTenantIds: ["user_123"],
   query: "refund policy",
   type: "all",
   queryBy: "hybrid",
@@ -218,7 +218,7 @@ client.context.ingest(
 # 2. Search Knowledge + Memories together with type: "all".
 result = client.query(
     tenant_id="acme_corp",
-    sub_tenant_id="user_123",
+    sub_tenant_ids=["user_123"],
     query="refund policy",
     type="all",
     query_by="hybrid",
@@ -232,8 +232,8 @@ result = client.query(
 
 ## 6. Common mistakes
 
-**Mismatched `sub_tenant_id` between write and read.**
-Data written under one sub-tenant should not be expected to surface when queried under another. Use the same `sub_tenant_id` consistently for the same logical scope.
+**Mismatched sub-tenant scope between write and read.**
+Data written under one sub-tenant should not be expected to surface when queried under another. Write with singular `sub_tenant_id`; query with `sub_tenant_ids` containing that value.
 
 **Sharing a `tenant_id` across environments.**
 Do not use one tenant for both production and staging. Create separate tenants for separate environments.
@@ -241,14 +241,14 @@ Do not use one tenant for both production and staging. Create separate tenants f
 **Confusing `tenant_id` with `sub_tenant_id`.**
 Use `tenant_id` for primary boundaries such as customers or environments. Use `sub_tenant_id` for partitions inside a tenant, such as users or workspaces.
 
-**Assuming query automatically merges scopes.**
-A query call uses the scope you provide. If your application needs data from multiple scopes, make multiple calls and merge the results yourself.
+**Assuming query automatically searches every sub-tenant.**
+A query call uses the scope you provide. If your application needs data from multiple scopes, pass `sub_tenant_ids` as a list or weighted object.
 
 **Writing shared Knowledge under a user scope by accident.**
 If broadly shared Knowledge is written with a user-specific `sub_tenant_id`, it may not appear where other users expect it. Choose the write scope based on where the content should be queried later.
 
 **Using metadata filters as a substitute for sub-tenants.**
-Metadata filters narrow results inside a scope. They are not a replacement for choosing the right `tenant_id` and `sub_tenant_id`.
+Metadata filters narrow results inside a scope. They are not a replacement for choosing the right `tenant_id` and sub-tenant scope.
 
 **Using unstable identifiers.**
 Avoid display names, emails that may change, or user-provided labels as long-term scope identifiers. Prefer stable internal IDs such as `user_123`, `workspace_42`, or `org_acme`.
