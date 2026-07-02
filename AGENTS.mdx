@@ -67,6 +67,7 @@ Core raw HTTP responses (`/tenants`, `/context/*`, and `/query`) are wrapped:
 | Delete sources/memories | `DELETE /context` · `client.context.delete()` |
 | Inspect graph relations | `GET /context/relations` · `client.context.relations()` |
 | Indexing webhooks | `/webhooks/indexing*` |
+| Continuously sync external apps (Slack, GitHub, Linear, Notion, Gmail) | `/connectors*` (raw HTTP; see Connectors) |
 
 ### Async lifecycle
 
@@ -584,7 +585,138 @@ Memory item fields:
 
 ---
 
-## 7. Context status and lifecycle
+## 7. Connectors
+
+Connectors continuously sync external app data (Slack, GitHub, Linear, Notion, Gmail) into the knowledge store, so you do not hand-build `app_knowledge` payloads. Authenticate once, pick which resources to sync, and HydraDB replicates new content on a schedule as searchable app sources.
+
+- Connectors are a raw HTTP / REST feature. The Python and TypeScript SDKs do **not** yet expose connector methods; call these endpoints directly.
+- Use the same auth headers as everything else: `Authorization: Bearer <api_key>` and `API-Version: 2`.
+- Connector endpoints return their response object **directly** — they are not wrapped in the `{ success, data, error, meta }` envelope.
+
+### Lifecycle
+
+```text
+POST /connectors                 -> create with credentials (returns connector_id)
+GET  /connectors/:id/discover    -> list resources available to the credentials
+POST /connectors/:id/configure   -> activate chosen resources, set lookback_days
+POST /connectors/:id/sync        -> (optional) force a sync; scheduler runs hourly
+GET  /connectors/:id/resources   -> poll until provider_cursor is non-empty
+POST /query  (query_apps: true)  -> search the synced app data
+```
+
+### Endpoints
+
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `/connectors` | POST | Create a connector |
+| `/connectors` | GET | List connectors for the organization |
+| `/connectors/:id` | GET | Get one connector |
+| `/connectors/:id` | DELETE | Delete a connector (already-synced data is retained) |
+| `/connectors/:id/discover` | GET | List resources available from the provider |
+| `/connectors/:id/configure` | POST | Activate resources and set sync options |
+| `/connectors/:id/sync` | POST | Trigger an on-demand sync |
+| `/connectors/:id/resources` | GET | List configured resources and their sync state |
+| `/connectors/:id/resources` | POST | Add a single resource row |
+| `/connectors/:id/resources/:resource_id` | DELETE | Remove a resource |
+
+### Create a connector
+
+The create contract uses `database` (the tenant) and `collection` (the sub-tenant) — **not** `tenant_id` / `sub_tenant_id`. The response echoes them back as `tenant_id` and `sub_tenant_id`.
+
+```bash
+curl -X POST 'https://api.hydradb.com/connectors' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "provider": "slack",
+    "name": "acme-engineering",
+    "database": "acme_corp",
+    "collection": "engineering",
+    "provider_account_scope": "T12345ACME",
+    "credentials": { "api_token": "xoxp-..." }
+  }'
+```
+
+| Field | Required | Description |
+|---|---|---|
+| `provider` | yes | One of `slack`, `github`, `linear`, `notion`, `gmail` |
+| `name` | no | Human-readable label for this connector |
+| `database` | yes | Tenant that receives the synced data |
+| `collection` | no | Default sub-tenant partition (per-resource override available); default `""` |
+| `provider_account_scope` | no | Stable external-account identifier; part of the deduplication key |
+| `credentials` | yes | Provider token, e.g. `{ "api_token": "..." }` or `{ "access_token": "..." }` |
+
+`provider_account_scope` must be distinct across connectors for the same provider — two connectors that share a scope (or both omit it) share a deduplication namespace and overwrite each other. Use the Slack workspace ID (`T...`), GitHub org/user login, or Linear/Notion workspace name; leave it empty for Gmail.
+
+### Discover and configure
+
+`GET /connectors/:id/discover` returns every syncable resource for the credentials under a provider-agnostic `resources` array, plus a per-type grouping key (`channels`, `repos`, `teams`, `projects`, `databases`, `pages`, `mailboxes`). **Always read from `resources`.** Each item has `id`, `name`, `resource_type`, and a provider-specific `metadata` object.
+
+Activate resources with `POST /connectors/:id/configure`:
+
+```bash
+curl -X POST 'https://api.hydradb.com/connectors/{connector_id}/configure' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "lookback_days": 30,
+    "resources": [
+      {
+        "resource_id": "{resource_id}",
+        "resource_type": "channel",
+        "name": "general",
+        "sub_tenant_id": "all-hands",
+        "metadata": { "department": "all-hands" },
+        "additional_metadata": { "internal_label": "general-slack" }
+      }
+    ]
+  }'
+```
+
+- `lookback_days` (default `30`) controls only how far back the **first** sync fetches; later syncs are incremental from the cursor.
+- A per-resource `sub_tenant_id` overrides the connector-level `collection`.
+- Reconfigure at any time to add resources or change routing — the cursor is preserved.
+- `POST /connectors/:id/resources` adds a single resource without the full configure flow (use `sub_tenant_id_override` on that endpoint).
+
+### Sync and confirm
+
+Syncs run on a schedule (default hourly). Force one with `POST /connectors/:id/sync`; it returns `202` with a `run_id` — queued, not complete. Confirm a sync ran by polling `GET /connectors/:id/resources` until each resource's `provider_cursor` is non-empty.
+
+### Metadata on synced objects
+
+Each synced object carries the same two metadata layers as manual ingestion:
+
+- **Tenant metadata (`metadata`)** — schema-declared and filterable. HydraDB always writes `provider`; your per-resource `metadata` is merged in, but `provider` wins on conflict. Only keys declared in `tenant_metadata_schema` are indexed for filtering.
+- **Document metadata (`additional_metadata`)** — free-form. Auto-populated on every object with `connector_id`, `resource_id`, `provider_account_scope`, and provider-native IDs (Slack TS, GitHub issue number, Linear identifier, etc.). Your per-resource `additional_metadata` is merged in, but provider-generated fields win on conflict.
+
+### Search synced data
+
+Synced content is ordinary app-source knowledge. Query it with `type: "knowledge"` and `query_apps: true`, and scope to a connector, resource, or account via document-metadata filters:
+
+```json
+{
+  "tenant_id": "acme_corp",
+  "query": "deployment checklist",
+  "type": "knowledge",
+  "query_by": "hybrid",
+  "query_apps": true,
+  "metadata_filters": {
+    "additional_metadata": { "connector_id": "{connector_id}" }
+  }
+}
+```
+
+| Scope to | `additional_metadata` key |
+|---|---|
+| One connector | `connector_id` |
+| One channel / repo / label | `resource_id` |
+| One external account | `provider_account_scope` |
+
+---
+
+## 8. Context status and lifecycle
 
 ### Poll indexing
 
@@ -673,7 +805,7 @@ Rules:
 
 ---
 
-## 8. Query API
+## 9. Query API
 
 `POST /query` · `client.query()`
 
@@ -817,7 +949,7 @@ Use `chunks` as the primary LLM context. Preserve server order; do not re-sort u
 
 ---
 
-## 9. Turning search results into LLM prompts
+## 10. Turning search results into LLM prompts
 
 Practical guidance from `essentials/v2/api-results.mdx`:
 
@@ -916,7 +1048,7 @@ Common mistakes:
 
 ---
 
-## 10. Metadata guide
+## 11. Metadata guide
 
 ### Tenant schema
 
@@ -968,7 +1100,7 @@ Rules:
 
 ---
 
-## 11. Browse, fetch, relations, delete
+## 12. Browse, fetch, relations, delete
 
 ### List documents or memories
 
@@ -1052,7 +1184,7 @@ Use `type: "memory"` to delete memory IDs.
 
 ---
 
-## 12. Error handling
+## 13. Error handling
 
 ### HTTP status codes
 
@@ -1126,7 +1258,7 @@ try {
 
 ---
 
-## 13. Cookbook patterns
+## 14. Cookbook patterns
 
 The cookbooks show production patterns. Click the links below to read the raw Markdown guides with complete setup code and schemas:
 
@@ -1156,7 +1288,7 @@ Common architecture across cookbooks:
 
 ---
 
-## 14. Common mistakes checklist
+## 15. Common mistakes checklist
 
 - [ ] Forgetting `API-Version: 2` in raw HTTP calls.
 - [ ] Parsing raw HTTP response from the top level instead of `data`.
@@ -1176,12 +1308,16 @@ Common architecture across cookbooks:
 - [ ] Passing too many chunks to the LLM.
 - [ ] Using `operator` without `query_by: "text"`.
 - [ ] Forgetting to verify webhook signatures when a signing secret is configured.
+- [ ] Using `tenant_id` / `sub_tenant_id` in the `POST /connectors` body instead of `database` / `collection`.
+- [ ] Reusing the same `provider_account_scope` across connectors for the same provider (dedup collision).
+- [ ] Treating a `202` from `POST /connectors/:id/sync` as sync completion instead of polling `provider_cursor`.
+- [ ] Hand-building `app_knowledge` for a source a connector already syncs.
 
 ---
 
-## 15. SDK Method Reference
+## 16. SDK Method Reference
 
-### 15.1 TypeScript SDK
+### 16.1 TypeScript SDK
 
 | Method | Endpoint | Purpose |
 |---|---|---|
@@ -1199,7 +1335,7 @@ Common architecture across cookbooks:
 | `client.tenants.subTenants()` | `GET /tenants/sub-tenants` | List active sub-tenants |
 | `client.tenants.stats()` | `GET /tenants/stats` | Get tenant usage stats |
 
-### 15.2 Python SDK
+### 16.2 Python SDK
 
 | Group | Method | Endpoint | Description |
 |---|---|---|---|
@@ -1217,7 +1353,7 @@ Common architecture across cookbooks:
 | Tenants | `client.tenants.sub_tenants()` | `GET /tenants/sub-tenants` | List active sub-tenants |
 | Tenants | `client.tenants.stats()` | `GET /tenants/stats` | Get tenant usage stats |
 
-### 15.3 Minimal cURL example
+### 16.3 Minimal cURL example
 
 Use `type` on raw `/query` requests to select `knowledge`, `memory`, or `all`. The raw API response is wrapped; read payloads from `.data`.
 
@@ -1266,7 +1402,7 @@ curl -s -X POST 'https://api.hydradb.com/query' \
   | jq '.data.chunks'
 ```
 
-### 15.4 Raw HTTP: ingest app-source knowledge
+### 16.4 Raw HTTP: ingest app-source knowledge
 
 Use this for connector output where your app already extracted the text. `app_knowledge` must be a JSON string in multipart form data.
 
@@ -1324,7 +1460,7 @@ curl -s -X POST 'https://api.hydradb.com/query' \
 
 ---
 
-## 16. Navigation and support
+## 17. Navigation and support
 
 - Docs root for v2: `get-started/v2`, `essentials/v2`, `api-reference/v2`, `cookbooks/v2`
 - API reference OpenAPI: `api-reference/v2/openapi.json`
