@@ -19,8 +19,8 @@ That context exists somewhere - in Confluence pages, Slack threads, decision log
 
 HydraDB fixes this with two capabilities:
 
-1. **Company knowledge graph** - decision logs, org charts, meeting notes, and product specs are ingested into a shared sub-tenant. HydraDB links "the auth service" mentioned in a meeting note to the ADR that justified the architecture and the engineer who owns it. A new hire asking "why is auth built this way?" gets all three sources in one answer.
-2. **Per-hire memory** - every new hire gets their own memory profile via `sub_tenant_id`. Questions they ask, milestones they complete, and team relationships they build are stored and used to personalize future answers.
+1. **Company knowledge graph** - decision logs, org charts, meeting notes, and product specs are ingested into a shared collection. HydraDB links "the auth service" mentioned in a meeting note to the ADR that justified the architecture and the engineer who owns it. A new hire asking "why is auth built this way?" gets all three sources in one answer.
+2. **Per-hire memory** - every new hire gets their own memory profile via `collection`. Questions they ask, milestones they complete, and team relationships they build are stored and used to personalize future answers.
 
 ---
 
@@ -28,14 +28,14 @@ HydraDB fixes this with two capabilities:
 
 ```mermaid
 graph LR
-    A["Decision logs<br/>Org charts<br/>Meeting notes<br/>Product specs"] -->|"context.ingest()"| B["HydraDB<br/>tenant: onboarding<br/>sub_tenant: company-context"]
+    A["Decision logs<br/>Org charts<br/>Meeting notes<br/>Product specs"] -->|"context.ingest()"| B["HydraDB<br/>database: onboarding<br/>collection: company-context"]
     C["New hire question"] -->|"query()"| B
     B -->|"retrieved context"| D["Onboarding agent"]
-    D -->|"context.ingest(type=memory)"| E["HydraDB<br/>sub_tenant: hire-{id}"]
+    D -->|"context.ingest(type=memory)"| E["HydraDB<br/>collection: hire-{id}"]
     E -->|"query(type=memory)"| F["Manager dashboard"]
 ```
 
-- **Phase 0**: Install SDK, create tenant, upload one document, run the first search query.
+- **Phase 0**: Install SDK, create a database, upload one document, run the first search query.
 - **Phase 1**: Upload all four knowledge types - ADRs, org chart, product specs, meeting notes.
 - **Phase 2**: Store per-hire memory and build the manager dashboard.
 
@@ -55,7 +55,7 @@ By the end of this cookbook, you'll be able to:
 ## Phase 0 - Minimal Working System
 *10–15 minutes · Goal: upload one document and get a real answer from it*
 
-> Do Phase 0 first, even if you plan to skip ahead. Every later phase assumes the tenant exists and indexing works.
+> Do Phase 0 first, even if you plan to skip ahead. Every later phase assumes the database exists and indexing works.
 
 ### Prerequisites
 
@@ -84,36 +84,36 @@ from dotenv import load_dotenv
 load_dotenv()
 
 API_KEY   = os.environ["HYDRA_DB_API_KEY"]
-TENANT_ID = os.environ.get("HYDRADB_TENANT_ID", "onboarding")
+DATABASE_ID = os.environ.get("HYDRADB_TENANT_ID", "onboarding")
 ```
 
 ---
 
-### Step 1 - Create a Tenant
+### Step 1 - Create a Database
 
-One tenant holds all onboarding content. The free plan supports one tenant - if you already have one, skip creation and reuse it.
+One database holds all onboarding content. The free plan supports one database - if you already have one, skip creation and reuse it.
 
 ```python
 # phase0/create_tenant.py
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-from config import API_KEY, TENANT_ID
+from config import API_KEY, DATABASE_ID
 from hydra_db import HydraDB
 
 client = HydraDB(token=API_KEY)
 
 def create_tenant():
     try:
-        result = client.tenants.create(tenant_id=TENANT_ID)
-        print(f"Tenant created: {result}")
+        result = client.tenants.create(database=DATABASE_ID)
+        print(f"Database created: {result}")
     except Exception as e:
         if "already exists" in str(e).lower() or "limit" in str(e).lower():
-            print(f"Tenant already exists - reusing '{TENANT_ID}'")
+            print(f"Database already exists - reusing '{DATABASE_ID}'")
         else:
             raise
 
-    # Confirm tenant is ready
-    status = client.tenants.status(tenant_id=TENANT_ID).data
+    # Confirm database is ready
+    status = client.tenants.status(database=DATABASE_ID).data
     print(f"Status: {status.message}")
     print(f"  scheduler={status.infra.scheduler_status}")
     print(f"  graph={status.infra.graph_status}")
@@ -129,8 +129,8 @@ python phase0/create_tenant.py
 
 Output:
 ```
-Tenant created: {'tenant_id': 'onboarding', 'status': 'created'}
-Status: Tenant infrastructure is ready
+Database created: {'database': 'onboarding', 'status': 'created'}
+Status: Database infrastructure is ready
   scheduler=running
   graph=running
   vectorstore=running
@@ -138,14 +138,14 @@ Status: Tenant infrastructure is ready
 
 **Expected output:**
 ```
-Tenant created: ...
+Database created: ...
 Status: Deployed infrastructure status
   scheduler=True
   graph=True
   vectorstore=[True, True]
 ```
 
-**If it fails:** `403 Plan limit reached` - you already have a tenant. Skip this step and use your existing `TENANT_ID`.
+**If it fails:** `403 Plan limit reached` - you already have a database. Skip this step and use your existing `DATABASE_ID`.
 
 ---
 
@@ -178,19 +178,19 @@ EOF
 # phase0/upload_doc.py
 import sys, os, json, time
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-from config import API_KEY, TENANT_ID
+from config import API_KEY, DATABASE_ID
 from hydra_db import HydraDB
 
 client = HydraDB(token=API_KEY)
 
 def upload_doc(filepath: str, doc_id: str, doc_type: str, team: str):
     """
-    Upload a single text file to the shared company-context sub-tenant.
+    Upload a single text file to the shared company-context collection.
     document_metadata must be a JSON string, not a dict.
     """
     with open(filepath, "rb") as f:
         result = client.context.ingest(
-            tenant_id=TENANT_ID,
+            database=DATABASE_ID,
             documents=[(os.path.basename(filepath), f, "application/octet-stream")],
             document_metadata=json.dumps([
                 {
@@ -238,14 +238,14 @@ Ready to query.
 # phase0/query.py
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-from config import API_KEY, TENANT_ID
+from config import API_KEY, DATABASE_ID
 from hydra_db import HydraDB
 
 client = HydraDB(token=API_KEY)
 
 def retrieve_context(question: str):
     return client.query(
-        tenant_id=TENANT_ID,
+        database=DATABASE_ID,
         query=question,
         max_results=5,
         mode="thinking",
@@ -282,7 +282,7 @@ If no chunks are returned, the document is still indexing. Wait 30 seconds and r
 ## Phase 1 - Ingest All Company Knowledge
 *20–30 minutes · Goal: all four knowledge types indexed and answering real questions*
 
-Four types of institutional knowledge feed the onboarding agent. All go into the shared `company-context` sub-tenant. Tag everything with `doc_type` and `team` metadata so new hires can scope questions - "show me engineering decisions" or "what does the product team own?"
+Four types of institutional knowledge feed the onboarding agent. All go into the shared `company-context` collection. Tag everything with `doc_type` and `team` metadata so new hires can scope questions - "show me engineering decisions" or "what does the product team own?"
 
 > **Batch limit**: Max 20 files per `context.ingest()` call. For large document sets, upload in batches with a 1-second sleep between them.
 
@@ -296,7 +296,7 @@ These are the most valuable documents for new hires - they explain *why* things 
 # phase1/ingest_decisions.py
 import sys, os, json, time
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-from config import API_KEY, TENANT_ID
+from config import API_KEY, DATABASE_ID
 from hydra_db import HydraDB
 
 client = HydraDB(token=API_KEY)
@@ -328,7 +328,7 @@ def ingest_decision_docs(folder: str):
         ])
         try:
             result = client.context.ingest(
-                tenant_id=TENANT_ID,
+                database=DATABASE_ID,
                 documents=file_handles,
                 document_metadata=metadata,
             )
@@ -357,7 +357,7 @@ Upload a structured people directory - who owns what, who to ask about which sys
 # phase1/ingest_org.py
 import sys, os, json, time, tempfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-from config import API_KEY, TENANT_ID
+from config import API_KEY, DATABASE_ID
 from hydra_db import HydraDB
 
 client = HydraDB(token=API_KEY)
@@ -396,7 +396,7 @@ def ingest_people(people: list):
 
     try:
         result = client.context.ingest(
-            tenant_id=TENANT_ID,
+            database=DATABASE_ID,
             documents=file_handles,
             document_metadata=json.dumps(metadata_list),
         )
@@ -441,7 +441,7 @@ if __name__ == "__main__":
 # phase1/ingest_product.py
 import sys, os, json, time
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-from config import API_KEY, TENANT_ID
+from config import API_KEY, DATABASE_ID
 from hydra_db import HydraDB
 
 client = HydraDB(token=API_KEY)
@@ -474,7 +474,7 @@ def ingest_product_docs(folder: str, team: str = "product", status: str = "curre
 
     try:
         result = client.context.ingest(
-            tenant_id=TENANT_ID,
+            database=DATABASE_ID,
             documents=file_handles,
             document_metadata=metadata,
         )
@@ -499,7 +499,7 @@ if __name__ == "__main__":
 # phase1/ingest_meetings.py
 import sys, os, json, time
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-from config import API_KEY, TENANT_ID
+from config import API_KEY, DATABASE_ID
 from hydra_db import HydraDB
 
 client = HydraDB(token=API_KEY)
@@ -531,7 +531,7 @@ def ingest_meeting_notes(folder: str):
 
     try:
         result = client.context.ingest(
-            tenant_id=TENANT_ID,
+            database=DATABASE_ID,
             documents=file_handles,
             document_metadata=metadata,
         )
@@ -558,7 +558,7 @@ After all four knowledge types are uploaded, test with questions that require pu
 # phase1/test_queries.py
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-from config import API_KEY, TENANT_ID
+from config import API_KEY, DATABASE_ID
 from hydra_db import HydraDB
 
 client = HydraDB(token=API_KEY)
@@ -574,7 +574,7 @@ TEST_QUESTIONS = [
 for question in TEST_QUESTIONS:
     print(f"\nQ: {question}")
     result = client.query(
-        tenant_id=TENANT_ID,
+        database=DATABASE_ID,
         query=question,
         max_results=5,
         mode="thinking",
@@ -610,20 +610,20 @@ Context: Alice Chen (Senior Engineer) owns the payments pipeline. Her Slack hand
 
 ### Step 1 - Store New Hire Memory
 
-Every new hire gets their own memory profile via `sub_tenant_id`. Store their background, milestones, and questions asked.
+Every new hire gets their own memory profile via `collection`. Store their background, milestones, and questions asked.
 
 ```python
 # phase2/memory.py
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-from config import API_KEY, TENANT_ID
+from config import API_KEY, DATABASE_ID
 from hydra_db import HydraDB
 from datetime import datetime, timezone
 
 client = HydraDB(token=API_KEY)
 
 def hire_sub(hire_id: str) -> str:
-    """Map hire ID to their HydraDB sub_tenant_id."""
+    """Map hire ID to their HydraDB collection."""
     return f"hire-{hire_id.lower()}"
 
 def store_milestone(hire_id: str, milestone: str):
@@ -635,8 +635,8 @@ def store_milestone(hire_id: str, milestone: str):
     ts = datetime.now(timezone.utc).isoformat()[:10]
     client.context.ingest(
         type='memory',
-        tenant_id=TENANT_ID,
-        sub_tenant_id=hire_sub(hire_id),
+        database=DATABASE_ID,
+        collection=hire_sub(hire_id),
         memories=[{
             "text":  f"[{ts}] Milestone completed: {milestone}",
             "infer": True,
@@ -656,8 +656,8 @@ def log_question(hire_id: str, question: str, topic: str = ""):
         text += f" [topic: {topic}]"
     client.context.ingest(
         type='memory',
-        tenant_id=TENANT_ID,
-        sub_tenant_id=hire_sub(hire_id),
+        database=DATABASE_ID,
+        collection=hire_sub(hire_id),
         memories=[{
             "text":  text,
             "infer": False,
@@ -671,8 +671,8 @@ def store_relationship(hire_id: str, person: str, context: str):
     """
     client.context.ingest(
         type='memory',
-        tenant_id=TENANT_ID,
-        sub_tenant_id=hire_sub(hire_id),
+        database=DATABASE_ID,
+        collection=hire_sub(hire_id),
         memories=[{
             "text":  f"Team relationship: {person} - {context}",
             "infer": True,
@@ -699,13 +699,13 @@ if __name__ == "__main__":
 
 ### Step 2 - Personalized Search
 
-Use the hire's `sub_tenant_id` for personal memory and the default company knowledge scope for source context:
+Use the hire's `collection` for personal memory and the default company knowledge scope for source context:
 
 ```python
 # phase2/ask.py
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-from config import API_KEY, TENANT_ID
+from config import API_KEY, DATABASE_ID
 from phase2.memory import log_question, hire_sub
 from hydra_db import HydraDB
 
@@ -719,7 +719,7 @@ def ask_onboarding(hire_id: str, question: str, topic: str = "") -> str:
     log_question(hire_id, question, topic)
 
     company_context = client.query(
-        tenant_id=TENANT_ID,
+        database=DATABASE_ID,
         query=question,
         max_results=5,
         mode="thinking",
@@ -727,8 +727,8 @@ def ask_onboarding(hire_id: str, question: str, topic: str = "") -> str:
     )
     hire_context = client.query(
         type="memory",
-        tenant_id=TENANT_ID,
-        sub_tenant_id=hire_sub(hire_id),
+        database=DATABASE_ID,
+        collection=hire_sub(hire_id),
         query=question,
         max_results=3,
     )
@@ -756,7 +756,7 @@ Generate a structured weekly progress report for any hire from their stored memo
 # phase2/dashboard.py
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-from config import API_KEY, TENANT_ID
+from config import API_KEY, DATABASE_ID
 from phase2.memory import hire_sub
 from hydra_db import HydraDB
 
@@ -778,8 +778,8 @@ def generate_progress_report(hire_id: str) -> dict:
     for key, query in queries.items():
         result = client.query(
             type="memory",
-            tenant_id=TENANT_ID,
-            sub_tenant_id=hire_sub(hire_id),
+            database=DATABASE_ID,
+            collection=hire_sub(hire_id),
             query=query,
         )
         report[key] = result
@@ -801,7 +801,7 @@ if __name__ == "__main__":
 | Error | Cause | Fix |
 |---|---|---|
 | `ModuleNotFoundError: No module named 'hydra_db'` | SDK not installed or wrong package name | Run `pip install hydradb-sdk`. Import as `from hydra_db import HydraDB`. |
-| `403 Plan limit reached` | Free plan allows 1 tenant only | Skip `create_tenant()` - reuse your existing tenant ID. |
+| `403 Plan limit reached` | Free plan allows 1 database only | Skip `create_tenant()` - reuse your existing database ID. |
 | `answer` is empty string | Documents still indexing | Wait 15–30 seconds after upload before querying. |
 | `UserWarning: Core Pydantic V1 functionality isn't compatible` | Python 3.14 incompatibility | Use Python 3.11 or 3.12. |
 | `422 Unprocessable Entity` on upload | Sending JSON text instead of files | Use `client.context.ingest(documents=[...])` - not raw JSON body. |
@@ -818,8 +818,8 @@ if __name__ == "__main__":
 | Indexing delays | Always wait 12–15 seconds after upload before querying. Never rely on upload success alone. |
 | Python version | Use Python 3.11 or 3.12. Python 3.14 shows Pydantic compatibility warnings with the SDK. |
 | File formats | Upload `.txt` or `.md` files. Convert PDFs and Notion exports to plain text before ingesting. |
-| Sub-tenant isolation | Use `sub_tenant_id=f"hire-{hire_id}"` for per-hire memory. Company knowledge lives in the default sub-tenant. |
-| Free plan | 1 tenant maximum. All cookbooks share the same tenant - use different `doc_type` metadata to distinguish them. |
+| Collection isolation | Use `collection=f"hire-{hire_id}"` for per-hire memory. Company knowledge lives in the default collection. |
+| Free plan | 1 database maximum. All cookbooks share the same database - use different `doc_type` metadata to distinguish them. |
 
 ---
 
@@ -829,18 +829,18 @@ All SDK methods used in this cookbook.
 
 | Method | Purpose |
 |---|---|
-| `client.tenants.create(tenant_id=...)` | Create the onboarding tenant |
-| `client.tenants.status(tenant_id=...)` | Check tenant is ready |
-| `client.context.ingest(tenant_id=..., documents=..., document_metadata=...)` | Upload company knowledge documents |
-| `client.context.ingest(type='memory', tenant_id=..., sub_tenant_id=..., memories=[...])` | Store per-hire memory |
-| `client.query(tenant_id=..., query=..., max_results=..., mode=...)` | Retrieve company context for a hire question |
-| `client.query(type="memory", tenant_id=..., sub_tenant_id=..., query=...)` | Search hire memory for manager dashboard |
+| `client.tenants.create(database=...)` | Create the onboarding database |
+| `client.tenants.status(database=...)` | Check database is ready |
+| `client.context.ingest(database=..., documents=..., document_metadata=...)` | Upload company knowledge documents |
+| `client.context.ingest(type='memory', database=..., collection=..., memories=[...])` | Store per-hire memory |
+| `client.query(database=..., query=..., max_results=..., mode=...)` | Retrieve company context for a hire question |
+| `client.query(type="memory", database=..., collection=..., query=...)` | Search hire memory for manager dashboard |
 
 ### client.context.ingest - key parameters
 
 | Parameter | Type | Notes |
 |---|---|---|
-| `tenant_id` | `str` | Required. Your tenant ID. |
+| `database` | `str` | Required. Your database ID. |
 | `documents` | `list[IO[bytes]]` | Required. Open file handles - not file paths, not dicts. |
 | `document_metadata` | `str` | Optional. JSON **string** (not dict) with per-document `id` and `additional_metadata`. |
 
@@ -848,7 +848,7 @@ All SDK methods used in this cookbook.
 
 | Parameter | Type | Notes |
 |---|---|---|
-| `tenant_id` | `str` | Required. |
+| `database` | `str` | Required. |
 | `query` | `str` | Required. The hire's question in natural language. |
 | `max_results` | `int` | Optional. Number of chunks to retrieve. |
 | `mode` | `str` | Optional. `"fast"` or `"thinking"`. Use `"thinking"` for complex questions. |
@@ -873,7 +873,7 @@ Tested across onboarding evaluations at three companies (50–200 employees, kno
 
 ## Next Steps
 
-1. Run `phase0/create_tenant.py` to create your tenant and verify the connection.
+1. Run `phase0/create_tenant.py` to create your database and verify the connection.
 2. Run `phase0/upload_doc.py` with the sample ADR, wait 15 seconds, then run `phase0/query.py`.
 3. Add your real documents with the Phase 1 scripts.
 4. Create hire profiles with `phase2/memory.py` as new people join.
