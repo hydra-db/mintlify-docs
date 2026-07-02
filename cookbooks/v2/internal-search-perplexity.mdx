@@ -1,13 +1,13 @@
 ---
 title: "Perplexity for Internal Knowledge"
-description: "Ingest Slack, Gmail, Confluence, GitHub, and Linear into one HydraDB tenant. Ask any question in natural language and get a cited, synthesized answer drawing from across all your company's knowledge - including 'what led to the decision to sunset Project X?' with full decision provenance."
+description: "Ingest Slack, Gmail, Confluence, GitHub, and Linear into one HydraDB database. Ask any question in natural language and get a cited, synthesized answer drawing from across all your company's knowledge - including 'what led to the decision to sunset Project X?' with full decision provenance."
 ---
 
 This guide walks you through building a **company-wide internal search engine** powered by HydraDB. Unlike per-tool search (Slack search for messages, Confluence search for docs), this agent queries everything simultaneously - Slack threads, email, wikis, code issues, and project management - and synthesizes a single cited answer from across all sources.
 
 > **Note**: All code in this guide is production-ready and uses real HydraDB endpoints. Base URL: `https://api.hydradb.com`. Get your API key at [app.hydradb.com](https://app.hydradb.com).
 
-> **Goal**: Ingest six source types into one HydraDB tenant, store per-user memory profiles for personalized answers, and answer three query patterns - simple factual lookup, decision provenance, and cross-source synthesis - all through `POST /query`.
+> **Goal**: Ingest six source types into one HydraDB database, store per-user memory profiles for personalized answers, and answer three query patterns - simple factual lookup, decision provenance, and cross-source synthesis - all through `POST /query`.
 
 ---
 
@@ -22,7 +22,7 @@ This guide walks you through building a **company-wide internal search engine** 
 ## What You'll Build
 
 By the end of this cookbook, you'll be able to:
-- Ingest Slack threads, Gmail, Confluence pages, GitHub issues, and Linear tickets into a single HydraDB tenant
+- Ingest Slack threads, Gmail, Confluence pages, GitHub issues, and Linear tickets into a single HydraDB database
 - Answer cross-source questions like "Why did we move to a monorepo?" that span multiple tools and time periods
 - Use `recency_bias` and `graph_context: true` to surface the most relevant, connected context across all sources
 - Store per-user memory so answers are personalized to each employee's role and project context
@@ -44,7 +44,7 @@ The critical capability that makes this possible is HydraDB's context graph. It 
 ```mermaid
 graph LR
     A["Slack · Gmail · Confluence<br/>GitHub · Linear · Notion"] -->|"multipart upload"| B["Ingestion Layer<br/>connectors/slack.py<br/>connectors/gmail.py<br/>connectors/confluence.py<br/>connectors/github.py"]
-    B -->|"POST /context/ingest"| C["HydraDB<br/>tenant: company-knowledge<br/>sub_tenants: slack, email, docs, github"]
+    B -->|"POST /context/ingest"| C["HydraDB<br/>database: company-knowledge<br/>collections: slack, email, docs, github"]
     D["User / Slack bot / Web UI"] -->|"POST /query"| C
     C -->|"ranked chunks + graph_context"| D
     E["POST /context/ingest"] -->|"user profile"| C
@@ -57,15 +57,15 @@ graph LR
 
 ---
 
-## Step 1 - Create Tenant
+## Step 1 - Create Database
 
-One tenant for all company knowledge. Use `sub_tenant_id` to isolate by source type - `"slack"`, `"email"`, `"docs"`, `"github"`. All created automatically on first write, no setup required.
+One database for all company knowledge. Use `collection` to isolate by source type - `"slack"`, `"email"`, `"docs"`, `"github"`. All created automatically on first write, no setup required.
 
 ```bash
-curl -X POST 'https://api.hydradb.com/tenants' \
+curl -X POST 'https://api.hydradb.com/databases' \
   -H "Authorization: Bearer YOUR_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"tenant_id": "company-knowledge"}'
+  -d '{"database": "company-knowledge"}'
 ```
 
 <CodeGroup>
@@ -77,7 +77,7 @@ from hydra_db import HydraDB
 client = HydraDB(token=os.environ["HYDRA_DB_API_KEY"])
 TENANT_ID = "company-knowledge"
 
-client.tenants.create(tenant_id=TENANT_ID)
+client.tenants.create(database=TENANT_ID)
 ```
 
 ```typescript TypeScript SDK
@@ -87,7 +87,7 @@ import { HydraDBClient } from "@hydradb/sdk";
 const client = new HydraDBClient({ token: process.env.HYDRA_DB_API_KEY! });
 const TENANT_ID = "company-knowledge";
 
-await client.tenants.create({ tenantId: TENANT_ID });
+await client.tenants.create({ database: TENANT_ID });
 ```
 </CodeGroup>
 
@@ -95,7 +95,7 @@ await client.tenants.create({ tenantId: TENANT_ID });
 
 ## Step 2 - Ingest Company Knowledge
 
-All connectors use the same endpoint: `POST /context/ingest`. This endpoint uses **multipart form-data** - not JSON. `tenant_id` and `sub_tenant_id` are form fields alongside the file.
+All connectors use the same endpoint: `POST /context/ingest`. This endpoint uses **multipart form-data** - not JSON. `database` and `collection` are form fields alongside the file.
 
 > **Important**: Do not set `Content-Type: application/json`. Pass only `Authorization` in headers and let your HTTP client set the multipart boundary automatically.
 
@@ -196,8 +196,8 @@ def _upload_batch(batch: list, sub_tenant: str) -> list:
     ids = []
     for filename, content in batch:
         result = client.context.ingest(
-            tenant_id=TENANT_ID,
-            sub_tenant_id=sub_tenant,
+            database=TENANT_ID,
+            collection=sub_tenant,
             documents=[(filename, content.encode("utf-8"), "text/plain")],
         )
         items = result.data.results or []
@@ -257,8 +257,8 @@ async function ingestSlackChannel(
       writeFileSync(filename, content, "utf-8");
 
       const result = await client.context.ingest({
-        tenantId: TENANT_ID,
-        subTenantId: "slack",
+        database: TENANT_ID,
+        collection: "slack",
         documents: [{ data: readFileSync(filename), filename, contentType: "application/octet-stream" }],
       });
       const results = result.data?.results ?? [];
@@ -337,8 +337,8 @@ def ingest_gmail_threads(credentials_path: str, query: str, max_threads: int = 2
         filename = f"email-{thread['id']}.txt"
 
         result = client.context.ingest(
-            tenant_id=TENANT_ID,
-            sub_tenant_id="email",
+            database=TENANT_ID,
+            collection="email",
             documents=[(filename, content.encode("utf-8"), "text/plain")],
         )
         items = result.data.results or []
@@ -413,8 +413,8 @@ async function ingestGmailThreads(
     writeFileSync(filename, content, "utf-8");
 
     const result = await client.context.ingest({
-      tenantId: TENANT_ID,
-      subTenantId: "email",
+      database: TENANT_ID,
+      collection: "email",
       documents: [{ data: readFileSync(filename), filename, contentType: "application/octet-stream" }],
     });
     const results = result.data?.results ?? [];
@@ -479,8 +479,8 @@ def ingest_confluence_space(space_key: str):
             filename = f"confluence-{space_key}-{page['id']}.txt"
 
             result = client.context.ingest(
-                tenant_id=TENANT_ID,
-                sub_tenant_id="docs",
+                database=TENANT_ID,
+                collection="docs",
                 documents=[(filename, content.encode("utf-8"), "text/plain")],
             )
             items = result.data.results or []
@@ -538,8 +538,8 @@ async function ingestConfluenceSpace(spaceKey: string): Promise<string[]> {
       writeFileSync(filename, content, "utf-8");
 
       const result = await client.context.ingest({
-        tenantId: TENANT_ID,
-        subTenantId: "docs",
+        database: TENANT_ID,
+        collection: "docs",
         documents: [{ data: readFileSync(filename), filename, contentType: "application/octet-stream" }],
       });
       const results = result.data?.results ?? [];
@@ -605,8 +605,8 @@ def ingest_github_issues(repo_name: str, state: str = "all", limit: int = 500):
         filename = f"github-{sub}-issue-{issue.number}.txt"
 
         result = client.context.ingest(
-            tenant_id=TENANT_ID,
-            sub_tenant_id="github",
+            database=TENANT_ID,
+            collection="github",
             documents=[(filename, content.encode("utf-8"), "text/plain")],
         )
         items = result.data.results or []
@@ -667,8 +667,8 @@ async function ingestGithubIssues(
       writeFileSync(filename, content, "utf-8");
 
       const result = await client.context.ingest({
-        tenantId: TENANT_ID,
-        subTenantId: "github",
+        database: TENANT_ID,
+        collection: "github",
         documents: [{ data: readFileSync(filename), filename, contentType: "application/octet-stream" }],
       });
       const results = result.data?.results ?? [];
@@ -683,7 +683,7 @@ async function ingestGithubIssues(
 ```
 </CodeGroup>
 
-> **Linear connector**: Use the Linear GraphQL API (`https://api.linear.app/graphql`) with your API key. Format each issue + comments as a plain text file with `Source: Linear` prepended, and upload with `sub_tenant_id: "linear"`. The same multipart upload pattern applies.
+> **Linear connector**: Use the Linear GraphQL API (`https://api.linear.app/graphql`) with your API key. Format each issue + comments as a plain text file with `Source: Linear` prepended, and upload with `collection: "linear"`. The same multipart upload pattern applies.
 
 ---
 
@@ -691,13 +691,13 @@ async function ingestGithubIssues(
 
 After uploading, poll `GET /context/status` until `indexing_status` is `completed` before running any queries. HydraDB indexes asynchronously - typically 10–30 seconds per file.
 
-> **Note**: [`GET /context/status`](/api-reference/v2/endpoint/source-status) takes `ids` and `tenant_id` as **query parameters**. Pass multiple `ids` to check a batch in one call.
+> **Note**: [`GET /context/status`](/api-reference/v2/endpoint/source-status) takes `ids` and `database` as **query parameters**. Pass multiple `ids` to check a batch in one call.
 
 ```bash
 curl -G \
   'https://api.hydradb.com/context/status' \
   -H "Authorization: Bearer YOUR_API_KEY" \
-  --data-urlencode "tenant_id=company-knowledge" \
+  --data-urlencode "database=company-knowledge" \
   --data-urlencode "ids=YOUR_ID"
 ```
 
@@ -729,7 +729,7 @@ def wait_until_indexed(id: str, max_tries: int = 20, interval: int = 3) -> None:
     for i in range(max_tries):
         time.sleep(interval)
         result = client.context.status(
-            tenant_id=TENANT_ID,
+            database=TENANT_ID,
             ids=[id],
         )
         items  = result.data.statuses or []
@@ -762,8 +762,8 @@ async function waitUntilIndexed(
   for (let i = 0; i < maxTries; i++) {
     await new Promise((r) => setTimeout(r, intervalMs));
     const result = await client.context.status({
-      tenantId: TENANT_ID,
-      subTenantId: subTenant,
+      database: TENANT_ID,
+      collection: subTenant,
       ids: [id],
     });
     const statuses = result.data.statuses ?? [];
@@ -799,8 +799,8 @@ curl -X POST 'https://api.hydradb.com/context/ingest' \
       "infer": true,
       "user_name": "alice"
     }],
-    "tenant_id": "company-knowledge",
-    "sub_tenant_id": "user-alice",
+    "database": "company-knowledge",
+    "collection": "user-alice",
     "upsert": true
   }'
 ```
@@ -844,8 +844,8 @@ def store_user_profile(user_id: str, profile_text: str) -> str:
     """
     result = client.context.ingest(
         type='memory',
-        tenant_id=TENANT_ID,
-        sub_tenant_id=f"user-{user_id}",
+        database=TENANT_ID,
+        collection=f"user-{user_id}",
         upsert=True,
         memories=[{
             "text":      profile_text,
@@ -879,8 +879,8 @@ async function storeUserProfile(
    */
   const result = await client.context.ingest({
     type: 'memory',
-    tenantId: TENANT_ID,
-    subTenantId: `user-${userId}`,
+    database: TENANT_ID,
+    collection: `user-${userId}`,
     upsert: true,
     memories: [
       {
@@ -930,7 +930,7 @@ Three query patterns cover every internal search use case. All use `POST /query`
 
 ### 5.1 Simple Factual Lookup - "What is X?" / "How does X work?"
 
-Use balanced `recency_bias: 0.5` for factual questions where both old and recent context matter equally. Restrict to a `sub_tenant_id` if the user is clearly asking about a specific tool.
+Use balanced `recency_bias: 0.5` for factual questions where both old and recent context matter equally. Restrict to a `collection` if the user is clearly asking about a specific tool.
 
 <CodeGroup>
 ```python Python SDK
@@ -955,14 +955,14 @@ def search(
     mode="thinking" enables multi-query reranking automatically.
     """
     return client.query(
-        tenant_id=TENANT_ID,
+        database=TENANT_ID,
         query=question,
         max_results=max_results,
         graph_context=True,
         mode="thinking",
         alpha=0.5,
         recency_bias=recency_bias,
-        **(sub_tenant and {"sub_tenant_id": sub_tenant} or {}),
+        **(sub_tenant and {"collection": sub_tenant} or {}),
     )
 
 
@@ -1005,7 +1005,7 @@ async function search(
    * mode="thinking" enables multi-query reranking automatically.
    */
   const payload: Record<string, any> = {
-    tenantId: TENANT_ID,
+    database: TENANT_ID,
     query: question,
     maxResults: maxResults,
     graphContext: true,
@@ -1013,7 +1013,7 @@ async function search(
     alpha: 0.5,
     recencyBias: recencyBias,
   };
-  if (subTenant) payload["subTenantId"] = subTenant;
+  if (subTenant) payload["collection"] = subTenant;
 
   return await client.query(payload);
 }
@@ -1059,8 +1059,8 @@ def get_user_profile(user_id: str) -> str:
     """Retrieve a user's stored memory profile via /query with type: "memory"."""
     result = client.query(
         type="memory",
-        tenant_id=TENANT_ID,
-        sub_tenant_id=f"user-{user_id}",
+        database=TENANT_ID,
+        collection=f"user-{user_id}",
         query="expertise background role preferences",
         mode="thinking",
     )
@@ -1079,7 +1079,7 @@ def explain_decision(question: str, user_id: str) -> str:
     """
     # Step 1: Search with graph context
     data            = client.query(
-        tenant_id=TENANT_ID,
+        database=TENANT_ID,
         query=question,
         max_results=18,
         graph_context=True,
@@ -1157,8 +1157,8 @@ async function getUserProfile(userId: string): Promise<string> {
   /** Retrieve a user's stored memory profile via recallPreferences. */
   const resp = await client.query({
     type: "memory",
-    tenantId: TENANT_ID,
-    subTenantId: `user-${userId}`,
+    database: TENANT_ID,
+    collection: `user-${userId}`,
     query: "expertise background role preferences",
     mode: "thinking",
   });
@@ -1178,7 +1178,7 @@ async function explainDecision(
    */
   // Step 1: Search with graph context
   const data = await client.query({
-    tenantId: TENANT_ID,
+    database: TENANT_ID,
     query: question,
     maxResults: 18,
     graphContext: true,
@@ -1241,7 +1241,7 @@ console.log(answer);
 
 ### 5.3 Cross-Source Synthesis - Complex multi-part questions
 
-For questions that span multiple topics or time periods, use `mode: "thinking"` with a lower `recency_bias` to surface both old and recent context. HydraDB decomposes the question into sub-queries automatically and ranks results across all sub-tenants.
+For questions that span multiple topics or time periods, use `mode: "thinking"` with a lower `recency_bias` to surface both old and recent context. HydraDB decomposes the question into sub-queries automatically and ranks results across all collections.
 
 ```python
 # search/synthesis.py
@@ -1279,8 +1279,8 @@ curl -X POST 'https://api.hydradb.com/query' \
   -H "Authorization: Bearer YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "tenant_id":     "company-knowledge",
-    "sub_tenant_id": "user-alice",
+    "database":     "company-knowledge",
+    "collection": "user-alice",
     "query":         "expertise background role preferences",
     "mode":          "thinking"
   }'
@@ -1439,16 +1439,16 @@ All endpoints used in this cookbook. Base URL: `https://api.hydradb.com` · Head
 
 | Method | Endpoint | Purpose |
 |--------|----------|---------|
-| `POST` | `/tenants` | Create the company-knowledge tenant |
+| `POST` | `/databases` | Create the company-knowledge database |
 | `POST` | `/context/ingest` | Upload a source file (multipart form-data) |
-| `GET` | `/context/status?tenant_id=...&ids=...` | Check indexing status |
+| `GET` | `/context/status?database=...&ids=...` | Check indexing status |
 | `POST` | `/context/ingest` | Store a user profile memory |
 | `POST` | `/query` | Retrieve user profile for personalization |
 | `POST` | `/query` | Query all indexed knowledge |
 
-### Create Tenant
+### Create Database
 ```json
-{ "tenant_id": "company-knowledge" }
+{ "database": "company-knowledge" }
 ```
 
 ### Upload Knowledge (form-data)
@@ -1457,13 +1457,13 @@ All endpoints used in this cookbook. Base URL: `https://api.hydradb.com` · Head
 
 | Form field | Type | Value |
 |---|---|---|
-| `tenant_id` | Text | `company-knowledge` |
-| `sub_tenant_id` | Text | `slack` / `email` / `docs` / `github` |
+| `database` | Text | `company-knowledge` |
+| `collection` | Text | `slack` / `email` / `docs` / `github` |
 | `documents` | File | your `.txt` file |
 
 ### Verify Processing (query params)
 ```
-GET /context/status?tenant_id=company-knowledge&ids=YOUR_ID
+GET /context/status?database=company-knowledge&ids=YOUR_ID
 ```
 
 ### Store User Memory
@@ -1474,8 +1474,8 @@ GET /context/status?tenant_id=company-knowledge&ids=YOUR_ID
     "infer":     true,
     "user_name": "alice"
   }],
-  "tenant_id":     "company-knowledge",
-  "sub_tenant_id": "user-alice",
+  "database":     "company-knowledge",
+  "collection": "user-alice",
   "upsert":        true
 }
 ```
@@ -1483,8 +1483,8 @@ GET /context/status?tenant_id=company-knowledge&ids=YOUR_ID
 ### Search User Preferences
 ```json
 {
-  "tenant_id":     "company-knowledge",
-  "sub_tenant_id": "user-alice",
+  "database":     "company-knowledge",
+  "collection": "user-alice",
   "query":         "expertise background role preferences",
   "mode":          "thinking"
 }
@@ -1493,7 +1493,7 @@ GET /context/status?tenant_id=company-knowledge&ids=YOUR_ID
 ### Full Search - All Sources
 ```json
 {
-  "tenant_id":     "company-knowledge",
+  "database":     "company-knowledge",
   "query":         "why did we move from microservices to a monorepo?",
   "mode":          "thinking",
   "max_results":   18,
@@ -1506,8 +1506,8 @@ GET /context/status?tenant_id=company-knowledge&ids=YOUR_ID
 ### Full Search - Scoped to One Source Type
 ```json
 {
-  "tenant_id":     "company-knowledge",
-  "sub_tenant_id": "docs",
+  "database":     "company-knowledge",
+  "collection": "docs",
   "query":         "what is our data retention policy?",
   "mode":          "thinking",
   "max_results":   12,
@@ -1541,7 +1541,7 @@ Tested across a 2-year company knowledge base: 12 Slack channels, 3 Gmail accoun
 
 ```
 internal_search/
-├── setup.py                      # tenant creation + shared constants
+├── setup.py                      # database creation + shared constants
 ├── config.py                     # API_KEY, TENANT_ID, BASE_URL
 ├── requirements.txt
 ├── connectors/
@@ -1583,7 +1583,7 @@ atlassian-python-api
 
 ## Next Steps
 
-1. Run `setup.py` to create your tenant.
+1. Run `setup.py` to create your database.
 2. Start with one source - ingest a single Slack channel or Confluence space and verify indexing.
 3. Store profiles for 2–3 users via `memory/profiles.py`.
 4. Run `python search/qa.py` with a real question to confirm results.
@@ -1598,5 +1598,5 @@ The search quality improves as more sources are indexed - each new Slack channel
 
 | Version | Date | Notes |
 |---|---|---|
-| 1.1 | 2026-05-14 | Added TypeScript SDK tabs (CodeGroup) for all HydraDB API call blocks: tenant creation, all four connector uploads (Slack, Gmail, Confluence, GitHub), verify processing, add memory, full search (factual + provenance), and search preferences. |
+| 1.1 | 2026-05-14 | Added TypeScript SDK tabs (CodeGroup) for all HydraDB API call blocks: database creation, all four connector uploads (Slack, Gmail, Confluence, GitHub), verify processing, add memory, full search (factual + provenance), and search preferences. |
 | 1.0 | 2026-05-09 | Initial release. Python SDK + curl examples for all six source connectors. |

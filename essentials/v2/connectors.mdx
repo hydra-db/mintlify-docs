@@ -1,0 +1,347 @@
+---
+title: "Connectors"
+description: "How HydraDB connectors continuously sync app data from Slack, GitHub, Linear, Notion, and Gmail into the knowledge store."
+---
+
+Connectors bring external app data into HydraDB automatically. Instead of manually ingesting documents, you authenticate once, pick which resources to sync, and HydraDB continuously replicates new content  -  Slack messages, GitHub issues, Linear tickets, Notion pages, Gmail threads  -  as searchable [app sources](/essentials/v2/app-sources) in your knowledge store.
+
+---
+
+## How it works
+
+A connector runs three stages on every sync cycle:
+
+```
+Discover → Configure → Sync
+```
+
+1. **Discover**  -  the connector lists all available resources from the provider: Slack channels, GitHub repos, Linear teams and projects, Notion databases and pages, Gmail labels. Call `GET /connectors/:id/discover` to see what's available before committing.
+2. **Configure**  -  you choose which resources to activate and set sync options. Call `POST /connectors/:id/configure` with the list of resource IDs to enable.
+3. **Sync**  -  HydraDB fetches objects from each active resource since the last cursor and ingests them as app sources. Sync runs on a schedule (default: hourly) or on demand via `POST /connectors/:id/sync`.
+
+### Authentication
+
+All connector endpoints use the same API key as the rest of HydraDB:
+
+```bash
+Authorization: Bearer $HYDRA_DB_API_KEY
+API-Version: 2
+```
+
+### Creating a connector
+
+```bash
+curl -X POST 'https://api.hydradb.com/connectors' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "provider": "slack",
+    "name": "acme-engineering",
+    "database": "acme_corp",
+    "collection": "engineering",
+    "provider_account_scope": "T12345ACME",
+    "credentials": { "api_token": "xoxp-..." }
+  }'
+```
+
+| Field | Purpose |
+|---|---|
+| `provider` | One of `slack`, `github`, `linear`, `notion`, `gmail` |
+| `name` | Human-readable label for this connector |
+| `tenant_id` | Which tenant receives the synced data |
+| `sub_tenant_id` | Which sub-tenant partition receives the data |
+| `provider_account_scope` | Stable identifier for the external account. See below. |
+| `credentials` | Provider API token or access token |
+
+### provider_account_scope
+
+`provider_account_scope` tells HydraDB which external account this connector belongs to. It becomes part of the deduplication key for every object the connector syncs, so two objects with the same content but from different accounts don't overwrite each other.
+
+**What value to use and where to find it:**
+
+| Provider | Value to use | Where to find it |
+|---|---|---|
+| Slack | Workspace ID (starts with `T`) | Open Slack in a browser. The URL is `app.slack.com/client/TXXXXXXXX/...` - the `T...` segment is your workspace ID. |
+| GitHub | Organization or user login | The org or username in your GitHub URL: `github.com/my-github-org` |
+| Linear | Workspace name | Settings → Workspace → the name shown under your workspace |
+| Notion | Workspace name | Settings → Workspace → the name shown at the top |
+| Gmail | Leave empty | Gmail does not use this field - use `account_email` in `additional_metadata` to scope by account instead |
+
+**Why it matters:** if you create two Slack connectors for different workspaces but give them the same `provider_account_scope` (or omit it on both), their synced messages share a deduplication namespace and will overwrite each other. Set a distinct value per connector whenever you connect more than one account of the same provider.
+
+### Configuring resources
+
+After creation, activate specific resources to sync:
+
+```bash
+curl -X POST 'https://api.hydradb.com/connectors/:id/configure' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "lookback_days": 30,
+    "resources": [
+      {
+        "resource_id": "C_GENERAL",
+        "resource_type": "channel",
+        "name": "general",
+        "sub_tenant_id": "all-hands",
+        "metadata": { "department": "all-hands" },
+        "additional_metadata": { "internal_label": "general-slack" }
+      },
+      {
+        "resource_id": "C_ENG",
+        "resource_type": "channel",
+        "name": "engineering",
+        "sub_tenant_id": "engineering",
+        "metadata": { "department": "engineering" },
+        "additional_metadata": { "internal_label": "eng-slack" }
+      }
+    ]
+  }'
+```
+
+`lookback_days` controls how far back in time the first sync fetches historical data (default: `30`). After the initial sync, only new content since the last cursor is fetched.
+
+Each resource accepts the following optional fields:
+
+| Field | Purpose |
+|---|---|
+| `sub_tenant_id` | Routes objects from this resource into a specific sub-tenant partition (overrides the connector-level `sub_tenant_id`) |
+| `metadata` | Key-value pairs merged into tenant metadata on every synced object from this resource. Undeclared keys are accepted but only keys in `tenant_metadata_schema` are indexed for filtering. |
+| `additional_metadata` | Key-value pairs merged into document metadata on every synced object from this resource |
+
+See [Metadata on synced objects](#metadata-on-synced-objects) for how these merge with system-generated fields.
+
+---
+
+## Metadata on synced objects
+
+Every object synced by a connector lands in HydraDB with two metadata layers:
+
+### Tenant metadata (`metadata`)
+
+Tenant metadata is the **schema-declared** layer. Fields here are defined once per tenant via `tenant_metadata_schema` and are indexed for fast, exact-match filtering. This is what you use for stable high-cardinality fields you filter on often  -  `department`, `region`, `status`, `priority`.
+
+HydraDB always writes `provider` into tenant metadata for every synced object. You can extend this with your own fields by passing `metadata` on each resource in `POST /connectors/:id/configure`. User-supplied fields are merged first; `provider` always takes precedence.
+
+### Document metadata (`additional_metadata`)
+
+Document metadata is the **free-form** layer. No schema required. Each connector automatically populates this with provider-specific fields on every synced object: connector ID, resource ID, provider account scope, and provider-native identifiers (Slack TS, GitHub issue number, Linear identifier, etc.).
+
+You can extend this with your own fields by passing `additional_metadata` on each resource in `POST /connectors/:id/configure`. User-supplied fields are merged first; provider-generated fields always take precedence.
+
+This is what you filter on when you want to scope a query to a specific connector, channel, repo, or inbox.
+
+```json Querying with document metadata filter
+{
+  "database": "acme_corp",
+  "query": "deployment checklist",
+  "query_apps": true,
+  "metadata_filters": {
+    "additional_metadata": {
+      "connector_id": "{connector_id}"
+    }
+  }
+}
+```
+
+| Filter target | Key in `additional_metadata` |
+|---|---|
+| Specific connector | `connector_id` |
+| Specific channel / repo / label | `resource_id` |
+| Specific external account | `provider_account_scope` |
+
+---
+
+## What each connector stores
+
+### Slack
+
+**Resources:** Channels
+
+**Syncs:** Messages and thread replies (replies are attached as comments on the parent message)
+
+**`fields`** (searchable):
+
+| Field | Content |
+|---|---|
+| `body` | Message text, attachment text, file titles |
+| `author` | Slack user ID or bot ID |
+| `thread_id` | `{channel_id}:{thread_ts}` |
+| `parent_id` | Set for thread replies; empty for root messages |
+| `created_at` | RFC3339 timestamp |
+| `is_edited` | Whether the message was edited |
+| `edited_by` / `edited_at` | Editor and edit time (when edited) |
+| `attachment_count` / `file_count` | Rich attachment and file counts |
+
+**`additional_metadata`** (auto-indexed by connector):
+
+| Key | Value |
+|---|---|
+| `connector_id` | Connector UUID |
+| `resource_id` | Channel ID |
+| `provider_account_scope` | Workspace identifier (e.g. `T12345ACME`) |
+| `slack_ts` | Message timestamp |
+| `slack_thread_ts` | Thread root timestamp |
+| `slack_subtype` | Message subtype |
+| `slack_bot_id` | Bot ID when applicable |
+| `slack_reply_count` | Number of thread replies |
+| `slack_files` | File metadata array |
+
+---
+
+### GitHub
+
+**Resources:** Repositories
+
+**Syncs:** Issues and pull requests
+
+**`fields`**:
+
+| Field | Content |
+|---|---|
+| `body` | Issue or PR description |
+| `author` | GitHub login of opener |
+| `state` | `open` or `closed` |
+| `assignees` | List of assignee logins |
+| `labels` | List of label names |
+| `is_pr` | `true` for pull requests |
+| `created_at` / `updated_at` / `closed_at` | Timestamps |
+| `url` | GitHub permalink |
+| `milestone` / `milestone_due` | Milestone title and due date |
+
+**`additional_metadata`**:
+
+| Key | Value |
+|---|---|
+| `connector_id` | Connector UUID |
+| `resource_id` | `{owner}/{repo}` |
+| `provider_account_scope` | GitHub account (e.g. `my-github-org`) |
+| `github_repo` | `{owner}/{repo}` |
+| `github_issue_number` | Integer issue/PR number |
+
+---
+
+### Linear
+
+**Resources:** Teams and projects
+
+**Syncs:** Issues (with comments, attachments, and parent relations)
+
+**`fields`**:
+
+| Field | Content |
+|---|---|
+| `body` | Issue description |
+| `state` | Workflow state name |
+| `priority` / `priority_label` | Integer (0–4) and label (`Urgent`, etc.) |
+| `assignee` / `creator` | Display names |
+| `team_key` / `team_name` | Team identifier and name |
+| `project_name` | Project name (when assigned) |
+| `created_at` / `updated_at` | Timestamps |
+| `url` | Linear issue permalink |
+
+**`additional_metadata`**:
+
+| Key | Value |
+|---|---|
+| `connector_id` | Connector UUID |
+| `resource_id` | Team or project ID |
+| `resource_type` | `linear_team` or `linear_project` |
+| `provider_account_scope` | Linear account identifier |
+| `linear_issue_id` | Linear UUID |
+| `linear_identifier` | Human identifier (e.g. `ENG-142`) |
+
+---
+
+### Notion
+
+**Resources:** Databases and top-level pages
+
+**Syncs:** Pages (full block content as body, file attachments)
+
+**`fields`**:
+
+| Field | Content |
+|---|---|
+| `title` | Page title |
+| `body` | Full page block content as text |
+| `created_at` / `last_edited_time` | Timestamps |
+| `url` | Notion page URL |
+| `created_by` / `last_edited_by` | Notion user IDs |
+
+**`additional_metadata`**:
+
+| Key | Value |
+|---|---|
+| `connector_id` | Connector UUID |
+| `resource_id` | Database or page ID |
+| `resource_type` | `notion_database` or `notion_page` |
+| `provider_account_scope` | Notion account identifier |
+| `notion_page_id` | Notion page UUID |
+
+---
+
+### Gmail
+
+**Resources:** Labels (`INBOX`, `[Gmail]/All Mail`, custom labels)
+
+**Syncs:** Emails (with thread relations linking replies to parent messages)
+
+<Warning>
+  Gmail does not populate `provider_account_scope` in `additional_metadata`. Use `account_email` instead to scope queries to a specific Gmail account. `thread_id` appears in both `fields` (for full-text search) and `additional_metadata` (for exact-match filtering)  -  this is intentional and specific to Gmail.
+</Warning>
+
+**`fields`**:
+
+| Field | Content |
+|---|---|
+| `subject` | Email subject |
+| `body` | Plain-text email body |
+| `from` | Sender address |
+| `to` / `cc` / `reply_to` | Recipient lists |
+| `message_id` | RFC2822 Message-ID header |
+| `thread_id` | Gmail thread ID (also available in `additional_metadata` for filtering) |
+| `gmail_msg_id` | Gmail numeric message ID |
+| `created_at` | Send timestamp |
+| `account_email` | Gmail account address |
+
+**`additional_metadata`**:
+
+| Key | Value |
+|---|---|
+| `connector_id` | Connector UUID |
+| `resource_id` | Gmail label ID (e.g. `INBOX`) |
+| `account_email` | Gmail account address  -  use this to scope by account (replaces `provider_account_scope` for Gmail) |
+| `imap_uid` | IMAP UID |
+| `thread_id` | Gmail thread ID (also exposed in `fields` for search) |
+
+---
+
+## Multiple connectors per provider
+
+You can create more than one connector for the same provider  -  two Slack workspaces, two GitHub accounts, a personal and a work Gmail. Each connector is independent: its own credentials, its own resources, its own `provider_account_scope`.
+
+Set distinct `provider_account_scope` values per connector. This value is part of every object's deduplication key  -  without it, objects from two accounts of the same provider collide.
+
+You can also route different resources from the same connector into different sub-tenants via `POST /connectors/:id/configure`:
+
+```json
+{
+  "resources": [
+    { "resource_id": "C_GENERAL", "name": "general",     "sub_tenant_id": "all-hands" },
+    { "resource_id": "C_ENG",     "name": "engineering", "sub_tenant_id": "engineering" }
+  ]
+}
+```
+
+---
+
+## Related
+
+- [App Sources](/essentials/v2/app-sources)  -  ingestion model connector objects use
+- [Metadata](/essentials/v2/metadata)  -  tenant metadata vs document metadata in depth
+- [Multi-Tenant](/essentials/v2/multi-tenant)  -  routing resources to tenants and sub-tenants
+- [Query](/essentials/v2/query)  -  querying connector-synced data with `query_apps: true`

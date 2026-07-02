@@ -27,7 +27,7 @@ Standard RAG fails on these because **two earnings calls produce nearly identica
 ## What You'll Build
 
 By the end of this cookbook, you'll be able to:
-- Ingest earnings PDFs, internal metric series, and board memos into a per-quarter HydraDB sub-tenant
+- Ingest earnings PDFs, internal metric series, and board memos into a per-quarter HydraDB collection
 - Answer trend questions like "How did gross margin change across the last four quarters?" using `recency_bias` and `mode: "thinking"`
 - Compare point-in-time statements across quarters ("What did the CFO say about guidance in Q2 vs Q4?")
 - Build a financial analyst interface that cites the exact source document and timestamp for every answer
@@ -69,16 +69,16 @@ graph TD
 ```
 
 **Key design decisions:**
-- One **tenant** for the entire financial data corpus. Sub-tenants namespace by company or analyst team.
+- One **database** for the entire financial data corpus. Collections namespace by company or analyst team.
 - **`recency_bias: 0.7`** for trend questions (surface recent but still gather historical). **`recency_bias: 0.3`** for historical comparison (spread evenly across time).
 - **`mode: "thinking"`** for all analytical queries - multi-query reranking is essential for financial reasoning.
 - **`graph_context: true`** on `/query` gives you `query_paths` - the entity relationship chains that show how a metric's value evolved across documents.
 
 ---
 
-## Step 1 - Create Tenant & Environment
+## Step 1 - Create Database & Environment
 
-One tenant for the whole financial corpus. Sub-tenants isolate by company, fund, or analyst team.
+One database for the whole financial corpus. Collections isolate by company, fund, or analyst team.
 
 ```python
 # setup.py
@@ -90,12 +90,12 @@ TENANT_ID = "financial-analyst"
 
 client = HydraDB(token=API_KEY)
 
-# Create tenant
-result = client.tenants.create(tenant_id=TENANT_ID)
+# Create database
+result = client.tenants.create(database=TENANT_ID)
 print(result)
-# Output: {'status': 'accepted', 'tenant_id': 'financial-analyst', ...}
+# Output: {'status': 'accepted', 'database': 'financial-analyst', ...}
 
-# Sub-tenant conventions used throughout this guide:
+# Collection conventions used throughout this guide:
 #   "earnings-{TICKER}"        - earnings calls + SEC filings for one company
 #   "internal-metrics"         - internal financial metrics exports
 #   "board-memos"              - board meeting memos
@@ -132,18 +132,18 @@ def ingest_earnings_pdf(
     """
     Upload a single earnings PDF. Returns the id for verification.
 
-    IMPORTANT: tenant_id and sub_tenant_id must appear both as top-level
+    IMPORTANT: database and collection must appear both as top-level
     SDK params AND inside the app_knowledge JSON - AppKnowledgeModel validates both.
     """
-    sub_tenant_id = f"earnings-{ticker.lower()}"
+    collection = f"earnings-{ticker.lower()}"
 
     app_knowledge = json.dumps([{
         "id":           f"{ticker}-{doc_type}-{fiscal_year}-Q{fiscal_quarter}",
         "title":        f"{ticker} {period_label} {doc_type.replace('_', ' ').title()}",
         "type":         "pdf",
         "timestamp":    period_end_date,   # drives recency ranking - must be accurate
-        "tenant_id":    TENANT_ID,
-        "sub_tenant_id": sub_tenant_id,
+        "database":    TENANT_ID,
+        "collection": collection,
         "metadata": {
             "ticker":          ticker,
             "doc_type":        doc_type,
@@ -157,8 +157,8 @@ def ingest_earnings_pdf(
     with open(file_path, "rb") as f:
         # FIX: SDK expects a tuple of (filename, file_obj, mime_type), not a raw file handle.
         result = client.context.ingest(
-            tenant_id=TENANT_ID,
-            sub_tenant_id=sub_tenant_id,
+            database=TENANT_ID,
+            collection=collection,
             app_knowledge=app_knowledge,
             documents=[(os.path.basename(file_path), f, "application/pdf")],
         )
@@ -280,8 +280,8 @@ def ingest_metrics_series(metrics_by_period: list[dict]) -> list[str]:
 
         result = client.context.ingest(
             type='memory',
-            tenant_id=TENANT_ID,
-            sub_tenant_id="internal-metrics",
+            database=TENANT_ID,
+            collection="internal-metrics",
             upsert=True,
             memories=[{
                 "text":   text_chunk,
@@ -405,15 +405,15 @@ def ingest_board_memo(
     period_label: str,   # e.g. "Q3 2023 Board Meeting"
     memo_type: str,      # "board_memo" | "investor_letter" | "management_commentary"
 ) -> str:
-    sub_tenant_id = "board-memos"
+    collection = "board-memos"
 
     app_knowledge = json.dumps([{
         "id":           f"{ticker}-{memo_type}-{meeting_date[:10]}",
         "title":        f"{ticker} {period_label} - {memo_type.replace('_', ' ').title()}",
         "type":         "pdf",
         "timestamp":    meeting_date,
-        "tenant_id":    TENANT_ID,
-        "sub_tenant_id": sub_tenant_id,
+        "database":    TENANT_ID,
+        "collection": collection,
         "metadata": {
             "ticker":       ticker,
             "doc_type":     memo_type,
@@ -425,8 +425,8 @@ def ingest_board_memo(
     with open(file_path, "rb") as f:
         # FIX: SDK expects a tuple of (filename, file_obj, mime_type), not a raw file handle.
         result = client.context.ingest(
-            tenant_id=TENANT_ID,
-            sub_tenant_id=sub_tenant_id,
+            database=TENANT_ID,
+            collection=collection,
             app_knowledge=app_knowledge,
             documents=[(os.path.basename(file_path), f, "application/pdf")],
         )
@@ -461,7 +461,7 @@ def verify_all_indexed(ids: list[str], poll_interval: int = 3, max_polls: int = 
 
         for fid in list(pending):
             status = client.context.status(
-                tenant_id=TENANT_ID,
+                database=TENANT_ID,
                 ids=[fid],
             )
             items = status.data.statuses or []
@@ -517,8 +517,8 @@ def store_analyst_profile(user_id: str, profile_text: str) -> dict:
     """
     result = client.context.ingest(
         type='memory',
-        tenant_id=TENANT_ID,
-        sub_tenant_id=f"analyst-{user_id}",
+        database=TENANT_ID,
+        collection=f"analyst-{user_id}",
         upsert=True,
         memories=[{
             "text":  profile_text,
@@ -595,8 +595,8 @@ def query_point_in_time(
     mode: "thinking" - multi-query reranking, personalised search.
     """
     return client.query(
-        tenant_id=TENANT_ID,
-        sub_tenant_id=f"analyst-{user_id}",
+        database=TENANT_ID,
+        collection=f"analyst-{user_id}",
         query=question,
         max_results=12,
         graph_context=True,
@@ -663,7 +663,7 @@ def query_trend(
         filters["fiscal_year"] = fiscal_year
 
     search = client.query(
-        tenant_id=TENANT_ID,
+        database=TENANT_ID,
         query=question,
         max_results=20,    # more results needed to cover all quarters
         mode="thinking",
@@ -704,8 +704,8 @@ def query_trend(
     # Retrieve analyst profile for answer personalization
     analyst_prefs = client.query(
         type="memory",
-        tenant_id=TENANT_ID,
-        sub_tenant_id=f"analyst-{user_id}",
+        database=TENANT_ID,
+        collection=f"analyst-{user_id}",
         mode="thinking",
         query="focus area metrics preferences output format",
     )
@@ -791,12 +791,12 @@ def cross_source_reconciliation(
     Retrieve the same period from all three source types - earnings transcript,
     internal metrics, and board memo - and ask the LLM to surface discrepancies.
 
-    Uses three separate search calls, one per sub-tenant, then merges context.
+    Uses three separate search calls, one per collection, then merges context.
     """
 
-    def search(sub_tenant_id: str, doc_type_filter: str) -> list[dict]:
+    def search(collection: str, doc_type_filter: str) -> list[dict]:
         resp = client.query(
-            tenant_id=TENANT_ID,
+            database=TENANT_ID,
             query=f"{ticker} {period_label} financial performance",
             max_results=8,
             mode="thinking",
@@ -920,7 +920,7 @@ def track_narrative_shift(
     alpha: 0.3 - lean keyword for topic-specific terms like "churn", "guidance".
     """
     search = client.query(
-        tenant_id=TENANT_ID,
+        database=TENANT_ID,
         query=f"{ticker} management commentary {topic}",
         max_results=n_quarters * 4,   # 4 chunks per quarter
         mode="thinking",
@@ -1041,8 +1041,8 @@ def financial_recall(
     if fiscal_quarter: filters["fiscal_quarter"]  = fiscal_quarter
 
     payload: dict = {
-        "tenant_id":     TENANT_ID,
-        "sub_tenant_id": f"analyst-{user_id}",
+        "database":     TENANT_ID,
+        "collection": f"analyst-{user_id}",
         "query":         question,
         "max_results":   15,
         "graph_context": True,
@@ -1165,7 +1165,7 @@ def generate_quarterly_briefing(
     # ── 1. This quarter - all sources ────────────────────────────────────
     print("[1/4] Searching current quarter...")
     current_q = client.query(
-        tenant_id=TENANT_ID,
+        database=TENANT_ID,
         query=f"{ticker} {period_label} performance revenue margin guidance",
         max_results=15,
         mode="thinking",
@@ -1210,8 +1210,8 @@ def generate_quarterly_briefing(
     # Search analyst profile
     analyst_prefs = client.query(
         type="memory",
-        tenant_id=TENANT_ID,
-        sub_tenant_id=f"analyst-{analyst_user_id}",
+        database=TENANT_ID,
+        collection=f"analyst-{analyst_user_id}",
         mode="thinking",
         query="coverage focus metrics preferences format",
     )
@@ -1254,8 +1254,8 @@ def generate_quarterly_briefing(
     # ── 5. Store briefing back to HydraDB ────────────────────────────────
     store_resp = client.context.ingest(
         type='memory',
-        tenant_id=TENANT_ID,
-        sub_tenant_id=f"analyst-{analyst_user_id}",
+        database=TENANT_ID,
+        collection=f"analyst-{analyst_user_id}",
         upsert=True,
         memories=[{
             "text":  f"QUARTERLY BRIEFING [{ticker}] [{period_label}] [run:{run_id}]:\n{briefing_text}",
@@ -1372,14 +1372,14 @@ if __name__ == "__main__":
 All endpoints used in this cookbook. Base URL: `https://api.hydradb.com`  
 Header: `Authorization: Bearer YOUR_API_KEY`
 
-### Create Tenant
+### Create Database
 
 ```http
-POST /tenants
+POST /databases
 ```
 
 ```json
-{ "tenant_id": "financial-analyst" }
+{ "database": "financial-analyst" }
 ```
 
 ### Upload Financial Document (SDK required)
@@ -1396,8 +1396,8 @@ Content-Type: multipart/form-data
   "title":        "ACME Q2 2023 Earnings Transcript",
   "type":         "pdf",
   "timestamp":    "2023-06-30T00:00:00Z",
-  "tenant_id":    "financial-analyst",
-  "sub_tenant_id":"earnings-acme",
+  "database":    "financial-analyst",
+  "collection":"earnings-acme",
   "metadata": {
     "ticker":          "ACME",
     "doc_type":        "earnings_transcript",
@@ -1417,14 +1417,14 @@ Content-Type: multipart/form-data
 curl -X POST 'https://api.hydradb.com/context/ingest' \
   -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
   -F "documents=@ACME_Q2_2023_transcript.pdf" \
-  -F "tenant_id=financial-analyst" \
-  -F "sub_tenant_id=earnings-acme"
+  -F "database=financial-analyst" \
+  -F "collection=earnings-acme"
 ```
 
 ### Verify Indexing
 
 ```http
-GET /context/status?ids=ID&tenant_id=financial-analyst
+GET /context/status?ids=ID&database=financial-analyst
 ```
 
 ### Store Metrics / Analyst Memory
@@ -1439,8 +1439,8 @@ POST /context/ingest
     "text":  "Q2 2023 Metrics - ACME: revenue_usd: 9100000, arr_usd: 37200000, gross_margin_pct: 72.8, churn_rate_pct: 1.6, cac_usd: 4050",
     "infer": true
   }],
-  "tenant_id":     "financial-analyst",
-  "sub_tenant_id": "internal-metrics",
+  "database":     "financial-analyst",
+  "collection": "internal-metrics",
   "upsert":        true
 }
 ```
@@ -1453,8 +1453,8 @@ POST /query
 
 ```json
 {
-  "tenant_id":     "financial-analyst",
-  "sub_tenant_id": "analyst-alice",
+  "database":     "financial-analyst",
+  "collection": "analyst-alice",
   "query":         "What did management say about gross margin in Q2 2023?",
   "max_results":   12,
   "graph_context": true,
@@ -1477,7 +1477,7 @@ POST /query
 
 ```json
 {
-  "tenant_id":     "financial-analyst",
+  "database":     "financial-analyst",
   "query":         "ACME gross margin trend across 2023",
   "max_results":   20,
   "mode":          "thinking",
@@ -1499,7 +1499,7 @@ POST /query
 
 ```json
 {
-  "tenant_id":    "financial-analyst",
+  "database":    "financial-analyst",
   "query":        "How has ACME's churn narrative shifted across the past year?",
   "max_results":  20,
   "mode":         "thinking",
@@ -1521,8 +1521,8 @@ POST /query
 
 ```json
 {
-  "tenant_id":     "financial-analyst",
-  "sub_tenant_id": "analyst-alice",
+  "database":     "financial-analyst",
+  "collection": "analyst-alice",
   "mode":          "thinking",
   "query":         "coverage focus metrics preferences output format"
 }
@@ -1605,7 +1605,7 @@ Tested across 3 company corpora (4 quarters of earnings transcripts + internal m
 | No `/context/status` polling | Queries return empty results silently | Always poll status before querying |
 | `infer: false` on analyst profiles | No personalization applied | Leave `infer: true` (the default) for profiles |
 | Empty `chunks` passed to LLM | Confident hallucinations about quarters | Add guard: `if not chunks: return "No data found"` |
-| Mismatched `sub_tenant_id` on read/write | Empty results despite successful ingestion | Read and write sub-tenants must match exactly |
+| Mismatched `collection` on read/write | Empty results despite successful ingestion | Read and write collections must match exactly |
 | Relative imports in `briefing.py` / `slack_bot.py` | `ModuleNotFoundError` when running as a script | Add `sys.path.insert(0, project_root)` at top of file |
 | `str \| None` type hints in Slack bot | `SyntaxError` on Python 3.9 | Use `Optional[str]` from `typing` module instead |
 
@@ -1614,7 +1614,7 @@ Tested across 3 company corpora (4 quarters of earnings transcripts + internal m
 ## Next Steps
 
 1. **Expand your corpus** - add 10-K and 10-Q filings as `doc_type: "10K"` / `"10Q"` with annual timestamps.
-2. **Add a second company** - create a new sub-tenant `earnings-{TICKER2}` and compare two companies directly using cross-ticker queries.
+2. **Add a second company** - create a new collection `earnings-{TICKER2}` and compare two companies directly using cross-ticker queries.
 3. **Schedule automated ingestion** - run the ingestion pipeline on a cron job triggered by each earnings release date.
 4. **Wire up a Slack briefing** - schedule `generate_quarterly_briefing` to post to a `#earnings-briefings` channel automatically after each filing.
 5. **Add a web scraper** - ingest sell-side analyst notes or financial news articles alongside the official filings for a richer context graph.

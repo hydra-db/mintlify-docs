@@ -1,18 +1,22 @@
 ---
-title: "Tenants & sub-tenants"
-description: "How HydraDB scopes data using tenants and sub-tenants, and how scoping affects writes and query."
+title: "Multi tenancy"
+description: "How HydraDB scopes data using databases and collections, and how scoping affects writes and query."
 ---
+
+<Note>
+  The request fields are now named **`database`** (formerly `tenant_id`) and **`collection`** (formerly `sub_tenant_id`). The old names and the old `/tenants` routes remain fully supported as deprecated aliases, so existing integrations keep working without any changes -- however, we recommend using the latest conventions. See [Migrating from `tenant_id` and `sub_tenant_id`](#7-migrating-from-the-legacy-tenant-and-sub-tenant-fields) for the full compatibility contract.
+</Note>
 
 ## 1. What it is
 
 HydraDB scopes data using two identifiers:
 
-- **`tenant_id`** - the top-level scoping identifier. Use it for customers, environments, or other primary data boundaries.
-- **`sub_tenant_id`** - an optional scoping identifier within a tenant. Use it for users, workspaces, teams, or other logical partitions.
+- **`database`** - the top-level scoping identifier. Use it for customers, environments, or other primary data boundaries.
+- **`collection`** - an optional scoping identifier within a database. Use it for users, workspaces, teams, or other logical partitions.
 
-HydraDB write and query operations are scoped by `tenant_id`. Writes use singular `sub_tenant_id`. Query uses preferred `sub_tenant_ids`, which can select one or many sub-tenants; legacy query calls may still send singular `sub_tenant_id`. If you omit both query selectors, HydraDB uses the tenant's default sub-tenant.
+HydraDB write and query operations are scoped by `database`. When `collection` is provided, it further narrows the scope for that operation. If you omit `collection`, HydraDB uses the database's default collection.
 
-Use the same scoping values consistently across writes and reads. If you write data with one `sub_tenant_id` and later query without including that ID in `sub_tenant_ids`, that data may not appear in the query results.
+Use the same scoping values consistently across writes and reads. If you write data with one `collection` and later query with a different one, that data may not appear in the query results.
 
 ---
 
@@ -20,18 +24,18 @@ Use the same scoping values consistently across writes and reads. If you write d
 
 | Goal | Use |
 |---|---|
-| Separate customers on your platform | A different `tenant_id` per customer |
-| Separate environments (`prod` vs `staging`) | A different `tenant_id` per environment |
-| Separate per-user state within one customer | One `tenant_id`, `sub_tenant_id = user_id` |
-| Separate per-workspace data within one customer | One `tenant_id`, `sub_tenant_id = workspace_id` |
-| Store broadly shared Knowledge | Omit `sub_tenant_id` to use the tenant's default sub-tenant |
+| Separate customers on your platform | A different `database` per customer |
+| Separate environments (`prod` vs `staging`) | A different `database` per environment |
+| Separate per-user state within one customer | One `database`, `collection = user_id` |
+| Separate per-workspace data within one customer | One `database`, `collection = workspace_id` |
+| Store broadly shared Knowledge | Omit `collection` to use the database's default collection |
 
 Two practical rules:
 
-- Use a separate **tenant** whenever data must not mix across customers or environments.
-- Use a **sub-tenant** for logical partitions inside a tenant, such as users, workspaces, teams, or projects.
+- Use a separate **database** whenever data must not mix across customers or environments.
+- Use a **collection** for logical partitions inside a database, such as users, workspaces, teams, or projects.
 
-Do not use `sub_tenant_id` as a substitute for separate production and staging tenants. Environments should usually be separated at the `tenant_id` level.
+Do not use `collection` as a substitute for separate production and staging databases. Environments should usually be separated at the `database` level.
 
 ---
 
@@ -39,35 +43,35 @@ Do not use `sub_tenant_id` as a substitute for separate production and staging t
 
 ### B2C application
 
-Use one tenant for the application or customer account, and use each end-user as a sub-tenant.
+Use one database for the application or customer account, and use each end-user as a collection.
 
 ```text
-tenant_id      = "acme_app"
-sub_tenant_id  = "user_123"
+database      = "acme_app"
+collection  = "user_123"
 ```
 
 Use this when each user has private Memories, preferences, or conversation history.
 
 Typical flow:
 
-- Write user Memories with `sub_tenant_id = user_id`.
-- Query user Memories with `sub_tenant_ids: [user_id]`.
+- Write user Memories with `collection = user_id`.
+- Query user Memories with the same `collection`.
 - Keep shared Knowledge outside the user-specific scope.
 
 ### B2B SaaS
 
-Use one tenant per customer organization. Use `sub_tenant_id` for the workspace, team, project, or user scope inside that customer.
+Use one database per customer organization. Use `collection` for the workspace, team, project, or user scope inside that customer.
 
 ```text
-tenant_id      = "acme_corp"
-sub_tenant_id  = "workspace_42"
+database      = "acme_corp"
+collection  = "workspace_42"
 ```
 
 Typical flow:
 
-- Customer-level Knowledge uses the customer `tenant_id`.
-- Workspace-specific data uses a workspace `sub_tenant_id`.
-- User-specific Memories use a user-level `sub_tenant_id`.
+- Customer-level Knowledge uses the customer `database`.
+- Workspace-specific data uses a workspace `collection`.
+- User-specific Memories use a user-level `collection`.
 
 ### Shared Knowledge + user personalization
 
@@ -85,25 +89,25 @@ When you need different formatting for shared vs personal context in the LLM pro
 
 ### Writes
 
-Writes include `tenant_id`, and may include `sub_tenant_id`.
+Writes include `database`, and may include `collection`.
 
-Use `sub_tenant_id` when the data belongs to a specific user, workspace, team, or other logical partition. Omit it when you intentionally want the data written to the tenant's default sub-tenant.
+Use `collection` when the data belongs to a specific user, workspace, team, or other logical partition. Omit it when you intentionally want the data written to the database's default collection.
 
 Examples:
 
-- A memory about John's preferences should be written with John's `sub_tenant_id`.
-- Workspace-specific runbooks should be written with that workspace's `sub_tenant_id`.
+- A memory about John's preferences should be written with John's `collection`.
+- Workspace-specific runbooks should be written with that workspace's `collection`.
 - Broadly shared Knowledge should use the same scope you plan to use when querying it.
 
 ### Reads
 
-Query requests include `tenant_id`, and should use `sub_tenant_ids` for sub-tenant scope. Send a single-item list for one scope, a longer list to fan out across multiple scopes with equal normalized weights, or an object mapping sub-tenant IDs to positive relative ranking weights with at most one decimal place. If both `sub_tenant_ids` and legacy `sub_tenant_id` are omitted, query uses the tenant's default sub-tenant.
+Query requests include `database`, and may include `collection`. If `collection` is omitted, query uses the database's default collection.
 
-Use the same scoping values on query that you used when writing the data. A query request should not be expected to retrieve data written under a sub-tenant unless that ID is included in `sub_tenant_ids`.
+Use the same scoping values on query that you used when writing the data. A query request with one `collection` should not be expected to retrieve data written under a different `collection`.
 
-If your application needs to combine data from multiple scopes, prefer one query call with `sub_tenant_ids` unless you need separate response formatting or client-side treatment per scope.
+If your application needs to combine data from multiple scopes, prefer one query call with `collections` unless you need separate response formatting or client-side treatment per scope.
 
-Use sub-tenants for partitioning data. Use `metadata_filters` for narrowing results within that scope.
+Use `collection` for partitioning data. Use `metadata_filters` for narrowing results within that scope.
 
 ### Memories and Knowledge
 
@@ -113,29 +117,29 @@ Memories and Knowledge live in separate stores, both reached through `POST /quer
 - `type: "knowledge"` retrieves **Knowledge** (shared documents and app sources).
 - `type: "all"` retrieves both in one call.
 
-For a personalized answer, the common pattern is one `POST /query` with `type: "all"` and `sub_tenant_ids: ["user_123"]`. HydraDB runs both stores in parallel and merges results. Use two separate calls only when you need to format the two streams differently in your LLM prompt.
+For a personalized answer, the common pattern is one `POST /query` with `type: "all"` and the user's `collection`. HydraDB runs both stores in parallel and merges results. Use two separate calls only when you need to format the two streams differently in your LLM prompt.
 
 <Warning>
-  <strong>Use the same sub-tenant ID on writes and reads for the same logical scope.</strong>
-  <p>Writes use <code>sub_tenant_id</code>; query should include that value in <code>sub_tenant_ids</code>. Data written under one sub-tenant should not be expected to appear when querying from another.</p>
+  <strong>Use the same <code>collection</code> on writes and reads for the same logical scope.</strong>
+  <p>Data written under one collection should not be expected to appear when querying from another. Keep scope identifiers stable and consistent in your application.</p>
 </Warning>
 
 ---
 
 ## 5. Minimal working example
 
-The example below shows a common personalized-answer flow: write a user Memory with singular `sub_tenant_id`, then query Knowledge and Memories together with `sub_tenant_ids`.
+The example below shows a common personalized-answer flow: write a user Memory with a single `collection`, then query Knowledge and Memories together with `collections`.
 
 <CodeGroup>
 
 ```bash cURL
-# 1. Write a per-user memory under the user's sub_tenant_id.
+# 1. Write a per-user memory under the user's collection.
 curl -X POST 'https://api.hydradb.com/context/ingest' \
   -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
   -H "API-Version: 2" \
   -F "type=memory" \
-  -F "tenant_id=acme_corp" \
-  -F "sub_tenant_id=user_123" \
+  -F "database=acme_corp" \
+  -F "collection=user_123" \
   -F "upsert=true" \
   -F 'memories=[
     {
@@ -151,8 +155,8 @@ curl -X POST 'https://api.hydradb.com/query' \
   -H "API-Version: 2" \
   -H "Content-Type: application/json" \
   -d '{
-    "tenant_id": "acme_corp",
-    "sub_tenant_ids": ["user_123"],
+    "database": "acme_corp",
+    "collection": "user_123",
     "query": "refund policy",
     "type": "all",
     "query_by": "hybrid",
@@ -167,11 +171,11 @@ const client = new HydraDBClient({
   token: process.env.HYDRA_DB_API_KEY,
 });
 
-// 1. Write a per-user memory under the user's sub_tenant_id.
+// 1. Write a per-user memory under the user's collection.
 await client.context.ingest({
   type: "memory",
-  tenantId: "acme_corp",
-  subTenantId: "user_123",
+  database: "acme_corp",
+  collection: "user_123",
   upsert: true,
   memories: JSON.stringify([
     {
@@ -184,8 +188,8 @@ await client.context.ingest({
 
 // 2. Search Knowledge + Memories together with type: "all".
 const result = await client.query({
-  tenantId: "acme_corp",
-  subTenantIds: ["user_123"],
+  database: "acme_corp",
+  collection: "user_123",
   query: "refund policy",
   type: "all",
   queryBy: "hybrid",
@@ -200,11 +204,11 @@ from hydra_db import HydraDB
 
 client = HydraDB(token=os.environ["HYDRA_DB_API_KEY"])
 
-# 1. Write a per-user memory under the user's sub_tenant_id.
+# 1. Write a per-user memory under the user's collection.
 client.context.ingest(
     type="memory",
-    tenant_id="acme_corp",
-    sub_tenant_id="user_123",
+    database="acme_corp",
+    collection="user_123",
     upsert=True,
     memories=json.dumps([
         {
@@ -217,8 +221,8 @@ client.context.ingest(
 
 # 2. Search Knowledge + Memories together with type: "all".
 result = client.query(
-    tenant_id="acme_corp",
-    sub_tenant_ids=["user_123"],
+    database="acme_corp",
+    collection="user_123",
     query="refund policy",
     type="all",
     query_by="hybrid",
@@ -232,26 +236,80 @@ result = client.query(
 
 ## 6. Common mistakes
 
-**Mismatched sub-tenant scope between write and read.**
-Data written under one sub-tenant should not be expected to surface when queried under another. Write with singular `sub_tenant_id`; query with `sub_tenant_ids` containing that value.
+**Mismatched `collection` between write and read.**
+Data written under one collection should not be expected to surface when queried under another. Use the same `collection` consistently for the same logical scope.
 
-**Sharing a `tenant_id` across environments.**
-Do not use one tenant for both production and staging. Create separate tenants for separate environments.
+**Sharing a `database` across environments.**
+Do not use one database for both production and staging. Create separate databases for separate environments.
 
-**Confusing `tenant_id` with `sub_tenant_id`.**
-Use `tenant_id` for primary boundaries such as customers or environments. Use `sub_tenant_id` for partitions inside a tenant, such as users or workspaces.
+**Confusing `database` with `collection`.**
+Use `database` for primary boundaries such as customers or environments. Use `collection` for partitions inside a database, such as users or workspaces.
 
-**Assuming query automatically searches every sub-tenant.**
-A query call uses the scope you provide. If your application needs data from multiple scopes, pass `sub_tenant_ids` as a list or weighted object.
+**Assuming query automatically searches every collection.**
+A query call uses the scope you provide. If your application needs data from multiple scopes, pass `collections` as a list or weighted object.
 
 **Writing shared Knowledge under a user scope by accident.**
-If broadly shared Knowledge is written with a user-specific `sub_tenant_id`, it may not appear where other users expect it. Choose the write scope based on where the content should be queried later.
+If broadly shared Knowledge is written with a user-specific `collection`, it may not appear where other users expect it. Choose the write scope based on where the content should be queried later.
 
-**Using metadata filters as a substitute for sub-tenants.**
-Metadata filters narrow results inside a scope. They are not a replacement for choosing the right `tenant_id` and sub-tenant scope.
+**Using metadata filters as a substitute for collections.**
+Metadata filters narrow results inside a scope. They are not a replacement for choosing the right `database` and `collection`.
 
 **Using unstable identifiers.**
 Avoid display names, emails that may change, or user-provided labels as long-term scope identifiers. Prefer stable internal IDs such as `user_123`, `workspace_42`, or `org_acme`.
+
+---
+
+## 7. Migrating from the legacy tenant and sub-tenant fields
+
+`database`/`collection` are the canonical v2 names for what were historically called `tenant_id`/`sub_tenant_id`. The rename is **user-facing only**: internally HydraDB still uses the historical names, so nothing about your data changes. **The old names remain accepted forever; migration is optional and non-breaking.**
+
+Backward compatibility is total across every surface:
+
+| Surface | Legacy (still works) | Canonical (preferred) |
+|---|---|---|
+| Routes | `/tenants`, `/tenants/status`, `/tenants/{tenant_id}/metadata-schema`, … | `/databases`, `/databases/status`, `/databases/{database}/metadata-schema`, … |
+| Request fields | `tenant_id`, `sub_tenant_id` | `database`, `collection` |
+| `/query` multi-scope selector | `sub_tenant_ids` | `collections` |
+| Query params | `?tenant_id=…&sub_tenant_id=…` | `?database=…&collection=…` |
+
+Both prefixes dispatch to the same handlers, and the legacy fields are accepted in the query string, JSON body, and multipart form. An existing integration that uses only the old names is a pure no-op and behaves exactly as before.
+
+On `/query`, `collections` is the canonical way to scope to one or more collections (send a list, or an object mapping collection ID to a relative ranking weight). `sub_tenant_ids` remains accepted as its deprecated alias, and the singular `sub_tenant_id` still works too. See [Query](/api-reference/v2/endpoint/query).
+
+### Deprecation signals
+
+When a request uses a legacy route **or** a legacy field, HydraDB adds a non-breaking migration nudge (never an error, and the status code is unchanged):
+
+- **`Deprecation: true`** response header, plus a `Warning` header carrying the migration message.
+- **`meta.deprecation`**: a list of structured notices in the response envelope's `meta` object (for endpoints that return the envelope). Each entry carries `deprecated`, a human-readable `message`, and `deprecated_since` (e.g. `"2.0.1"`); field-level notices (such as `sub_tenant_ids` → `collections`) also include `deprecated_field` and `preferred_field`, while route-level notices omit them. Fully-migrated requests omit the list entirely.
+
+```json
+{
+  "success": true,
+  "data": { "...": "..." },
+  "error": null,
+  "meta": {
+    "request_id": "9d13aef4-02f4-4e73-8c62-4c2601d04f9d",
+    "latency_ms": 12.3,
+    "deprecation": [
+      {
+        "deprecated": true,
+        "message": "The /tenants routes are deprecated. Migrate to the /databases routes.",
+        "deprecated_since": "2.0.1"
+      }
+    ]
+  }
+}
+```
+
+Use these signals to find and retire legacy usage; once you send only the canonical names on the `/databases` routes, the header and `meta.deprecation` disappear.
+
+### Sending both names
+
+If you send **both** a canonical field and its deprecated alias:
+
+- **Same value** (for example `database` and `tenant_id` both `"acme"`): accepted. HydraDB uses the canonical value.
+- **Different values** (for example `database: "acme"` and `tenant_id: "other"`): rejected with `400`, since the two names refer to the same thing and must agree. Send only one. The same rule applies to `collection`/`sub_tenant_id` and to `collections`/`sub_tenant_ids` on `/query`.
 
 ---
 
@@ -261,4 +319,4 @@ Avoid display names, emails that may change, or user-provided labels as long-ter
 - [Knowledge](/essentials/v2/knowledge) - shared document context
 - [Query](/essentials/v2/query) - how scoping is applied at query time
 - [How to Use API Results](/essentials/v2/api-results) - merging query results into a prompt
-- [Create Tenant](/api-reference/v2/endpoint/tenants-overview) - defining tenants and their metadata schema
+- [Create Database](/api-reference/v2/endpoint/tenants-overview) - defining databases and their metadata schema
