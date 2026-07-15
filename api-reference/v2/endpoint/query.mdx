@@ -8,11 +8,11 @@ import { Field } from "/snippets/field.jsx";
 
 The single retrieval endpoint for everything. Use it any time you need to feed an LLM with grounded context, surface user preferences, or fetch chunks ranked by relevance.
 
-Two independent dimensions control behavior:
+Three independent dimensions control behavior:
 
 - **`type`** picks **what** to query: `"knowledge"`, `"memory"`, or `"all"` (both, merged and re-ranked together).
 - **`query_by`** picks **how** to match: `"hybrid"` (semantic + BM25, the default) or `"text"` (BM25 only  -  pair with `operator`).
-- **`mode`** picks **how** to rank results: `"fast"` (single-pass, low-latency), or `"thinking"` (expands query, reranks, and can include forceful-relation context).
+- **`mode`** picks **how** to rank results: `"fast"` (single-pass, low-latency), `"thinking"` (expands query, reranks, and can include forceful-relation context), or `"auto"` (scores the query and routes to `"fast"` or `"thinking"` automatically, defaulting to `"thinking"` when the signal is inconclusive  -  **the default if `mode` is omitted**).
 
 Read more about choosing the perfect mode for your use case [here](/api-reference/v2/endpoint/query-overview#recommended-configurations).
 
@@ -377,6 +377,48 @@ result = client.query(
 
     </CodeGroup>
   </Accordion>
+
+  <Accordion title="5. Let HydraDB decide - auto-route between fast and thinking">
+    <CodeGroup>
+
+```bash cURL
+curl -X POST 'https://api.hydradb.com/query' \
+  -H "Authorization: Bearer <your_api_key>" \
+  -H "API-Version: 2" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "database": "acme_corp",
+    "query": "How does the Q2 partnership between Acme and Globex affect our SLA with Initech?",
+    "type": "knowledge",
+    "query_by": "hybrid",
+    "mode": "auto"
+  }'
+```
+
+```typescript TypeScript SDK
+const result = await client.query({
+  database: "acme_corp",
+  query: "How does the Q2 partnership between Acme and Globex affect our SLA with Initech?",
+  type: "knowledge",
+  queryBy: "hybrid",
+  mode: "auto",
+});
+```
+
+```python Python SDK
+result = client.query(
+    database="acme_corp",
+    query="How does the Q2 partnership between Acme and Globex affect our SLA with Initech?",
+    type="knowledge",
+    query_by="hybrid",
+    mode="auto",
+)
+```
+
+    </CodeGroup>
+
+    HydraDB scores the query before retrieval and routes it to `"fast"` or `"thinking"`  -  a query naming several distinct entities like this one is likely to route to `"thinking"`. Use `"auto"` for traffic where query complexity varies call-to-call and you don't want to hand-pick per request. This is also the default: an omitted `mode` field behaves exactly like `mode: "auto"`. Set `mode` to `"fast"` or `"thinking"` explicitly if you want a deterministic pipeline instead.
+  </Accordion>
 </AccordionGroup>
 
 ## Request body
@@ -391,12 +433,12 @@ result = client.query(
 | <Field name="query_by" type='"hybrid" or "text"' /> | Retrieval method. See [Query methods](#decision-matrix). (default=`"hybrid"`) |
 | <Field name="query_apps" type="boolean" /> | Adds an app-aware retrieval lane for app sources while still querying the full selected knowledge scope. Set `true` for better app-source matching, thread/relation traversal, exact IDs, and actor/provider hints. It does **not** limit query to only app sources. (default=`false`) |
 | <Field name="operator" type='"or" or "and" or "phrase"' /> | BM25 operator for `query_by: "text"`. Ignored for `hybrid`. (default=`"or"`) |
-| <Field name="mode" type='"fast" or "thinking"' /> | Retrieval pipeline. Applies to `hybrid` only; ignored for `text`. (default=`"fast"`) |
+| <Field name="mode" type='"fast", "thinking", or "auto"' /> | Retrieval pipeline. Applies to `hybrid` only; ignored for `text`. `"auto"` scores the query before retrieval and resolves it to `"fast"` or `"thinking"`, defaulting to `"thinking"` when the signal is inconclusive; it also overrides whatever `graph_context` you sent to match that resolved mode. (default=`"auto"`) |
 | <Field name="max_results" type="integer or null" /> | Maximum chunks to return. Default `10`; maximum `50`. Start with `10`, use `5` for tight prompts, and increase only when reranking downstream. |
 | <Field name="alpha" type='float 0.0–1.0 or "auto"' /> | Hybrid weight (`1.0` = pure semantic, `0.0` = pure BM25). Applies to `query_by: "hybrid"` only. (default=`0.8`) |
 | <Field name="recency_bias" type="float 0.0–1.0" /> | Boost newer content. (default=`0.0`) |
-| <Field name="graph_context" type="boolean" /> | When `true`, includes the entity/relation graph slice in the response under `graph_context`. Set to `false` when you only need ranked chunks. Relations you supplied via [Bring Your Own Graph](/essentials/v2/bring-your-own-graph) appear here identically to extracted ones. (default=`true`) |
-| <Field name="query_forceful_relations" type="boolean" /> | Pull author-declared related sources into `additional_context`. **Only takes effect when `mode: "thinking"`**  -  silently ignored in `fast` mode. (default=`true`) |
+| <Field name="graph_context" type="boolean" /> | When `true`, includes the entity/relation graph slice in the response under `graph_context`. Set to `false` when you only need ranked chunks. Relations you supplied via [Bring Your Own Graph](/essentials/v2/bring-your-own-graph) appear here identically to extracted ones. (default=`true`)  -  **under `mode: "auto"`, this value is overridden by the resolved mode regardless of what you send.** |
+| <Field name="query_forceful_relations" type="boolean" /> | Pull author-declared related sources into `additional_context`. **Only takes effect when `mode` resolves to `"thinking"`**  -  silently ignored in `fast` mode, and under `mode: "auto"` whether it takes effect depends on the automatic routing decision. (default=`true`) |
 | <Field name="additional_context" type="string or null" /> | Request-time hint to guide retrieval (e.g., "user is on the billing page"). This is different from the response `additional_context` map. (default=`null`) |
 | <Field name="metadata_filters" type="object or null" /> | Deterministic narrowing before ranking. See [Filters](#decision-matrix). (default=`null`) |
 
@@ -433,8 +475,11 @@ result = client.query(
 
     | Mode | Behavior | When to use |
     |---|---|---|
-    | `"fast"` *(default)* | Single query pass | Real-time chat, autocomplete, simple lookups. |
+    | `"fast"` | Single query pass | Real-time chat, autocomplete, simple lookups. |
     | `"thinking"` | Multi-query expansion + reranking + forceful-relation context | Complex queries, customer-facing answers, anything where quality matters. |
+    | `"auto"` *(default if `mode` is omitted)* | Scores the query before retrieval and routes to `"fast"` or `"thinking"`; defaults to `"thinking"` when the signal is inconclusive. Also overrides `graph_context` to match whichever mode it picks. | Mixed or unpredictable query traffic where you don't want to hand-pick per request. |
+
+    `"auto"`'s resolved pipeline isn't reported back in the response, so budget latency as thinking-level in the worst case. Omitting `mode` behaves exactly like `mode: "auto"` - set it explicitly to `"fast"` or `"thinking"` if you want a deterministic pipeline instead.
   </Accordion>
 
   <Accordion title="Filters">
@@ -455,7 +500,7 @@ result = client.query(
 
     | Where | What it matches |
     |---|---|
-    | **Top-level keys** (`department`, `region`) | The source's schema-backed `metadata`. Keys must be declared in the database's `tenant_metadata_schema` with `enable_match: true`, otherwise they are silently ignored. |
+    | **Top-level keys** (`department`, `region`) | The source's schema-backed `metadata`. Keys must be declared in the database's `database_metadata_schema` with `enable_match: true`, otherwise they are silently ignored. |
     | **Nested under `additional_metadata`** | The source's free-form per-document fields. No schema declaration required. `document_metadata` is accepted as a legacy alias. |
 
     Multiple filters are ANDed. Range, contains, fuzzy, and OR operators are not supported in user-provided `metadata_filters`; run multiple queries or post-process client-side for those cases.
@@ -646,15 +691,18 @@ A zero-result query returns empty arrays/maps rather than an error, as shown in 
 
 <Info>
 **Default Behaviors**
+- **`mode` defaults to `"auto"`.** Omitting `mode` entirely behaves exactly like `mode: "auto"`  -  set it explicitly to `"fast"` or `"thinking"` if you want a deterministic pipeline.
 - **`graph_context` is on by default.** Set it to `false` if you only need ranked chunks and want to drop the graph slice from the response.
 - **`recency_bias` is off by default.** Defaults to `0.0`  -  no recency boost is applied unless you set it.
 </Info>
 
 <Warning>
 **Important Considerations & Common Mistakes**
-- **`query_forceful_relations` requires `mode: "thinking"`.** In `fast` mode the flag is silently ignored. The server does not error or warn  -  your `additional_context` will simply be empty.
-- **Use the right metadata namespace.** Top-level `metadata_filters` keys match `metadata`; free-form per-document fields must be nested under `additional_metadata` (`document_metadata` is only a legacy alias). Declare hot top-level filter fields in `tenant_metadata_schema` with `enable_match: true`.
-- **Common mistakes.** Check [Ingestion Status](/api-reference/v2/endpoint/source-status) for recently ingested documents before querying. If you omit `collection` and `collections`, HydraDB defaults to the resolved primary tenant ID (the default collection); use [List Collections](/api-reference/v2/endpoint/list-sub-tenants) to discover available IDs.
+- **`query_forceful_relations` requires `mode` to resolve to `"thinking"`.** In `fast` mode the flag is silently ignored. The server does not error or warn  -  your `additional_context` will simply be empty. Under `mode: "auto"` this depends on that request's routing decision, not on what you asked for.
+- **`mode: "auto"` overrides `graph_context`.** Whatever you send for `graph_context` is replaced to match the resolved mode  -  `true` if auto escalates to `thinking`, `false` if it resolves to `fast`. This also applies when `mode` is omitted, since it defaults to `"auto"`. Set `graph_context` explicitly only when calling `"fast"` or `"thinking"` directly.
+- **Want a deterministic pipeline instead of automatic routing?** Set `mode` explicitly to `"fast"` or `"thinking"`  -  an omitted `mode` field now defaults to `"auto"`, not `"fast"`.
+- **Use the right metadata namespace.** Top-level `metadata_filters` keys match `metadata`; free-form per-document fields must be nested under `additional_metadata` (`document_metadata` is only a legacy alias). Declare hot top-level filter fields in `database_metadata_schema` with `enable_match: true`.
+- **Common mistakes.** Check [Ingestion Status](/api-reference/v2/endpoint/source-status) for recently ingested documents before querying. If you omit `collection`, HydraDB defaults to the resolved primary tenant ID (the default collection); use [List Collections](/api-reference/v2/endpoint/list-sub-tenants) to discover available IDs.
 </Warning>
 
 ## Errors
