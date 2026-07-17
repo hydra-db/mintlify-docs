@@ -1,0 +1,268 @@
+---
+title: "Connector Setup Guides"
+description: "Step-by-step credential setup for every connector provider - Slack, GitHub, Linear, Notion, and Gmail - from provider console to first successful query."
+---
+
+The [Connectors](/essentials/v2/connectors) guide explains how connectors work. This page covers the part that happens *outside* HydraDB: what to create in each provider's console, which token to copy, what to put in `credentials` and `provider_account_scope`, and how to confirm the whole pipeline works  -  before you wire it into your application.
+
+Every provider follows the same six steps:
+
+```
+Get credentials → Validate → Create → Configure → Sync → Verify
+```
+
+Only step 1 differs per provider.
+
+---
+
+## Before you start
+
+- An API key from [app.hydradb.com](https://app.hydradb.com)
+- A provisioned database  -  see the [Quickstart](/get-started/v2/quickstart) if you don't have one yet
+
+```bash
+export HYDRA_DB_API_KEY="your_api_key"
+# All requests: -H "Authorization: Bearer $HYDRA_DB_API_KEY" -H "API-Version: 2"
+```
+
+<Note>
+  The authoritative credential shape for every provider is served by the API itself: `GET /connectors/providers?id=<provider>` returns a `credential_schema` (a JSON Schema for the credential inputs). If anything on this page disagrees with that response, trust the API  -  it comes from the same normalizers that run the sync. See [Inspect a single provider](/essentials/v2/connectors#inspect-a-single-provider).
+</Note>
+
+---
+
+## Step 1  -  Get provider credentials
+
+<Tabs>
+<Tab title="Slack">
+
+**What you need:** a Slack app token that can read the channels you want to sync, and your workspace ID.
+
+1. Go to [api.slack.com/apps](https://api.slack.com/apps) → **Create New App** → **From scratch**. Name it (e.g. `HydraDB Sync`) and pick the workspace to sync.
+2. In **OAuth & Permissions → Scopes**, add read scopes for the content you plan to sync:
+
+   | Scope | Grants |
+   | --- | --- |
+   | `channels:read` | List public channels (required for discovery) |
+   | `channels:history` | Read public channel messages |
+   | `groups:read` / `groups:history` | List and read private channels |
+   | `users:read` | Resolve author names on messages |
+
+3. Click **Install to Workspace** and authorize. Copy the token from **OAuth & Permissions**.
+4. Find your workspace ID for `provider_account_scope`: open Slack in a browser  -  the URL is `app.slack.com/client/TXXXXXXXX/...`, and the `T...` segment is the workspace ID.
+
+<Warning>
+  **Bot token vs user token.** A **bot token** (`xoxb-...`) can only see channels the app has been invited to  -  run `/invite @HydraDB Sync` in each channel you want to sync. A **user token** (`xoxp-...`) sees everything the installing user can access, with no invites needed. Bot tokens give you explicit control over what syncs; user tokens are faster to set up. Either works  -  but if discovery returns fewer channels than you expect, this is almost always why.
+</Warning>
+
+</Tab>
+<Tab title="GitHub">
+
+**What you need:** a personal access token that can read the repositories you want to sync, and your org or user login.
+
+1. Go to **GitHub → Settings → Developer settings → Personal access tokens**.
+2. Create a **fine-grained token**: select the org or user as resource owner, choose the repositories to sync, and grant **read-only** access to *Contents*, *Issues*, *Pull requests*, and *Metadata*. (A classic token also works: `public_repo` for public repos, `repo` for private ones, plus `read:org` to list organization repositories.)
+3. Copy the token.
+4. Use the **organization or user login** as `provider_account_scope`  -  the segment in your GitHub URL, e.g. `my-github-org` for `github.com/my-github-org`.
+
+</Tab>
+<Tab title="Linear">
+
+**What you need:** a personal API key.
+
+1. In Linear, open **Settings → Security & access → Personal API keys** (labeled just **API** in older workspace settings).
+2. Create a new key and copy it  -  it starts with `lin_api_`.
+3. The key inherits your team access: the connector can discover and sync any team or project you can see.
+4. Use the **workspace name** as `provider_account_scope`  -  shown under **Settings → Workspace**.
+
+</Tab>
+<Tab title="Notion">
+
+**What you need:** an internal integration secret, with pages explicitly shared to the integration.
+
+1. Go to [notion.so/my-integrations](https://www.notion.so/my-integrations) → **New integration**. Pick the workspace to sync and keep the type **Internal**.
+2. Under **Capabilities**, *Read content* is sufficient  -  the connector never writes.
+3. Copy the **Internal Integration Secret**.
+4. **Share content with the integration**  -  this step is mandatory and the most commonly missed: open each top-level page or database you want to sync → **•••** menu → **Connections** → add your integration. Child pages inherit access from their parent, so sharing a few top-level pages usually covers the whole tree.
+5. Use the **workspace name** as `provider_account_scope`  -  shown at the top of **Settings → Workspace**.
+
+<Warning>
+  A Notion integration can only see pages that have been explicitly connected to it. If discovery returns an empty list, the secret is fine  -  you just haven't shared any pages yet (step 4).
+</Warning>
+
+</Tab>
+<Tab title="Gmail">
+
+**What you need:** Google OAuth credentials authorized for read-only Gmail access.
+
+1. In the [Google Cloud Console](https://console.cloud.google.com/), create (or pick) a project and **enable the Gmail API**.
+2. Configure the **OAuth consent screen**. While the app is in *Testing* status, add the mailbox you'll sync as a **test user**.
+3. Under **Credentials**, create an **OAuth client ID** and complete an OAuth authorization for the mailbox with the read-only scope:
+
+   ```
+   https://www.googleapis.com/auth/gmail.readonly
+   ```
+
+   Make sure the flow requests offline access so you receive a **refresh token**  -  the connector needs it to keep syncing after the short-lived access token expires.
+4. Fetch the exact credential keys to send from `GET /connectors/providers?id=gmail`  -  OAuth-based providers take a credential bundle rather than a single token, and the `credential_schema` in that response is the contract.
+5. Leave `provider_account_scope` **empty**  -  Gmail does not use it. To scope queries to one connected mailbox later, filter on `account_email` (filter key `additional_metadata.account_email`) instead.
+
+</Tab>
+</Tabs>
+
+---
+
+## Step 2  -  Validate credentials before creating anything
+
+[`POST /connector-discovery`](/api-reference/v2/endpoint/preview-connector-resources) lists the provider's resources directly from the credentials you supply  -  no connector required, nothing stored:
+
+```bash
+curl -X POST 'https://api.hydradb.com/connector-discovery' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "provider": "slack",
+    "credentials": { "api_token": "xoxb-..." }
+  }'
+```
+
+Read the result before moving on:
+
+- **`200` with the resources you expect**  -  credentials are good; continue.
+- **`200` but resources are missing**  -  the token authenticates but can't see everything: Slack bot not invited to channels, Notion pages not shared, GitHub token scoped to the wrong repos. Fix access in the provider console and re-run  -  no HydraDB state to clean up.
+- **`400` / `502`**  -  wrong credential shape, or the provider rejected the token. Check the shape against `GET /connectors/providers?id=<provider>` and re-issue the token if needed.
+
+---
+
+## Step 3  -  Create the connector
+
+Pass the validated credentials, the target database, and the `provider_account_scope` from step 1:
+
+```bash
+curl -X POST 'https://api.hydradb.com/connectors' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "provider": "slack",
+    "name": "acme-engineering",
+    "database": "acme_corp",
+    "collection": "engineering",
+    "provider_account_scope": "T12345ACME",
+    "credentials": { "api_token": "xoxb-..." }
+  }'
+```
+
+Save the `connector_id` from the response  -  every remaining step uses it. If you connect **more than one account of the same provider** (two Slack workspaces, a personal and a work Gmail), give each connector a distinct `provider_account_scope`  -  it is part of the deduplication key, and omitting it makes objects from the two accounts overwrite each other. See [Multiple connectors per provider](/essentials/v2/connectors#multiple-connectors-per-provider).
+
+---
+
+## Step 4  -  Configure which resources sync
+
+Activate the resources you previewed in step 2, and set how far back the first sync reaches:
+
+```bash
+curl -X POST 'https://api.hydradb.com/connectors/{connector_id}/configure' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "lookback_days": 30,
+    "resources": [
+      {
+        "resource_id": "C_ENG",
+        "resource_type": "channel",
+        "name": "engineering",
+        "metadata": { "department": "engineering" }
+      }
+    ]
+  }'
+```
+
+- `lookback_days` only affects the **first** sync; after that, each sync picks up from the last cursor.
+- Per-resource `sub_tenant_id`, `metadata`, and `additional_metadata` control where each resource's objects land and how they can be filtered later  -  see [Metadata on synced objects](/essentials/v2/connectors#metadata-on-synced-objects).
+
+---
+
+## Step 5  -  Run the first sync
+
+Syncs run hourly by default. Trigger the first one immediately:
+
+```bash
+curl -X POST 'https://api.hydradb.com/connectors/{connector_id}/sync' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2"
+```
+
+A `202` means *queued*, not *done*. Poll [Connector Resources](/api-reference/v2/endpoint/connector-resources) until each resource's `provider_cursor` advances:
+
+```bash
+curl 'https://api.hydradb.com/connectors/{connector_id}/resources' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2"
+```
+
+---
+
+## Step 6  -  Verify the data landed, then query it
+
+List the synced documents with [List Context](/api-reference/v2/endpoint/list-documents), scoped to this connector:
+
+```bash
+curl -s -X POST 'https://api.hydradb.com/context/list' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "database": "acme_corp",
+    "type": "knowledge",
+    "filters": {
+      "additional_metadata": { "connector_id": "{connector_id}" }
+    },
+    "include_fields": ["title", "type", "timestamp", "additional_metadata"]
+  }'
+```
+
+Then run a real query with the app-aware retrieval lane enabled:
+
+```bash
+curl -X POST 'https://api.hydradb.com/query' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "database": "acme_corp",
+    "query": "what did we decide about the deployment checklist?",
+    "query_apps": true,
+    "mode": "thinking",
+    "metadata_filters": { "provider": "slack" }
+  }'
+```
+
+If relevant chunks come back, the pipeline is live  -  from here, syncs continue on schedule with no further action.
+
+---
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| `502` from credential preview or discovery | Provider rejected the token  -  expired, revoked, or missing scopes | Re-check step 1 for your provider; re-issue the token and validate again with [`POST /connector-discovery`](/api-reference/v2/endpoint/preview-connector-resources) |
+| Discovery returns an empty list (Notion) | No pages shared with the integration | Open each top-level page → **•••** → **Connections** → add the integration; child pages inherit |
+| Discovery misses channels (Slack) | Bot token not invited to those channels | `/invite` the app in each channel, or install with a user token |
+| Discovery misses repos (GitHub) | Fine-grained token scoped to the wrong repos, or missing `read:org` on a classic token | Edit the token's repository access in GitHub settings |
+| Sync queued but nothing lands | Sync still running, or indexing in progress | Poll `provider_cursor` on [Connector Resources](/api-reference/v2/endpoint/connector-resources); synced objects are queryable only after indexing completes |
+| Synced messages from two accounts overwrite each other | Same (or missing) `provider_account_scope` on two connectors of one provider | Set a distinct `provider_account_scope` per connector |
+| Query returns nothing from app data | App-aware lane not enabled, or filter key in the wrong namespace | Set `query_apps: true`; `connector_id` and `resource_id` filters belong under `additional_metadata`, while `provider` is top-level  -  see [Metadata on synced objects](/essentials/v2/connectors#metadata-on-synced-objects) |
+| Old history missing | First sync limited by `lookback_days` (default 30) | Re-configure with a larger `lookback_days` before the first sync of a resource |
+
+---
+
+## Related
+
+- [Connectors](/essentials/v2/connectors)  -  how the discover → configure → sync cycle works
+- [Preview Provider Resources](/api-reference/v2/endpoint/preview-connector-resources)  -  validate credentials before creating a connector
+- [Create Connector](/api-reference/v2/endpoint/create-connector)  -  full request schema
+- [App Sources](/essentials/v2/app-sources)  -  the ingestion model connector objects use
+- [Query](/essentials/v2/query)  -  tuning `query_apps` and metadata filters
