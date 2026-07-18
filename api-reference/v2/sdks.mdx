@@ -3,18 +3,18 @@ title: "SDKs – Python and Node"
 description: "Official Python and TypeScript/Node.js SDKs for the HydraDB API."
 ---
 
-The SDKs wrap every endpoint in the [API Reference](/api-reference/v2) with typed methods and IDE autocomplete. They automatically set the `API-Version: 2` header on every request  -  you do not need to send it manually.
+The SDKs expose typed methods and IDE autocomplete for the published v2 surface. They automatically set the `API-Version: 2` header on SDK requests, so you do not need to send it manually. Check the installed package's autocomplete against the [API Reference](/api-reference/v2); for a newly added operation that is not yet generated, use raw HTTP (or the TypeScript client's `fetch()` passthrough) until the next SDK release.
 
 ## Installation
 
-The SDKs ship as major-version bumps of the same packages used for v1. Pin to `>=2.0.0` to use the latest method surface.
+The examples on this page are verified against SDK 2.1.1. Pin the version you test and upgrade deliberately.
 
 <CodeGroup>
 ```bash Python SDK
-pip install "hydradb-sdk>=2,<3"
+pip install "hydradb-sdk==2.1.1"
 ```
 ```bash TypeScript / Node.js
-npm install @hydradb/sdk@^2
+npm install @hydradb/sdk@2.1.1
 ```
 </CodeGroup>
 
@@ -70,17 +70,21 @@ The Python SDK also uses snake_case throughout (e.g., `client.context.list(datab
 `database` and `collection` are the current field names (formerly `tenant_id` and `sub_tenant_id`). The old names remain accepted as deprecated aliases for full backward compatibility.
 </Info>
 
-Your IDE's autocomplete and type checking work directly off the API contract  -  if a field is optional in the API, it's optional in the SDK.
+Your IDE's autocomplete and type checking reflect the OpenAPI snapshot used for that SDK release. Runtime validation is authoritative when an endpoint page documents a stricter rule; for example, source metadata edits require `collection` even though SDK 2.1.1 currently marks it optional.
 
 ## SDK method structure
 
-SDK methods are grouped under three top-level namespaces  -  one per `/api-reference/v2` group:
+Generated methods are grouped under resource clients, with query and provider discovery also available on the root client:
 
 | URL prefix | SDK group | Purpose |
 |---|---|---|
 | `/context/*` and `/context` | `client.context` | Ingest, status, fetch, list, delete, graph relations |
 | `/query` | `client.query` | Unified retrieval over knowledge, memories, or both |
 | `/databases/*` and `/databases` | `client.databases` | Create, list, delete, status, collections, stats. Legacy `/tenants/*` paths remain as deprecated aliases. |
+| `/connectors/*` and `/connectors` | `client.connectors` | Create, discover, configure, sync, and manage connector resources. |
+| `/webhooks/indexing*` | `client.webhooks` | Register, inspect, test, and retry indexing webhook deliveries. |
+| `/connector-catalog` | `client.catalog` | List connector providers and availability. |
+| `/connectors/providers` | `client.listProviders` | Inspect provider capabilities and credential requirements. |
 
 
 ## Method reference
@@ -97,6 +101,7 @@ SDK methods are grouped under three top-level namespaces  -  one per `/api-refer
 | `client.context.list()` | `POST /context/list` |
 | `client.context.delete()` | `DELETE /context` |
 | `client.context.relations()` | `GET /context/relations` |
+| Python `client.context.update_source_metadata()` / TypeScript `client.context.updateSourceMetadata()` | `PATCH /context/{id}/metadata` |
 
 ### Query
 
@@ -116,6 +121,11 @@ A single method covers all retrieval. Pick `type` (`"knowledge"`, `"memory"`, `"
 | `client.databases.status()` | `GET /databases/status` |
 | `client.databases.collections()` | `GET /databases/collections` |
 | `client.databases.stats()` | `GET /databases/stats` |
+| Python `client.databases.update_metadata_schema()` / TypeScript `client.databases.updateMetadataSchema()` | `PATCH /databases/{database}/metadata-schema` |
+
+### Connectors, provider discovery, and webhooks
+
+Use `client.connectors.*` for connector lifecycle and resource operations, and `client.webhooks.*` for indexing webhooks and delivery inspection. Provider discovery is exposed as root methods: Python uses `client.catalog()` / `client.list_providers()`, while TypeScript uses `client.catalog()` / `client.listProviders()`. Use IDE autocomplete for the generated method names in the installed release.
 
 The method-reference tables above use the Python (snake_case) method names. TypeScript camelCases multi-word methods and request fields (for example, Python `list_resources(page_size=50)` becomes TypeScript `listResources({ pageSize: 50 })`).
 
@@ -216,24 +226,17 @@ Upload documents, app sources, or both in one call:
 ```python Python SDK
 import json
 
-with open("contract.pdf", "rb") as f1, open("policy.pdf", "rb") as f2:
+# SDK 2.1.1 types one File per call; repeat the call for additional files.
+with open("contract.pdf", "rb") as f1:
     result = client.context.ingest(
         type="knowledge",
         database="my_first_database",
-        documents=[
-            ("contract.pdf", f1, "application/pdf"),
-            ("policy.pdf", f2, "application/pdf"),
-        ],
+        documents=("contract.pdf", f1, "application/pdf"),
         document_metadata=json.dumps([
             {
                 "id": "contract_q4",
                 "metadata": {"department": "legal"},
                 "additional_metadata": {"author": "Alice"},
-            },
-            {
-                "id": "policy_2025",
-                "metadata": {"department": "legal"},
-                "additional_metadata": {"author": "Bob"},
             },
         ]),
     )
@@ -461,7 +464,7 @@ await client.context.delete({
 
 ## Response shapes
 
-Successful endpoint-handler responses use a consistent envelope:
+Many core endpoint handlers return this success envelope:
 
 ```json
 {
@@ -477,26 +480,42 @@ Successful endpoint-handler responses use a consistent envelope:
 }
 ```
 
-The SDKs return the full success envelope. Read the payload from `data` (for example, `response.data`); on HTTP failure they raise an exception whose body follows the documented `detail` error shape.
+Only SDK methods whose return type is an envelope expose the resource payload under `data`. Core database, context, query, and webhook methods generally use that shape. Connector catalog, discovery, and resource methods, plus `databases.updateMetadataSchema()`, can return direct objects instead. Follow the method's generated return type rather than adding `.data` mechanically.
+
+```typescript TypeScript SDK
+const queryResponse = await client.query({
+  database: "my_first_database",
+  query: "What are the pricing tiers?",
+  type: "knowledge",
+});
+console.log(queryResponse.data?.chunks ?? []);
+
+const connector = await client.connectors.get({ id: "connector_123" });
+console.log(connector.provider);
+```
+
+On HTTP failure, SDK methods raise an exception whose body follows the endpoint's documented `detail` error shape.
 
 ## Type safety
 
 <Check>
-Both SDKs are fully typed:
+Both SDKs provide generated types for the methods they expose:
 
 - **Autocomplete** for all method names and parameters
 - **Type checking** for request and response objects
 - **Inline documentation** for each parameter, sourced from the OpenAPI spec
-- **Compile-time validation** for required vs optional fields
+- **Compile-time validation** for required vs optional fields represented in the generated schema
 - **Enum-typed values** for `type`, `query_by`, `operator` and `mode`
 </Check>
 
-The SDKs provide exact type parity with the API specification:
+Generated types reflect the published API specification for that SDK release:
 
-- **Request parameters**  -  every field documented in the API reference is reflected in method signatures
-- **Response objects**  -  return types match the JSON schema for each endpoint
-- **Error types**  -  exception structures mirror error response formats
-- **Nested objects**  -  complex parameters and responses keep their full structure
+- **Request parameters**  -  method signatures reflect the OpenAPI snapshot used to generate that release
+- **Response objects**  -  return types reflect each published direct or envelope 2xx schema
+- **Error types**  -  exceptions expose HTTP status and the endpoint's generated error body
+- **Nested objects**  -  structured parameters and responses keep their generated shape
+
+JSON-stringified multipart fields such as `memories`, `app_knowledge`, and `document_metadata` are typed as strings at the SDK boundary, so TypeScript cannot validate their nested JSON. Follow the endpoint's documented inner schema and keep runtime validation enabled.
 
 ## Error handling
 

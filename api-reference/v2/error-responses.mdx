@@ -5,7 +5,7 @@ description: "Response envelope, HTTP status codes, error codes, and retry patte
 
 ### Success envelope and HTTP error shape
 
-Successful v2 endpoint-handler responses use the `{ success, data, error, meta }` envelope. This includes webhook management endpoints (`/webhooks/indexing*`); their resource-specific response object is under `data`.
+Many core v2 handlers use the `{ success, data, error, meta }` envelope. This includes webhook management endpoints (`/webhooks/indexing*`); their resource-specific response object is under `data`. Do not assume the shape for every endpoint: connector catalog, discovery, and resource operations, plus database metadata-schema updates, can return direct objects. Follow the endpoint's documented 2xx schema.
 
 ```json
 {
@@ -54,6 +54,7 @@ Branch on the HTTP status before parsing the body. When `detail` is structured, 
 | `422` | Well-formed request that failed validation | No |
 | `429` | Rate limit exceeded | Yes, with backoff |
 | `500` | Internal server error | Yes, with backoff |
+| `502` | Upstream provider or dependency returned a bad gateway response | Yes, with backoff for idempotent operations |
 | `503` | Temporary service unavailability | Yes, with backoff |
 
 ## Common error codes
@@ -81,7 +82,7 @@ Endpoint pages list the most common codes for that operation. New codes may be a
 
 ## Retry pattern
 
-Retry only transient failures: `429`, `500`, and `503`. Use exponential backoff with jitter and keep retries bounded.
+Retry only transient failures: `429` and server-side `5xx` responses such as `500`, `502`, and `503`. Retry writes only when they are idempotent (for example, stable IDs with explicit upsert behavior). Use exponential backoff with jitter and keep retries bounded.
 
 <CodeGroup>
 ```typescript TypeScript SDK
@@ -98,7 +99,8 @@ async function withRetry<T>(
       if (!(error instanceof HydraDBError)) throw error;
 
       const retryable =
-        error.statusCode !== undefined && [429, 500, 503].includes(error.statusCode);
+        error.statusCode !== undefined &&
+        (error.statusCode === 429 || error.statusCode >= 500);
       if (!retryable || attempt === maxRetries) throw error;
 
       const baseDelayMs = 2 ** attempt * 1000;
@@ -129,7 +131,7 @@ def with_retry(operation, max_retries=3):
         try:
             return operation()
         except ApiError as exc:
-            retryable = exc.status_code in (429, 500, 503)
+            retryable = exc.status_code == 429 or exc.status_code >= 500
             if not retryable or attempt == max_retries:
                 raise
 
@@ -148,7 +150,7 @@ async function hydraRequest(url: string, options: RequestInit, maxRetries = 3) {
     const response = await fetch(url, options);
     if (response.ok) return response.json();
 
-    const retryable = [429, 500, 503].includes(response.status);
+    const retryable = response.status === 429 || response.status >= 500;
     if (!retryable || attempt === maxRetries) {
       throw await response.json();
     }
@@ -206,21 +208,22 @@ def get_error_code(exc: ApiError):
         else getattr(detail, "error_code", None)
     )
 
-try:
-    client.context.ingest(
-        type="knowledge",
-        database="my_first_database",
-        documents=[("policy.pdf", open("policy.pdf", "rb"), "application/pdf")],
-    )
-except ApiError as exc:
-    if get_error_code(exc) == "DATABASE_NOT_FOUND":
-        # Create or select a valid database before ingesting.
-        pass
-    elif exc.status_code == 429:
-        # Retry with backoff.
-        pass
-    else:
-        raise
+with open("policy.pdf", "rb") as policy:
+    try:
+        client.context.ingest(
+            type="knowledge",
+            database="my_first_database",
+            documents=("policy.pdf", policy, "application/pdf"),
+        )
+    except ApiError as exc:
+        if get_error_code(exc) == "DATABASE_NOT_FOUND":
+            # Create or select a valid database before ingesting.
+            pass
+        elif exc.status_code == 429:
+            # Retry with backoff.
+            pass
+        else:
+            raise
 ```
 </CodeGroup>
 

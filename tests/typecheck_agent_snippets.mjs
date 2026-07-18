@@ -10,8 +10,13 @@ const documents = [
   ".mintlify/skills/hydradb-ingest-context/SKILL.md",
   ".mintlify/skills/hydradb-query-context/SKILL.md",
   "get-started/v2/quickstart.mdx",
+  "api-reference/v2/endpoint/ingest-context.mdx",
+  "api-reference/v2/endpoint/tenant-status.mdx",
+  "api-reference/v2/endpoint/update-source-metadata.mdx",
   "api-reference/v2/error-responses.mdx",
+  "api-reference/v2/index.mdx",
   "api-reference/v2/sdks.mdx",
+  "essentials/v2/metadata.mdx",
   "AGENTS.mdx",
 ];
 
@@ -24,6 +29,7 @@ const options = {
   target: ts.ScriptTarget.ES2022,
   types: ["node"],
 };
+const expectedSnippetCount = 41;
 
 let failures = 0;
 let snippetNumber = 0;
@@ -82,6 +88,13 @@ for (const document of documents) {
 
 if (snippetNumber === 0) {
   console.error("No TypeScript agent snippets found.");
+  process.exit(1);
+}
+if (snippetNumber !== expectedSnippetCount) {
+  console.error(
+    `Expected ${expectedSnippetCount} changed-page TypeScript snippets, found ${snippetNumber}; ` +
+    "review the coverage list and update the audited count intentionally."
+  );
   process.exit(1);
 }
 

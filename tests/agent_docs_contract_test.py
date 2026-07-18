@@ -7,8 +7,10 @@ import ast
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import textwrap
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -35,8 +37,13 @@ KNOWN_CONTRADICTIONS = (
     "TooManyRequestsError",
     "body?.error?.code",
     "App-source object kinds in OpenAPI include:",
-    "a richer app shape with `kind`, `provider`, `external_id`, `fields`, `attachments`, `comments`, and `relations`",
     "`metadata` and `additional_metadata` are both plain objects",
+    "SDKs return the full success envelope",
+    "Errors use the same envelope with `success: false`",
+    "SDK methods are grouped under three top-level namespaces",
+    "The TypeScript SDK accepts the same snake_case keys",
+    "They wrap every endpoint in this reference",
+    "Both SDKs return a `{ success, data, error, meta }` envelope",
 )
 
 
@@ -71,6 +78,8 @@ def docs_route_exists(route: str) -> bool:
         return True
 
     relative = route.lstrip("/")
+    if relative.endswith(".json"):
+        return (ROOT / relative).is_file()
     if relative.endswith(".md"):
         relative = relative[:-3]
 
@@ -125,16 +134,43 @@ def check_skills() -> list[str]:
 
 def check_endpoint_mentions(texts: list[str]) -> None:
     spec = json.loads(read(OPENAPI_PATH))
-    spec_paths = set(spec.get("paths", {}))
-    route_pattern = re.compile(r"\b(?:GET|POST|PUT|PATCH|DELETE)\s+(`?)(/[a-z0-9_/{}/-]+)\1", re.IGNORECASE)
+    spec_paths = spec.get("paths", {})
+    route_pattern = re.compile(
+        r"\b(GET|POST|PUT|PATCH|DELETE)\s+(`?)(/[a-z0-9_/{}/-]+)\2",
+        re.IGNORECASE,
+    )
+    table_route_pattern = re.compile(
+        r"\|\s*\[\s*`?(/[a-z0-9_/{}/-]+)`?\s*\]\([^)]+\)\s*\|\s*`(GET|POST|PUT|PATCH|DELETE)`",
+        re.IGNORECASE,
+    )
 
-    for path, text in zip(EXPECTED_SKILLS, texts):
-        for match in route_pattern.finditer(text):
-            route = match.group(2).rstrip("/") or "/"
+    documents = list(zip(EXPECTED_SKILLS, texts))
+    for extra in (
+        ROOT / "get-started/v2/agent-quickstart.mdx",
+        ROOT / "get-started/v2/quickstart.mdx",
+        ROOT / "api-reference/v2/index.mdx",
+    ):
+        documents.append((extra, read(extra)))
+
+    for path, text in documents:
+        mentions = [
+            (match.group(1).lower(), match.group(3).rstrip("/") or "/")
+            for match in route_pattern.finditer(text)
+        ]
+        mentions.extend(
+            (match.group(2).lower(), match.group(1).rstrip("/") or "/")
+            for match in table_route_pattern.finditer(text)
+        )
+        for method, route in mentions:
             require(
                 route in spec_paths,
                 f"{path.relative_to(ROOT)}: endpoint {route!r} is absent from the v2 OpenAPI spec",
             )
+            if route in spec_paths:
+                require(
+                    method in spec_paths[route],
+                    f"{path.relative_to(ROOT)}: {method.upper()} is not defined for v2 endpoint {route!r}",
+                )
 
 
 def check_links() -> None:
@@ -143,6 +179,13 @@ def check_links() -> None:
         ROOT / "get-started/v2/agent-quickstart.mdx",
         ROOT / "get-started/v2/quickstart.mdx",
         ROOT / "api-reference/v2/error-responses.mdx",
+        ROOT / "api-reference/v2/index.mdx",
+        ROOT / "api-reference/v2/sdks.mdx",
+        ROOT / "api-reference/v2/endpoint/tenant-status.mdx",
+        ROOT / "api-reference/v2/endpoint/ingest-context.mdx",
+        ROOT / "api-reference/v2/endpoint/update-source-metadata.mdx",
+        ROOT / "essentials/v2/metadata.mdx",
+        ROOT / "AGENTS.mdx",
     ]
     link_pattern = re.compile(r"\[[^\]]+\]\((https://docs\.hydradb\.com)?(/[^)#\s]+)(?:#[^)]+)?\)")
 
@@ -204,7 +247,12 @@ def check_agent_quickstart() -> None:
 
 
 def check_known_contradictions() -> None:
-    targets = [ROOT / "AGENTS.mdx", ROOT / "api-reference/v2/sdks.mdx", *EXPECTED_SKILLS]
+    targets = [
+        ROOT / "AGENTS.mdx",
+        ROOT / "api-reference/v2/index.mdx",
+        ROOT / "api-reference/v2/sdks.mdx",
+        *EXPECTED_SKILLS,
+    ]
     for path in targets:
         text = read(path)
         for contradiction in KNOWN_CONTRADICTIONS:
@@ -219,8 +267,12 @@ def check_known_contradictions() -> None:
         "SDK page must describe TypeScript camelCase fields",
     )
     require(
-        "SDKs return the full success envelope" in sdk_text,
-        "SDK page must preserve the .data response envelope contract",
+        "Only SDK methods whose return type is an envelope" in sdk_text,
+        "SDK page must qualify which methods expose payloads under .data",
+    )
+    require(
+        "can return direct objects instead" in sdk_text,
+        "SDK page must document direct-return operations",
     )
     require(
         '"metadata": json.dumps({"team": "engineering"})' in sdk_text,
@@ -236,12 +288,37 @@ def check_known_contradictions() -> None:
         "`app_kind`: free-form string; the OpenAPI does not define an enum." in agents_text,
         "AGENTS.mdx must not invent a closed app_kind enum",
     )
+    agents_app_marker = "### Knowledge from app sources"
+    require(agents_app_marker in agents_text, "AGENTS.mdx must preserve its app-source section")
+    agents_app_section = agents_text.split(agents_app_marker, 1)[1].split("### Memories", 1)[0] if agents_app_marker in agents_text else ""
+    require(
+        all(field in agents_app_section for field in ("kind", "provider", "external_id", "fields"))
+        and "content.text" not in agents_app_section
+        and not re.search(r'(?m)^\s+(?:"content"|content):\s*\{', agents_app_section),
+        "AGENTS.mdx must use the canonical app-native ingestion shape",
+    )
+    require(
+        "`fast`, `thinking`, `auto`" in agents_text,
+        "AGENTS.mdx must preserve every documented query mode",
+    )
 
     package = json.loads(read(ROOT / "package.json"))
     sdk_version = package.get("dependencies", {}).get("@hydradb/sdk", "")
     require(
-        sdk_version.startswith("^2."),
-        "package.json must pin @hydradb/sdk 2.x so agent snippets use the documented type surface",
+        sdk_version == "^2.1.1",
+        "package.json must use the SDK 2.1.1 range validated by agent snippets",
+    )
+    npm_lock = json.loads(read(ROOT / "package-lock.json"))
+    npm_root_version = npm_lock.get("packages", {}).get("", {}).get("dependencies", {}).get("@hydradb/sdk")
+    npm_resolved_version = npm_lock.get("packages", {}).get("node_modules/@hydradb/sdk", {}).get("version")
+    require(
+        npm_root_version == "^2.1.1" and npm_resolved_version == "2.1.1",
+        "package-lock.json must resolve the same @hydradb/sdk 2.1.1 contract as package.json",
+    )
+    pnpm_lock = read(ROOT / "pnpm-lock.yaml")
+    require(
+        "specifier: ^2.1.1" in pnpm_lock and "'@hydradb/sdk@2.1.1':" in pnpm_lock,
+        "pnpm-lock.yaml must resolve @hydradb/sdk 2.1.1",
     )
 
     metadata_page = read(ROOT / "api-reference/v2/endpoint/update-source-metadata.mdx")
@@ -253,6 +330,83 @@ def check_known_contradictions() -> None:
         "/context/sources/" not in metadata_page,
         "source metadata page contains the stale non-OpenAPI route",
     )
+    require(
+        '<Field name="collection" type="string" required />' in metadata_page,
+        "source metadata page must require explicit collection scope",
+    )
+    require(
+        "accepted deprecated alias for `additional_metadata`" in metadata_page,
+        "source metadata page must preserve the document_metadata compatibility alias",
+    )
+
+    ingest_page = read(ROOT / "api-reference/v2/endpoint/ingest-context.mdx")
+    ingest_app_marker = '<Accordion title="App sources'
+    require(ingest_app_marker in ingest_page, "ingest endpoint must preserve its app-source field section")
+    ingest_app_section = ingest_page.split(ingest_app_marker, 1)[1].split("</Accordion>", 1)[0] if ingest_app_marker in ingest_page else ""
+    require(
+        all(f'<Field name="{field}"' in ingest_app_section for field in ("kind", "provider", "external_id", "fields"))
+        and '<Field name="content"' not in ingest_app_section
+        and not re.search(r'(?m)^\s+(?:"content"|content):\s*\{', ingest_page),
+        "ingest endpoint must match the canonical app-native item schema",
+    )
+    memory_marker = '<Accordion title="3. User memories'
+    require(memory_marker in ingest_page, "ingest endpoint must preserve its memory field section")
+    memory_section = ingest_page.split(memory_marker, 1)[1].split("</Accordion>", 1)[0] if memory_marker in ingest_page else ""
+    require(
+        '<Field name="metadata" type="string (JSON object)" />' in memory_section,
+        "memory metadata must remain a JSON-encoded string inside each memories item",
+    )
+    require(
+        '<Field name="additional_metadata" type="object" />' in memory_section
+        and '<Field name="additional_metadata" type="string' not in memory_section,
+        "memory additional_metadata must remain an object inside each memories item",
+    )
+    require(
+        "SDK 2.1.1 accepts one Uploadable per call" in ingest_page,
+        "ingest endpoint must document the TypeScript SDK's single-Uploadable contract",
+    )
+    require(
+        'upsert="true"' in ingest_page and "upsert=True" not in ingest_page,
+        "Python ingest examples must use the SDK 2.1.1 string type for upsert",
+    )
+    for path in (
+        ROOT / "AGENTS.mdx",
+        ROOT / "api-reference/v2/endpoint/ingest-context.mdx",
+        ROOT / "api-reference/v2/error-responses.mdx",
+        ROOT / "api-reference/v2/sdks.mdx",
+    ):
+        require(
+            not re.search(r"documents\s*=\s*\[", read(path)),
+            f"{path.relative_to(ROOT)}: Python SDK 2.1.1 accepts one typed File per ingest call",
+        )
+
+    api_index = read(ROOT / "api-reference/v2/index.mdx")
+    require(
+        "/context/sources/" not in api_index
+        and "`/context/{id}/metadata`" in api_index
+        and "context.updateSourceMetadata" in api_index,
+        "API index must preserve the v2 source-metadata route and SDK method",
+    )
+
+    error_page = read(ROOT / "api-reference/v2/error-responses.mdx")
+    require(
+        "`502`" in error_page and "statusCode >= 500" in error_page and "status_code >= 500" in error_page,
+        "retry guidance must cover transient 502 and other 5xx responses",
+    )
+    require(
+        "`502`" in agents_text and "exc.status_code < 500" in agents_text,
+        "AGENTS.mdx retry guidance must cover transient 502 and other 5xx responses",
+    )
+
+    quickstart = read(ROOT / "get-started/v2/quickstart.mdx")
+    require(
+        'status.indexing_status in ("errored", "failed")' in quickstart,
+        "Python quickstart must stop on both documented indexing failure states",
+    )
+    require(
+        '[ "$INDEXING_STATUS" = "errored" ] || [ "$INDEXING_STATUS" = "failed" ]' in quickstart,
+        "cURL quickstart must stop on both documented indexing failure states",
+    )
 
 
 def fenced_blocks(text: str, language: str) -> list[str]:
@@ -260,27 +414,65 @@ def fenced_blocks(text: str, language: str) -> list[str]:
     return re.findall(pattern, text, re.DOTALL | re.IGNORECASE)
 
 
+def resolve_bash() -> str | None:
+    candidates = [os.environ.get("BASH"), shutil.which("bash")]
+    if os.name == "nt":
+        candidates.extend(
+            [
+                r"C:\Program Files\Git\bin\bash.exe",
+                r"C:\Program Files\Git\usr\bin\bash.exe",
+            ]
+        )
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        try:
+            probe = subprocess.run(
+                [candidate, "--version"],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+        except OSError:
+            continue
+        if probe.returncode == 0:
+            return candidate
+    return None
+
+
 def check_code_blocks() -> None:
-    paths = [*EXPECTED_SKILLS, ROOT / "get-started/v2/agent-quickstart.mdx"]
+    paths = [
+        *EXPECTED_SKILLS,
+        ROOT / "get-started/v2/agent-quickstart.mdx",
+        ROOT / "get-started/v2/quickstart.mdx",
+        ROOT / "api-reference/v2/endpoint/ingest-context.mdx",
+    ]
+    bash = resolve_bash()
 
     for path in paths:
         text = read(path)
         for index, block in enumerate(fenced_blocks(text, "python"), 1):
             try:
-                ast.parse(block)
+                ast.parse(textwrap.dedent(block))
             except SyntaxError as exc:
                 errors.append(f"{path.relative_to(ROOT)}: Python block {index} is invalid: {exc}")
 
         for index, block in enumerate(fenced_blocks(text, "json"), 1):
             try:
-                json.loads(block)
+                json.loads(textwrap.dedent(block))
             except json.JSONDecodeError as exc:
                 errors.append(f"{path.relative_to(ROOT)}: JSON block {index} is invalid: {exc}")
 
         for index, block in enumerate(fenced_blocks(text, "bash"), 1):
+            if bash is None:
+                require(False, f"{path.relative_to(ROOT)}: no working Bash parser is available")
+                break
             result = subprocess.run(
-                [os.environ.get("BASH", "bash"), "-n"],
-                input=block,
+                [bash, "-n"],
+                input=textwrap.dedent(block),
                 text=True,
                 capture_output=True,
                 check=False,

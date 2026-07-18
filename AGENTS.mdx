@@ -31,7 +31,7 @@ This document is a self-contained reference designed for AI coding agents. It co
 
 ### Response shapes
 
-Successful v2 endpoint-handler responses use this envelope:
+Many core v2 handlers use this success envelope:
 
 ```json
 {
@@ -45,8 +45,9 @@ Successful v2 endpoint-handler responses use this envelope:
 }
 ```
 
-- Parse successful handler-envelope payloads from `data`, including webhook management responses.
-- The SDKs return the full envelope object; read the payload from its `data` field (e.g. `response.data`). On failure they raise a typed exception rather than returning an envelope with `error` set.
+- For an operation whose OpenAPI 2xx schema or SDK return type is a handler envelope, parse the resource payload from `data`. Core database, context, query, and webhook-management methods use this shape.
+- Do not assume every v2 response has `data`. Connector catalog, discovery, and resource operations, plus database metadata-schema updates, can return direct objects. Follow the endpoint's 2xx schema or the SDK method's return type.
+- On failure, SDK methods raise a typed exception rather than returning a success envelope with `error` set.
 - Authentication or gateway middleware can reject a request before the handler and return a `detail` error shape. Branch on HTTP status before parsing a success envelope.
 - Log a request or correlation ID when the response provides one.
 - `meta` may also carry an optional `deprecation` list (with a `Deprecation: true` response header) when a request uses a legacy tenant route or a deprecated field (`tenant_id`/`sub_tenant_id`, or `sub_tenant_ids` on `/query`). Each entry has `deprecated`, `deprecated_field`, `preferred_field`, `message`, and `deprecated_since`. It is a non-breaking nudge. The status code is unchanged. Prefer the `/databases` routes and `database`/`collection`/`collections` fields to avoid it. Treat `meta` as an open object: ignore keys you do not recognize.
@@ -239,7 +240,7 @@ SDK naming:
 
 - Python methods and fields: snake_case, e.g. `client.databases.collections()`, `database`, `collection`, `page_size`, `query_by`.
 - TypeScript methods and fields: camelCase, e.g. `client.databases.collections()`, `database`, `collection`, `pageSize`, `queryBy`.
-- Both SDKs return a `{ success, data, error, meta }` envelope; the payload is under `.data` (e.g. `response.data.infra`, `response.data.statuses`, `response.data.results`).
+- For methods whose generated return type is a `{ success, data, error, meta }` envelope, read the payload under `.data` (e.g. `response.data.infra`, `response.data.statuses`, `response.data.results`). Connector catalog, discovery, and resource methods, plus database metadata-schema updates, can return direct objects instead.
 - Values that are passed as JSON strings (`memories`, `app_knowledge`, `document_metadata`) keep snake_case keys inside the stringified payload in both SDKs, since that is raw wire data.
 
 ---
@@ -472,7 +473,7 @@ with open("policy.pdf", "rb") as f:
     result = client.context.ingest(
         type="knowledge",
         database="acme_corp",
-        documents=[("policy.pdf", f, "application/pdf")],
+        documents=("policy.pdf", f, "application/pdf"),
         document_metadata=json.dumps([
             {
                 "id": "policy_v2",
@@ -510,22 +511,22 @@ await client.context.ingest({
       collection: "default",
       title: "Pricing discussion - Slack #product",
       type: "slack",
+      kind: "message",
+      provider: "slack",
+      external_id: "1715012345.000100",
       url: "https://slack.com/archives/C123/p1715012345000100",
       timestamp: "2025-01-15T12:30:00Z",
-      content: {
-        text: "We agreed on three tiers: Starter, Pro, and Enterprise."
+      fields: {
+        kind: "message",
+        body: "We agreed on three tiers: Starter, Pro, and Enterprise.",
+        author: "alice",
+        thread_id: "1715012345.000100"
       },
       metadata: {
         channel: "product",
         workspace: "acme"
       },
-      additional_metadata: {
-        author: "alice",
-        slack_ts: "1715012345.000100"
-      },
-      relations: {
-        ids: ["slack_thread_root_001"]
-      }
+      additional_metadata: { slack_ts: "1715012345.000100" }
     }
   ]),
 });
@@ -538,12 +539,13 @@ Recommended app-source fields:
 | `id` | stable HydraDB ID and upsert key |
 | `title` | readable result/citation title |
 | `type` | category such as `slack`, `gmail`, `jira`, `notion`, `webpage` |
-| `content.text` / `content.markdown` | primary searchable content |
+| `kind`, `provider`, `external_id` | app-native identity and provider namespace |
+| `fields` | primary searchable content in the kind-specific shape |
 | `metadata` | fast filters such as channel, project, region, workspace |
 | `additional_metadata` | provider IDs, author, status, assignee, timestamps |
 | `url` | citation / navigation link |
 | `timestamp` | freshness and chronology |
-| `relations.ids` | thread, parent/child, linked issue, related source expansion |
+| `relations`, `attachments`, `comments` | optional app-native connected context |
 
 On retrieval, the v2 OpenAPI exposes three app-source identity fields:
 
@@ -551,7 +553,7 @@ On retrieval, the v2 OpenAPI exposes three app-source identity fields:
 - `app_provider`: provider name such as `slack` or `github`.
 - `app_external_id`: provider-assigned source identifier.
 
-Do not invent app-kind enums or undocumented nested app fields. For ingestion, use the documented `app_knowledge` content shape and place provider-specific attributes in `metadata` or `additional_metadata`.
+The v2 OpenAPI types `app_knowledge` only as a JSON string, so it cannot validate the nested item schema. For ingestion, follow the [App Sources](/essentials/v2/app-sources) guide's `kind` / `provider` / `external_id` / `fields` shape. On retrieval, treat `app_kind` as free-form rather than deriving a closed enum from the response schema.
 
 ### Memories
 
@@ -703,7 +705,7 @@ Rules:
 | `type` | `knowledge`, `memory`, `all` | store selector for knowledge, memories, or both |
 | `query_by` | `hybrid`, `text` | default hybrid |
 | `operator` | `or`, `and`, `phrase` | only for `query_by: "text"` |
-| `mode` | `fast`, `thinking` | applies to hybrid; thinking improves quality but adds latency |
+| `mode` | `fast`, `thinking`, `auto` | applies to hybrid; thinking improves quality but adds latency; auto lets the service choose |
 | `max_results` | integer/null | default around 10; max documented as 50 |
 | `alpha` | `0.0`–`1.0` or `auto` | hybrid weight; `1.0` semantic, `0.0` BM25 |
 | `recency_bias` | `0.0`–`1.0` | boost newer content |
@@ -969,7 +971,7 @@ Field options:
 |---|---|---|
 | Hot-path exact filters: department, region, environment, status | `metadata` | top-level `metadata_filters` |
 | Free-form display/bookkeeping: author, provider IDs, version | `additional_metadata` | `metadata_filters.additional_metadata` |
-| Provider app fields for UI/citations | `additional_metadata` or app `fields` | usually not filtered unless needed |
+| Provider-specific values for UI/citations | `additional_metadata` | usually not filtered unless needed |
 | User/workspace partition | `collection` | not metadata |
 
 Rules:
@@ -1079,6 +1081,7 @@ Use `type: "memory"` to delete memory IDs.
 | `422` | semantic validation failure | No |
 | `429` | rate limited | Yes with backoff |
 | `500` | internal error | Yes with backoff |
+| `502` | upstream provider/dependency error | Yes with backoff for idempotent operations |
 | `503` | temporary unavailability | Yes with backoff |
 
 ### Common error codes
@@ -1096,7 +1099,7 @@ Use `type: "memory"` to delete memory IDs.
 | `INTERNAL_ERROR` | unexpected server error |
 | `SERVICE_UNAVAILABLE` | dependency unavailable / under load |
 
-Retry only `429`, `500`, `503`; use bounded exponential backoff with jitter.
+Retry only `429` and transient `5xx` responses such as `500`, `502`, and `503`; retry writes only when they are idempotent. Use bounded exponential backoff with jitter.
 
 SDK errors:
 
@@ -1110,7 +1113,7 @@ try:
         type="knowledge",
     )
 except ApiError as exc:
-    if exc.status_code not in (429, 500, 503):
+    if exc.status_code != 429 and exc.status_code < 500:
         raise
     # Retryable: back off with jitter, keep attempts bounded, then retry.
 ```
@@ -1292,23 +1295,22 @@ curl -s -X POST 'https://api.hydradb.com/context/ingest' \
       "collection": "default",
       "title": "Pricing discussion - Slack #product",
       "type": "slack",
+      "kind": "message",
+      "provider": "slack",
+      "external_id": "1715012345.000100",
       "url": "https://slack.com/archives/C123/p1715012345000100",
       "timestamp": "2025-01-15T12:30:00Z",
-      "content": {
-        "text": "We agreed on three tiers: Starter at $29, Pro at $79, Enterprise at $199."
+      "fields": {
+        "kind": "message",
+        "body": "We agreed on three tiers: Starter at $29, Pro at $79, Enterprise at $199.",
+        "author": "alice",
+        "thread_id": "1715012345.000100"
       },
       "metadata": {
         "channel": "product",
         "workspace": "acme"
       },
-      "additional_metadata": {
-        "author": "alice",
-        "slack_ts": "1715012345.000100"
-      },
-      "relations": {
-        "ids": ["slack_thread_root_001"],
-        "properties": { "relation": "same_thread" }
-      }
+      "additional_metadata": { "slack_ts": "1715012345.000100" }
     }
   ]'
 ```
