@@ -31,7 +31,7 @@ Successful envelope responses expose the payload under `.data`. In TypeScript, w
 
 Fields inside JSON-stringified multipart payloads remain raw snake_case even when the outer TypeScript request uses camelCase.
 
-Memory-item `metadata` is currently JSON-encoded; `additional_metadata` remains an object. Example: `metadata: JSON.stringify({ department: "support" })`.
+Inside each memory item, `metadata` and `additional_metadata` are both plain objects. Example: `metadata: { department: "support" }`. Only the outer `memories` array is stringified.
 
 ## Python: complete memory path
 
