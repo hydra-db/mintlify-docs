@@ -34,6 +34,9 @@ KNOWN_CONTRADICTIONS = (
     "tenant_metadata",
     "TooManyRequestsError",
     "body?.error?.code",
+    "App-source object kinds in OpenAPI include:",
+    "a richer app shape with `kind`, `provider`, `external_id`, `fields`, `attachments`, `comments`, and `relations`",
+    "`metadata` and `additional_metadata` are both plain objects",
 )
 
 
@@ -218,6 +221,20 @@ def check_known_contradictions() -> None:
     require(
         "SDKs return the full success envelope" in sdk_text,
         "SDK page must preserve the .data response envelope contract",
+    )
+    require(
+        '"metadata": json.dumps({"team": "engineering"})' in sdk_text,
+        "Python memory metadata must remain JSON-encoded inside the memories field",
+    )
+    require(
+        'metadata: JSON.stringify({ team: "engineering" })' in sdk_text,
+        "TypeScript memory metadata must remain JSON-encoded inside the memories field",
+    )
+
+    agents_text = read(ROOT / "AGENTS.mdx")
+    require(
+        "`app_kind`: free-form string; the OpenAPI does not define an enum." in agents_text,
+        "AGENTS.mdx must not invent a closed app_kind enum",
     )
 
     package = json.loads(read(ROOT / "package.json"))

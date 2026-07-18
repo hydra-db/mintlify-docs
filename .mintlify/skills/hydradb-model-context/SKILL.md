@@ -58,7 +58,7 @@ Query the relevant collection or use the `collections` field when intentionally 
 
 | Metadata | Shape | Filter path | Use it for |
 |---|---|---|---|
-| `metadata` | Object for knowledge and memory items | Top-level keys in `metadata_filters` | Hot, repeated exact filters |
+| `metadata` | Object for knowledge; JSON-encoded string for a memory item | Top-level keys in `metadata_filters` | Hot, repeated exact filters |
 | `additional_metadata` | Free-form object | `metadata_filters.additional_metadata` | Citations, source IDs, UI fields, occasional filters |
 
 Declare hot fields when creating the database:
@@ -84,7 +84,7 @@ client.databases.create(
 
 The TypeScript equivalent uses `databaseMetadataSchema`, `dataType`, `enableMatch`, and `maxLength`.
 
-For `type="memory"`, only the outer `memories` multipart field is JSON-stringified. Inside each item, `metadata` and `additional_metadata` are both plain objects, the same shape knowledge `document_metadata` and `app_knowledge` use.
+For `type="memory"`, the outer `memories` multipart field is JSON-stringified and each item's schema-backed `metadata` is currently another JSON-encoded string. Keep its `additional_metadata` as an object. Knowledge `document_metadata` and `app_knowledge` keep `metadata` as an object.
 
 Use exact values in `metadata_filters`. Range, contains, and fuzzy intent belong in the natural-language query, a semantic metadata field, a reranker, or application code.
 
