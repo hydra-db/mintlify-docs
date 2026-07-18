@@ -26,7 +26,7 @@ Never print the API key or private source content.
 | Empty result immediately after ingest | Asynchronous race | Poll `context.status()` to `completed` |
 | Filtered query returns unexpected or unscoped data | Undeclared top-level filter key was silently ignored | Verify the schema and `enable_match`; never use filters as authorization |
 | Graph paths absent | Graph disabled or unsuitable mode/query | Enable graph context and use `thinking` for multi-hop work |
-| Duplicates after retry | Unstable IDs or upsert disabled | Use deterministic IDs and `upsert=true` |
+| Duplicates after retry | Unstable IDs or upsert disabled | Use deterministic IDs and `upsert="true"` |
 | Intermittent 429/5xx | Transient load or rate limit | Bounded exponential backoff with jitter |
 
 ## Confirm the active contract

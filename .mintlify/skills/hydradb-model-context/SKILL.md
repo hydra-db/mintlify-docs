@@ -98,7 +98,7 @@ message:  slack:<workspace>:<channel>:<timestamp>
 memory:   user:<user_id>:preference:<preference_key>
 ```
 
-Reusing an ID with `upsert=true` turns retry into update instead of duplication. Do not use a random ID when a source already has a durable identity.
+Reusing an ID with `upsert="true"` turns retry into update instead of duplication. Do not use a random ID when a source already has a durable identity.
 
 ## Design the query before the schema is final
 
