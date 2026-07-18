@@ -1,0 +1,224 @@
+---
+title: "Migrate from v1"
+description: "A field-by-field, endpoint-by-endpoint map from the v1 API to v2 - what was renamed, what was merged, and what is now automatic."
+---
+
+HydraDB v2 keeps every v1 capability but reorganizes the API around a smaller, clearer set of primitives. Ingestion, recall, and tenant management collapsed into three verbs - **ingest**, **query**, and **databases** - and several field names were renamed for consistency.
+
+<Info>
+  **Migration is optional and non-breaking.** The old field names (`tenant_id`, `sub_tenant_id`) and the old `/tenants/*` routes are still accepted as deprecated aliases, so existing v1 integrations keep working unchanged. This guide is for teams who want to move to the v2 surface. For the exact field-alias compatibility contract, see [Multi-tenant → Migrating from the legacy fields](/essentials/v2/multi-tenant#7-migrating-from-the-legacy-tenant-and-sub-tenant-fields).
+</Info>
+
+The single most important change: **every v2 request must send the `API-Version: 2` header.** That header is what selects the v2 routing and response shape described below.
+
+---
+
+## 1. The three things that changed
+
+Everything in this guide reduces to three shifts:
+
+1. **Terminology.** `tenant_id` → `database`, `sub_tenant_id` → `collection`, and the verbs "recall" and "upload" became "query" and "ingest".
+2. **Consolidation.** Many narrow endpoints (`/memories/add_memory`, `/ingestion/upload_knowledge`, the `/recall/*` family) collapsed into `POST /context/ingest` and `POST /query`, selected by a `type` parameter.
+3. **A response envelope.** Every v2 response is wrapped in `{ success, data, error, meta }`. Your payload now lives under `response.data`, not at the top level.
+
+---
+
+## 2. Terminology map
+
+| v1 name | v2 name | Notes |
+|---|---|---|
+| `tenant_id` | `database` | Old name still accepted as a deprecated alias. |
+| `sub_tenant_id` | `collection` | Old name still accepted; on `/query`, `collections` (plural) is the canonical multi-scope selector. |
+| tenant | database | The isolation boundary. |
+| sub-tenant | collection | A logical partition within a database. |
+| "recall" / search | "query" | One `POST /query` endpoint replaces the `/recall/*` family. |
+| "upload" / add | "ingest" | One `POST /context/ingest` endpoint replaces the upload/add endpoints. |
+| `file_metadata` | `document_metadata` | Per-file metadata array on ingest. |
+| `files` | `documents` | Binary files on ingest. |
+| `search_forceful_relations` | `query_forceful_relations` | Same behavior; renamed for the `query` verb. |
+| `tenant_metadata_schema` | `database_metadata_schema` | Schema field on database creation. |
+
+---
+
+## 3. Endpoint map
+
+Every v1 endpoint and its v2 equivalent. Paths marked "now automatic" describe capabilities HydraDB handles internally in v2, so there is no direct call to port.
+
+### Tenants → Databases
+
+| v1 | v2 | Notes |
+|---|---|---|
+| `POST /tenants/create` | `POST /databases` | `tenant_id` → `database`. |
+| `DELETE /tenants/delete` | `DELETE /databases` | |
+| `GET /tenants/infra/status` | `GET /databases/status` | Check `data.infra.ready_for_ingestion` before ingesting. |
+| `GET /tenants/monitor` | `GET /databases/stats` | Usage and counts. |
+| `GET /tenants/sub_tenant_ids` | `GET /databases/collections` | Lists collections in a database. |
+| _(none)_ | `PATCH /databases/{database}/metadata-schema` | New in v2: update the metadata schema after creation. |
+
+### Ingestion → Context ingest
+
+| v1 | v2 | Notes |
+|---|---|---|
+| `POST /memories/add_memory` | `POST /context/ingest` with `type=memory` | Send a JSON-stringified `memories` array. |
+| `POST /ingestion/upload_knowledge` | `POST /context/ingest` with `type=knowledge` | `files` → `documents`, `file_metadata` → `document_metadata`. |
+| `POST /ingestion/verify_processing` | `GET /context/status` | Poll until `graph_creation` (queryable) or `completed`. |
+| `POST /knowledge/delete_knowledge` | `DELETE /context` | Delete knowledge sources. |
+| `DELETE /memories/delete_memory` | `DELETE /context` | Delete memories by `id`. |
+
+### Recall → Query
+
+| v1 | v2 | Notes |
+|---|---|---|
+| `POST /recall/full_recall` | `POST /query` with `type: "knowledge"` (or `"all"`) | The general retrieval call. |
+| `POST /recall/boolean_recall` | `POST /query` with `query_by: "text"` | Keyword/boolean matching via `operator`. |
+| `POST /recall/recall_preferences` | `POST /query` with `type: "memory"` | Retrieves user memories. |
+
+### List, fetch, and relations
+
+| v1 | v2 | Notes |
+|---|---|---|
+| `POST /list/data` | `POST /context/list` | List ingested sources. |
+| `GET /list/graph_relations_by_id` | `GET /context/relations` | Graph relations for a source. |
+| `POST /fetch/content` | `GET /context/inspect` | Fetch stored content for a source. |
+
+### Raw embeddings
+
+The v1 `/embeddings/*` endpoints (`insert_raw_embeddings`, `search_raw_embeddings`, `filter_raw_embeddings`, `delete_raw_embeddings`) have **no v2 equivalent**. In v2, embedding is handled internally by the ingestion pipeline - you send content to `POST /context/ingest` and HydraDB embeds it for you. If you relied on inserting precomputed vectors, reach out to the team before migrating.
+
+---
+
+## 4. Before and after: the three core flows
+
+Each flow shows the v1 call and its v2 replacement side by side. All v2 calls include the `API-Version: 2` header.
+
+### Create a workspace
+
+<CodeGroup>
+```bash v2
+curl -X POST 'https://api.hydradb.com/databases' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -H "Content-Type: application/json" \
+  -d '{ "database": "acme_corp" }'
+```
+```bash v1
+curl -X POST 'https://api.hydradb.com/tenants/create' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{ "tenant_id": "acme_corp" }'
+```
+</CodeGroup>
+
+### Ingest content
+
+<CodeGroup>
+```bash v2
+curl -X POST 'https://api.hydradb.com/context/ingest' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -F "type=memory" \
+  -F "database=acme_corp" \
+  -F "collection=user_john_123" \
+  -F 'memories=[{"text": "User prefers dark mode.", "infer": true}]'
+```
+```bash v1
+curl -X POST 'https://api.hydradb.com/memories/add_memory' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "tenant_id": "acme_corp",
+    "sub_tenant_id": "user_john_123",
+    "memories": [{"text": "User prefers dark mode.", "infer": true}]
+  }'
+```
+</CodeGroup>
+
+<Note>
+  In v2, both memories and knowledge go through the same `POST /context/ingest` endpoint - `type=memory` sends a JSON-stringified `memories` array, `type=knowledge` sends `documents` (files, formerly `files`) plus `document_metadata` (formerly `file_metadata`). See [Memories](/essentials/v2/memories) and [Knowledge](/essentials/v2/knowledge).
+</Note>
+
+### Query / recall
+
+<CodeGroup>
+```bash v2
+curl -X POST 'https://api.hydradb.com/query' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "database": "acme_corp",
+    "collection": "user_john_123",
+    "query": "What does the user prefer?",
+    "type": "all"
+  }'
+```
+```bash v1
+curl -X POST 'https://api.hydradb.com/recall/full_recall' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "tenant_id": "acme_corp",
+    "sub_tenant_id": "user_john_123",
+    "query": "What does the user prefer?"
+  }'
+```
+</CodeGroup>
+
+<Note>
+  v1 had separate recall endpoints for knowledge, keyword, and preferences. v2 unifies them under `POST /query` and lets you pick the store with `type` (`"knowledge"`, `"memory"`, or `"all"`) and the matching strategy with `query_by` (`"hybrid"`, `"text"`). See [Query](/essentials/v2/query).
+</Note>
+
+---
+
+## 5. The response envelope
+
+The other change that touches every call: v2 wraps every response in a standard envelope.
+
+```json
+{
+  "success": true,
+  "data": { "...": "your actual payload lives here" },
+  "error": null,
+  "meta": { "request_id": "...", "latency_ms": 12.3 }
+}
+```
+
+Any code that read a field at the top level in v1 now reads it under `data`. For example, query results move from `response.chunks` to `response.data.chunks`, and ingestion IDs from `response.results` to `response.data.results`.
+
+---
+
+## 6. Migration checklist
+
+<Steps>
+  <Step title="Add the version header">
+    Send `API-Version: 2` on every request. This selects the v2 routing and response shape.
+  </Step>
+  <Step title="Rename the scope fields">
+    `tenant_id` → `database`, `sub_tenant_id` → `collection`. The old names still work, so you can do this incrementally.
+  </Step>
+  <Step title="Swap tenant endpoints for databases">
+    `/tenants/create` → `POST /databases`, `/tenants/infra/status` → `GET /databases/status`, and so on (see the [endpoint map](#3-endpoint-map)).
+  </Step>
+  <Step title="Move ingestion onto /context/ingest">
+    Replace `/memories/add_memory` and `/ingestion/upload_knowledge` with `POST /context/ingest`, choosing `type=memory` or `type=knowledge`. Rename `files` → `documents` and `file_metadata` → `document_metadata`.
+  </Step>
+  <Step title="Move recall onto /query">
+    Replace the `/recall/*` family with `POST /query`, selecting the store via `type` and the strategy via `query_by`. Rename `search_forceful_relations` → `query_forceful_relations`.
+  </Step>
+  <Step title="Poll /context/status instead of verify_processing">
+    Swap `/ingestion/verify_processing` for `GET /context/status`. Content is queryable at `graph_creation`; wait for `completed` only if you need full graph traversal.
+  </Step>
+  <Step title="Unwrap the response envelope">
+    Read your payload from `response.data`, not the top level.
+  </Step>
+</Steps>
+
+---
+
+## Related
+
+- [Multi-tenant → Migrating from the legacy fields](/essentials/v2/multi-tenant#7-migrating-from-the-legacy-tenant-and-sub-tenant-fields) - the exact `tenant_id`/`sub_tenant_id` compatibility contract
+- [Knowledge](/essentials/v2/knowledge) and [Memories](/essentials/v2/memories) - the two ingestion stores and how to choose
+- [Quickstart](/get-started/v2/quickstart) - the v2 loop end to end
+- [Query](/essentials/v2/query) - the endpoint that replaces recall
+- [API Reference (v2)](/api-reference/v2) - full endpoint specs
