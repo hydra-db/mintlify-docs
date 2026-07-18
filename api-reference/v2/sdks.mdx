@@ -54,16 +54,16 @@ You can verify which version your client is using by inspecting the response hea
 
 ## Naming conventions
 
-The REST API uses **snake_case** for all request and response fields, and both SDKs preserve those field names for request/response objects. TypeScript only camelCases multi-word **method names**.
+The REST API and Python SDK use **snake_case** request and response fields. The TypeScript SDK exposes **camelCase** fields and serializes them to the API's snake_case wire format.
 
 | | Method naming | Parameter field naming | Example |
 |---|---|---|---|
 | **Raw HTTP / cURL** |  -  | snake_case | `database`, `collection`, `query_by` |
 | **Python SDK** | snake_case | snake_case | method: `query()`, params: `database`, `query_by` |
-| **TypeScript SDK** | camelCase for multi-word methods | snake_case | method: `query()`, params: `database`, `query_by` |
+| **TypeScript SDK** | camelCase for multi-word methods | camelCase | method: `query()`, params: `database`, `queryBy` |
 
 <Info>
-**Use snake_case request fields in TypeScript examples too** (e.g., `client.context.list({ database: "...", page_size: 50 })`). The SDK sends the same names on the wire, matching the OpenAPI schema.
+**Do not copy raw OpenAPI field names directly into TypeScript.** Use the generated camelCase fields (for example, `client.context.list({ database: "...", pageSize: 50 })`). The SDK converts them to snake_case on the wire.
 
 The Python SDK also uses snake_case throughout (e.g., `client.context.list(database="...", page_size=50)`).
 
@@ -117,7 +117,7 @@ A single method covers all retrieval. Pick `type` (`"knowledge"`, `"memory"`, `"
 | `client.databases.collections()` | `GET /databases/collections` |
 | `client.databases.stats()` | `GET /databases/stats` |
 
-The method-reference tables above use the Python (snake_case) method names. TypeScript keeps the same method names but camelCases any that are multi-word (for example, the connector method `list_resources()` in Python is `listResources()` in TypeScript). Request parameters stay snake_case in both SDKs.
+The method-reference tables above use the Python (snake_case) method names. TypeScript camelCases multi-word methods and request fields (for example, Python `list_resources(page_size=50)` becomes TypeScript `listResources({ pageSize: 50 })`).
 
 ## Migrating from v1
 
@@ -196,12 +196,12 @@ while (true) {
   const status = await client.databases.status({
     database: "my_first_database",
   });
-  const { schedulerStatus, graphStatus, vectorstoreStatus } = status.data.infra;
+  const infra = status.data?.infra;
   if (
-    schedulerStatus &&
-    graphStatus &&
-    vectorstoreStatus.knowledge &&
-    vectorstoreStatus.memories
+    infra?.schedulerStatus === true &&
+    infra.graphStatus === true &&
+    infra.vectorstoreStatus?.knowledge === true &&
+    infra.vectorstoreStatus.memories === true
   ) break;
   await new Promise((r) => setTimeout(r, 2000));
 }
@@ -239,23 +239,20 @@ with open("contract.pdf", "rb") as f1, open("policy.pdf", "rb") as f2:
     )
 ```
 ```typescript TypeScript SDK
+// SDK 2.1.1 accepts one Uploadable per request; repeat the call for more files.
 const result = await client.context.ingest({
   type: "knowledge",
   database: "my_first_database",
-  documents: [
-    { path: "contract.pdf", filename: "contract.pdf", contentType: "application/pdf" },
-    { path: "policy.pdf", filename: "policy.pdf", contentType: "application/pdf" },
-  ],
+  documents: {
+    path: "contract.pdf",
+    filename: "contract.pdf",
+    contentType: "application/pdf",
+  },
   documentMetadata: JSON.stringify([
     {
       id: "contract_q4",
       metadata: { department: "legal" },
       additional_metadata: { author: "Alice" },
-    },
-    {
-      id: "policy_2025",
-      metadata: { department: "legal" },
-      additional_metadata: { author: "Bob" },
     },
   ]),
 });
@@ -462,9 +459,9 @@ await client.context.delete({
 ```
 </CodeGroup>
 
-## Response envelope
+## Response shapes
 
-All responses are wrapped in a consistent envelope:
+Successful endpoint-handler responses use a consistent envelope:
 
 ```json
 {
@@ -480,7 +477,7 @@ All responses are wrapped in a consistent envelope:
 }
 ```
 
-The SDKs return the full envelope. Read the payload from the `data` field (e.g. `response.data`); on failure the SDK raises a typed exception instead of returning an envelope with `error` populated.
+The SDKs return the full success envelope. Read the payload from `data` (for example, `response.data`); on HTTP failure they raise an exception whose body follows the documented `detail` error shape.
 
 ## Type safety
 
@@ -503,11 +500,11 @@ The SDKs provide exact type parity with the API specification:
 
 ## Error handling
 
-Both SDKs throw exceptions for non-2xx responses. Error objects expose the envelope's `error` payload:
+Both SDKs throw exceptions for non-2xx responses. Branch on HTTP status, then inspect the documented `detail` error body when needed:
 
 <CodeGroup>
 ```python Python SDK
-from hydra_db.errors import NotFoundError, TooManyRequestsError
+from hydra_db.core.api_error import ApiError
 
 try:
     result = client.query(
@@ -515,19 +512,22 @@ try:
         query="...",
         type="knowledge",
     )
-except NotFoundError:
-    # Handle missing database / resource (HTTP 404)
-    pass
-except TooManyRequestsError:
-    # Rate limit (HTTP 429) — retry with backoff
-    pass
+except ApiError as exc:
+    if exc.status_code == 404:
+        # Handle missing database or resource.
+        pass
+    elif exc.status_code == 429:
+        # Retry with bounded backoff and jitter.
+        pass
+    else:
+        raise
 ```
 
 <Info>
-The Python SDK raises one of the typed exceptions exported from `hydra_db.errors`  -  `BadRequestError` (400), `UnauthorizedError` (401), `ForbiddenError` (403), `NotFoundError` (404), `UnprocessableEntityError` (422), `TooManyRequestsError` (429), `InternalServerError` (500), and `ServiceUnavailableError` (503). Each carries `status_code` and the parsed response `body` (from which you can read `body["error"]["code"]`).
+The Python SDK exports typed exceptions for several statuses, including 400, 403, 404, 409, 413, 422, 500, 502, and 503. Other non-2xx responses, including 401 and 429 in SDK 2.1.1, use the base `hydra_db.core.api_error.ApiError`. All carry `status_code` and `body`; structured handler errors expose `body.detail.error_code` (or `body["detail"]["error_code"]` when the body is a raw dictionary).
 </Info>
 ```typescript TypeScript SDK
-import { HydraDBError } from "@hydradb/sdk";
+import { HydraDB, HydraDBError } from "@hydradb/sdk";
 
 try {
   const result = await client.query({
@@ -537,7 +537,8 @@ try {
   });
 } catch (error) {
   if (error instanceof HydraDBError) {
-    const code = error.body?.error?.code;
+    const body = error.body as HydraDB.HandlerErrorResponse | undefined;
+    const code = body?.detail?.errorCode;
 
     if (code === "DATABASE_NOT_FOUND") {
       // Handle missing database

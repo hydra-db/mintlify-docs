@@ -3,18 +3,15 @@ title: "Error Responses"
 description: "Response envelope, HTTP status codes, error codes, and retry patterns."
 ---
 
-### Response envelope
+### Success envelope and HTTP error shape
 
-HydraDB core endpoints (`/databases`, `/context/*`, and `/query`) use the same top-level envelope for successful and failed requests. Webhook management endpoints (`/webhooks/indexing*`) return their documented response object directly and do not include this envelope.
+Successful v2 endpoint-handler responses use the `{ success, data, error, meta }` envelope. This includes webhook management endpoints (`/webhooks/indexing*`); their resource-specific response object is under `data`.
 
 ```json
 {
-  "success": false,
-  "data": null,
-  "error": {
-    "code": "VALIDATION_ERROR",
-    "message": "Request validation failed"
-  },
+  "success": true,
+  "data": {},
+  "error": null,
   "meta": {
     "request_id": "9d13aef4-02f4-4e73-8c62-4c2601d04f9d",
     "latency_ms": 4.8
@@ -22,19 +19,27 @@ HydraDB core endpoints (`/databases`, `/context/*`, and `/query`) use the same t
 }
 ```
 
+Failed raw HTTP calls use the endpoint's documented error response. V2 handler errors use `detail`; authentication or gateway middleware may return `detail` as a string instead of the structured object:
 
+```json
+{
+  "detail": {
+    "success": false,
+    "error_code": "VALIDATION_ERROR",
+    "message": "Request validation failed"
+  }
+}
+```
 
 Field | Description |
 |---|---|
-| `success` | `false` for errors. |
-| `data` | Always `null` for error responses. |
-| `error.code` | Machine-readable code for programmatic handling. |
-| `error.message` | Human-readable explanation of what failed. |
-| `meta.request_id` | Request identifier. Include it when contacting support. |
-| `meta.latency_ms` | Server-side processing time in milliseconds. 
+| `detail.error_code` | Machine-readable code for structured handler errors. |
+| `detail.message` | Human-readable explanation for structured handler errors. |
+| `detail.success` | `false` for structured handler errors. |
+| `detail` string | Authentication, gateway, or other middleware rejection message. |
 
 <Info>
-Use `error.code` for branching and log `meta.request_id` for every failed request. The HTTP status tells you the class of failure; the error code tells you what to do.
+Branch on the HTTP status before parsing the body. When `detail` is structured, use `detail.error_code` for finer handling. Log a request or correlation ID when the response provides one.
 </Info>
 
 ## HTTP status codes
@@ -67,7 +72,7 @@ Use `error.code` for branching and log `meta.request_id` for every failed reques
 | `SERVICE_UNAVAILABLE` | `503` | A dependency is temporarily unavailable or the service is under load. |
 
 <Note>
-Endpoint pages list the most common codes for that operation. New codes may be added over time, so clients should handle unknown `error.code` values gracefully.
+Endpoint pages list the most common codes for that operation. New codes may be added over time, so clients should handle unknown `detail.error_code` values gracefully.
 </Note>
 
 <Note>
@@ -80,7 +85,7 @@ Retry only transient failures: `429`, `500`, and `503`. Use exponential backoff 
 
 <CodeGroup>
 ```typescript TypeScript SDK
-import { HydraDBError } from "@hydradb/sdk";
+import { HydraDB, HydraDBError } from "@hydradb/sdk";
 
 async function withRetry<T>(
   operation: () => Promise<T>,
@@ -92,7 +97,8 @@ async function withRetry<T>(
     } catch (error) {
       if (!(error instanceof HydraDBError)) throw error;
 
-      const retryable = [429, 500, 503].includes(error.statusCode);
+      const retryable =
+        error.statusCode !== undefined && [429, 500, 503].includes(error.statusCode);
       if (!retryable || attempt === maxRetries) throw error;
 
       const baseDelayMs = 2 ** attempt * 1000;
@@ -116,13 +122,13 @@ const result = await withRetry(() =>
 import random
 import time
 
-from hydra_db import HydraDBError
+from hydra_db.core.api_error import ApiError
 
 def with_retry(operation, max_retries=3):
     for attempt in range(max_retries + 1):
         try:
             return operation()
-        except HydraDBError as exc:
+        except ApiError as exc:
             retryable = exc.status_code in (429, 500, 503)
             if not retryable or attempt == max_retries:
                 raise
@@ -159,25 +165,25 @@ async function hydraRequest(url: string, options: RequestInit, maxRetries = 3) {
 
 <CodeGroup>
 ```typescript TypeScript SDK
-import { HydraDBError } from "@hydradb/sdk";
+import { HydraDB, HydraDBError } from "@hydradb/sdk";
 
 try {
   await client.context.ingest({
     type: "knowledge",
     database: "my_first_database",
-    documents: [{ path: "policy.pdf", filename: "policy.pdf" }],
+    documents: { path: "policy.pdf", filename: "policy.pdf" },
   });
 } catch (error) {
   if (error instanceof HydraDBError) {
-    const code = error.body?.error?.code;
-    const requestId = error.body?.meta?.request_id;
+    const body = error.body as HydraDB.HandlerErrorResponse | undefined;
+    const code = body?.detail?.errorCode;
 
     if (code === "DATABASE_NOT_FOUND") {
       // Create or select a valid database before ingesting.
     } else if (error.statusCode === 429) {
       // Retry with backoff.
     } else {
-      console.error({ code, requestId });
+      console.error({ code, statusCode: error.statusCode });
       throw error;
     }
   } else {
@@ -186,16 +192,28 @@ try {
 }
 ```
 ```python Python SDK
-from hydra_db import HydraDBError
+from hydra_db.core.api_error import ApiError
+
+def get_error_code(exc: ApiError):
+    detail = (
+        exc.body.get("detail")
+        if isinstance(exc.body, dict)
+        else getattr(exc.body, "detail", None)
+    )
+    return (
+        detail.get("error_code")
+        if isinstance(detail, dict)
+        else getattr(detail, "error_code", None)
+    )
 
 try:
     client.context.ingest(
-    type="knowledge",
+        type="knowledge",
         database="my_first_database",
         documents=[("policy.pdf", open("policy.pdf", "rb"), "application/pdf")],
     )
-except HydraDBError as exc:
-    if exc.error_code == "DATABASE_NOT_FOUND":
+except ApiError as exc:
+    if get_error_code(exc) == "DATABASE_NOT_FOUND":
         # Create or select a valid database before ingesting.
         pass
     elif exc.status_code == 429:

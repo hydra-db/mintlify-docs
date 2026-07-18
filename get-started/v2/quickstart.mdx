@@ -54,7 +54,13 @@ client.databases.create(database=database)
 # 2. Wait until the database can accept data.
 while True:
     infra = client.databases.status(database=database).data.infra
-    if infra.ready_for_ingestion:
+    vectorstore = infra.vectorstore_status
+    if (
+        infra.scheduler_status
+        and infra.graph_status
+        and vectorstore.knowledge
+        and vectorstore.memories
+    ):
         break
     time.sleep(5)
 
@@ -67,7 +73,10 @@ ingest = client.context.ingest(
     ]),
 )
 
-id = ingest.data.results[0].id
+results = ingest.data.results if ingest.data else []
+id = next((item.id for item in results if item.id and not item.error), None)
+if not id:
+    raise RuntimeError("ingestion returned no context ID")
 
 # 4. Wait until the memory is indexed.
 while True:
@@ -101,7 +110,13 @@ await client.databases.create({ database: database });
 // 2. Wait until the database can accept data.
 while (true) {
   const { data } = await client.databases.status({ database: database });
-  if (data?.infra.readyForIngestion) break;
+  const infra = data?.infra;
+  if (
+    infra?.schedulerStatus === true &&
+    infra.graphStatus === true &&
+    infra.vectorstoreStatus?.knowledge === true &&
+    infra.vectorstoreStatus.memories === true
+  ) break;
   await new Promise((resolve) => setTimeout(resolve, 5_000));
 }
 
@@ -114,18 +129,21 @@ const ingest = await client.context.ingest({
   ]),
 });
 
-const id = ingest.data.results[0].id;
+const id = ingest.data?.results?.find((item) => item.id && !item.error)?.id;
+if (!id) throw new Error("ingestion returned no context ID");
 
 // 4. Wait until the memory is indexed.
 while (true) {
-  const status = (await client.context.status({
+  const envelope = await client.context.status({
     database: database,
     ids: [id],
-  })).data.statuses[0];
+  });
+  const status = envelope.data?.statuses?.[0];
+  if (!status) throw new Error("status response contained no item");
 
   if (status.indexingStatus === "completed") break;
-  if (status.indexingStatus === "errored") {
-    throw new Error(status.errorMessage);
+  if (["errored", "failed"].includes(status.indexingStatus ?? "")) {
+    throw new Error(status.errorMessage ?? "indexing failed");
   }
 
   await new Promise((resolve) => setTimeout(resolve, 2_000));
@@ -138,7 +156,7 @@ const results = await client.query({
   query: "What does the user prefer?",
 });
 
-console.log(results.data.chunks);
+console.log(results.data?.chunks ?? []);
 ```
 ```bash cURL
 export HYDRA_DB_API_KEY="your_api_key"
@@ -155,7 +173,7 @@ curl -s -X POST 'https://api.hydradb.com/databases' \
 until curl -s "https://api.hydradb.com/databases/status?database=${DATABASE}" \
   -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
   -H "API-Version: 2" \
-  | jq -e '.data.infra.ready_for_ingestion' > /dev/null; do
+  | jq -e '.data.infra as $i | ($i.scheduler_status == true and $i.graph_status == true and $i.vectorstore_status.knowledge == true and $i.vectorstore_status.memories == true)' > /dev/null; do
   sleep 5
 done
 
