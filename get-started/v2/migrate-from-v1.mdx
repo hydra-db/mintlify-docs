@@ -3,7 +3,11 @@ title: "Migrate from v1"
 description: "A field-by-field, endpoint-by-endpoint map from the v1 API to v2 - what was renamed, what was merged, and what is now automatic."
 ---
 
-HydraDB v2 keeps every v1 capability but reorganizes the API around a smaller, clearer set of primitives. Ingestion, recall, and tenant management collapsed into three verbs - **ingest**, **query**, and **databases** - and several field names were renamed for consistency.
+HydraDB v2 keeps nearly every v1 capability but reorganizes the API around a smaller, clearer set of primitives. Ingestion, recall, and tenant management collapsed into three verbs - **ingest**, **query**, and **databases** - and several field names were renamed for consistency. (The one exception is the v1 raw-embeddings endpoints, which have no v2 equivalent - see [Raw embeddings](#raw-embeddings).)
+
+<Warning>
+  **Migrating is more than swapping the URL.** Several endpoints also changed where their parameters live - v1 query strings became v2 JSON bodies, some identifiers were renamed, and filter keys moved under a nested `filters` object. Each row in the [endpoint map](#3-endpoint-map) that changes shape carries a note; read it before porting a call.
+</Warning>
 
 <Info>
   **Migration is optional and non-breaking.** The old field names (`tenant_id`, `sub_tenant_id`) and the old `/tenants/*` routes are still accepted as deprecated aliases, so existing v1 integrations keep working unchanged. This guide is for teams who want to move to the v2 surface. For the exact field-alias compatibility contract, see [Multi-tenant → Migrating from the legacy fields](/essentials/v2/multi-tenant#7-migrating-from-the-legacy-tenant-and-sub-tenant-fields).
@@ -48,11 +52,11 @@ Every v1 endpoint and its v2 equivalent. Paths marked "now automatic" describe c
 
 | v1 | v2 | Notes |
 |---|---|---|
-| `POST /tenants/create` | `POST /databases` | `tenant_id` → `database`. |
-| `DELETE /tenants/delete` | `DELETE /databases` | |
-| `GET /tenants/infra/status` | `GET /databases/status` | Check `data.infra.ready_for_ingestion` before ingesting. |
-| `GET /tenants/monitor` | `GET /databases/stats` | Usage and counts. |
-| `GET /tenants/sub_tenant_ids` | `GET /databases/collections` | Lists collections in a database. |
+| `POST /tenants/create` | `POST /databases` | `tenant_id` → `database` in the JSON body. |
+| `DELETE /tenants/delete` | `DELETE /databases` | Pass `database` as a query parameter (required). |
+| `GET /tenants/infra/status` | `GET /databases/status` | `database` query parameter required. Check `data.infra.ready_for_ingestion` before ingesting. |
+| `GET /tenants/monitor` | `GET /databases/stats` | `database` query parameter required. Usage and counts. |
+| `GET /tenants/sub_tenant_ids` | `GET /databases/collections` | `database` query parameter required. Lists collections in a database. |
 | _(none)_ | `PATCH /databases/{database}/metadata-schema` | New in v2: update the metadata schema after creation. |
 
 ### Ingestion → Context ingest
@@ -61,25 +65,25 @@ Every v1 endpoint and its v2 equivalent. Paths marked "now automatic" describe c
 |---|---|---|
 | `POST /memories/add_memory` | `POST /context/ingest` with `type=memory` | Send a JSON-stringified `memories` array. |
 | `POST /ingestion/upload_knowledge` | `POST /context/ingest` with `type=knowledge` | `files` → `documents`, `file_metadata` → `document_metadata`. |
-| `POST /ingestion/verify_processing` | `GET /context/status` | Poll until `graph_creation` (queryable) or `completed`. |
-| `POST /knowledge/delete_knowledge` | `DELETE /context` | Delete knowledge sources. |
-| `DELETE /memories/delete_memory` | `DELETE /context` | Delete memories by `id`. |
+| `POST /ingestion/verify_processing` | `GET /context/status` | Now a GET with query parameters: `database` (required); v1 `file_id`/`file_ids` become `id`/`ids`. Poll until `graph_creation` (queryable) or `completed`. |
+| `POST /knowledge/delete_knowledge` | `DELETE /context` | Send a JSON body with `ids`, `database`, `collection`, and `type: "knowledge"` (v1 used a body with `tenant_id`/`sub_tenant_id`/`ids`). |
+| `DELETE /memories/delete_memory` | `DELETE /context` | Now takes a JSON body with `ids`, `database`, `collection`, and `type: "memory"` - not the v1 `memory_id`/`tenant_id` query parameters. |
 
 ### Recall → Query
 
 | v1 | v2 | Notes |
 |---|---|---|
-| `POST /recall/full_recall` | `POST /query` with `type: "knowledge"` (or `"all"`) | The general retrieval call. |
-| `POST /recall/boolean_recall` | `POST /query` with `query_by: "text"` | Keyword/boolean matching via `operator`. |
+| `POST /recall/full_recall` | `POST /query` with `type: "knowledge"` (or `"all"`) | The general retrieval call. `search_forceful_relations` → `query_forceful_relations`. |
+| `POST /recall/boolean_recall` | `POST /query` with `query_by: "text"` | Keyword/boolean matching via `operator`. Note `query_forceful_relations` **defaults to `true`** - if you had disabled relation traversal in v1 (`force_relations: false`), set `query_forceful_relations: false` to keep that behavior. |
 | `POST /recall/recall_preferences` | `POST /query` with `type: "memory"` | Retrieves user memories. |
 
 ### List, fetch, and relations
 
 | v1 | v2 | Notes |
 |---|---|---|
-| `POST /list/data` | `POST /context/list` | List ingested sources. |
-| `GET /list/graph_relations_by_id` | `GET /context/relations` | Graph relations for a source. |
-| `POST /fetch/content` | `GET /context/inspect` | Fetch stored content for a source. |
+| `POST /list/data` | `POST /context/list` | Filters moved under a nested `filters` object: v1 flat `tenant_metadata`/`document_metadata`/`source_fields` become `filters.metadata`/`filters.additional_metadata`/`filters.source_fields`. A body that keeps the flat v1 keys is silently unfiltered. |
+| `GET /list/graph_relations_by_id` | `GET /context/relations` | v1 `source_id`/`tenant_id` query parameters → `id` plus `database` (required) and `collection`. |
+| `POST /fetch/content` | `GET /context/inspect` | Now a GET with query parameters: `id` (required, was the v1 body field `source_id`) and `database` (required), plus optional `collection`. |
 
 ### Raw embeddings
 
@@ -206,7 +210,7 @@ Any code that read a field at the top level in v1 now reads it under `data`. For
     Replace the `/recall/*` family with `POST /query`, selecting the store via `type` and the strategy via `query_by`. Rename `search_forceful_relations` → `query_forceful_relations`.
   </Step>
   <Step title="Poll /context/status instead of verify_processing">
-    Swap `/ingestion/verify_processing` for `GET /context/status`. Content is queryable at `graph_creation`; wait for `completed` only if you need full graph traversal.
+    Swap `/ingestion/verify_processing` for `GET /context/status`, passing `database` (required) and the renamed `id`/`ids` (v1 `file_id`/`file_ids`) as query parameters. Content is queryable at `graph_creation`; wait for `completed` only if you need full graph traversal.
   </Step>
   <Step title="Unwrap the response envelope">
     Read your payload from `response.data`, not the top level.
