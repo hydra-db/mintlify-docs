@@ -35,11 +35,12 @@ This is a real trade-off, not a strictly-better claim. If you need full control 
 Before any implementation detail, hold this shape in your head:
 
 ```mermaid
-flowchart LR
+flowchart TD
   User([User]) --> App([Your Application])
   App --> Hydra([HydraDB])
-  Hydra --> LLM([LLM])
-  LLM --> App
+  Hydra -->|"retrieved context"| App
+  App --> LLM([LLM])
+  LLM -->|"answer"| App
   App --> User
 
   style User fill:#0f172a,stroke:#334155,stroke-width:2px,color:#f8fafc,stroke-linecap:round
@@ -48,9 +49,9 @@ flowchart LR
   style LLM fill:#1e293b,stroke:#334155,stroke-width:2px,color:#f8fafc,stroke-linecap:round
 ```
 
-Your application never asks the LLM to remember things, and it never asks a bare vector store to guess at relevance. It asks HydraDB one question - *"what does this user need to know, right now, to answer this?"* - and HydraDB answers using everything it has stored: what this specific user has told you, what your organization knows, and how those things connect. Your application hands that answer to the LLM as context. The LLM never touches storage directly, and your application never touches embeddings, chunking, or ranking directly.
+HydraDB never talks to the LLM, and the LLM never talks to HydraDB - your application sits between both, every time. It asks HydraDB one question - *"what does this user need to know, right now, to answer this?"* - and HydraDB answers using everything it has stored: what this specific user has told you, what your organization knows, and how those things connect. Your application then hands that answer to the LLM as context, gets a response back, and relays it to the user. The LLM never touches storage directly, and your application never touches embeddings, chunking, or ranking directly.
 
-Everything past this point in HydraDB is in service of making that one arrow - `App → HydraDB` - return the right thing.
+Everything past this point in HydraDB is in service of making that one arrow - `App → HydraDB` - return the right thing. The `HydraDB → App` and `App → LLM` arrows are two separate calls your code makes; HydraDB never makes the second one for you.
 
 ---
 
@@ -168,8 +169,9 @@ flowchart TD
   Dev([Developer / App]) --> API([HydraDB API])
   API --> Storage([Storage\nKnowledge + Memory + Graph])
   Storage --> Retrieval([Query and Retrieval])
-  Retrieval --> LLM([LLM])
-  LLM --> Dev
+  Retrieval -->|"retrieved context"| Dev
+  Dev --> LLM([LLM])
+  LLM -->|"answer"| Dev
 
   style Dev fill:#0f172a,stroke:#334155,stroke-width:2px,color:#f8fafc,stroke-linecap:round
   style API fill:#1e293b,stroke:#334155,stroke-width:2px,color:#f8fafc,stroke-linecap:round
@@ -177,6 +179,8 @@ flowchart TD
   style Retrieval fill:#1e293b,stroke:#334155,stroke-width:2px,color:#f8fafc,stroke-linecap:round
   style LLM fill:#1e293b,stroke:#334155,stroke-width:2px,color:#f8fafc,stroke-linecap:round
 ```
+
+Same rule as §2, drawn at the pipeline level: HydraDB returns context to your application, and your application - never HydraDB - makes the separate call to the LLM.
 
 The one detail worth internalizing at this level: **storage and retrieval run on different clocks.** Ingestion is asynchronous - your upload returns quickly, then HydraDB parses, embeds, and graphs the content in the background. Query is synchronous and only ever reads what's already indexed. Every "I ingested it but query returns nothing" problem traces back to this line.
 
@@ -193,6 +197,7 @@ One realistic build, step by step, using the exact calls you'd use in production
 One database for the support system. Each customer becomes a collection inside it - created automatically on first write, no setup required.
 
 ```python
+import json
 import os
 from hydra_db import HydraDB
 
@@ -209,11 +214,12 @@ client.databases.create(database=database)
 Help articles and past ticket resolutions go in once, shared across every customer and every agent.
 
 ```python
-client.context.ingest(
-    type="knowledge",
-    database=database,
-    files=[("refund-policy.pdf", open("refund-policy.pdf", "rb"), "application/pdf")],
-)
+with open("refund-policy.pdf", "rb") as f:
+    client.context.ingest(
+        type="knowledge",
+        database=database,
+        documents=[("refund-policy.pdf", f, "application/pdf")],
+    )
 ```
 
 </Step>
@@ -227,9 +233,9 @@ client.context.ingest(
     type="memory",
     database=database,
     collection="customer_482",
-    memories=[
+    memories=json.dumps([
         {"text": "Enterprise plan. Prefers email over chat.", "infer": True}
-    ],
+    ]),
 )
 ```
 
@@ -245,7 +251,7 @@ result = client.query(
     collection="customer_482",
     type="all",
     query="my refund hasn't shown up yet",
-    mode="thinking",
+    mode="fast",  # start here; upgrade to "thinking" only where retrieval quality demands it (see §9)
 )
 ```
 
@@ -266,9 +272,9 @@ client.context.ingest(
     type="memory",
     database=database,
     collection="customer_482",
-    memories=[
+    memories=json.dumps([
         {"text": "Refund delay resolved - payment provider outage, refund reissued.", "infer": True}
-    ],
+    ]),
 )
 ```
 
