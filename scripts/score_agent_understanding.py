@@ -159,12 +159,17 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    fixture_path = Path(args.fixture)
+    fixture_path = Path(args.fixture).resolve()
     tasks = load_json(fixture_path)
     nav_pages = flatten_nav_pages(load_json(DOCS_JSON).get("navigation", {}))
 
+    try:
+        fixture_label = fixture_path.relative_to(ROOT)
+    except ValueError:
+        fixture_label = fixture_path
+
     print("=== HydraDB agent-understanding docs eval ===")
-    print(f"Fixture: {fixture_path.relative_to(ROOT)}")
+    print(f"Fixture: {fixture_label}")
     print(f"Tasks: {len(tasks)}")
     print()
 
@@ -175,7 +180,10 @@ def main() -> int:
     total = sum(result.total for result in results)
     matched = sum(result.matched for result in results)
     failed = [result for result in results if not result.passed]
-    score = (matched / total * 100) if total else 100.0
+    if total == 0:
+        print("ERROR: fixture contains no required checks", file=sys.stderr)
+        return 1
+    score = matched / total * 100
 
     print()
     print(
