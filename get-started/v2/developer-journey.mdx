@@ -58,7 +58,11 @@ from hydra_db import HydraDB
 
 client = HydraDB(token=os.environ["HYDRA_DB_API_KEY"])
 
-client.databases.create(database="acme_corp")
+try:
+    client.databases.create(database="acme_corp")
+except Exception as e:
+    if "already exists" not in str(e).lower():
+        raise
 
 while True:
     infra = client.databases.status(database="acme_corp").data.infra
@@ -71,7 +75,11 @@ import { HydraDBClient } from "@hydradb/sdk";
 
 const client = new HydraDBClient({ token: process.env.HYDRA_DB_API_KEY });
 
-await client.databases.create({ database: "acme_corp" });
+try {
+  await client.databases.create({ database: "acme_corp" });
+} catch (e: any) {
+  if (!e?.message?.toLowerCase().includes("already exists")) throw e;
+}
 
 while (true) {
   const { data } = await client.databases.status({ database: "acme_corp" });
@@ -82,16 +90,18 @@ while (true) {
 ```bash cURL
 export HYDRA_DB_API_KEY="your_api_key"
 
-curl -s -X POST 'https://api.hydradb.com/databases' \
+STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST 'https://api.hydradb.com/databases' \
   -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
   -H "API-Version: 2" \
   -H "Content-Type: application/json" \
-  -d '{"database":"acme_corp"}'
+  -d '{"database":"acme_corp"}')
+if [ "$STATUS" != "200" ] && [ "$STATUS" != "409" ]; then
+  echo "ERROR: database create returned HTTP $STATUS" >&2; exit 1
+fi
 
-until curl -s "https://api.hydradb.com/databases/status?database=acme_corp" \
+until RESP=$(curl -sf "https://api.hydradb.com/databases/status?database=acme_corp" \
   -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
-  -H "API-Version: 2" \
-  | jq -e '.data.infra.ready_for_ingestion' > /dev/null; do
+  -H "API-Version: 2") && echo "$RESP" | jq -e '.data.infra.ready_for_ingestion' > /dev/null; do
   sleep 5
 done
 ```
@@ -354,18 +364,20 @@ if (failed.length) throw new Error(`Indexing failed for: ${failed.map((s) => s.i
 ```
 ```bash cURL
 while true; do
-  STATUSES=$(curl -s -G 'https://api.hydradb.com/context/status' \
+  RESP=$(curl -sf -G 'https://api.hydradb.com/context/status' \
     -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
     -H "API-Version: 2" \
     --data-urlencode "database=acme_corp" \
     --data-urlencode "ids=slack_pricing_2026_0520" \
-    --data-urlencode "ids=notion_onboarding_wiki" \
-    | jq -r '.data.statuses[].indexing_status')
+    --data-urlencode "ids=notion_onboarding_wiki") || {
+    echo "ERROR: status request failed" >&2; exit 1
+  }
+  STATUSES=$(echo "$RESP" | jq -r '.data.statuses[].indexing_status')
   if ! echo "$STATUSES" | grep -qvE '^(completed|graph_creation|errored)$'; then break; fi
   sleep 5
 done
 
-if echo "$STATUSES" | grep -q '^errored$'; then
+if echo "$STATUSES" | grep -q 'errored'; then
   echo "ERROR: one or more sources failed indexing" >&2; exit 1
 fi
 ```
@@ -433,7 +445,20 @@ result2 = client.context.ingest(
 )
 memory_ids += [r.id for r in result2.data.results]
 
-# Poll memory readiness before querying (same loop as Section 2c)
+# Wait for memory indexing before querying
+terminal = {"completed", "graph_creation", "errored"}
+while True:
+    statuses = client.context.status(
+        database="acme_corp",
+        ids=memory_ids,
+    ).data.statuses
+    if all(s.indexing_status in terminal for s in statuses):
+        break
+    time.sleep(5)
+
+failed = [s for s in statuses if s.indexing_status == "errored"]
+if failed:
+    raise RuntimeError(f"Memory indexing failed for: {[s.id for s in failed]}")
 ```
 ```typescript TypeScript SDK
 // Path 1: raw chat log → infer: true
@@ -469,11 +494,22 @@ const { data: d2 } = await client.context.ingest({
 });
 
 const memoryIds = [...d1.results.map((r) => r.id), ...d2.results.map((r) => r.id)];
-// Poll memoryIds for readiness before querying (same loop as Section 2c)
+
+// Wait for memory indexing before querying
+const memTerminal = new Set(["completed", "graph_creation", "errored"]);
+let memStatuses: { id: string; indexingStatus: string }[] = [];
+while (true) {
+  const { data } = await client.context.status({ database: "acme_corp", ids: memoryIds });
+  memStatuses = data.statuses;
+  if (memStatuses.every((s) => memTerminal.has(s.indexingStatus))) break;
+  await new Promise((r) => setTimeout(r, 5_000));
+}
+const memFailed = memStatuses.filter((s) => s.indexingStatus === "errored");
+if (memFailed.length) throw new Error(`Memory indexing failed for: ${memFailed.map((s) => s.id)}`);
 ```
 ```bash cURL
 # Path 1: raw chat log → infer: true
-MEMORY_IDS=$(curl -s -X POST 'https://api.hydradb.com/context/ingest' \
+RESP1=$(curl -sf -X POST 'https://api.hydradb.com/context/ingest' \
   -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
   -H "API-Version: 2" \
   -F "type=memory" \
@@ -489,10 +525,10 @@ MEMORY_IDS=$(curl -s -X POST 'https://api.hydradb.com/context/ingest' \
       "custom_instructions": "Focus on communication style preferences.",
       "user_name": "Alice"
     }
-  ]' | jq -r '.data.results[].id')
+  ]') || { echo "ERROR: memory ingest (path 1) failed" >&2; exit 1; }
 
 # Path 2: pre-extracted fact → infer: false
-MEMORY_IDS="$MEMORY_IDS $(curl -s -X POST 'https://api.hydradb.com/context/ingest' \
+RESP2=$(curl -sf -X POST 'https://api.hydradb.com/context/ingest' \
   -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
   -H "API-Version: 2" \
   -F "type=memory" \
@@ -504,9 +540,30 @@ MEMORY_IDS="$MEMORY_IDS $(curl -s -X POST 'https://api.hydradb.com/context/inges
       "text": "User is on the Pro plan. Renewal date: 2027-01-15.",
       "infer": false
     }
-  ]' | jq -r '.data.results[].id')"
+  ]') || { echo "ERROR: memory ingest (path 2) failed" >&2; exit 1; }
 
-# Poll $MEMORY_IDS for readiness before querying (same loop as Section 2c)
+MEMORY_IDS=$(printf '%s\n%s' \
+  "$(echo "$RESP1" | jq -r '.data.results[].id')" \
+  "$(echo "$RESP2" | jq -r '.data.results[].id')")
+
+# Wait for memory indexing before querying
+while true; do
+  QUERY_PARAMS="database=acme_corp"
+  for ID in $MEMORY_IDS; do QUERY_PARAMS="$QUERY_PARAMS&ids=$ID"; done
+  RESP=$(curl -sf -G "https://api.hydradb.com/context/status" \
+    -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+    -H "API-Version: 2" \
+    --data-urlencode "database=acme_corp" \
+    $(echo "$MEMORY_IDS" | xargs -I{} echo "--data-urlencode ids={}")) || {
+    echo "ERROR: memory status request failed" >&2; exit 1
+  }
+  MEM_STATUSES=$(echo "$RESP" | jq -r '.data.statuses[].indexing_status')
+  if ! echo "$MEM_STATUSES" | grep -qvE '^(completed|graph_creation|errored)$'; then break; fi
+  sleep 5
+done
+if echo "$MEM_STATUSES" | grep -q 'errored'; then
+  echo "ERROR: one or more memory sources failed indexing" >&2; exit 1
+fi
 ```
 </CodeGroup>
 
@@ -673,20 +730,28 @@ const promptContext =
   `Relevant company knowledge:\n${buildString(knowledgeResult)}`;
 ```
 ```bash cURL
-# Run both in background
-curl -s -X POST 'https://api.hydradb.com/query' \
-  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
-  -H "API-Version: 2" \
-  -H "Content-Type: application/json" \
-  -d '{"database":"acme_corp","query":"refund policy","type":"knowledge","query_by":"hybrid","mode":"thinking"}' &
+KNOWLEDGE_FILE=$(mktemp)
+MEMORY_FILE=$(mktemp)
 
-curl -s -X POST 'https://api.hydradb.com/query' \
+curl -sf -X POST 'https://api.hydradb.com/query' \
   -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
   -H "API-Version: 2" \
   -H "Content-Type: application/json" \
-  -d '{"database":"acme_corp","collection":"user_alice","query":"communication style preferences","type":"memory","query_by":"hybrid"}' &
+  -d '{"database":"acme_corp","query":"refund policy","type":"knowledge","query_by":"hybrid","mode":"thinking"}' \
+  -o "$KNOWLEDGE_FILE" &
+
+curl -sf -X POST 'https://api.hydradb.com/query' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -H "Content-Type: application/json" \
+  -d '{"database":"acme_corp","collection":"user_alice","query":"communication style preferences","type":"memory","query_by":"hybrid"}' \
+  -o "$MEMORY_FILE" &
 
 wait
+
+KNOWLEDGE_CONTEXT=$(jq -r '[.data.chunks[].chunk_content] | join("\n---\n")' "$KNOWLEDGE_FILE")
+MEMORY_CONTEXT=$(jq -r '[.data.chunks[].chunk_content] | join("\n---\n")' "$MEMORY_FILE")
+rm -f "$KNOWLEDGE_FILE" "$MEMORY_FILE"
 ```
 </CodeGroup>
 
@@ -702,6 +767,8 @@ from hydra_db.helpers import build_string
 from openai import OpenAI
 
 openai_client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+
+user_question = "What is our refund policy?"
 
 result = client.query(
     database="acme_corp",
@@ -739,6 +806,8 @@ import { buildString } from "@hydradb/sdk";
 import OpenAI from "openai";
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+const userQuestion = "What is our refund policy?";
 
 const result = await client.query({
   database: "acme_corp",
