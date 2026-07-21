@@ -1,14 +1,29 @@
 ---
 title: "One Change, Different Result"
 sidebarTitle: "One Change, Different Result"
-description: "Evidence-backed experiments: change one HydraDB field, predict the result, then compare simultaneous requests and verified live responses."
+description: "Evidence-backed experiments for HydraDB context decisions: store, infer, readiness, source shape, and shared+personal retrieval."
 ---
 
-This page is a controlled experiment, not a decision flowchart. HydraDB requests can look nearly identical while producing meaningfully different behavior. Each card below changes **exactly one field**, asks you to predict the result, reveals the control and variant side by side, shows **observed live responses**, and ends with an **agent-readable decision record**.
+This page is a controlled experiment, not a decision flowchart. HydraDB requests can look nearly identical while producing meaningfully different behavior. Each card below changes **one controlled variable**, asks you to predict the result, reveals the control and variant side by side, shows **observed responses**, and ends with an **agent-readable decision record**.
+
+Together the cards cover the core context workflow: Memory vs Knowledge, `infer`, matching ingest/status/retrieve endpoints, how sources are structured, and combining shared knowledge with user-scoped memories.
 
 <Info>
-  These cards complement — they do not replace — the canonical [Knowledge](/essentials/v2/knowledge), [Memories](/essentials/v2/memories), [Query](/essentials/v2/query), and [Ingest Context](/api-reference/v2/endpoint/ingest-context) pages. Use those for the full parameter reference and production recipes.
+  These cards complement — they do not replace — the canonical [Knowledge](/essentials/v2/knowledge), [Memories](/essentials/v2/memories), [Query](/essentials/v2/query), [Ingest Context](/api-reference/v2/endpoint/ingest-context), [Source status](/api-reference/v2/endpoint/source-status), [App sources](/essentials/v2/app-sources), and [Multi-tenant](/essentials/v2/multi-tenant) pages. Use those for full parameter reference and production recipes.
 </Info>
+
+## The endpoint chain every card uses
+
+The complete context loop is the same for every experiment. Cards change one variable **inside** this chain; they do not invent alternate APIs.
+
+| Step | Endpoint | Role |
+| --- | --- | --- |
+| 1. Accept work | [`POST /context/ingest`](/api-reference/v2/endpoint/ingest-context) | Returns `202` and source `id`s. Acceptance is not queryability. |
+| 2. Wait for readiness | [`GET /context/status`](/api-reference/v2/endpoint/source-status) | Poll until `indexing_status` reaches at least `graph_creation` (queryable) or `completed` when you need full indexing/graph. |
+| 3. Inspect (optional) | [`GET /context/inspect`](/api-reference/v2/endpoint/fetch-content) | Read stored `content` / `inferred_content` without running retrieval. |
+| 4. Retrieve | [`POST /query`](/api-reference/v2/endpoint/query) | Search with `type: "memory"`, `"knowledge"`, or `"all"`. |
+
+**Demo scope used below:** `database=contrastive_docs_demo`, user collection `reader_001`. Shared company knowledge is written without a user collection (database default) unless a card says otherwise.
 
 ## Choose the store you query
 
@@ -16,6 +31,10 @@ Use `type` to choose whether the same query searches per-user Memories or shared
 
 <Accordion title="Predict before you reveal: what changes when type changes?">
   `type: "memory"` searches context scoped to a user or collection. `type: "knowledge"` searches shared documents and app content. The query text and retrieval method can remain identical, but the result comes from a different store.
+
+### Endpoint chain
+
+Seed both stores first (`POST /context/ingest` → `GET /context/status`). This card only changes the query step: `POST /query`.
 
 ### Requests
 
@@ -123,9 +142,13 @@ Use `infer` to decide whether HydraDB should extract a useful memory from raw si
 <Accordion title="Predict before you reveal: what changes when infer changes?">
   `infer: true` asks HydraDB to extract the underlying preference, trait, or fact. `infer: false` stores and indexes the text as written. Keep the raw input identical so the extraction step is the only behavioral variable.
 
+### Endpoint chain
+
+`POST /context/ingest` → `GET /context/status` (wait until queryable) → `GET /context/inspect`. Upsert is enabled by default, so submit the control, inspect it, then submit the variant with the same `id` so only `infer` changes.
+
 ### Requests
 
-For a clean probe, use a fresh throwaway database for the pair. Inspect the control after it becomes queryable, then submit the variant with the same ID. Upsert is enabled by default, so the variant replaces the control while `infer` remains the only changed request field.
+For a clean probe, use a fresh throwaway database for the pair when possible.
 
 <Columns cols={2}>
   <Card title="Control: Extract meaning">
@@ -232,12 +255,542 @@ evidence_status: verified-v2-2026-07-21
 
 </Accordion>
 
+## Wait for readiness before you query
+
+Successful ingest means HydraDB **accepted** work. It does not mean chunks are searchable yet. This card keeps the query body identical and changes only whether you wait for a queryable status.
+
+<Accordion title="Predict before you reveal: what changes when you skip the status wait?">
+  The control fires `POST /query` immediately after `POST /context/ingest` returns. The variant polls [`GET /context/status`](/api-reference/v2/endpoint/source-status) until `indexing_status` reaches at least `graph_creation`, then runs the **same** query. Use a fresh source `id` each run so prior indexing does not poison the control.
+
+### Endpoint chain
+
+`POST /context/ingest` → (control skips wait) / (variant: `GET /context/status`) → `POST /query`
+
+### Ingest once (shared setup)
+
+```bash
+PROBE_ID="readiness_probe_$(date +%s)"
+
+curl -X POST 'https://api.hydradb.com/context/ingest' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -F "type=memory" \
+  -F "database=contrastive_docs_demo" \
+  -F "collection=reader_001" \
+  -F "memories=[{\"id\":\"${PROBE_ID}\",\"text\":\"Readiness probe: page on-call in #release-ops for SEV-1.\",\"infer\":false}]"
+```
+
+### Status poll (variant only)
+
+```bash
+curl -G 'https://api.hydradb.com/context/status' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  --data-urlencode "database=contrastive_docs_demo" \
+  --data-urlencode "collection=reader_001" \
+  --data-urlencode "ids=${PROBE_ID}"
+```
+
+Repeat until `indexing_status` is `graph_creation` or `completed` (or terminal `errored`).
+
+### Requests
+
+The query JSON is identical for both arms. Only the readiness gate changes.
+
+<Columns cols={2}>
+  <Card title="Control: Query immediately">
+
+  **Changed field:** readiness gate = none
+
+  ```bash
+  curl -X POST 'https://api.hydradb.com/query' \
+    -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+    -H "API-Version: 2" \
+    -H "Content-Type: application/json" \
+    -d "{
+      \"query\": \"Where should I page on-call for SEV-1?\",
+      \"database\": \"contrastive_docs_demo\",
+      \"collection\": \"reader_001\",
+      \"type\": \"memory\",
+      \"query_by\": \"hybrid\",
+      \"mode\": \"fast\",
+      \"graph_context\": false
+    }"
+  ```
+
+  </Card>
+  <Card title="Variant: Query after ready">
+
+  **Changed field:** readiness gate = wait for queryable status
+
+  ```bash
+  # After GET /context/status shows graph_creation or completed:
+  curl -X POST 'https://api.hydradb.com/query' \
+    -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+    -H "API-Version: 2" \
+    -H "Content-Type: application/json" \
+    -d "{
+      \"query\": \"Where should I page on-call for SEV-1?\",
+      \"database\": \"contrastive_docs_demo\",
+      \"collection\": \"reader_001\",
+      \"type\": \"memory\",
+      \"query_by\": \"hybrid\",
+      \"mode\": \"fast\",
+      \"graph_context\": false
+    }"
+  ```
+
+  </Card>
+</Columns>
+
+### Responses
+
+<Info>
+  Evidence status: `protocol-pending`. Replace the excerpts below after live runs. Expected pattern from the async pipeline docs: the immediate query often misses the new source; the post-ready query returns it. Race windows vary by load.
+</Info>
+
+<Columns cols={2}>
+  <Card title="Observed: Immediate query">
+
+  ```json
+  {
+    "chunks": [],
+    "note": "protocol-pending: often empty or missing the fresh PROBE_ID"
+  }
+  ```
+
+  </Card>
+  <Card title="Observed: After ready">
+
+  ```json
+  {
+    "id": "readiness_probe_<timestamp>",
+    "chunk_content": "Readiness probe: page on-call in #release-ops for SEV-1.",
+    "source_type": "memory",
+    "…": "protocol-pending live excerpt"
+  }
+  ```
+
+  </Card>
+</Columns>
+
+**First meaningful difference:** presence of the new source in `data.chunks` after a queryable status, not a different query body.
+
+**Selection rule:** never treat ingest `202` as searchable. Poll status (or use a webhook) before correctness checks, evals, or user-facing answers that depend on the new content. `graph_creation` is already queryable for normal retrieval; wait for `completed` when you need full graph behavior.
+
+```yaml Agent decision record
+decision: query-readiness
+changed_field: readiness_gate
+control_value: query_immediately_after_ingest
+variant_value: query_after_graph_creation_or_completed
+effect: newly ingested content is invisible until processing reaches a queryable status
+use_control_when: never for correctness checks; only to demonstrate the async race
+use_variant_when: any production or evaluation retrieval after ingest
+evidence_status: protocol-pending
+```
+
+</Accordion>
+
+## Choose how the same fact is structured
+
+The same sentence can land in different stores with different `source_type` values depending on how you structure the ingest payload. This is the structuring decision for conversations vs documents vs app-extracted sources — without a full connector setup guide.
+
+<Accordion title="Predict before you reveal: what changes when the ingest shape changes?">
+  Keep the fact fixed: `Post escalation updates in #release-ops.` Change only the ingest path: user **Memory** (`memories[]`) versus shared **Knowledge document** (`documents`). Both arms use `infer: false` / no extraction so structure is the only variable.
+
+### Endpoint chain
+
+`POST /context/ingest` → `GET /context/status` → `POST /query` (with matching `type`)
+
+### Requests
+
+<Columns cols={2}>
+  <Card title="Control: Memory (conversation signal)">
+
+  **Changed field:** `type=memory` + `memories[]`
+
+  ```bash
+  curl -X POST 'https://api.hydradb.com/context/ingest' \
+    -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+    -H "API-Version: 2" \
+    -F "type=memory" \
+    -F "database=contrastive_docs_demo" \
+    -F "collection=reader_001" \
+    -F 'memories=[{
+      "id": "structure_memory_probe",
+      "text": "Post escalation updates in #release-ops.",
+      "infer": false
+    }]'
+  ```
+
+  Query after ready:
+
+  ```bash
+  curl -X POST 'https://api.hydradb.com/query' \
+    -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+    -H "API-Version: 2" \
+    -H "Content-Type: application/json" \
+    -d '{
+      "query": "Where should escalation updates be posted?",
+      "database": "contrastive_docs_demo",
+      "collection": "reader_001",
+      "type": "memory",
+      "query_by": "hybrid",
+      "mode": "fast",
+      "graph_context": false
+    }'
+  ```
+
+  </Card>
+  <Card title="Variant: Knowledge document">
+
+  **Changed field:** `type=knowledge` + `documents`
+
+  ```bash
+  printf '%s\n' 'Post escalation updates in #release-ops.' > /tmp/escalation-runbook.txt
+
+  curl -X POST 'https://api.hydradb.com/context/ingest' \
+    -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+    -H "API-Version: 2" \
+    -F "type=knowledge" \
+    -F "database=contrastive_docs_demo" \
+    -F "upsert=true" \
+    -F "documents=@/tmp/escalation-runbook.txt;type=text/plain;filename=escalation-runbook.txt" \
+    -F 'document_metadata=[{
+      "id": "structure_knowledge_probe",
+      "metadata": { "doc_type": "runbook" }
+    }]'
+  ```
+
+  Query after ready (shared knowledge — no user collection):
+
+  ```bash
+  curl -X POST 'https://api.hydradb.com/query' \
+    -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+    -H "API-Version: 2" \
+    -H "Content-Type: application/json" \
+    -d '{
+      "query": "Where should escalation updates be posted?",
+      "database": "contrastive_docs_demo",
+      "type": "knowledge",
+      "query_by": "hybrid",
+      "mode": "fast",
+      "graph_context": false
+    }'
+  ```
+
+  </Card>
+</Columns>
+
+### Also consider: app-extracted sources
+
+When Slack, Notion, tickets, or email are **already extracted** by your app, use `type=knowledge` with `app_knowledge` instead of a raw file upload. Shape follows the [App sources](/essentials/v2/app-sources) contract; a minimal probe:
+
+```bash
+curl -X POST 'https://api.hydradb.com/context/ingest' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -F "type=knowledge" \
+  -F "database=contrastive_docs_demo" \
+  -F "upsert=true" \
+  -F 'app_knowledge=[{
+    "id": "structure_slack_probe",
+    "database": "contrastive_docs_demo",
+    "title": "Escalation channel note",
+    "type": "slack",
+    "content": { "text": "Post escalation updates in #release-ops." },
+    "additional_metadata": { "channel": "#release-ops" }
+  }]'
+```
+
+Conversations and user signals still belong in Memory. Shared channels, pages, and runbooks belong in Knowledge (`documents` or `app_knowledge`).
+
+### Responses
+
+<Info>
+  Evidence status: `protocol-pending`. Replace after live runs. Compare `source_type` and scope, not formatting noise.
+</Info>
+
+<Columns cols={2}>
+  <Card title="Observed: Memory shape">
+
+  ```json
+  {
+    "id": "structure_memory_probe",
+    "chunk_content": "Post escalation updates in #release-ops.",
+    "source_type": "memory",
+    "…": "protocol-pending live excerpt"
+  }
+  ```
+
+  </Card>
+  <Card title="Observed: Document shape">
+
+  ```json
+  {
+    "id": "structure_knowledge_probe",
+    "chunk_content": "Post escalation updates in #release-ops.",
+    "source_type": "knowledge_base",
+    "…": "protocol-pending live excerpt"
+  }
+  ```
+
+  </Card>
+</Columns>
+
+**First meaningful difference:** same fact, different store and `source_type` / source identity, driven only by ingest payload shape and `type`.
+
+**Selection rule:**
+
+- User conversation, preference, or behavioral signal → Memory (`memories[]`), then apply the infer card
+- Files and static docs (PDF, markdown, txt) → Knowledge `documents`
+- Pre-extracted Slack / Notion / tickets / email → Knowledge `app_knowledge`
+- Do not store company-wide runbooks only in one user's memory collection if everyone needs them
+
+```yaml Agent decision record
+decision: source-structure
+changed_field: ingest_payload_shape
+control_value: type=memory + memories[]
+variant_value: type=knowledge + documents
+effect: same fact lands in different stores with different source_type and default scope
+use_control_when: user-specific conversation, preference, or behavioral signal
+use_variant_when: shared documents and files; use app_knowledge when the app already extracted structured content
+evidence_status: protocol-pending
+```
+
+</Accordion>
+
+## Combine shared knowledge with user-scoped memories
+
+Personalized answers usually need company facts and user-specific context together. This card keeps the query text and user `collection` fixed and changes only `type` between `memory` and `all`.
+
+<Accordion title="Predict before you reveal: what changes when type is all instead of memory?">
+  Seed **shared** knowledge (no user collection) and a **user** memory under `reader_001`, wait until both are queryable, then compare retrieval.
+
+### Endpoint chain
+
+Two ingests → status for both ids → `POST /query` with only `type` changed.
+
+### Seed (run once before the pair)
+
+```bash
+# Shared company knowledge (database default collection)
+printf '%s\n' 'Post escalation updates in #release-ops.' > /tmp/company-escalation.txt
+
+curl -X POST 'https://api.hydradb.com/context/ingest' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -F "type=knowledge" \
+  -F "database=contrastive_docs_demo" \
+  -F "upsert=true" \
+  -F "documents=@/tmp/company-escalation.txt;type=text/plain;filename=company-escalation.txt" \
+  -F 'document_metadata=[{"id":"combine_knowledge_probe","metadata":{"doc_type":"runbook"}}]'
+
+# User-specific memory
+curl -X POST 'https://api.hydradb.com/context/ingest' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -F "type=memory" \
+  -F "database=contrastive_docs_demo" \
+  -F "collection=reader_001" \
+  -F 'memories=[{
+    "id": "combine_memory_probe",
+    "text": "Reader prefers escalation updates as a single Slack message, not a thread.",
+    "infer": false
+  }]'
+```
+
+Poll status for `combine_knowledge_probe` and `combine_memory_probe` until each is queryable.
+
+### Requests
+
+<Columns cols={2}>
+  <Card title="Control: User memory only">
+
+  **Changed field:** `type: "memory"`
+
+  ```bash
+  curl -X POST 'https://api.hydradb.com/query' \
+    -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+    -H "API-Version: 2" \
+    -H "Content-Type: application/json" \
+    -d '{
+      "query": "How should I post escalation updates for this reader?",
+      "database": "contrastive_docs_demo",
+      "collection": "reader_001",
+      "type": "memory",
+      "query_by": "hybrid",
+      "mode": "fast",
+      "graph_context": false
+    }'
+  ```
+
+  </Card>
+  <Card title="Variant: Shared + personal">
+
+  **Changed field:** `type: "all"`
+
+  ```bash
+  curl -X POST 'https://api.hydradb.com/query' \
+    -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+    -H "API-Version: 2" \
+    -H "Content-Type: application/json" \
+    -d '{
+      "query": "How should I post escalation updates for this reader?",
+      "database": "contrastive_docs_demo",
+      "collection": "reader_001",
+      "type": "all",
+      "query_by": "hybrid",
+      "mode": "fast",
+      "graph_context": false
+    }'
+  ```
+
+  </Card>
+</Columns>
+
+### Responses
+
+<Info>
+  Evidence status: `protocol-pending`. Live verification must confirm whether `type: "all"` with a user `collection` returns both the user memory and shared knowledge written on the default collection. Document the **observed** scoping rule — do not assume. If shared knowledge is missing, re-query knowledge without `collection` or adjust write scopes so shared content and user memories use a documented combine pattern from [Multi-tenant](/essentials/v2/multi-tenant).
+</Info>
+
+<Columns cols={2}>
+  <Card title="Observed: memory only">
+
+  ```json
+  {
+    "chunks": [
+      {
+        "id": "combine_memory_probe",
+        "source_type": "memory",
+        "chunk_content": "Reader prefers escalation updates as a single Slack message, not a thread.",
+        "…": "protocol-pending live excerpt"
+      }
+    ]
+  }
+  ```
+
+  </Card>
+  <Card title="Observed: type all">
+
+  ```json
+  {
+    "chunks": [
+      {
+        "id": "combine_memory_probe",
+        "source_type": "memory",
+        "…": "protocol-pending"
+      },
+      {
+        "id": "combine_knowledge_probe",
+        "source_type": "knowledge_base",
+        "…": "protocol-pending — confirm presence after live run"
+      }
+    ]
+  }
+  ```
+
+  </Card>
+</Columns>
+
+**First meaningful difference:** which stores appear in `data.chunks` (`source_type` / source ids), not absolute scores.
+
+**Selection rule:**
+
+- User-only personalization → `type: "memory"` with the user's `collection`
+- Company-only RAG → `type: "knowledge"` with the shared write scope
+- Personalized grounded answers → `type: "all"` with **consistent** write/read scoping for both stores
+- Always write memories with the same collection you query for that user
+
+```yaml Agent decision record
+decision: personalized-combine
+changed_field: type
+control_value: memory
+variant_value: all
+effect: memory-only retrieval vs merged retrieval across stores (subject to database/collection scoping)
+use_control_when: only user-specific context is required
+use_variant_when: answers must use shared company knowledge and user-specific memories together
+scoping_rule: write and query with consistent database/collection (or collections) for each store's intended visibility
+evidence_status: protocol-pending
+```
+
+</Accordion>
+
+## Agent decision pack
+
+Copy these records into agent context when generating HydraDB integrations. Each record is defined on the card above; prefer the live-verified cards when behavior is critical.
+
+```yaml
+# decision: query-store
+decision: query-store
+changed_field: type
+control_value: memory
+variant_value: knowledge
+effect: searches per-user Memories instead of shared Knowledge
+use_control_when: retrieving user-scoped preferences or history
+use_variant_when: retrieving documents or shared application content
+evidence_status: verified-v2-2026-07-21
+
+# decision: memory-extraction
+decision: memory-extraction
+changed_field: infer
+control_value: true
+variant_value: false
+effect: extracts an underlying memory instead of storing the input literally
+use_control_when: the input is raw behavior, dialogue, feedback, or another indirect signal
+use_variant_when: the input is already the exact memory to retain
+evidence_status: verified-v2-2026-07-21
+
+# decision: query-readiness
+decision: query-readiness
+changed_field: readiness_gate
+control_value: query_immediately_after_ingest
+variant_value: query_after_graph_creation_or_completed
+effect: newly ingested content is invisible until processing reaches a queryable status
+use_control_when: never for correctness checks; only to demonstrate the async race
+use_variant_when: any production or evaluation retrieval after ingest
+evidence_status: protocol-pending
+
+# decision: source-structure
+decision: source-structure
+changed_field: ingest_payload_shape
+control_value: type=memory + memories[]
+variant_value: type=knowledge + documents
+effect: same fact lands in different stores with different source_type and default scope
+use_control_when: user-specific conversation, preference, or behavioral signal
+use_variant_when: shared documents and files; use app_knowledge when the app already extracted structured content
+evidence_status: protocol-pending
+
+# decision: personalized-combine
+decision: personalized-combine
+changed_field: type
+control_value: memory
+variant_value: all
+effect: memory-only retrieval vs merged retrieval across stores (subject to database/collection scoping)
+use_control_when: only user-specific context is required
+use_variant_when: answers must use shared company knowledge and user-specific memories together
+scoping_rule: write and query with consistent database/collection (or collections) for each store's intended visibility
+evidence_status: protocol-pending
+```
+
 ## Read the evidence safely
 
 - Treat result ordering and absolute relevance scores as run-specific noise.
 - Treat inferred wording as nondeterministic; compare whether meaning was extracted, not the exact sentence.
 - Compare only the field or content difference named by the card.
 - `type` selects which store is searched; isolation still depends on database, collection, and authorization.
-- Wait until ingestion reaches a queryable status before comparing results.
+- Wait until ingestion reaches a queryable status before comparing results — except on the readiness card, where that wait is the variable.
+- On the structure card, compare `source_type` and scope, not prose formatting.
+- On the combine card, compare which stores and source ids appear; re-check scoping if shared knowledge is missing from `type: "all"`.
 
-For parameter details and production examples, continue to [Query](/essentials/v2/query) or [Ingest Context](/api-reference/v2/endpoint/ingest-context).
+## Next
+
+| Decision | Canonical page |
+| --- | --- |
+| Stores and retrieval modes | [Query](/essentials/v2/query) |
+| Memory writes and infer | [Memories](/essentials/v2/memories) |
+| Documents and shared content | [Knowledge](/essentials/v2/knowledge) |
+| Slack, Notion, tickets | [App sources](/essentials/v2/app-sources) |
+| database / collection scoping | [Multi-tenant](/essentials/v2/multi-tenant) |
+| Ingest and status APIs | [Ingest Context](/api-reference/v2/endpoint/ingest-context), [Source status](/api-reference/v2/endpoint/source-status) |
