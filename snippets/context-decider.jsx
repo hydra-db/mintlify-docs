@@ -18,8 +18,9 @@ export const ContextDecider = () => {
   -H "API-Version: 2" \\
   -F "type=knowledge" \\
   -F "database=acme_corp" \\
+  -F "collection=team_docs" \\
   -F "documents=@/path/to/policy.pdf"`,
-          next: 'Poll GET /context/status, then POST /query with type: "knowledge" or "all".',
+          next: 'Poll GET /context/status, then POST /query with type: "knowledge" (or "all" with collections that include team_docs).',
           href: '/essentials/v2/knowledge',
         }
       : audience === 'personal' && signal === 'raw'
@@ -90,6 +91,7 @@ export const ContextDecider = () => {
         <div className="grid gap-3 sm:grid-cols-2">
           <button
             type="button"
+            aria-pressed={audience === 'shared'}
             className={optionClass(audience === 'shared')}
             onClick={() => {
               setAudience('shared');
@@ -105,6 +107,7 @@ export const ContextDecider = () => {
           </button>
           <button
             type="button"
+            aria-pressed={audience === 'personal'}
             className={optionClass(audience === 'personal')}
             onClick={() => setAudience('personal')}
           >
@@ -126,6 +129,7 @@ export const ContextDecider = () => {
           <div className="grid gap-3 sm:grid-cols-2">
             <button
               type="button"
+              aria-pressed={signal === 'raw'}
               className={optionClass(signal === 'raw')}
               onClick={() => setSignal('raw')}
             >
@@ -138,6 +142,7 @@ export const ContextDecider = () => {
             </button>
             <button
               type="button"
+              aria-pressed={signal === 'structured'}
               className={optionClass(signal === 'structured')}
               onClick={() => setSignal('structured')}
             >
