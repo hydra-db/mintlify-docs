@@ -346,7 +346,7 @@ The query JSON is identical for both arms. Only the readiness gate changes.
 ### Responses
 
 <Info>
-  Evidence status: `protocol-pending`. Replace the excerpts below after live runs. Expected pattern from the async pipeline docs: the immediate query often misses the new source; the post-ready query returns it. Race windows vary by load.
+  Verified against HydraDB v2 on July 21, 2026. Across matched runs, the fresh `PROBE_ID` was absent from immediate `POST /query` results and present after `GET /context/status` reached `graph_creation` or `completed`. Older similar memories may still rank; compare whether the **new id** appears.
 </Info>
 
 <Columns cols={2}>
@@ -354,8 +354,13 @@ The query JSON is identical for both arms. Only the readiness gate changes.
 
   ```json
   {
-    "chunks": [],
-    "note": "protocol-pending: often empty or missing the fresh PROBE_ID"
+    "chunks": [
+      {
+        "id": "readiness_probe_1784626730",
+        "note": "prior similar memories may appear; the fresh PROBE_ID does not"
+      }
+    ],
+    "fresh_probe_id_present": false
   }
   ```
 
@@ -364,17 +369,18 @@ The query JSON is identical for both arms. Only the readiness gate changes.
 
   ```json
   {
-    "id": "readiness_probe_<timestamp>",
+    "id": "readiness_probe_1784626814",
     "chunk_content": "Readiness probe: page on-call in #release-ops for SEV-1.",
     "source_type": "memory",
-    "…": "protocol-pending live excerpt"
+    "source_title": "readiness_probe_1784626814",
+    "…": "request metadata and run-specific scores omitted"
   }
   ```
 
   </Card>
 </Columns>
 
-**First meaningful difference:** presence of the new source in `data.chunks` after a queryable status, not a different query body.
+**First meaningful difference:** presence of the **new** source `id` in `data.chunks` after a queryable status, not a different query body.
 
 **Selection rule:** never treat ingest `202` as searchable. Poll status (or use a webhook) before correctness checks, evals, or user-facing answers that depend on the new content. `graph_creation` is already queryable for normal retrieval; wait for `completed` when you need full graph behavior.
 
@@ -386,7 +392,7 @@ variant_value: query_after_graph_creation_or_completed
 effect: newly ingested content is invisible until processing reaches a queryable status
 use_control_when: never for correctness checks; only to demonstrate the async race
 use_variant_when: any production or evaluation retrieval after ingest
-evidence_status: protocol-pending
+evidence_status: verified-v2-2026-07-21
 ```
 
 </Accordion>
@@ -508,7 +514,7 @@ Conversations and user signals still belong in Memory. Shared channels, pages, a
 ### Responses
 
 <Info>
-  Evidence status: `protocol-pending`. Replace after live runs. Compare `source_type` and scope, not formatting noise.
+  Verified against HydraDB v2 on July 21, 2026. Same fact text produced `source_type: "memory"` via `memories[]` and `source_type: "document"` via file `documents`. Compare type and source identity, not scores.
 </Info>
 
 <Columns cols={2}>
@@ -519,7 +525,8 @@ Conversations and user signals still belong in Memory. Shared channels, pages, a
     "id": "structure_memory_probe",
     "chunk_content": "Post escalation updates in #release-ops.",
     "source_type": "memory",
-    "…": "protocol-pending live excerpt"
+    "source_title": "structure_memory_probe",
+    "…": "request metadata and run-specific scores omitted"
   }
   ```
 
@@ -529,21 +536,23 @@ Conversations and user signals still belong in Memory. Shared channels, pages, a
   ```json
   {
     "id": "structure_knowledge_probe",
-    "chunk_content": "Post escalation updates in #release-ops.",
-    "source_type": "knowledge_base",
-    "…": "protocol-pending live excerpt"
+    "chunk_content": "Post escalation updates in #release-ops.\n",
+    "source_type": "document",
+    "source_title": "escalation-runbook.txt",
+    "metadata": { "doc_type": "runbook" },
+    "…": "request metadata and run-specific scores omitted"
   }
   ```
 
   </Card>
 </Columns>
 
-**First meaningful difference:** same fact, different store and `source_type` / source identity, driven only by ingest payload shape and `type`.
+**First meaningful difference:** same fact, different store and `source_type` (`memory` vs `document`) / source identity, driven only by ingest payload shape and `type`.
 
 **Selection rule:**
 
 - User conversation, preference, or behavioral signal → Memory (`memories[]`), then apply the infer card
-- Files and static docs (PDF, markdown, txt) → Knowledge `documents`
+- Files and static docs (PDF, markdown, txt) → Knowledge `documents` (returns `source_type: "document"`)
 - Pre-extracted Slack / Notion / tickets / email → Knowledge `app_knowledge`
 - Do not store company-wide runbooks only in one user's memory collection if everyone needs them
 
@@ -552,20 +561,20 @@ decision: source-structure
 changed_field: ingest_payload_shape
 control_value: type=memory + memories[]
 variant_value: type=knowledge + documents
-effect: same fact lands in different stores with different source_type and default scope
+effect: same fact lands in different stores with different source_type (memory vs document) and default scope
 use_control_when: user-specific conversation, preference, or behavioral signal
 use_variant_when: shared documents and files; use app_knowledge when the app already extracted structured content
-evidence_status: protocol-pending
+evidence_status: verified-v2-2026-07-21
 ```
 
 </Accordion>
 
 ## Combine shared knowledge with user-scoped memories
 
-Personalized answers usually need company facts and user-specific context together. This card keeps the query text and user `collection` fixed and changes only `type` between `memory` and `all`.
+Personalized answers need company facts and user-specific context together. This card keeps the query text and `collection` fixed and changes only `type` between `memory` and `all`. **Both stores must be written under a scope the query can see.**
 
 <Accordion title="Predict before you reveal: what changes when type is all instead of memory?">
-  Seed **shared** knowledge (no user collection) and a **user** memory under `reader_001`, wait until both are queryable, then compare retrieval.
+  Seed a company document **and** a user memory under the **same** `collection` (`reader_001`), wait until both are queryable, then compare `type: "memory"` vs `type: "all"`.
 
 ### Endpoint chain
 
@@ -574,19 +583,20 @@ Two ingests → status for both ids → `POST /query` with only `type` changed.
 ### Seed (run once before the pair)
 
 ```bash
-# Shared company knowledge (database default collection)
-printf '%s\n' 'Post escalation updates in #release-ops.' > /tmp/company-escalation.txt
+# Company knowledge co-scoped with the user collection (required for type:all merge)
+printf '%s\n' 'Company rule: Post escalation updates in #release-ops.' > /tmp/shared-in-user-scope.txt
 
 curl -X POST 'https://api.hydradb.com/context/ingest' \
   -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
   -H "API-Version: 2" \
   -F "type=knowledge" \
   -F "database=contrastive_docs_demo" \
+  -F "collection=reader_001" \
   -F "upsert=true" \
-  -F "documents=@/tmp/company-escalation.txt;type=text/plain;filename=company-escalation.txt" \
-  -F 'document_metadata=[{"id":"combine_knowledge_probe","metadata":{"doc_type":"runbook"}}]'
+  -F "documents=@/tmp/shared-in-user-scope.txt;type=text/plain;filename=shared-in-user-scope.txt" \
+  -F 'document_metadata=[{"id":"combine_knowledge_user_scope","metadata":{"doc_type":"runbook"}}]'
 
-# User-specific memory
+# User-specific memory (same collection)
 curl -X POST 'https://api.hydradb.com/context/ingest' \
   -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
   -H "API-Version: 2" \
@@ -600,7 +610,7 @@ curl -X POST 'https://api.hydradb.com/context/ingest' \
   }]'
 ```
 
-Poll status for `combine_knowledge_probe` and `combine_memory_probe` until each is queryable.
+Poll status for both ids until each is queryable.
 
 ### Requests
 
@@ -615,7 +625,7 @@ Poll status for `combine_knowledge_probe` and `combine_memory_probe` until each 
     -H "API-Version: 2" \
     -H "Content-Type: application/json" \
     -d '{
-      "query": "How should I post escalation updates for this reader?",
+      "query": "How should I post escalation updates for this reader? single Slack message release-ops",
       "database": "contrastive_docs_demo",
       "collection": "reader_001",
       "type": "memory",
@@ -636,7 +646,7 @@ Poll status for `combine_knowledge_probe` and `combine_memory_probe` until each 
     -H "API-Version: 2" \
     -H "Content-Type: application/json" \
     -d '{
-      "query": "How should I post escalation updates for this reader?",
+      "query": "How should I post escalation updates for this reader? single Slack message release-ops",
       "database": "contrastive_docs_demo",
       "collection": "reader_001",
       "type": "all",
@@ -652,7 +662,7 @@ Poll status for `combine_knowledge_probe` and `combine_memory_probe` until each 
 ### Responses
 
 <Info>
-  Evidence status: `protocol-pending`. Live verification must confirm whether `type: "all"` with a user `collection` returns both the user memory and shared knowledge written on the default collection. Document the **observed** scoping rule — do not assume. If shared knowledge is missing, re-query knowledge without `collection` or adjust write scopes so shared content and user memories use a documented combine pattern from [Multi-tenant](/essentials/v2/multi-tenant).
+  Verified against HydraDB v2 on July 21, 2026. With knowledge and memory both written under `collection: "reader_001"`, `type: "memory"` returned only memory chunks; `type: "all"` merged memory and document chunks. A separate probe wrote knowledge on the database default collection (no user `collection`): `type: "all"` + `collection: "reader_001"` then returned **memories only** — scoping mismatch, not a store bug. See [Multi-tenant](/essentials/v2/multi-tenant).
 </Info>
 
 <Columns cols={2}>
@@ -663,11 +673,12 @@ Poll status for `combine_knowledge_probe` and `combine_memory_probe` until each 
     "chunks": [
       {
         "id": "combine_memory_probe",
-        "source_type": "memory",
         "chunk_content": "Reader prefers escalation updates as a single Slack message, not a thread.",
-        "…": "protocol-pending live excerpt"
+        "source_type": "memory",
+        "…": "other memory hits and scores omitted"
       }
-    ]
+    ],
+    "document_chunks_present": false
   }
   ```
 
@@ -679,28 +690,33 @@ Poll status for `combine_knowledge_probe` and `combine_memory_probe` until each 
     "chunks": [
       {
         "id": "combine_memory_probe",
+        "chunk_content": "Reader prefers escalation updates as a single Slack message, not a thread.",
         "source_type": "memory",
-        "…": "protocol-pending"
+        "…": "scores omitted"
       },
       {
-        "id": "combine_knowledge_probe",
-        "source_type": "knowledge_base",
-        "…": "protocol-pending — confirm presence after live run"
+        "id": "combine_knowledge_user_scope",
+        "chunk_content": "Company rule: Post escalation updates in #release-ops.\\n",
+        "source_type": "document",
+        "source_title": "shared-in-user-scope.txt",
+        "…": "scores omitted"
       }
-    ]
+    ],
+    "document_chunks_present": true
   }
   ```
 
   </Card>
 </Columns>
 
-**First meaningful difference:** which stores appear in `data.chunks` (`source_type` / source ids), not absolute scores.
+**First meaningful difference:** which stores appear in `data.chunks` (`source_type` / source ids). Control is memory-only; variant includes `document` knowledge when co-scoped.
 
 **Selection rule:**
 
 - User-only personalization → `type: "memory"` with the user's `collection`
 - Company-only RAG → `type: "knowledge"` with the shared write scope
-- Personalized grounded answers → `type: "all"` with **consistent** write/read scoping for both stores
+- Personalized grounded answers → `type: "all"` **and** write knowledge into a scope the query can see (same `collection`, or a `collections` plan you control)
+- Mismatch footgun: knowledge on the default collection + `type: "all"` with a different user `collection` does **not** merge that knowledge in observed runs
 - Always write memories with the same collection you query for that user
 
 ```yaml Agent decision record
@@ -708,11 +724,11 @@ decision: personalized-combine
 changed_field: type
 control_value: memory
 variant_value: all
-effect: memory-only retrieval vs merged retrieval across stores (subject to database/collection scoping)
+effect: memory-only retrieval vs merged memory+knowledge retrieval when both stores share queryable scope
 use_control_when: only user-specific context is required
 use_variant_when: answers must use shared company knowledge and user-specific memories together
-scoping_rule: write and query with consistent database/collection (or collections) for each store's intended visibility
-evidence_status: protocol-pending
+scoping_rule: co-scope knowledge writes with the collection (or collections) used at query time; type:all does not pull knowledge from an unrelated default collection
+evidence_status: verified-v2-2026-07-21
 ```
 
 </Accordion>
@@ -750,28 +766,28 @@ variant_value: query_after_graph_creation_or_completed
 effect: newly ingested content is invisible until processing reaches a queryable status
 use_control_when: never for correctness checks; only to demonstrate the async race
 use_variant_when: any production or evaluation retrieval after ingest
-evidence_status: protocol-pending
+evidence_status: verified-v2-2026-07-21
 
 # decision: source-structure
 decision: source-structure
 changed_field: ingest_payload_shape
 control_value: type=memory + memories[]
 variant_value: type=knowledge + documents
-effect: same fact lands in different stores with different source_type and default scope
+effect: same fact lands in different stores with different source_type (memory vs document) and default scope
 use_control_when: user-specific conversation, preference, or behavioral signal
 use_variant_when: shared documents and files; use app_knowledge when the app already extracted structured content
-evidence_status: protocol-pending
+evidence_status: verified-v2-2026-07-21
 
 # decision: personalized-combine
 decision: personalized-combine
 changed_field: type
 control_value: memory
 variant_value: all
-effect: memory-only retrieval vs merged retrieval across stores (subject to database/collection scoping)
+effect: memory-only retrieval vs merged memory+knowledge retrieval when both stores share queryable scope
 use_control_when: only user-specific context is required
 use_variant_when: answers must use shared company knowledge and user-specific memories together
-scoping_rule: write and query with consistent database/collection (or collections) for each store's intended visibility
-evidence_status: protocol-pending
+scoping_rule: co-scope knowledge writes with the collection (or collections) used at query time; type:all does not pull knowledge from an unrelated default collection
+evidence_status: verified-v2-2026-07-21
 ```
 
 ## Read the evidence safely
@@ -782,7 +798,7 @@ evidence_status: protocol-pending
 - `type` selects which store is searched; isolation still depends on database, collection, and authorization.
 - Wait until ingestion reaches a queryable status before comparing results — except on the readiness card, where that wait is the variable.
 - On the structure card, compare `source_type` and scope, not prose formatting.
-- On the combine card, compare which stores and source ids appear; re-check scoping if shared knowledge is missing from `type: "all"`.
+- On the combine card, compare which stores and source ids appear. If `type: "all"` is missing knowledge, check whether knowledge was written under a different collection than the query.
 
 ## Next
 
