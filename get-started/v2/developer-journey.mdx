@@ -4,6 +4,34 @@ sidebarTitle: "Developer Journey"
 description: "A single end-to-end walkthrough: ingest Slack, Notion, PDFs, and user conversations, then query them with one call."
 ---
 
+<Info>
+**What you'll build:** An internal assistant that knows your company's Slack, Notion, and PDFs — and remembers each user's preferences. By the end, one query call returns personalized, grounded answers ready for your LLM.
+
+You'll follow one scenario all the way through: Acme Corp, one user (Alice), real data.
+</Info>
+
+Here's what the finished system looks like before you write a single line:
+
+```
+User asks: "What's our refund policy?"
+                    │
+                    ▼
+         HydraDB  POST /query  (type: "all")
+         ┌──────────────────────────────────┐
+         │  Knowledge store                 │  shared — Slack, Notion, PDFs
+         ├──────────────────────────────────┤
+         │  Memory store  (collection:      │  per-user — Alice's preferences
+         │  user_alice)                     │  and history
+         └──────────────────────────────────┘
+                    │
+                    ▼
+          build_string()  →  LLM prompt  →  Personalized answer
+```
+
+This guide takes you through each piece: what to ingest, how to wait for it, and how to query it. Five sections, one working system at the end.
+
+---
+
 ## Section 0: Before You Write Any Code
 
 > You have data. HydraDB has two stores: Knowledge and Memory.
@@ -29,6 +57,8 @@ Yes → Knowledge. No → Memory.
 ---
 
 ## Section 1: Set Up Your Database
+
+*Store decided. Now create the database and wait until it's ready.*
 
 One database = one organization. One collection = one user.
 
@@ -110,6 +140,8 @@ done
 ---
 
 ## Section 2: Ingest Your Knowledge (Shared Data)
+
+*Database is ready. Now load the shared data — Slack, Notion, PDFs — that every user can query.*
 
 ### 2a: Files (PDFs, DOCX, Markdown)
 
@@ -393,6 +425,8 @@ fi
 
 ## Section 3: Ingest User Memories (Per-User Data)
 
+*Shared data is indexed. Now write Alice's personal context — her communication style, her plan tier.*
+
 ### 3a: The `infer` Decision
 
 `infer` is the most important flag on memory ingestion. It controls whether HydraDB extracts a preference from raw signal, or stores exactly what you send.
@@ -411,7 +445,7 @@ Do you already have a structured fact?
        YES → infer: false → HydraDB stores exactly what you send
 ```
 
-Same user, two paths:
+Same user (Alice), same topic (communication style), two different inputs. The first is raw dialogue — HydraDB extracts the preference. The second is a fact you've already written out — HydraDB stores it verbatim:
 
 <CodeGroup>
 ```python Python SDK
@@ -585,11 +619,15 @@ fi
 Always use the user's ID as `collection`. If you skip it, memories land in the default collection and can surface for the wrong user. `collection` is the new name for `sub_tenant_id` — both work in the API, but `collection` is preferred in v2.
 </Warning>
 
+Both calls use `collection="user_alice"` — that's what scopes the memories to Alice and not to every user in the database. When Alice logs in and asks a question, her query uses the same collection value to retrieve only her context.
+
 For a deeper reference on `infer`, see [Infer Guide](/essentials/v2/infer-guide).
 
 ---
 
 ## Section 4: Querying — One Endpoint, Three Modes
+
+*Both stores are indexed. Alice's memories are ready. Now query them together.*
 
 <Warning>
 **Poll before querying — both stores.**
@@ -658,6 +696,30 @@ curl -sf -X POST 'https://api.hydradb.com/query' \
   }' || { echo "ERROR: query failed" >&2; exit 1; }
 ```
 </CodeGroup>
+
+The response looks like this (truncated):
+
+```json
+{
+  "data": {
+    "chunks": [
+      {
+        "chunk_content": "Refund policy: customers may request a full refund within 30 days...",
+        "relevancy_score": 0.94,
+        "source_type": "knowledge",
+        "metadata": { "document_type": "policy", "status": "approved" }
+      },
+      {
+        "chunk_content": "User prefers concise, direct answers with no preamble.",
+        "relevancy_score": 0.87,
+        "source_type": "memory"
+      }
+    ]
+  }
+}
+```
+
+Knowledge and Memory chunks are ranked together in one list. Pass this directly to `build_string()` — don't re-sort it.
 
 <Warning>
 **Knowledge is database-wide. Memory is collection-scoped.**
@@ -773,6 +835,8 @@ rm -f "$KNOWLEDGE_FILE" "$MEMORY_FILE"
 ---
 
 ## Section 5: From Query Result to LLM Prompt
+
+*You have ranked chunks from HydraDB. Now turn them into a prompt your LLM can use.*
 
 Use `build_string` / `buildString` from the SDK to convert the query response into a clean string for your LLM. It strips IDs and metadata noise, preserves chunk order, and includes graph context.
 
@@ -939,6 +1003,144 @@ Your Data
                                                       │
                                               Personalized answer
 ```
+
+### Complete script (Python)
+
+Copy this, add your API key, and run it end to end against a real HydraDB database.
+
+<Accordion title="Show complete Python script">
+```python
+import os, time, json
+from hydra_db import HydraDB
+from hydra_db.helpers import build_string
+from openai import OpenAI
+
+client = HydraDB(token=os.environ["HYDRA_DB_API_KEY"])
+openai_client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+
+# ── Section 1: Create database ──────────────────────────────────────────────
+try:
+    client.databases.create(database="acme_corp")
+except Exception as e:
+    if "already exists" not in str(e).lower():
+        raise
+
+while True:
+    infra = client.databases.status(database="acme_corp").data.infra
+    if infra.ready_for_ingestion:
+        break
+    time.sleep(5)
+
+# ── Section 2: Ingest Knowledge ─────────────────────────────────────────────
+result = client.context.ingest(
+    type="knowledge",
+    database="acme_corp",
+    app_knowledge=json.dumps([
+        {
+            "database": "acme_corp",
+            "id": "slack_pricing_2026_0520",
+            "title": "Pricing discussion — Slack #product",
+            "type": "slack", "kind": "message", "provider": "slack",
+            "external_id": "1716213600.000100",
+            "fields": {
+                "kind": "message",
+                "body": "We agreed on three tiers: Starter $29, Pro $79, Enterprise $199.",
+                "author": "alice", "thread_id": "1716213600.000100",
+                "created_at": "2026-05-20T10:00:00Z",
+            },
+            "metadata": {"channel": "product", "status": "finalized"},
+        }
+    ]),
+)
+ids = [r.id for r in result.data.results]
+
+terminal = {"completed", "graph_creation", "errored", "failed", "success"}
+failure_states = {"errored", "failed"}
+while True:
+    statuses = client.context.status(database="acme_corp", ids=ids).data.statuses
+    if not statuses:
+        raise RuntimeError("Empty status response")
+    if all(s.indexing_status in terminal for s in statuses):
+        break
+    time.sleep(5)
+failed = [s for s in statuses if s.indexing_status in failure_states]
+if failed:
+    raise RuntimeError(f"Knowledge indexing failed: {[s.id for s in failed]}")
+
+# ── Section 3: Ingest Memory ─────────────────────────────────────────────────
+r1 = client.context.ingest(
+    type="memory", database="acme_corp", collection="user_alice",
+    memories=json.dumps([{
+        "user_assistant_pairs": [
+            {"user": "Can you make that shorter?", "assistant": "Sure..."},
+            {"user": "Perfect, I like it that way.", "assistant": "Noted."},
+        ],
+        "infer": True,
+        "custom_instructions": "Focus on communication style preferences.",
+        "user_name": "Alice",
+    }]),
+)
+r2 = client.context.ingest(
+    type="memory", database="acme_corp", collection="user_alice",
+    memories=json.dumps([{
+        "id": "alice_plan_tier",
+        "text": "User is on the Pro plan. Renewal date: 2027-01-15.",
+        "infer": False,
+    }]),
+)
+memory_ids = [r.id for r in r1.data.results] + [r.id for r in r2.data.results]
+
+while True:
+    statuses = client.context.status(
+        database="acme_corp", collection="user_alice", ids=memory_ids
+    ).data.statuses
+    if not statuses:
+        raise RuntimeError("Empty memory status response")
+    if all(s.indexing_status in terminal for s in statuses):
+        break
+    time.sleep(5)
+failed = [s for s in statuses if s.indexing_status in failure_states]
+if failed:
+    raise RuntimeError(f"Memory indexing failed: {[s.id for s in failed]}")
+
+# ── Section 4: Query ──────────────────────────────────────────────────────────
+user_question = "What is our refund policy?"
+
+query_result = client.query(
+    database="acme_corp",
+    collection="user_alice",
+    query=user_question,
+    type="all",
+    query_by="hybrid",
+    mode="thinking",
+    max_results=10,
+)
+
+# ── Section 5: Build prompt and call LLM ─────────────────────────────────────
+context = build_string(query_result)
+
+completion = openai_client.chat.completions.create(
+    model="gpt-4o",
+    messages=[
+        {
+            "role": "system",
+            "content": (
+                "You are an internal assistant for Acme Corp.\n"
+                "Answer using only the context provided.\n"
+                "Match the user's preferred communication style if indicated.\n"
+                "If the answer is not in the context, say you don't know.\n\n"
+                f"Context:\n{context}"
+            ),
+        },
+        {"role": "user", "content": user_question},
+    ],
+)
+
+print(completion.choices[0].message.content)
+```
+</Accordion>
+
+---
 
 ### Where to go next
 
