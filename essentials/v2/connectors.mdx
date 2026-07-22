@@ -1,0 +1,308 @@
+---
+title: "Connectors"
+description: "How HydraDB connectors continuously sync external app data into the knowledge store."
+---
+
+Connectors bring external app data into HydraDB automatically. Instead of manually ingesting documents, you authenticate once, pick which resources to sync, and HydraDB continuously replicates provider content as searchable [app sources](/essentials/v2/app-sources) in your knowledge store.
+
+---
+
+## How it works
+
+A connector runs three stages on every sync cycle:
+
+```
+Discover → Configure → Sync
+```
+
+1. **Discover**  -  the connector lists all available resources from the provider: Slack channels, GitHub repos, Linear teams and projects, Notion databases and pages, Gmail labels. Call `GET /connectors/:id/discover` to see what's available before committing.
+2. **Configure**  -  you choose which resources to activate and set sync options. Call `POST /connectors/:id/configure` with the list of resource IDs to enable.
+3. **Sync**  -  HydraDB fetches objects from each active resource since the last cursor and ingests them as app sources. Sync runs on a schedule (default: hourly) or on demand via `POST /connectors/:id/sync`.
+
+### Authentication
+
+All connector endpoints use the same API key as the rest of HydraDB:
+
+```bash
+Authorization: Bearer $HYDRA_DB_API_KEY
+API-Version: 2
+```
+
+### Creating a connector
+
+```bash
+curl -X POST 'https://api.hydradb.com/connectors' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "provider": "slack",
+    "name": "acme-engineering",
+    "database": "acme_corp",
+    "collection": "engineering",
+    "provider_account_scope": "T12345ACME",
+    "credentials": { "api_token": "xoxp-..." }
+  }'
+```
+
+| Field | Purpose |
+|---|---|
+| `provider` | A supported provider identifier returned by [`GET /connectors/providers`](#list-available-providers) |
+| `name` | Human-readable label for this connector |
+| `tenant_id` | Which tenant receives the synced data |
+| `sub_tenant_id` | Which sub-tenant partition receives the data |
+| `provider_account_scope` | Stable identifier for the external account. See below. |
+| `credentials` | Provider API token or access token |
+
+### provider_account_scope
+
+`provider_account_scope` tells HydraDB which external account this connector belongs to. It becomes part of the deduplication key for every object the connector syncs, so two objects with the same content but from different accounts don't overwrite each other.
+
+**What value to use and where to find it:**
+
+| Provider | Value to use | Where to find it |
+|---|---|---|
+| Slack | Workspace ID (starts with `T`) | Open Slack in a browser. The URL is `app.slack.com/client/TXXXXXXXX/...` - the `T...` segment is your workspace ID. |
+| GitHub | Organization or user login | The org or username in your GitHub URL: `github.com/my-github-org` |
+| Linear | Workspace name | Settings → Workspace → the name shown under your workspace |
+| Notion | Workspace name | Settings → Workspace → the name shown at the top |
+| Gmail | Leave empty | Gmail does not use this field - use `account_email` in `additional_metadata` to scope by account instead |
+
+**Why it matters:** if you create two Slack connectors for different workspaces but give them the same `provider_account_scope` (or omit it on both), their synced messages share a deduplication namespace and will overwrite each other. Set a distinct value per connector whenever you connect more than one account of the same provider.
+
+### Configuring resources
+
+After creation, activate specific resources to sync:
+
+```bash
+curl -X POST 'https://api.hydradb.com/connectors/:id/configure' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "lookback_days": 30,
+    "resources": [
+      {
+        "resource_id": "C_GENERAL",
+        "resource_type": "channel",
+        "name": "general",
+        "sub_tenant_id": "all-hands",
+        "metadata": { "department": "all-hands" },
+        "additional_metadata": { "internal_label": "general-slack" }
+      },
+      {
+        "resource_id": "C_ENG",
+        "resource_type": "channel",
+        "name": "engineering",
+        "sub_tenant_id": "engineering",
+        "metadata": { "department": "engineering" },
+        "additional_metadata": { "internal_label": "eng-slack" }
+      }
+    ]
+  }'
+```
+
+`lookback_days` controls how far back in time the first sync fetches historical data (default: `30`). After the initial sync, only new content since the last cursor is fetched.
+
+Each resource accepts the following optional fields:
+
+| Field | Purpose |
+|---|---|
+| `sub_tenant_id` | Routes objects from this resource into a specific sub-tenant partition (overrides the connector-level `sub_tenant_id`) |
+| `metadata` | Key-value pairs merged into tenant metadata on every synced object from this resource. Undeclared keys are accepted but only keys in `database_metadata_schema` are indexed for filtering. |
+| `additional_metadata` | Key-value pairs merged into document metadata on every synced object from this resource |
+
+See [Metadata on synced objects](#metadata-on-synced-objects) for how these merge with system-generated fields.
+
+---
+
+## Metadata on synced objects
+
+Every object synced by a connector lands in HydraDB with two metadata layers:
+
+### Tenant metadata (`metadata`)
+
+Tenant metadata is the **schema-declared** layer. Fields here are defined once per tenant via `database_metadata_schema` and are indexed for fast, exact-match filtering. This is what you use for stable high-cardinality fields you filter on often  -  `department`, `region`, `status`, `priority`.
+
+HydraDB always writes `provider` into tenant metadata for every synced object. You can extend this with your own fields by passing `metadata` on each resource in `POST /connectors/:id/configure`. User-supplied fields are merged first; `provider` always takes precedence.
+
+### Document metadata (`additional_metadata`)
+
+Document metadata is the **free-form** layer. No schema required. Each connector automatically populates this with provider-specific fields on every synced object: connector ID, resource ID, provider account scope, and provider-native identifiers (Slack TS, GitHub issue number, Linear identifier, etc.).
+
+You can extend this with your own fields by passing `additional_metadata` on each resource in `POST /connectors/:id/configure`. User-supplied fields are merged first; provider-generated fields always take precedence.
+
+This is what you filter on when you want to scope a query to a specific connector, channel, repo, or inbox.
+
+```json Querying with document metadata filter
+{
+  "database": "acme_corp",
+  "query": "deployment checklist",
+  "query_apps": true,
+  "metadata_filters": {
+    "additional_metadata": {
+      "connector_id": "{connector_id}"
+    }
+  }
+}
+```
+
+| Filter target | Key in `additional_metadata` |
+|---|---|
+| Specific connector | `connector_id` |
+| Specific channel / repo / label | `resource_id` |
+| Specific external account | `provider_account_scope` |
+
+---
+
+## Inspect what a connector stores
+
+Connector contracts are provider-owned and available through the API for every supported connector.
+
+### List available providers
+
+`GET /connectors/providers` without a query parameter returns the catalog of connectable providers:
+
+```bash
+curl 'https://api.hydradb.com/connectors/providers' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2"
+```
+
+```json
+{
+  "providers": [
+    {
+      "provider": "slack",
+      "category": "Communication",
+      "supported": true,
+      "moveit_support": false,
+      "is_alpha": false,
+      "is_beta": false,
+      "rank": 1
+    }
+  ]
+}
+```
+
+| Property | Meaning |
+|---|---|
+| `provider` | Provider identifier. This is exactly the value accepted by the `id` parameter below and by the `provider` field in `POST /connectors` |
+| `category` | Display grouping for the provider |
+| `supported` | Whether the provider can be connected today |
+| `moveit_support` | Whether the provider syncs through the MOVEIT pipeline |
+| `is_alpha` / `is_beta` | Maturity flags for the connector |
+| `rank` | Catalog display order (lower ranks first) |
+
+### Inspect a single provider
+
+Pass a provider identifier (a `provider` value from the list above) as the `id` query parameter:
+
+```bash
+curl 'https://api.hydradb.com/connectors/providers?id=affinity' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2"
+```
+
+The response returns the provider identity, which provider streams get indexed, which field values are reachable by search, which keys can filter a query, and the JSON Schema for the credentials the provider needs:
+
+```json
+{
+  "provider": "affinity",
+  "connector_type": "affinity",
+  "indexed_object_types": ["list_entries", "notes"],
+  "searchable_fields": [
+    {
+      "name": "author",
+      "data_type": "string",
+      "description": "Resolved name of the note's creator."
+    }
+  ],
+  "filterable_fields": [
+    {
+      "name": "container_id",
+      "data_type": "string",
+      "filter_key": "additional_metadata.container_id",
+      "description": "Affinity list id the record belongs to."
+    }
+  ],
+  "credential_schema": {
+    "type": "object",
+    "properties": { "...": "JSON Schema for the provider's credential inputs" }
+  }
+}
+```
+
+| Property | Meaning |
+|---|---|
+| `indexed_object_types` | The provider streams whose records become searchable documents |
+| `searchable_fields` | Field values rendered into the indexed document text. Semantic and full-text queries find them as part of the document - they cannot be targeted individually |
+| `filterable_fields` | Keys that support exact-match filtering. Each entry carries `filter_key`, the literal key to pass inside a query's `metadata_filters` |
+| `credential_schema` | JSON Schema describing the credentials the provider needs to connect. Omitted if the schema source is unavailable |
+
+<Note>
+  You cannot pinpoint or search over a single searchable field. All `searchable_fields` are combined into one indexed document text, and search queries run over that combined text as a whole. To narrow results, use `filterable_fields` with `metadata_filters` - that is the only per-field targeting mechanism.
+</Note>
+
+Each entry in `searchable_fields` and `filterable_fields` includes:
+
+| Property | Meaning |
+|---|---|
+| `name` | The normalized field or metadata key stored by HydraDB |
+| `data_type` | Its JSON type: `string`, `number`, `boolean`, `array`, `object`, or `null` |
+| `filter_key` | Filterable fields only - the exact key to use in `metadata_filters` |
+| `description` | Optional provider-specific context |
+
+To scope a query with a filterable field, place its `filter_key` inside `metadata_filters`. A dotted key like `additional_metadata.container_id` nests under `additional_metadata`; tenant-scoped keys like `provider` and `connector_id` are passed top-level:
+
+```json Filtering by a provider's filterable field
+{
+  "database": "acme_corp",
+  "query": "diligence notes",
+  "query_apps": true,
+  "metadata_filters": {
+    "additional_metadata": { "container_id": "12345" }
+  }
+}
+```
+
+```json Filtering by tenant-scoped keys
+{
+  "metadata_filters": { "provider": "slack" }
+}
+```
+
+For classic providers, `credential_schema` is HydraDB's own contract - `slack` and `linear` each take a single `access_token`. For MOVEIT-synced providers it is the tap's schema - `dropbox` takes `app_key`, `app_secret`, and `refresh_token`.
+
+<Note>
+  Connector contracts come from the same normalizers that prepare synced data. Query this endpoint instead of relying on a static field list: it covers the complete connector catalog and stays current as connector normalization changes.
+</Note>
+
+For Gmail, filter on `account_email` (filter key `additional_metadata.account_email`) rather than `provider_account_scope` when scoping to a connected account. The Gmail provider response calls out this exception in its field description.
+
+## Multiple connectors per provider
+
+You can create more than one connector for the same provider  -  two Slack workspaces, two GitHub accounts, a personal and a work Gmail. Each connector is independent: its own credentials, its own resources, its own `provider_account_scope`.
+
+Set distinct `provider_account_scope` values per connector. This value is part of every object's deduplication key  -  without it, objects from two accounts of the same provider collide.
+
+You can also route different resources from the same connector into different sub-tenants via `POST /connectors/:id/configure`:
+
+```json
+{
+  "resources": [
+    { "resource_id": "C_GENERAL", "name": "general",     "sub_tenant_id": "all-hands" },
+    { "resource_id": "C_ENG",     "name": "engineering", "sub_tenant_id": "engineering" }
+  ]
+}
+```
+
+---
+
+## Related
+
+- [App Sources](/essentials/v2/app-sources)  -  ingestion model connector objects use
+- [Metadata](/essentials/v2/metadata)  -  tenant metadata vs document metadata in depth
+- [Multi-Tenant](/essentials/v2/multi-tenant)  -  routing resources to tenants and sub-tenants
+- [Query](/essentials/v2/query)  -  querying connector-synced data with `query_apps: true`
+
