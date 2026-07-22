@@ -1,0 +1,481 @@
+---
+title: "Bring Your Own Graph (BYOG)"
+description: "BYOG - full Cypher access to graph collections you own end-to-end."
+---
+
+Bring Your Own Graph (BYOG) gives you full **Cypher** access to graph
+collections that you own end-to-end: you model the schema, you write the
+queries, HydraDB runs and stores them. It is built for teams migrating an
+existing property-graph workload (for example from Neo4j) who want to keep
+their Cypher and their data model as-is.
+
+- **Databases** group your collections. A BYOG database appears in your
+  dashboard and in the standard database APIs like any other HydraDB database.
+- **Collections** are independent graphs inside a database. Queries run
+  against exactly one collection - collections never see each other's data.
+- **Full Cypher support**: reads and writes alike - `CREATE`, `MERGE`,
+  `MATCH`, `SET`, `DELETE` - plus the graph-native surface: multi-hop and
+  variable-length traversal, relationship expansion, and shortest-path
+  finding. Your query is sent verbatim; HydraDB never rewrites it.
+- **Isolation is structural.** Each collection is a completely separate graph
+  owned by your organization. There is no cross-tenant data to reach:
+  `MATCH (n) RETURN n` returns *your* nodes and nothing else.
+
+## Quickstart
+
+```bash
+BASE=https://api.hydradb.com
+KEY=<your API key>
+
+# 1. Create a database (ready immediately)
+curl -X POST "$BASE/byog/databases" \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"database": "crm"}'
+
+# 2. Write data - collections auto-create on first use
+curl -X POST "$BASE/byog/query" \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{
+    "database": "crm",
+    "collection": "contacts",
+    "query": "UNWIND $rows AS row CREATE (p:Person) SET p = row RETURN count(p) AS created",
+    "params": {"rows": [{"name": "Alice", "role": "admin"},
+                        {"name": "Bob",   "role": "analyst"}]}
+  }'
+
+# 3. Read it back
+curl -X POST "$BASE/byog/query" \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{
+    "database": "crm",
+    "collection": "contacts",
+    "query": "MATCH (p:Person) RETURN p.name AS name, p.role AS role ORDER BY name"
+  }'
+```
+
+## Authentication
+
+Every request needs your HydraDB API key:
+
+```
+Authorization: Bearer <api key>
+```
+
+A missing or invalid key returns `403`. Databases are scoped to the
+organization that owns the API key - another organization's database names
+are invisible to you (they behave exactly like names that don't exist).
+
+## Endpoints
+
+### `POST /byog/databases` - create a database
+
+```json
+{ "database": "crm" }
+```
+
+Returns immediately with `{"database": "crm", "status": "ready"}` - there is
+no provisioning wait. Creating a name that already exists returns `409`.
+
+The database also shows up everywhere your other HydraDB databases do:
+`GET /databases` lists it, `GET /databases/status` reports it ready,
+`GET /databases/collections` includes its collections, and it is visible on
+the dashboard. Deleting it through the standard `DELETE /databases` flow
+removes its graph collections as well.
+
+### `POST /byog/query` - run Cypher
+
+```json
+{
+  "database":   "crm",
+  "collection": "contacts",
+  "query":      "CREATE (n:Person {name: $name}) RETURN n",
+  "params":     { "name": "Alice" }
+}
+```
+
+- **Collections auto-create** - there is no create-collection call. The first
+  write brings the collection into existence; reading a collection you never
+  wrote to simply returns zero rows.
+- Collection names must match `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`.
+  Database names have no charset restriction.
+- Always pass user data through `params` rather than string-building it into
+  the query - parameters are bound safely and keep query plans cacheable.
+- Request bodies are capped at **256 KiB** (`413` beyond that). For bulk
+  loads, send batches of rows with `UNWIND $rows AS row CREATE ...`.
+
+### `GET /byog/collections?database=crm` - list collections
+
+Returns the collection names that exist in the database. An unknown database
+returns `404`.
+
+### `DELETE /byog/collections` - drop one collection
+
+```json
+{ "database": "crm", "collection": "contacts" }
+```
+
+Drops the collection and all its data. Deleting a collection that does not
+exist is a success (idempotent).
+
+### `DELETE /byog/databases` - drop a database
+
+```json
+{ "database": "crm" }
+```
+
+Drops every collection in the database, and - if the database was created
+through `POST /byog/databases` - removes the database itself. The response
+lists what was removed:
+
+```json
+{ "database": "crm", "deleted": true, "deleted_collections": ["contacts"] }
+```
+
+If the database was created through the standard database API (and merely has
+graph collections in it), only the collections are dropped and `deleted` is
+`false` - manage the database itself through the standard `DELETE /databases`.
+
+## Supported Cypher
+
+<Note>
+  **Coverage in one line:** essentially all of openCypher is supported - only
+  server-side procedures and file loading are excluded - which is the entire
+  surface a real application needs for modelling, loading, querying and
+  maintaining its own graph.
+</Note>
+
+Your query is executed **verbatim** - HydraDB never rewrites it. "CRUD" is the
+floor, not the ceiling: two kinds of work are fully supported.
+
+**Modelling and CRUD** - the day-to-day read/write surface: pattern matching,
+aggregation, `UNWIND`, `WITH` pipelines, `MERGE`, indexes
+(`CREATE INDEX FOR (n:Label) ON (n.prop)`), and `CALL { ... }` subqueries.
+
+**Graph traversal and exploration** - the part that makes this a graph rather
+than a table. You are not limited to reading and writing single nodes; you can
+walk relationships to arbitrary depth, expand a node's neighborhood, follow
+chains of edges, and find paths between nodes:
+
+- **Multi-hop patterns** - chain relationships across as many hops as you need
+  in one `MATCH`:
+  `MATCH (a:Person)-[:KNOWS]->(b)-[:WORKS_AT]->(c:Company) RETURN c.name`.
+- **Variable-length traversal** - follow a relationship an unbounded or bounded
+  number of hops with `*`:
+  `MATCH (a:Person {name:$n})-[:KNOWS*1..4]->(reach) RETURN DISTINCT reach.name`
+  returns everyone within four degrees.
+- **Neighborhood expansion** - pull a node's edges and neighbors in a single
+  query, in any direction:
+  `MATCH (p:Person {name:$n})-[r]-(nbr) RETURN type(r) AS rel, nbr.name AS neighbor`.
+- **Path finding** - `shortestPath` returns the actual path - nodes and edges
+  in traversal order, not just the two endpoints. See
+  [Relationships and paths](#relationships-and-paths).
+- **Directed, typed, filtered traversal** - restrict to outgoing (`->`),
+  incoming (`<-`), or either (`-`) edges, filter by relationship type
+  (`[:KNOWS]`), and constrain node or edge properties anywhere along the walk.
+
+Two constructs are **rejected**. "Rejected" means the query is refused
+*before it runs*: the whole request fails with a `400` and a message
+explaining the reason, and **nothing is executed** - no partial writes, no
+side effects. It is a validation error, not a runtime one, so retrying the
+same query fails identically until you change it.
+
+<Warning>
+  The following constructs always return `400` and are never executed:
+
+  - **Procedure calls** - `CALL some.procedure(...)`. Procedures are
+    engine-specific internals that HydraDB does not commit to supporting.
+    (`CALL { ... }` *subqueries* are fine.)
+  - **`LOAD CSV`** - server-side file/URL loading. Send data through `params`
+    instead.
+</Warning>
+
+A few dialect notes (each verified against the live service):
+
+- **Existence checks** are written as bare pattern predicates -
+  `MATCH (p:Person) WHERE (p)-[:KNOWS]->() RETURN p.name AS name`.
+  The `EXISTS { ... }` block form and the `exists()` function are not
+  accepted.
+- **`shortestPath`** goes in a `RETURN` or `WITH` clause (not `MATCH p = …`)
+  and the traversal must be directed - see the paths example above.
+
+### Traversal examples
+
+Expand a node's relationships, follow chains of edges, and find the shortest
+path between two nodes - all in plain Cypher:
+
+```cypher Expand a node's neighborhood
+-- Every relationship on Alice and the node on the other end, in any direction.
+MATCH (p:Person {name: $name})-[r]-(nbr)
+RETURN type(r) AS rel, labels(nbr) AS kind, nbr.name AS neighbor
+ORDER BY rel, neighbor
+```
+
+```cypher Multi-hop relationship expansion
+-- Friends-of-friends up to 3 hops away, following only outgoing KNOWS edges.
+MATCH (a:Person {name: $name})-[:KNOWS*1..3]->(reach:Person)
+WHERE reach.name <> $name
+RETURN DISTINCT reach.name AS name
+ORDER BY name
+```
+
+```cypher Shortest path between two nodes
+-- The actual path (nodes + edges in order), not just the endpoints.
+MATCH (a:Person {name: $from}), (b:Person {name: $to})
+RETURN shortestPath((a)-[:KNOWS*..8]->(b)) AS path
+```
+
+```cypher Filtered, typed traversal
+-- Who does Alice know that works at a company in "fintech"?
+MATCH (a:Person {name: $name})-[:KNOWS]->(f:Person)-[:WORKS_AT]->(c:Company)
+WHERE c.sector = "fintech"
+RETURN f.name AS person, c.name AS company
+```
+
+## Response format
+
+Successful calls return the standard HydraDB envelope:
+
+```json
+{
+  "success": true,
+  "data": [ ... ],
+  "error": null,
+  "meta": { "request_id": "9be86a4e-…", "latency_ms": 12.4 }
+}
+```
+
+For `POST /byog/query`, `data` is always a JSON **array of row objects**, one
+per result row, keyed by your `RETURN` column names. Unaliased expressions use
+the expression text as the key - **alias everything you plan to parse**
+(`RETURN n.name AS name`). A pure write with no `RETURN` yields `data: []`.
+
+### How values are rendered
+
+| Cypher value | JSON |
+|---|---|
+| string / boolean / null | JSON string / boolean / null |
+| integer | JSON number. Graph integers are 64-bit; values beyond 2⁵³ lose precision in languages that parse numbers as doubles - keep your own ids inside the safe range, or return them as strings |
+| float | JSON number |
+| list / map | JSON array / object (rendered recursively) |
+| **node** | object with all node properties, plus `id` and `labels` |
+| **relationship** | object with all relationship properties, plus `id`, `relation`, `source_node_id`, `target_node_id` |
+| **path** | `{ "nodes": [...], "edges": [...] }` in traversal order |
+
+Example - `RETURN n` where `n` is a node:
+
+```json
+{ "data": [ { "n": { "id": 0, "labels": ["Person"], "name": "Alice", "age": 34 } } ] }
+```
+
+Two things to know about ids:
+
+- The `id` / `labels` / `relation` / `source_node_id` / `target_node_id` keys
+  are added by the renderer. If you store a property with one of those names,
+  it will be shadowed in the *response* (the stored value is unaffected) -
+  avoid those property names or alias explicitly (`RETURN n.id AS my_id`).
+- `id` values are internal and stable only within the life of a collection -
+  they can be reused after deletions and do not survive an export/re-import.
+  Key your application on a property you own.
+
+## Using results in your code
+
+The patterns below are everything you need to consume query results reliably.
+They're shown in Python and TypeScript; the ideas port to any language.
+
+### A minimal client
+
+Wrap the endpoint once and everything else becomes one-liners. Note the two
+response shapes: success puts rows in `data`, errors are wrapped in `detail`.
+
+```python
+import requests
+
+class HydraGraph:
+    def __init__(self, base_url, api_key, database, collection="default"):
+        self.base, self.db, self.col = base_url, database, collection
+        self.headers = {"Authorization": f"Bearer {api_key}"}
+
+    def query(self, cypher, params=None):
+        r = requests.post(f"{self.base}/byog/query", headers=self.headers, json={
+            "database": self.db, "collection": self.col,
+            "query": cypher, "params": params or {},
+        })
+        body = r.json()
+        if not r.ok:
+            err = body.get("detail", {})
+            raise RuntimeError(f"{r.status_code} {err.get('error_code')}: {err.get('message')}")
+        return body["data"]          # always a list of row dicts
+
+g = HydraGraph("https://api.hydradb.com", "<api key>", "crm", "contacts")
+```
+
+```typescript
+async function query(cypher: string, params: object = {}): Promise<Record<string, any>[]> {
+  const res = await fetch(`${BASE}/byog/query`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${KEY}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ database: "crm", collection: "contacts", query: cypher, params }),
+  });
+  const body = await res.json();
+  if (!res.ok) throw new Error(`${res.status} ${body.detail?.error_code}: ${body.detail?.message}`);
+  return body.data;                 // always an array of row objects
+}
+```
+
+### Prefer scalars with aliases - they parse themselves
+
+The easiest results to consume are the ones you shape in the query. Instead of
+returning whole nodes and digging properties out client-side, project exactly
+the fields you need, aliased:
+
+```python
+rows = g.query("MATCH (p:Person) RETURN p.name AS name, p.role AS role ORDER BY name")
+# rows == [{"name": "Alice", "role": "admin"}, {"name": "Bob", "role": "analyst"}]
+names = [r["name"] for r in rows]
+```
+
+This also makes your code robust to schema growth: adding properties to nodes
+never changes what your queries return.
+
+### When you do return nodes
+
+A returned node is one flat object: its properties merged with `id` and
+`labels`. There is no nesting to unwrap:
+
+```python
+rows = g.query("MATCH (p:Person {name: $n}) RETURN p", {"n": "Alice"})
+alice = rows[0]["p"]        # {"id": 0, "labels": ["Person"], "name": "Alice", "role": "admin"}
+props = {k: v for k, v in alice.items() if k not in ("id", "labels")}
+```
+
+Remember `id` is internal and non-portable - treat it as opaque within a
+session and never store it. Key your data on a property you own (`ext_id`,
+`email`, …).
+
+### Relationships and paths
+
+A relationship row carries its endpoints as `source_node_id` /
+`target_node_id`, which match the `id` of nodes returned **in the same
+query** - return both sides and join client-side:
+
+```python
+rows = g.query("""
+    MATCH (a:Person)-[k:KNOWS]->(b:Person)
+    RETURN a, k, b
+""")
+for row in rows:
+    print(f'{row["a"]["name"]} knows {row["b"]["name"]} since {row["k"]["since"]}')
+```
+
+A path is already assembled for you - `nodes` and `edges` in traversal order.
+Two constraints to know: `shortestPath` must appear in a `RETURN` or `WITH`
+clause (not in `MATCH p = ...`), and the traversal must be directed (`->`):
+
+```python
+rows = g.query("""
+    MATCH (a:Person {name:$x}), (b:Person {name:$y})
+    RETURN shortestPath((a)-[*..6]->(b)) AS p
+""", {"x": "Alice", "y": "Bob"})
+hops = [n["name"] for n in rows[0]["p"]["nodes"]]   # ["Alice", ..., "Bob"]
+```
+
+### Pagination - the loop to copy
+
+Result sets past the deployment cap are silently truncated, so any read that
+*could* be large should page. A stable `ORDER BY` makes pages consistent:
+
+```python
+def all_rows(cypher_body, page=500, params=None):
+    offset = 0
+    while True:
+        rows = g.query(f"{cypher_body} SKIP $offset LIMIT $limit",
+                       {**(params or {}), "offset": offset, "limit": page})
+        yield from rows
+        if len(rows) < page:
+            return
+        offset += page
+
+people = list(all_rows("MATCH (p:Person) RETURN p.name AS name ORDER BY name"))
+```
+
+### Bulk loading - the loop to copy
+
+Chunk rows to stay inside the 256 KiB body cap and the 30 s write budget;
+`MERGE` on your own key makes the load re-runnable after a failure:
+
+```python
+def load(rows, chunk=500):
+    for i in range(0, len(rows), chunk):
+        g.query("""
+            UNWIND $rows AS row
+            MERGE (n:Person {ext_id: row.ext_id})
+            SET n += row
+        """, {"rows": rows[i:i+chunk]})
+```
+
+### Handling failures
+
+- **`400`** - the message tells you what to fix: your Cypher (compiler
+  feedback is passed through) or a query that needs `LIMIT`/an index (budget
+  timeout). Retrying unchanged will fail identically.
+- **`429` / `500`** - transient; retry with backoff. Writes built on `MERGE`
+  (as above) are safe to retry; bare `CREATE` batches are not idempotent, so
+  a retried chunk can duplicate nodes - one more reason to key on your own id.
+- A write with no `RETURN` succeeds with `data: []` - don't treat empty as
+  failure.
+
+## Errors
+
+Errors use HydraDB's structured error shape:
+
+```json
+{ "detail": { "success": false, "message": "…", "error_code": "…" } }
+```
+
+| Status | Meaning |
+|---|---|
+| `400` | Invalid request (missing fields, bad collection name), unsupported construct, **Cypher errors** (the compiler's message is passed through so you can fix the query), or **query timeout** |
+| `403` | Missing or invalid API key |
+| `404` | Unknown database - create it with `POST /byog/databases` |
+| `409` | `POST /byog/databases` with a name that already exists |
+| `413` | Request body over 256 KiB |
+| `429` | Rate limit exceeded - back off and retry |
+| `500` | Something failed on our side - safe to retry; nothing for you to fix |
+
+## Limits & timeouts
+
+| Limit | Value | On exceeding |
+|---|---|---|
+| Request body | 256 KiB | `413` |
+| Read query execution | 8 s | `400` - "query exceeded the execution time budget; simplify it, add LIMIT, or create an index" |
+| Write query execution | 30 s | same `400` |
+| Result set size | deployment-configured cap; rows beyond it are **silently dropped** | no error - paginate |
+
+A query counts as a **write** (and gets the larger budget) when it contains
+any write clause - `CREATE`, `MERGE`, `SET`, `DELETE`, `REMOVE`, `FOREACH`.
+
+Practical guidance:
+
+- **Paginate anything potentially large**:
+  `ORDER BY … SKIP $offset LIMIT $page`. Without an `ORDER BY`, rows dropped
+  at the result-set cap are arbitrary.
+- **Chunk bulk imports** into `UNWIND $rows` batches sized to finish inside
+  the 30 s write budget (and the 256 KiB body cap).
+- **Create indexes** for properties you filter on -
+  `CREATE INDEX FOR (n:Person) ON (n.name)` - long-running reads are usually
+  missing one.
+
+## Migrating from Neo4j
+
+Most application Cypher ports directly. The differences you are most likely
+to notice:
+
+- `CALL db.*` / `CALL apoc.*` procedures are not available - the equivalents
+  are either plain Cypher or not part of the supported surface.
+- `LOAD CSV` is not available - batch data in through `params`.
+- Internal node ids are not portable (true in Neo4j as well) - migrate using
+  your own key properties, e.g.
+  `UNWIND $rows AS row MERGE (n:Person {ext_id: row.ext_id}) SET n += row`.
+
+One collection is a natural migration unit: export a graph, replay it into
+one collection, verify, repeat.
