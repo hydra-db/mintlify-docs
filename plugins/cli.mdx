@@ -303,7 +303,13 @@ set -euo pipefail
 : "${HYDRA_DB_API_KEY:?Set HYDRA_DB_API_KEY}"
 : "${HYDRA_DB_TENANT_ID:?Set HYDRA_DB_TENANT_ID}"
 
-upload_json="$(hydradb -o json knowledge upload ./runbook.md --upsert)"
+if ! upload_json="$(
+  hydradb -o json knowledge upload ./runbook.md --upsert
+)"; then
+  printf '%s\n' "Knowledge upload failed" >&2
+  printf '%s\n' "$upload_json" >&2
+  exit 1
+fi
 
 printf '%s\n' "$upload_json" | jq -e '
   (type == "object") and
@@ -316,27 +322,44 @@ printf '%s\n' "$upload_json" | jq -e '
     (.error? == null or .error == "")
   )
 ' >/dev/null || {
-  printf '%s\n' "$upload_json" | jq . >&2
+  printf '%s\n' "Upload response validation failed" >&2
+  printf '%s\n' "$upload_json" >&2
   exit 1
 }
 
-source_id="$(
+if ! source_id="$(
   printf '%s\n' "$upload_json" |
     jq -er 'first(.results[]? | .source_id // .id)'
-)"
+)"; then
+  printf '%s\n' "Upload response did not contain a source ID" >&2
+  printf '%s\n' "$upload_json" >&2
+  exit 1
+fi
 
 for attempt in $(seq 1 60); do
-  status_json="$(hydradb -o json knowledge verify "$source_id")"
-  status="$(
+  if ! status_json="$(
+    hydradb -o json knowledge verify "$source_id"
+  )"; then
+    printf '%s\n' "Status check failed for $source_id" >&2
+    printf '%s\n' "$status_json" >&2
+    exit 1
+  fi
+
+  if ! status="$(
     printf '%s\n' "$status_json" |
-      jq -r '(.statuses // .results // [])[0]
+      jq -er '(.statuses // .results // [])[0]
         | .indexing_status // .status // "unknown"'
-  )"
+  )"; then
+    printf '%s\n' "Could not parse status for $source_id" >&2
+    printf '%s\n' "$status_json" >&2
+    exit 1
+  fi
 
   case "$status" in
     indexed|completed|graph_creation) break ;;
     failed|errored|error)
-      printf '%s\n' "$status_json" | jq . >&2
+      printf '%s\n' "Indexing failed for $source_id" >&2
+      printf '%s\n' "$status_json" >&2
       exit 1
       ;;
     *)
@@ -352,6 +375,7 @@ done
 if ! recall_json="$(
   hydradb -o json recall full "credential rotation" --max-results 5
 )"; then
+  printf '%s\n' "Recall command failed" >&2
   printf '%s\n' "$recall_json" >&2
   exit 1
 fi
@@ -359,6 +383,7 @@ fi
 printf '%s\n' "$recall_json" | jq -e '
   ((.chunks // []) | type == "array" and length > 0)
 ' >/dev/null || {
+  printf '%s\n' "Recall response validation failed" >&2
   printf '%s\n' "$recall_json" >&2
   exit 1
 }
