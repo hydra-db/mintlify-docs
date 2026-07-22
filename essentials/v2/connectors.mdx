@@ -1,9 +1,9 @@
 ---
 title: "Connectors"
-description: "How HydraDB connectors continuously sync app data from Slack, GitHub, Linear, Notion, and Gmail into the knowledge store."
+description: "How HydraDB connectors continuously sync external app data into the knowledge store."
 ---
 
-Connectors bring external app data into HydraDB automatically. Instead of manually ingesting documents, you authenticate once, pick which resources to sync, and HydraDB continuously replicates new content  -  Slack messages, GitHub issues, Linear tickets, Notion pages, Gmail threads  -  as searchable [app sources](/essentials/v2/app-sources) in your knowledge store.
+Connectors bring external app data into HydraDB automatically. Instead of manually ingesting documents, you authenticate once, pick which resources to sync, and HydraDB continuously replicates provider content as searchable [app sources](/essentials/v2/app-sources) in your knowledge store.
 
 ---
 
@@ -47,7 +47,7 @@ curl -X POST 'https://api.hydradb.com/connectors' \
 
 | Field | Purpose |
 |---|---|
-| `provider` | One of `slack`, `github`, `linear`, `notion`, `gmail` |
+| `provider` | A supported provider identifier returned by [`GET /connectors/providers`](#list-available-providers) |
 | `name` | Human-readable label for this connector |
 | `tenant_id` | Which tenant receives the synced data |
 | `sub_tenant_id` | Which sub-tenant partition receives the data |
@@ -109,7 +109,7 @@ Each resource accepts the following optional fields:
 | Field | Purpose |
 |---|---|
 | `sub_tenant_id` | Routes objects from this resource into a specific sub-tenant partition (overrides the connector-level `sub_tenant_id`) |
-| `metadata` | Key-value pairs merged into tenant metadata on every synced object from this resource. Undeclared keys are accepted but only keys in `tenant_metadata_schema` are indexed for filtering. |
+| `metadata` | Key-value pairs merged into tenant metadata on every synced object from this resource. Undeclared keys are accepted but only keys in `database_metadata_schema` are indexed for filtering. |
 | `additional_metadata` | Key-value pairs merged into document metadata on every synced object from this resource |
 
 See [Metadata on synced objects](#metadata-on-synced-objects) for how these merge with system-generated fields.
@@ -122,7 +122,7 @@ Every object synced by a connector lands in HydraDB with two metadata layers:
 
 ### Tenant metadata (`metadata`)
 
-Tenant metadata is the **schema-declared** layer. Fields here are defined once per tenant via `tenant_metadata_schema` and are indexed for fast, exact-match filtering. This is what you use for stable high-cardinality fields you filter on often  -  `department`, `region`, `status`, `priority`.
+Tenant metadata is the **schema-declared** layer. Fields here are defined once per tenant via `database_metadata_schema` and are indexed for fast, exact-match filtering. This is what you use for stable high-cardinality fields you filter on often  -  `department`, `region`, `status`, `priority`.
 
 HydraDB always writes `provider` into tenant metadata for every synced object. You can extend this with your own fields by passing `metadata` on each resource in `POST /connectors/:id/configure`. User-supplied fields are merged first; `provider` always takes precedence.
 
@@ -155,170 +155,130 @@ This is what you filter on when you want to scope a query to a specific connecto
 
 ---
 
-## What each connector stores
+## Inspect what a connector stores
 
-### Slack
+Connector contracts are provider-owned and available through the API for every supported connector.
 
-**Resources:** Channels
+### List available providers
 
-**Syncs:** Messages and thread replies (replies are attached as comments on the parent message)
+`GET /connectors/providers` without a query parameter returns the catalog of connectable providers:
 
-**`fields`** (searchable):
+```bash
+curl 'https://api.hydradb.com/connectors/providers' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2"
+```
 
-| Field | Content |
+```json
+{
+  "providers": [
+    {
+      "provider": "slack",
+      "category": "Communication",
+      "supported": true,
+      "moveit_support": false,
+      "is_alpha": false,
+      "is_beta": false,
+      "rank": 1
+    }
+  ]
+}
+```
+
+| Property | Meaning |
 |---|---|
-| `body` | Message text, attachment text, file titles |
-| `author` | Slack user ID or bot ID |
-| `thread_id` | `{channel_id}:{thread_ts}` |
-| `parent_id` | Set for thread replies; empty for root messages |
-| `created_at` | RFC3339 timestamp |
-| `is_edited` | Whether the message was edited |
-| `edited_by` / `edited_at` | Editor and edit time (when edited) |
-| `attachment_count` / `file_count` | Rich attachment and file counts |
+| `provider` | Provider identifier. This is exactly the value accepted by the `id` parameter below and by the `provider` field in `POST /connectors` |
+| `category` | Display grouping for the provider |
+| `supported` | Whether the provider can be connected today |
+| `moveit_support` | Whether the provider syncs through the MOVEIT pipeline |
+| `is_alpha` / `is_beta` | Maturity flags for the connector |
+| `rank` | Catalog display order (lower ranks first) |
 
-**`additional_metadata`** (auto-indexed by connector):
+### Inspect a single provider
 
-| Key | Value |
+Pass a provider identifier (a `provider` value from the list above) as the `id` query parameter:
+
+```bash
+curl 'https://api.hydradb.com/connectors/providers?id=affinity' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2"
+```
+
+The response returns the provider identity, which provider streams get indexed, which field values are reachable by search, which keys can filter a query, and the JSON Schema for the credentials the provider needs:
+
+```json
+{
+  "provider": "affinity",
+  "connector_type": "affinity",
+  "indexed_object_types": ["list_entries", "notes"],
+  "searchable_fields": [
+    {
+      "name": "author",
+      "data_type": "string",
+      "description": "Resolved name of the note's creator."
+    }
+  ],
+  "filterable_fields": [
+    {
+      "name": "container_id",
+      "data_type": "string",
+      "filter_key": "additional_metadata.container_id",
+      "description": "Affinity list id the record belongs to."
+    }
+  ],
+  "credential_schema": {
+    "type": "object",
+    "properties": { "...": "JSON Schema for the provider's credential inputs" }
+  }
+}
+```
+
+| Property | Meaning |
 |---|---|
-| `connector_id` | Connector UUID |
-| `resource_id` | Channel ID |
-| `provider_account_scope` | Workspace identifier (e.g. `T12345ACME`) |
-| `slack_ts` | Message timestamp |
-| `slack_thread_ts` | Thread root timestamp |
-| `slack_subtype` | Message subtype |
-| `slack_bot_id` | Bot ID when applicable |
-| `slack_reply_count` | Number of thread replies |
-| `slack_files` | File metadata array |
+| `indexed_object_types` | The provider streams whose records become searchable documents |
+| `searchable_fields` | Field values rendered into the indexed document text. Semantic and full-text queries find them as part of the document - they cannot be targeted individually |
+| `filterable_fields` | Keys that support exact-match filtering. Each entry carries `filter_key`, the literal key to pass inside a query's `metadata_filters` |
+| `credential_schema` | JSON Schema describing the credentials the provider needs to connect. Omitted if the schema source is unavailable |
 
----
+<Note>
+  You cannot pinpoint or search over a single searchable field. All `searchable_fields` are combined into one indexed document text, and search queries run over that combined text as a whole. To narrow results, use `filterable_fields` with `metadata_filters` - that is the only per-field targeting mechanism.
+</Note>
 
-### GitHub
+Each entry in `searchable_fields` and `filterable_fields` includes:
 
-**Resources:** Repositories
-
-**Syncs:** Issues and pull requests
-
-**`fields`**:
-
-| Field | Content |
+| Property | Meaning |
 |---|---|
-| `body` | Issue or PR description |
-| `author` | GitHub login of opener |
-| `state` | `open` or `closed` |
-| `assignees` | List of assignee logins |
-| `labels` | List of label names |
-| `is_pr` | `true` for pull requests |
-| `created_at` / `updated_at` / `closed_at` | Timestamps |
-| `url` | GitHub permalink |
-| `milestone` / `milestone_due` | Milestone title and due date |
+| `name` | The normalized field or metadata key stored by HydraDB |
+| `data_type` | Its JSON type: `string`, `number`, `boolean`, `array`, `object`, or `null` |
+| `filter_key` | Filterable fields only - the exact key to use in `metadata_filters` |
+| `description` | Optional provider-specific context |
 
-**`additional_metadata`**:
+To scope a query with a filterable field, place its `filter_key` inside `metadata_filters`. A dotted key like `additional_metadata.container_id` nests under `additional_metadata`; tenant-scoped keys like `provider` and `connector_id` are passed top-level:
 
-| Key | Value |
-|---|---|
-| `connector_id` | Connector UUID |
-| `resource_id` | `{owner}/{repo}` |
-| `provider_account_scope` | GitHub account (e.g. `my-github-org`) |
-| `github_repo` | `{owner}/{repo}` |
-| `github_issue_number` | Integer issue/PR number |
+```json Filtering by a provider's filterable field
+{
+  "database": "acme_corp",
+  "query": "diligence notes",
+  "query_apps": true,
+  "metadata_filters": {
+    "additional_metadata": { "container_id": "12345" }
+  }
+}
+```
 
----
+```json Filtering by tenant-scoped keys
+{
+  "metadata_filters": { "provider": "slack" }
+}
+```
 
-### Linear
+For classic providers, `credential_schema` is HydraDB's own contract - `slack` and `linear` each take a single `access_token`. For MOVEIT-synced providers it is the tap's schema - `dropbox` takes `app_key`, `app_secret`, and `refresh_token`.
 
-**Resources:** Teams and projects
+<Note>
+  Connector contracts come from the same normalizers that prepare synced data. Query this endpoint instead of relying on a static field list: it covers the complete connector catalog and stays current as connector normalization changes.
+</Note>
 
-**Syncs:** Issues (with comments, attachments, and parent relations)
-
-**`fields`**:
-
-| Field | Content |
-|---|---|
-| `body` | Issue description |
-| `state` | Workflow state name |
-| `priority` / `priority_label` | Integer (0–4) and label (`Urgent`, etc.) |
-| `assignee` / `creator` | Display names |
-| `team_key` / `team_name` | Team identifier and name |
-| `project_name` | Project name (when assigned) |
-| `created_at` / `updated_at` | Timestamps |
-| `url` | Linear issue permalink |
-
-**`additional_metadata`**:
-
-| Key | Value |
-|---|---|
-| `connector_id` | Connector UUID |
-| `resource_id` | Team or project ID |
-| `resource_type` | `linear_team` or `linear_project` |
-| `provider_account_scope` | Linear account identifier |
-| `linear_issue_id` | Linear UUID |
-| `linear_identifier` | Human identifier (e.g. `ENG-142`) |
-
----
-
-### Notion
-
-**Resources:** Databases and top-level pages
-
-**Syncs:** Pages (full block content as body, file attachments)
-
-**`fields`**:
-
-| Field | Content |
-|---|---|
-| `title` | Page title |
-| `body` | Full page block content as text |
-| `created_at` / `last_edited_time` | Timestamps |
-| `url` | Notion page URL |
-| `created_by` / `last_edited_by` | Notion user IDs |
-
-**`additional_metadata`**:
-
-| Key | Value |
-|---|---|
-| `connector_id` | Connector UUID |
-| `resource_id` | Database or page ID |
-| `resource_type` | `notion_database` or `notion_page` |
-| `provider_account_scope` | Notion account identifier |
-| `notion_page_id` | Notion page UUID |
-
----
-
-### Gmail
-
-**Resources:** Labels (`INBOX`, `[Gmail]/All Mail`, custom labels)
-
-**Syncs:** Emails (with thread relations linking replies to parent messages)
-
-<Warning>
-  Gmail does not populate `provider_account_scope` in `additional_metadata`. Use `account_email` instead to scope queries to a specific Gmail account. `thread_id` appears in both `fields` (for full-text search) and `additional_metadata` (for exact-match filtering)  -  this is intentional and specific to Gmail.
-</Warning>
-
-**`fields`**:
-
-| Field | Content |
-|---|---|
-| `subject` | Email subject |
-| `body` | Plain-text email body |
-| `from` | Sender address |
-| `to` / `cc` / `reply_to` | Recipient lists |
-| `message_id` | RFC2822 Message-ID header |
-| `thread_id` | Gmail thread ID (also available in `additional_metadata` for filtering) |
-| `gmail_msg_id` | Gmail numeric message ID |
-| `created_at` | Send timestamp |
-| `account_email` | Gmail account address |
-
-**`additional_metadata`**:
-
-| Key | Value |
-|---|---|
-| `connector_id` | Connector UUID |
-| `resource_id` | Gmail label ID (e.g. `INBOX`) |
-| `account_email` | Gmail account address  -  use this to scope by account (replaces `provider_account_scope` for Gmail) |
-| `imap_uid` | IMAP UID |
-| `thread_id` | Gmail thread ID (also exposed in `fields` for search) |
-
----
+For Gmail, filter on `account_email` (filter key `additional_metadata.account_email`) rather than `provider_account_scope` when scoping to a connected account. The Gmail provider response calls out this exception in its field description.
 
 ## Multiple connectors per provider
 
