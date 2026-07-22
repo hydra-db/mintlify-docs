@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import {
+  DEFAULTS,
   FixtureValidationError,
   aggregateProfileResults,
   buildQueryRequest,
@@ -12,6 +13,7 @@ import {
   createApiClient,
   evaluateGates,
   nearestRankPercentile,
+  parseArgs,
   rankSources,
   requestJson,
   runCli,
@@ -353,6 +355,8 @@ test("profiles serialize the intended text, fast, and thinking query contracts",
     query_apps: true,
     operator: "or",
   });
+  assert.equal(Object.hasOwn(requests.text, "mode"), false);
+  assert.equal(Object.hasOwn(requests.text, "alpha"), false);
   assert.deepEqual(requests["hybrid-fast"], {
     database: "rql_unit_test",
     collection: fixture.collection,
@@ -365,6 +369,7 @@ test("profiles serialize the intended text, fast, and thinking query contracts",
     alpha: 0.8,
     mode: "fast",
   });
+  assert.equal(Object.hasOwn(requests["hybrid-fast"], "operator"), false);
   assert.deepEqual(requests["hybrid-thinking"], {
     database: "rql_unit_test",
     collection: fixture.collection,
@@ -402,7 +407,7 @@ test("fixture validation is strict and reports all discovered issues", () => {
       assert.match(issues, /duplicate/i);
       assert.match(issues, /source-that-does-not-exist/i);
       assert.match(issues, /multi-source/i);
-      assert.match(issues, /mode/i);
+      assert.match(issues, /mode applies only to hybrid retrieval and must be omitted for text/i);
       assert.match(issues, /max_results/i);
       assert.match(issues, /missing-profile/i);
       return true;
@@ -965,6 +970,43 @@ test("validate is completely offline", async () => {
   assert.doesNotMatch(`${stdout.read()}${stderr.read()}`, /api[_ -]?key/i);
 });
 
+test("request timeout CLI option is limited to seed and run and requires a bounded integer", () => {
+  const seed = parseArgs([
+    "seed",
+    "--database",
+    "rql_seed_test",
+    "--request-timeout-ms",
+    "120000",
+  ]);
+  const run = parseArgs([
+    "run",
+    "--database",
+    "rql_run_test",
+    "--request-timeout-ms=45000",
+  ]);
+
+  assert.equal(seed.options.requestTimeoutMs, 120_000);
+  assert.equal(run.options.requestTimeoutMs, 45_000);
+  assert.throws(
+    () => parseArgs(["validate", "--request-timeout-ms", "30000"]),
+    /not valid for validate/i,
+  );
+
+  for (const invalid of ["0", "-1", "1.5", "NaN", "2147483648"]) {
+    assert.throws(
+      () =>
+        parseArgs([
+          "run",
+          "--database",
+          "rql_run_test",
+          "--request-timeout-ms",
+          invalid,
+        ]),
+      /integer from 1 through 2147483647/i,
+    );
+  }
+});
+
 test("seed creates or explicitly reuses one sandbox and ingests fixed app-source IDs", async () => {
   for (const reuseDatabase of [false, true]) {
     const result = await invokeSeedCli({ reuseDatabase });
@@ -973,6 +1015,10 @@ test("seed creates or explicitly reuses one sandbox and ingests fixed app-source
     assert.equal(output.reused_database, reuseDatabase);
     assert.equal(output.database, "rql_seed_test");
     assert.equal(output.status, "completed");
+    assert.equal(
+      output.execution.request_timeout_ms,
+      DEFAULTS.requestTimeoutMs,
+    );
     assert.deepEqual(
       result.ingestedSources.map((source) => source.id),
       fixture.sources.map((source) => source.id),
@@ -1030,10 +1076,16 @@ test("run returns the threshold exit code and performs no mutations", async () =
     1,
   );
   assert.ok(result.calls.some((call) => call.pathname === "/query"));
+  const queryCalls = result.calls.filter((call) => call.pathname === "/query");
   assert.ok(
-    result.calls
-      .filter((call) => call.pathname === "/query")
-      .every((call) => call.request.query_apps === true),
+    queryCalls.every(
+      (call) =>
+        call.request.query_apps === true &&
+        call.request.query_by === "text" &&
+        call.request.graph_context === false &&
+        !Object.hasOwn(call.request, "mode") &&
+        !Object.hasOwn(call.request, "alpha"),
+    ),
   );
   assert.equal(
     result.calls.some(
@@ -1066,16 +1118,98 @@ test("API error messages cannot echo the credential", async () => {
   assert.match(result.stderr, /\[REDACTED\]/);
 });
 
+test("run applies the custom request timeout and bounds read-only timeout retries", async () => {
+  const stdout = outputBuffer();
+  const stderr = outputBuffer();
+  let queryAttempts = 0;
+  let abortedQueries = 0;
+
+  const fetchImpl = async (input, init = {}) => {
+    const url = new URL(
+      typeof input === "string" || input instanceof URL ? input : input.url,
+    );
+    if (url.pathname === "/databases/status") {
+      return successResponse({
+        database: "rql_timeout_test",
+        infra: {
+          scheduler_status: true,
+          graph_status: true,
+          vectorstore_status: { knowledge: true, memories: true },
+          ready_for_ingestion: true,
+        },
+      });
+    }
+    if (url.pathname === "/context/status") {
+      return successResponse({
+        statuses: fixture.sources.map((source) =>
+          statusEntry(source.id, "completed"),
+        ),
+      });
+    }
+    if (url.pathname === "/query") {
+      queryAttempts += 1;
+      return new Promise((_resolve, reject) => {
+        const rejectOnAbort = () => {
+          abortedQueries += 1;
+          const error = new Error("synthetic stalled query aborted");
+          error.name = "AbortError";
+          reject(error);
+        };
+        if (init.signal.aborted) rejectOnAbort();
+        else init.signal.addEventListener("abort", rejectOnAbort, { once: true });
+      });
+    }
+    throw new Error(`Unexpected timeout-test request: ${url.pathname}`);
+  };
+
+  const exitCode = await runCli(
+    [
+      "run",
+      "--fixture",
+      fixturePath,
+      "--database",
+      "rql_timeout_test",
+      "--profile",
+      "text",
+      "--format",
+      "json",
+      "--request-timeout-ms",
+      "20",
+    ],
+    {
+      cwd: repositoryRoot,
+      env: {
+        HYDRA_DB_API_KEY: "unit-test-secret-do-not-print",
+        HYDRA_DB_BASE_URL: "http://127.0.0.1:8787",
+      },
+      fetchImpl,
+      random: () => 0,
+      sleep: async () => {},
+      stdout: stdout.stream,
+      stderr: stderr.stream,
+    },
+  );
+
+  assert.equal(exitCode, 1);
+  assert.equal(queryAttempts, DEFAULTS.maxRetries + 1);
+  assert.equal(abortedQueries, DEFAULTS.maxRetries + 1);
+  assert.equal(stdout.read(), "");
+  assert.match(stderr.read(), /request timed out|REQUEST_TIMEOUT/i);
+});
+
 test("JSON output is byte-stable for identical deterministic runs", async () => {
-  const first = await invokeRunCli();
-  const second = await invokeRunCli();
+  const extraArgs = ["--request-timeout-ms", "1234"];
+  const first = await invokeRunCli({ extraArgs });
+  const second = await invokeRunCli({ extraArgs });
 
   assert.equal(first.exitCode, 0, first.stderr);
   assert.equal(second.exitCode, 0, second.stderr);
   assert.equal(first.stdout, second.stdout);
-  assert.deepEqual(JSON.parse(first.stdout), JSON.parse(second.stdout));
+  const firstReport = JSON.parse(first.stdout);
+  assert.deepEqual(firstReport, JSON.parse(second.stdout));
+  assert.equal(firstReport.execution.request_timeout_ms, 1234);
   assert.equal(
-    stableStringify(JSON.parse(first.stdout)).trim(),
+    stableStringify(firstReport).trim(),
     first.stdout.trim(),
   );
 });

@@ -21,6 +21,8 @@ export const DEFAULTS = Object.freeze({
   seedTimeoutMs: 15 * 60_000,
 });
 
+const MAX_TIMER_MS = 2_147_483_647;
+
 const SOURCE_KEYS = new Set([
   "additional_metadata",
   "attachments",
@@ -340,7 +342,9 @@ export function validateFixture(fixture) {
           issues.push(`${profilePath}.operator must be and, or, or phrase for text retrieval`);
         }
         if (hasOwn(profile, "alpha")) issues.push(`${profilePath}.alpha is only valid for hybrid retrieval`);
-        if (hasOwn(profile, "mode")) issues.push(`${profilePath}.mode must be omitted for text retrieval`);
+        if (hasOwn(profile, "mode")) {
+          issues.push(`${profilePath}.mode applies only to hybrid retrieval and must be omitted for text`);
+        }
       }
       if (profile.query_by === "hybrid") {
         if (!new Set(["fast", "thinking"]).has(profile.mode)) {
@@ -1007,11 +1011,13 @@ export function buildQueryRequest(fixture, profile, query, database) {
     graph_context: profile.graph_context,
     query_apps: profile.query_apps,
   };
+
+  // `mode` and `alpha` belong only to hybrid retrieval. Text retrieval uses
+  // BM25 plus `operator`, so deliberately omit hybrid routing controls.
+  const retrievalKeys = profile.query_by === "text" ? ["operator"] : ["alpha", "mode"];
   for (const key of [
-    "alpha",
+    ...retrievalKeys,
     "metadata_filters",
-    "mode",
-    "operator",
     "query_forceful_relations",
     "recency_bias",
   ]) {
@@ -1107,6 +1113,7 @@ export async function runEvaluation(
     cliThresholds = {},
     onProgress = () => {},
     now = () => performance.now(),
+    requestTimeoutMs = DEFAULTS.requestTimeoutMs,
   },
 ) {
   validateFixture(fixture);
@@ -1170,6 +1177,9 @@ export async function runEvaluation(
     },
     database,
     collection: fixture.collection,
+    execution: {
+      request_timeout_ms: requestTimeoutMs,
+    },
     profiles: profileReports,
   };
   const effectiveThresholds = Object.fromEntries(
@@ -1285,6 +1295,14 @@ function parseFiniteOption(raw, flag, { minimum = Number.NEGATIVE_INFINITY, maxi
   return value;
 }
 
+function parseRequestTimeoutOption(raw, flag) {
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 1 || value > MAX_TIMER_MS) {
+    throw new EvaluationError(`${flag} must be an integer from 1 through ${MAX_TIMER_MS}`);
+  }
+  return value;
+}
+
 function readFlagValue(argv, index, flag) {
   const argument = argv[index];
   const equalsIndex = argument.indexOf("=");
@@ -1313,7 +1331,13 @@ export function parseArgs(argv) {
   };
   const allowedByCommand = {
     validate: new Set(["--fixture"]),
-    seed: new Set(["--database", "--fixture", "--poll-interval-ms", "--timeout-ms"]),
+    seed: new Set([
+      "--database",
+      "--fixture",
+      "--poll-interval-ms",
+      "--request-timeout-ms",
+      "--timeout-ms",
+    ]),
     run: new Set([
       "--database",
       "--fixture",
@@ -1323,6 +1347,7 @@ export function parseArgs(argv) {
       "--min-mrr-at-k",
       "--min-recall-at-k",
       "--profile",
+      "--request-timeout-ms",
     ]),
   };
 
@@ -1355,6 +1380,9 @@ export function parseArgs(argv) {
       case "--poll-interval-ms":
         options.pollIntervalMs = parseFiniteOption(value, flag, { minimum: 0 });
         break;
+      case "--request-timeout-ms":
+        options.requestTimeoutMs = parseRequestTimeoutOption(value, flag);
+        break;
       case "--min-hit-at-k":
       case "--min-recall-at-k":
       case "--min-mrr-at-k":
@@ -1386,7 +1414,25 @@ function validateDatabaseName(database) {
 }
 
 function usage() {
-  return `HydraDB retrieval quality evaluator (Node.js 20+)\n\nUsage:\n  node scripts/retrieval-quality-eval.mjs validate [--fixture <path>]\n  node scripts/retrieval-quality-eval.mjs seed --database <sandbox> [--fixture <path>] [--timeout-ms <ms>] [--poll-interval-ms <ms>]\n  node scripts/retrieval-quality-eval.mjs run --database <sandbox> [--fixture <path>] [--format markdown|json] [--profile <id> ...]\n       [--min-hit-at-k <0..1>] [--min-recall-at-k <0..1>] [--min-mrr-at-k <0..1>]\n       [--max-p95-latency-ms <ms>]\n\nSafety:\n  validate is completely offline. run performs only status reads and retrieval queries.\n  seed is the only command that creates or ingests data. No command deletes data.\n`;
+  return `HydraDB retrieval quality evaluator (Node.js 20+)
+
+Usage:
+  node scripts/retrieval-quality-eval.mjs validate [--fixture <path>]
+  node scripts/retrieval-quality-eval.mjs seed --database <sandbox> [--fixture <path>] [--timeout-ms <ms>] [--poll-interval-ms <ms>]
+       [--request-timeout-ms <ms>]
+  node scripts/retrieval-quality-eval.mjs run --database <sandbox> [--fixture <path>] [--format markdown|json] [--profile <id> ...]
+       [--request-timeout-ms <ms>]
+       [--min-hit-at-k <0..1>] [--min-recall-at-k <0..1>] [--min-mrr-at-k <0..1>]
+       [--max-p95-latency-ms <ms>]
+
+Timeouts:
+  --request-timeout-ms bounds each HTTP attempt (default 30000). For seed, --timeout-ms
+  is the phase polling budget checked between bounded status requests.
+
+Safety:
+  validate is completely offline. run performs only status reads and retrieval queries.
+  seed is the only command that creates or ingests data. No command deletes data.
+`;
 }
 
 function writeTo(destination, text) {
@@ -1443,11 +1489,13 @@ export async function runCli(
 
     credential = env.HYDRA_DB_API_KEY;
     if (!isNonEmptyString(credential)) throw new EvaluationError("HYDRA_DB_API_KEY is required for seed and run");
+    const requestTimeoutMs = options.requestTimeoutMs ?? DEFAULTS.requestTimeoutMs;
     const client = createApiClient({
       apiKey: credential,
       baseUrl: env.HYDRA_DB_BASE_URL || DEFAULTS.baseUrl,
       fetchImpl,
       random,
+      requestTimeoutMs,
       sleep,
     });
     const onProgress = (message) => writeTo(stderr, `${message}\n`);
@@ -1462,7 +1510,13 @@ export async function runCli(
         now: now ?? Date.now,
         sleep,
       });
-      writeTo(stdout, `${stableStringify(result, 2)}\n`);
+      writeTo(
+        stdout,
+        `${stableStringify({
+          ...result,
+          execution: { request_timeout_ms: requestTimeoutMs },
+        }, 2)}\n`,
+      );
       return EXIT_CODES.SUCCESS;
     }
 
@@ -1473,6 +1527,7 @@ export async function runCli(
       cliThresholds: options.thresholds,
       onProgress,
       now: now ?? (() => performance.now()),
+      requestTimeoutMs,
     });
     writeTo(stdout, options.format === "json" ? formatJsonReport(report) : formatMarkdownReport(report));
     return report.gates.passed ? EXIT_CODES.SUCCESS : EXIT_CODES.GATE_FAILURE;
