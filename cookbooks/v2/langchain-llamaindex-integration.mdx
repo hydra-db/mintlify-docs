@@ -26,7 +26,7 @@ Both frameworks were designed around pluggable retrievers. HydraDB fits naturall
 
 ```bash
 pip install "hydradb-sdk>=2,<3" \
-  langchain-core langchain-openai langchain-community \
+  langchain langchain-core langchain-openai langchain-community \
   llama-index-core llama-index-llms-openai \
   openai
 ```
@@ -260,6 +260,10 @@ class HydraDBRetriever(BaseRetriever):
 
     # Required fields
     hydra_client: Any = Field(description="Synchronous HydraDB client instance.")
+    hydra_token: str = Field(
+        description="HydraDB API token. Used to build the async client so both "
+                    "sync and async paths operate under the same credentials."
+    )
     database: str = Field(description="HydraDB database name.")
     collection: str = Field(description="HydraDB collection (user ID, workspace, etc.).")
 
@@ -309,19 +313,27 @@ class HydraDBRetriever(BaseRetriever):
         *,
         run_manager: AsyncCallbackManagerForRetrieverRun,
     ) -> List[Document]:
-        """Async retrieval for async LCEL chains and agents."""
-        async_client = AsyncHydraDB(token=os.environ["HYDRA_DB_API_KEY"])
-        result = await async_client.query(
-            database=self.database,
-            collection=self.collection,
-            query=query,
-            type=self.query_type,
-            query_by="hybrid",
-            mode=self.mode,
-            max_results=self.max_results,
-            graph_context=self.graph_context,
-            alpha=self.alpha,
-        )
+        """Async retrieval for async LCEL chains and agents.
+
+        Uses the same token as the injected sync client so tenant-scoped
+        credentials are honoured. The async client is closed after each call
+        to avoid accumulating open HTTP transports under load.
+        """
+        async_client = AsyncHydraDB(token=self.hydra_token)
+        try:
+            result = await async_client.query(
+                database=self.database,
+                collection=self.collection,
+                query=query,
+                type=self.query_type,
+                query_by="hybrid",
+                mode=self.mode,
+                max_results=self.max_results,
+                graph_context=self.graph_context,
+                alpha=self.alpha,
+            )
+        finally:
+            await async_client.close()
         chunks = result.data.chunks or []
         return [self._chunk_to_document(c) for c in chunks]
 
@@ -359,6 +371,7 @@ client = HydraDB(token=os.environ["HYDRA_DB_API_KEY"])
 
 retriever = HydraDBRetriever(
     hydra_client=client,
+    hydra_token=os.environ["HYDRA_DB_API_KEY"],
     database="framework-demo",
     collection="docs",
     max_results=3,
@@ -412,6 +425,7 @@ llm = ChatOpenAI(model="gpt-4o", temperature=0.1)
 # Retriever
 retriever = HydraDBRetriever(
     hydra_client=hydra_client,
+    hydra_token=os.environ["HYDRA_DB_API_KEY"],
     database="framework-demo",
     collection="docs",
     max_results=6,
@@ -456,11 +470,28 @@ answer_prompt = ChatPromptTemplate.from_messages([
     ("human", "{input}"),
 ])
 
-# Chain: condense question, retrieve docs, generate answer
+# Chain: condense question, retrieve docs, generate answer.
+# The condense step rewrites follow-up questions into standalone questions
+# before they reach the retriever, so "How does its search work?" becomes
+# "How does HydraDB search work?" and HydraDB gets a resolvable query.
+condense_chain = condense_prompt | llm | StrOutputParser()
+
+
+def condense_and_retrieve(x: dict) -> str:
+    """Condense the question using chat history, then retrieve from HydraDB."""
+    history = x.get("chat_history", [])
+    if history:
+        standalone = condense_chain.invoke(
+            {"input": x["input"], "chat_history": history}
+        )
+    else:
+        standalone = x["input"]
+    docs = retriever.invoke(standalone)
+    return format_docs(docs)
+
+
 chain = (
-    RunnablePassthrough.assign(
-        context=lambda x: format_docs(retriever.invoke(x["input"]))
-    )
+    RunnablePassthrough.assign(context=condense_and_retrieve)
     | answer_prompt
     | llm
     | StrOutputParser()
@@ -527,6 +558,7 @@ hydra_client = HydraDB(token=os.environ["HYDRA_DB_API_KEY"])
 
 retriever = HydraDBRetriever(
     hydra_client=hydra_client,
+    hydra_token=os.environ["HYDRA_DB_API_KEY"],
     database="framework-demo",
     collection="docs",
     max_results=5,
@@ -591,6 +623,7 @@ class HydraDBRetriever(BaseRetriever):
     def __init__(
         self,
         hydra_client: HydraDB,
+        hydra_token: str,
         database: str,
         collection: str,
         top_k: int = 8,
@@ -600,6 +633,7 @@ class HydraDBRetriever(BaseRetriever):
         alpha: str = "auto",
     ) -> None:
         self._hydra_client = hydra_client
+        self._hydra_token = hydra_token  # kept so async path uses same credentials
         self._database = database
         self._collection = collection
         self._top_k = top_k
@@ -626,19 +660,27 @@ class HydraDBRetriever(BaseRetriever):
         return [self._chunk_to_node(c) for c in chunks]
 
     async def _aretrieve(self, query_bundle: QueryBundle) -> List[NodeWithScore]:
-        """Async retrieval for async query engines and chat engines."""
-        async_client = AsyncHydraDB(token=os.environ["HYDRA_DB_API_KEY"])
-        result = await async_client.query(
-            database=self._database,
-            collection=self._collection,
-            query=query_bundle.query_str,
-            type=self._query_type,
-            query_by="hybrid",
-            mode=self._mode,
-            max_results=self._top_k,
-            graph_context=self._graph_context,
-            alpha=self._alpha,
-        )
+        """Async retrieval for async query engines and chat engines.
+
+        Uses the same token as the injected sync client so tenant-scoped
+        credentials are honoured. The async client is closed after each call
+        to avoid accumulating open HTTP transports under load.
+        """
+        async_client = AsyncHydraDB(token=self._hydra_token)
+        try:
+            result = await async_client.query(
+                database=self._database,
+                collection=self._collection,
+                query=query_bundle.query_str,
+                type=self._query_type,
+                query_by="hybrid",
+                mode=self._mode,
+                max_results=self._top_k,
+                graph_context=self._graph_context,
+                alpha=self._alpha,
+            )
+        finally:
+            await async_client.close()
         chunks = result.data.chunks or []
         return [self._chunk_to_node(c) for c in chunks]
 
@@ -668,7 +710,10 @@ class HydraDBRetriever(BaseRetriever):
             },
         )
         raw_score = getattr(chunk, "relevancy_score", None)
-        score = float(raw_score) if raw_score is not None else 1.0
+        # Fall back to 0.0, not 1.0. A missing score means quality is unknown;
+        # defaulting to 1.0 would make every unscored chunk pass the
+        # SimilarityPostprocessor cutoff and outrank verified results.
+        score = float(raw_score) if raw_score is not None else 0.0
 
         return NodeWithScore(node=node, score=score)
 ```
@@ -687,6 +732,7 @@ client = HydraDB(token=os.environ["HYDRA_DB_API_KEY"])
 
 retriever = HydraDBRetriever(
     hydra_client=client,
+    hydra_token=os.environ["HYDRA_DB_API_KEY"],
     database="framework-demo",
     collection="docs",
     top_k=3,
@@ -723,6 +769,7 @@ client = HydraDB(token=os.environ["HYDRA_DB_API_KEY"])
 
 retriever = HydraDBRetriever(
     hydra_client=client,
+    hydra_token=os.environ["HYDRA_DB_API_KEY"],
     database="framework-demo",
     collection="docs",
     top_k=8,
@@ -822,6 +869,7 @@ def build_chat_engine(user_id: str) -> CondensePlusContextChatEngine:
     # Retriever 1: shared knowledge (type="knowledge", no user scope)
     knowledge_retriever = HydraDBRetriever(
         hydra_client=client,
+        hydra_token=os.environ["HYDRA_DB_API_KEY"],
         database=DATABASE,
         collection="docs",
         top_k=5,
@@ -832,6 +880,7 @@ def build_chat_engine(user_id: str) -> CondensePlusContextChatEngine:
     # Retriever 2: user memories (type="memory", scoped to this user)
     memory_retriever = HydraDBRetriever(
         hydra_client=client,
+        hydra_token=os.environ["HYDRA_DB_API_KEY"],
         database=DATABASE,
         collection=user_id,
         top_k=4,
@@ -844,6 +893,7 @@ def build_chat_engine(user_id: str) -> CondensePlusContextChatEngine:
     # with collection=user_id. HydraDB then merges knowledge and memories server-side.
     combined_retriever = HydraDBRetriever(
         hydra_client=client,
+        hydra_token=os.environ["HYDRA_DB_API_KEY"],
         database=DATABASE,
         collection=user_id,
         top_k=8,
@@ -959,7 +1009,7 @@ graph TD
 |---|---|---|
 | `PydanticUserError: A non-annotated attribute was detected` | LangChain: assigning a field in `__init__` without a class-level `Field(...)` declaration | Move attribute to `FieldName: Type = Field(...)` at class level and add `model_config = ConfigDict(arbitrary_types_allowed=True)` |
 | `_retrieve` never called in LlamaIndex | Forgot `super().__init__()` at the end of `__init__` | Add `super().__init__()` as the last line of your `__init__` |
-| `SimilarityPostprocessor` drops all nodes | `score=None` on all `NodeWithScore` objects | Return `score=float(raw_score) if raw_score is not None else 1.0` in `_chunk_to_node` |
+| `SimilarityPostprocessor` drops all nodes | `score=None` on all `NodeWithScore` objects | Return `score=float(raw_score) if raw_score is not None else 0.0` in `_chunk_to_node` (never fall back to 1.0 -- that would make unscored chunks bypass the cutoff) |
 | Empty `chunks` list from HydraDB | Database not yet ready, or documents not yet indexed | Poll `GET /databases/status` until `ready_for_ingestion`, poll `GET /context/status` until `completed` or `graph_creation` |
 | `401 Unauthorized` | Missing or wrong `Authorization: Bearer` header | Set `HYDRA_DB_API_KEY` env var; the SDK reads it automatically |
 | `404 Not Found` on `/query` | Querying a database or collection that does not exist | Verify database name and run `GET /databases` to list available databases |
@@ -1022,23 +1072,30 @@ from hydradb_llamaindex import HydraDBRetriever
 from llama_index.core import QueryBundle
 
 class AsyncHydraDBRetriever(HydraDBRetriever):
-    """Drop-in async version for use in FastAPI / async services."""
+    """Drop-in async version for use in FastAPI / async services.
+
+    Passes the same token as the injected sync client so tenant-scoped
+    credentials are honoured across both sync and async code paths.
+    The async client is closed after every call to prevent open HTTP
+    transports accumulating under sustained request load.
+    """
 
     async def _aretrieve(self, query_bundle: QueryBundle):
-        # Create a fresh async client per call to avoid event-loop issues.
-        # For production: use a connection pool or inject a shared async client.
-        async_client = AsyncHydraDB(token=os.environ["HYDRA_DB_API_KEY"])
-        result = await async_client.query(
-            database=self._database,
-            collection=self._collection,
-            query=query_bundle.query_str,
-            type=self._query_type,
-            query_by="hybrid",
-            mode=self._mode,
-            max_results=self._top_k,
-            graph_context=self._graph_context,
-            alpha=self._alpha,
-        )
+        async_client = AsyncHydraDB(token=self._hydra_token)
+        try:
+            result = await async_client.query(
+                database=self._database,
+                collection=self._collection,
+                query=query_bundle.query_str,
+                type=self._query_type,
+                query_by="hybrid",
+                mode=self._mode,
+                max_results=self._top_k,
+                graph_context=self._graph_context,
+                alpha=self._alpha,
+            )
+        finally:
+            await async_client.close()
         chunks = result.data.chunks or []
         return [self._chunk_to_node(c) for c in chunks]
 ```
