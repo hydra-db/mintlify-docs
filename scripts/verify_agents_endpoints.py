@@ -56,6 +56,19 @@ def path_exists(path: str, openapi_paths: set[str]) -> bool:
     return path in openapi_paths
 
 
+# Legacy aliases that still appear in deprecation guidance.
+DEPRECATED_PATH_PREFIXES = (
+    "/tenants",
+)
+
+
+def is_allowed_missing_path(path: str) -> bool:
+    return any(
+        path == prefix or path.startswith(prefix + "/")
+        for prefix in DEPRECATED_PATH_PREFIXES
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--docs", default="AGENTS.mdx", help="Path to the agents MDX file")
@@ -75,6 +88,8 @@ def main() -> int:
     for method, path in sorted(iter_doc_endpoints(text), key=lambda x: (x[1], x[0] or "")):
         checked.append((method, path))
         if not path_exists(path, openapi_paths):
+            if is_allowed_missing_path(path):
+                continue
             missing.append((method, path, "path not found"))
             continue
         if method and not path.endswith("*"):
