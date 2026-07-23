@@ -37,8 +37,10 @@ flowchart TD
   start -->|"Attach or update values on existing sources"| merge["Path B: PATCH schema if needed, then PATCH source metadata"]
   start -->|"Rename / delete / retype, or change field flags"| rebuild["Path C: new database with final schema, re-ingest, cut over"]
   add --> verify["Verify with POST /query"]
-  merge --> verify
-  rebuild --> verify
+  merge --> check["Check PATCH response; retry if vector sync failed"]
+  check --> verify
+  rebuild --> poll["Poll ingestion status"]
+  poll --> verify
 ```
 
 | If you need… | Use… |
@@ -138,7 +140,8 @@ Typical sequence:
 
 1. Add the field with Path A (if it is not already in the schema).
 2. PATCH each affected source with the new metadata keys.
-3. Verify filters with query.
+3. Inspect the PATCH response before you query (see Verification).
+4. Verify filters with query only after the edit has converged.
 
 This edit endpoint uses `tenant_metadata` for schema-backed fields (not the shorter `metadata` key used at ingest). `collection` is required and does not default.
 
@@ -200,7 +203,13 @@ const response = await fetch(
 ```
 </CodeGroup>
 
-If an edited `tenant_metadata` field has `enable_dense_embedding` or `enable_sparse_embedding`, HydraDB refreshes the relevant vector-store metadata search lane as part of the edit. For `enable_match`-only fields, the update stays on the MongoDB filter path.
+If an edited `tenant_metadata` field has `enable_dense_embedding` or `enable_sparse_embedding`, HydraDB refreshes the relevant vector-store metadata search lane as part of the edit. Check the response:
+
+- `vector_sync_required: false` — MongoDB-only (`enable_match`) edit; safe to query after a successful response
+- `vector_sync_required: true` and `vector_synced: true` — dense/sparse lane refreshed; safe to query
+- HTTP `500` with MongoDB written but vector sync failed — **retry the same idempotent PATCH** until `vector_synced` is `true` (or sync is no longer required). Do not treat the first `500` as final and do not verify with query yet
+
+Deprecated aliases `milvus_sync_required` / `milvus_synced` may still appear; prefer `vector_*`.
 
 Reserve a full `upsert: true` re-ingest only when the source **content** itself must change. Metadata-only migrations should use this PATCH.
 
@@ -226,7 +235,13 @@ Declare every field you will need for filtering and semantic metadata search **b
 
 ## Verification
 
-After Path B, confirm filters immediately with [`POST /query`](/api-reference/v2/endpoint/query).
+After Path B:
+
+1. Confirm the PATCH returned `success: true` (or a successful HTTP status with `updated: true`).
+2. If `vector_sync_required` is `true`, wait until `vector_synced` is `true`. If the request returns `500` because MongoDB updated but vector sync failed, retry the **same** PATCH — the edit is idempotent and retries converge the vector lane.
+3. Only then confirm filters with [`POST /query`](/api-reference/v2/endpoint/query).
+
+Querying before a successful dense/sparse sync can return missing or stale metadata-search results even though MongoDB already has the new values.
 
 After Path C, poll [`GET /context/status`](/api-reference/v2/endpoint/source-status) until sources reach at least `graph_creation` (or `completed` if you need full indexing), then query.
 
@@ -283,6 +298,7 @@ A valid filter with no matching sources returns an empty result set. HydraDB doe
 - **Case-insensitive uniqueness**  -  existing field names cannot be reused, even with different casing.
 - **Undeclared keys**  -  when a non-empty schema exists, unknown `metadata` keys are rejected on ingest and on source-metadata PATCH. Plan fields before you need them.
 - **Use merge PATCH for metadata-only edits**  -  do not replace a whole source with `upsert: true` just to change metadata.
+- **Retry failed vector sync**  -  a `500` after MongoDB write means dense/sparse sync failed; retry the same PATCH before verifying with query.
 - **`tenant_metadata` in the edit body**  -  the source-metadata PATCH does not accept the ingest-time `metadata` key; use `tenant_metadata`.
 - **`collection` is required** on source-metadata PATCH and does not default.
 - **Do not replace `collection` with metadata**  -  partition by user/workspace with `collection`; use metadata filters inside that partition.
