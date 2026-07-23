@@ -1,9 +1,13 @@
 ---
 title: "Migrating your metadata schema"
-description: "Safe procedures for changing database metadata schema: additive PATCH, re-ingest, or rebuild in a new database."
+description: "Safe procedures for changing database metadata schema: additive PATCH, in-place source metadata merge, or rebuild in a new database."
 ---
 
-Database metadata schema is largely immutable. There is no single "migrate schema" endpoint. Migration is a deliberate procedure using the additive [`PATCH /databases/{database}/metadata-schema`](/api-reference/v2/endpoint/update-metadata-schema) endpoint, re-ingestion, or a new database with the final schema.
+Database metadata schema is largely immutable. There is no single "migrate schema" endpoint. Migration is a deliberate procedure using:
+
+1. Additive [`PATCH /databases/{database}/metadata-schema`](/api-reference/v2/endpoint/update-metadata-schema) to add fields
+2. In-place [`PATCH /context/sources/{source_id}/metadata`](/api-reference/v2/endpoint/update-source-metadata) to merge values onto existing sources
+3. A new database with the final schema when you need rename, delete, retype, or flag changes
 
 For what metadata is and how filters work, see [Scoping using metadata](/essentials/v2/metadata).
 
@@ -14,39 +18,42 @@ For what metadata is and how filters work, see [Scoping using metadata](/essenti
 | Change | Supported? | How |
 | --- | --- | --- |
 | Add a new field | Yes | [`PATCH .../metadata-schema`](/api-reference/v2/endpoint/update-metadata-schema) with `add_fields` |
-| Attach new field values to existing sources | Yes | Re-ingest with `upsert: true` and the same `id` |
-| Use a new `enable_match` field in filters for newly ingested sources | Yes | PATCH, then ingest with the new key |
-| Make a new dense/sparse field participate in semantic/BM25 search over **existing** data | Not via PATCH alone | Create a new database with the final schema and re-ingest (Milvus is not backfilled) |
+| Attach or update field values on existing sources | Yes | [`PATCH .../sources/{source_id}/metadata`](/api-reference/v2/endpoint/update-source-metadata) (merge; omitted keys are preserved) |
+| Use a new `enable_match` field in filters for newly ingested sources | Yes | Schema PATCH, then ingest with the new key |
 | Rename, delete, or retype an existing field | No | Rebuild in a new database |
 | Change `enable_match` / embedding flags on an existing field | No | Rebuild in a new database |
 
+<Warning>
+  Prefer the source-metadata PATCH for metadata-only edits. A full `upsert: true` re-ingest replaces the source snapshot and can discard content, attachments, comments, or relations omitted from the submitted payload. Reserve full re-ingest for cases where the source content itself must change.
+</Warning>
+
 ---
 
-## Decision: in-place add vs re-ingest vs new database
+## Decision: in-place add vs metadata merge vs new database
 
 ```mermaid
 flowchart TD
   start["What schema change do you need?"] -->|"Add a new field for future ingest"| add["Path A: PATCH metadata-schema"]
-  start -->|"Attach new field values to existing sources"| reingest["Path B: PATCH, then re-ingest with upsert"]
-  start -->|"Rename / delete / retype, or need dense/sparse search on existing data"| rebuild["Path C: new database with final schema, re-ingest, cut over"]
-  add --> verify["Poll GET /context/status, verify with POST /query"]
-  reingest --> verify
+  start -->|"Attach or update values on existing sources"| merge["Path B: PATCH schema if needed, then PATCH source metadata"]
+  start -->|"Rename / delete / retype, or change field flags"| rebuild["Path C: new database with final schema, re-ingest, cut over"]
+  add --> verify["Verify with POST /query"]
+  merge --> verify
   rebuild --> verify
 ```
 
 | If you need… | Use… |
 | --- | --- |
 | A new exact-match filter field going forward | Path A |
-| Existing sources to carry new metadata values (and filter on them) | Path B |
-| Renames, deletes, type/flag changes, or semantic/BM25 metadata search over data already indexed | Path C |
+| Existing sources to carry new or updated metadata values | Path B |
+| Renames, deletes, type/flag changes on existing fields | Path C |
 
 ---
 
 ## Path A - Additive change (safe, in place)
 
-Use Path A when you only need to **append** fields. The PATCH is additive only. It cannot delete, rename, or change the type or flags of existing fields.
+Use Path A when you only need to **append** fields. The schema PATCH is additive only. It cannot delete, rename, or change the type or flags of existing fields.
 
-MongoDB indexes for `enable_match` fields are created when the schema is updated. Existing Milvus collections are **not** altered or backfilled for newly added dense/sparse metadata fields.
+MongoDB indexes for `enable_match` fields are created when the schema is updated. Existing Milvus collections are **not** altered for newly added dense/sparse metadata field definitions at schema time.
 
 <CodeGroup>
 ```bash cURL
@@ -117,109 +124,85 @@ After Path A, new ingestions can send `region` in `metadata`. Existing sources d
 
 ---
 
-## Path B - Re-ingest to attach values on existing sources
+## Path B - Merge metadata onto existing sources
 
-Ingested `metadata` and `additional_metadata` values are immutable. To add or change values on a source that is already indexed, re-ingest with `upsert: true` and the **same** `id`.
+Use Path B when the source content is already correct and you only need to attach or change metadata. Call [`PATCH /context/sources/{source_id}/metadata`](/api-reference/v2/endpoint/update-source-metadata).
+
+This endpoint **merges** metadata:
+
+- Keys present in the request are inserted or overwritten
+- Keys omitted from the request are preserved
+- Source content, attachments, comments, and relations are left intact
 
 Typical sequence:
 
 1. Add the field with Path A (if it is not already in the schema).
-2. Re-ingest each affected source with the new metadata keys populated.
-3. Poll status, then verify filters with query.
+2. PATCH each affected source with the new metadata keys.
+3. Verify filters with query.
+
+This edit endpoint uses `tenant_metadata` for schema-backed fields (not the shorter `metadata` key used at ingest). `collection` is required and does not default.
 
 <CodeGroup>
 ```bash cURL
-curl -X POST 'https://api.hydradb.com/context/ingest' \
+curl -X PATCH 'https://api.hydradb.com/context/sources/auth-controls-001/metadata' \
   -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
   -H "API-Version: 2" \
-  -F "type=knowledge" \
-  -F "database=acme_corp" \
-  -F "collection=team_docs" \
-  -F "upsert=true" \
-  -F 'app_knowledge=[
-    {
-      "database": "acme_corp",
-      "collection": "team_docs",
-      "id": "auth-controls-001",
-      "kind": "knowledge_base",
-      "fields": {
-        "title": "Authentication controls",
-        "body": "Authentication controls are reviewed quarterly for SOC2."
-      },
-      "metadata": {
-        "department": "security",
-        "region": "us"
-      }
+  -H "Content-Type: application/json" \
+  -d '{
+    "database": "acme_corp",
+    "collection": "team_docs",
+    "tenant_metadata": {
+      "region": "us"
     }
-  ]'
+  }'
 ```
 
-```python Python SDK
-import json
+```python Python
 import os
-from hydra_db import HydraDB
+import requests
 
-client = HydraDB(token=os.environ["HYDRA_DB_API_KEY"])
-
-client.context.ingest(
-    type="knowledge",
-    database="acme_corp",
-    collection="team_docs",
-    upsert=True,
-    app_knowledge=json.dumps([
-        {
-            "database": "acme_corp",
-            "collection": "team_docs",
-            "id": "auth-controls-001",
-            "kind": "knowledge_base",
-            "fields": {
-                "title": "Authentication controls",
-                "body": "Authentication controls are reviewed quarterly for SOC2.",
-            },
-            "metadata": {
-                "department": "security",
-                "region": "us",
-            },
-        }
-    ]),
+response = requests.patch(
+    "https://api.hydradb.com/context/sources/auth-controls-001/metadata",
+    headers={
+        "Authorization": f"Bearer {os.environ['HYDRA_DB_API_KEY']}",
+        "API-Version": "2",
+        "Content-Type": "application/json",
+    },
+    json={
+        "database": "acme_corp",
+        "collection": "team_docs",
+        "tenant_metadata": {
+            "region": "us",
+        },
+    },
 )
 ```
 
-```typescript TypeScript SDK
-import { HydraDBClient } from "@hydradb/sdk";
-
-const client = new HydraDBClient({
-  token: process.env.HYDRA_DB_API_KEY,
-});
-
-await client.context.ingest({
-  type: "knowledge",
-  database: "acme_corp",
-  collection: "team_docs",
-  upsert: true,
-  appKnowledge: JSON.stringify([
-    {
+```typescript TypeScript
+const response = await fetch(
+  "https://api.hydradb.com/context/sources/auth-controls-001/metadata",
+  {
+    method: "PATCH",
+    headers: {
+      Authorization: `Bearer ${process.env.HYDRA_DB_API_KEY}`,
+      "API-Version": "2",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
       database: "acme_corp",
       collection: "team_docs",
-      id: "auth-controls-001",
-      kind: "knowledge_base",
-      fields: {
-        title: "Authentication controls",
-        body: "Authentication controls are reviewed quarterly for SOC2.",
-      },
-      metadata: {
-        department: "security",
+      tenant_metadata: {
         region: "us",
       },
-    },
-  ]),
-});
+    }),
+  },
+);
 ```
 </CodeGroup>
 
-<Warning>
-  Path B updates metadata values and works for exact-match filtering (`enable_match`). It does not backfill Milvus dense/sparse lanes for fields added after the original index. If existing data must participate in semantic or BM25 metadata search on a newly added field, use Path C.
-</Warning>
+If an edited `tenant_metadata` field has `enable_dense_embedding` or `enable_sparse_embedding`, HydraDB refreshes the relevant vector-store metadata search lane as part of the edit. For `enable_match`-only fields, the update stays on the MongoDB filter path.
+
+Reserve a full `upsert: true` re-ingest only when the source **content** itself must change. Metadata-only migrations should use this PATCH.
 
 ---
 
@@ -229,7 +212,6 @@ Use Path C when you need to:
 
 - Rename, delete, or retype a field
 - Change flags such as `enable_match`, `enable_dense_embedding`, or `enable_sparse_embedding` on an existing field
-- Make new dense/sparse metadata fields searchable over data that is already indexed
 
 Procedure:
 
@@ -238,16 +220,15 @@ Procedure:
 3. Cut over clients to the new `database` name.
 4. Retire the old database when ready.
 
-Declare every field you will need for filtering and semantic metadata search **before** the first ingest into the new database. Schema field names are immutable after creation; later changes are additive-only.
+Declare every field you will need for filtering and semantic metadata search **before** the first ingest into the new database. Schema field names are immutable after creation; later schema changes are additive-only.
 
 ---
 
 ## Verification
 
-After Path B or Path C:
+After Path B, confirm filters immediately with [`POST /query`](/api-reference/v2/endpoint/query).
 
-1. Poll [`GET /context/status`](/api-reference/v2/endpoint/source-status) until sources reach at least `graph_creation` (or `completed` if you need full indexing).
-2. Confirm behavior with [`POST /query`](/api-reference/v2/endpoint/query):
+After Path C, poll [`GET /context/status`](/api-reference/v2/endpoint/source-status) until sources reach at least `graph_creation` (or `completed` if you need full indexing), then query.
 
 <CodeGroup>
 ```bash cURL
@@ -300,9 +281,10 @@ A valid filter with no matching sources returns an empty result set. HydraDB doe
 - **Reserved names**  -  names such as `source_id`, `chunk_id`, `metadata`, and `document_metadata` are rejected.
 - **Embeddings only on `VARCHAR`**  -  `enable_dense_embedding` and `enable_sparse_embedding` are only valid on `VARCHAR` fields.
 - **Case-insensitive uniqueness**  -  existing field names cannot be reused, even with different casing.
-- **Undeclared keys**  -  when a non-empty schema exists, unknown `metadata` keys are rejected on ingest. Plan fields before you need them.
-- **Immutable values**  -  change metadata on an indexed source only by re-ingesting with `upsert: true` and the same `id`.
-- **No Milvus backfill**  -  additive PATCH + same-database re-ingest does not enable dense/sparse search over previously indexed collections; use Path C for that.
+- **Undeclared keys**  -  when a non-empty schema exists, unknown `metadata` keys are rejected on ingest and on source-metadata PATCH. Plan fields before you need them.
+- **Use merge PATCH for metadata-only edits**  -  do not replace a whole source with `upsert: true` just to change metadata.
+- **`tenant_metadata` in the edit body**  -  the source-metadata PATCH does not accept the ingest-time `metadata` key; use `tenant_metadata`.
+- **`collection` is required** on source-metadata PATCH and does not default.
 - **Do not replace `collection` with metadata**  -  partition by user/workspace with `collection`; use metadata filters inside that partition.
 
 ---
@@ -311,6 +293,7 @@ A valid filter with no matching sources returns an empty result set. HydraDB doe
 
 - [Scoping using metadata](/essentials/v2/metadata)
 - [Update Metadata Schema](/api-reference/v2/endpoint/update-metadata-schema)
+- [Update Source Metadata](/api-reference/v2/endpoint/update-source-metadata)
 - [Create Database](/api-reference/v2/endpoint/create-tenant)
 - [Ingest Context](/api-reference/v2/endpoint/ingest-context)
 - [Ingestion Status](/api-reference/v2/endpoint/source-status)
