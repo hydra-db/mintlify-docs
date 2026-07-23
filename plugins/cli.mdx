@@ -1,225 +1,501 @@
 ---
 title: "HydraDB CLI"
-description: "Agent-friendly command line interface for HydraDB. Manage memories, recall context, and ingest knowledge from the terminal."
+description: "Install the HydraDB CLI, choose the right context primitive, and build a failure-aware ingest-to-recall workflow."
 ---
 
-## Quick Start
+The HydraDB CLI lets you store memories, ingest knowledge, recall context, and inspect
+sources without writing an SDK integration. This guide takes you from the first command
+to a script that handles asynchronous indexing and response-level failures.
+
+<Note>
+  The CLI currently uses the legacy terms **tenant** and **sub-tenant**. They map to
+  **database** and **collection** in the current API. Use the same tenant/database and
+  sub-tenant/collection values when moving between the CLI, SDKs, and raw API. See
+  [Databases and collections](/essentials/v2/multi-tenant).
+</Note>
+
+## The complete journey
+
+```mermaid
+flowchart TD
+  A["Choose the context"] --> B{"User-specific signal?"}
+  B -->|Yes| C["memories add"]
+  B -->|No| D["knowledge upload"]
+  C --> E["recall preferences"]
+  D --> F["knowledge verify"]
+  F -->|Indexed| G["recall full"]
+  F -->|Failed| H["Inspect JSON and stop"]
+```
+
+The important difference is the indexing boundary: memory commands can be recalled as
+memories, while uploaded knowledge must finish asynchronous processing before recall.
+
+## Quick start
 
 <Steps>
   <Step title="Install the CLI">
     ```bash
-    pip install hydradb-cli
+    python -m pip install hydradb-cli
     ```
 
-    <Note>
-      Requires Python 3.10 or later.
-    </Note>
-  </Step>
+    Python 3.10 or later is required. Confirm the executable is available:
 
-  <Step title="Get credentials">
-    - Create an API key from [Hydra DB](https://app.hydradb.com/keys)
-    - Create or copy your tenant ID from the [Hydra DB dashboard](https://app.hydradb.com/tenants)
-  </Step>
-
-  <Step title="Authenticate">
     ```bash
-    hydradb login
+    hydradb --version
     ```
-
-    The interactive prompt asks for your API key and tenant ID, then saves them
-    to `~/.hydradb/config.json` (file permissions `0600`).
   </Step>
 
-  <Step title="Verify">
+  <Step title="Authenticate and set a default tenant">
+    ```bash
+    hydradb login --tenant-id my-database
+    ```
+
+    The interactive prompt reads the API key without displaying it. The CLI saves the
+    key and tenant to `~/.hydradb/config.json` with file mode `0600`.
+
+    <Tip>
+      Passing only `hydradb login` prompts for the API key, but does not prompt for a
+      tenant. Add `--tenant-id`, or set it later with
+      `hydradb config set tenant_id my-database`.
+    </Tip>
+  </Step>
+
+  <Step title="Verify the resolved configuration">
     ```bash
     hydradb whoami
+    ```
+
+    The API key is masked. Check that the tenant and optional sub-tenant match the scope
+    you plan to use for both ingestion and recall.
+  </Step>
+
+  <Step title="Store and recall a memory">
+    ```bash
+    hydradb memories add \
+      --text "Alex prefers concise technical answers" \
+      --source-id alex_preferences \
+      --user-name Alex
+
+    hydradb recall preferences "How should I answer Alex?"
     ```
   </Step>
 </Steps>
 
+## Choose Memory or Knowledge
+
+Route data according to who it belongs to and how it should be recalled.
+
+| Input | CLI command | Recall command | Why |
+|---|---|---|---|
+| User preference, behavior, or conversation signal | `hydradb memories add` | `hydradb recall preferences` | Personalized context that follows a user or workspace |
+| Already-written memory that should be preserved verbatim | `hydradb memories add --no-infer` | `hydradb recall preferences` | Skips inference over content you have already normalized |
+| Shared PDF, Markdown, DOCX, or text file | `hydradb knowledge upload` | `hydradb recall full` | Reusable organizational or product knowledge |
+| Shared inline text | `hydradb knowledge upload-text` | `hydradb recall full` | Knowledge that does not need a file wrapper |
+| Exact word or phrase lookup | Ingest as Memory or Knowledge | `hydradb recall keyword` | Deterministic text matching instead of semantic recall |
+
+### Decide whether to infer
+
+`memories add` uses `--infer` by default.
+
+- Keep `--infer` for raw conversations, observations, or notes from which HydraDB should
+  extract durable facts and preferences.
+- Use `--no-infer` when the text is already the exact memory you want to store.
+
+```bash
+# Raw signal: extract durable preferences
+hydradb memories add \
+  --text "Alex asked for dark mode again and wants weekly summaries" \
+  --source-id onboarding_chat \
+  --infer
+
+# Already normalized: store the statement as written
+hydradb memories add \
+  --text "Preferred theme: dark" \
+  --source-id preferred_theme \
+  --no-infer
+```
+
+### Make reruns intentional
+
+| Command | Rerun control |
+|---|---|
+| `memories add` | Supply a stable `--source-id`. Upsert is enabled by default; use `--no-upsert` when replacement is not allowed. |
+| `knowledge upload` | Use `--upsert` when the server should update matching sources. |
+| `knowledge upload-text` | Supply a stable `--source-id`. Check `hydradb knowledge upload-text --help` for the upsert controls available in your installed version. |
+
+<Warning>
+  An automatically generated source ID makes each run a new source. For repeatable jobs,
+  choose a stable ID derived from the record's real identity, not from its latest text.
+</Warning>
+
 ## Configuration
 
-### Authentication
+The CLI resolves environment variables before values in `~/.hydradb/config.json`.
 
-The CLI resolves credentials in this order (first match wins):
-
-1. Environment variables (`HYDRA_DB_API_KEY`, `HYDRADB_TENANT_ID`)
-2. Config file (`~/.hydradb/config.json`, written by `hydradb login`)
+| Variable | Purpose | Default |
+|---|---|---|
+| `HYDRA_DB_API_KEY` | HydraDB API key | Required |
+| `HYDRA_DB_TENANT_ID` | Default tenant/database | Required for data commands unless `--tenant-id` is passed |
+| `HYDRA_DB_SUB_TENANT_ID` | Default sub-tenant/collection | None |
+| `HYDRA_DB_BASE_URL` | API base URL | `https://api.hydradb.com` |
+| `HYDRADB_OUTPUT` | `human` or `json` output | `human` |
 
 <Tabs>
-  <Tab title="macOS/Linux (bash)">
+  <Tab title="macOS/Linux">
     ```bash
-    echo 'export HYDRA_DB_API_KEY="your-api-key"' >> ~/.bashrc
-    echo 'export HYDRADB_TENANT_ID="your-tenant-id"' >> ~/.bashrc
-    source ~/.bashrc
+    export HYDRA_DB_API_KEY="your-api-key"
+    export HYDRA_DB_TENANT_ID="my-database"
+    export HYDRA_DB_SUB_TENANT_ID="user-alex"
     ```
   </Tab>
-
-  <Tab title="macOS/Linux (zsh)">
-    ```bash
-    echo 'export HYDRA_DB_API_KEY="your-api-key"' >> ~/.zshrc
-    echo 'export HYDRADB_TENANT_ID="your-tenant-id"' >> ~/.zshrc
-    source ~/.zshrc
-    ```
-  </Tab>
-
-  <Tab title="Windows (PowerShell)">
+  <Tab title="Windows PowerShell">
     ```powershell
-    [System.Environment]::SetEnvironmentVariable("HYDRA_DB_API_KEY", "your-api-key", "User")
-    [System.Environment]::SetEnvironmentVariable("HYDRADB_TENANT_ID", "your-tenant-id", "User")
+    $env:HYDRA_DB_API_KEY = "your-api-key"
+    $env:HYDRA_DB_TENANT_ID = "my-database"
+    $env:HYDRA_DB_SUB_TENANT_ID = "user-alex"
     ```
   </Tab>
 </Tabs>
 
-### Environment Variables
-
-| Variable | Description | Default |
-|---|---|---|
-| `HYDRA_DB_API_KEY` | Your HydraDB API key | *Required* |
-| `HYDRADB_TENANT_ID` | Your HydraDB tenant identifier | *Required* |
-| `HYDRADB_API_URL` | API base URL | `https://api.hydradb.com` |
-| `HYDRADB_OUTPUT` | Default output format (`human` or `json`) | `human` |
-| `HYDRADB_SUB_TENANT_ID` | Sub-tenant for data partitioning | - |
-
-### Output Formats
-
-Every command supports `--output human` (default, Rich-formatted tables) or `--output json`
-(machine-readable). Set the default globally:
+Use the config file for interactive development:
 
 ```bash
-hydradb config set output json
+hydradb config set tenant_id my-database
+hydradb config set sub_tenant_id user-alex
+hydradb config set base_url https://api.hydradb.com
+hydradb config show
 ```
 
-Or per-command:
+The supported persisted keys are `api_key`, `tenant_id`, `sub_tenant_id`, and
+`base_url`. Output is a global option, not a persisted config key. Set it with
+`HYDRADB_OUTPUT=json` or place the option before the command group:
 
 ```bash
-hydradb -o json memories list TENANT_ID
+hydradb -o json memories list
 ```
-
-## Commands
-
-### Authentication
-
-| Command | Description |
-|---|---|
-| `hydradb login` | Interactive login - saves API key and tenant ID to `~/.hydradb/config.json` |
-| `hydradb logout` | Remove stored credentials |
-| `hydradb whoami` | Show current authentication status and tenant info |
-
-### Tenant Management
-
-| Command | Description |
-|---|---|
-| `hydradb tenant create` | Create a new tenant |
-| `hydradb tenant monitor TENANT_ID` | Get tenant infrastructure status and statistics |
-| `hydradb tenant list-sub-tenants TENANT_ID` | List all sub-tenant IDs |
-| `hydradb tenant delete TENANT_ID` | Delete a tenant and all its data (irreversible) |
 
 <Warning>
-  `hydradb tenant delete` permanently removes the tenant and all associated memories,
-  knowledge, and graph data. This action cannot be undone.
+  `hydradb memories list --output json` is not equivalent. Global options such as
+  `--output` must appear before `memories`, `knowledge`, `recall`, or `fetch`.
 </Warning>
 
-### Memory Operations
+## Ingest Knowledge, verify it, then recall it
 
-| Command | Description |
-|---|---|
-| `hydradb memories add TENANT_ID TEXT` | Add a user memory (auto-extracts insights via `infer`) |
-| `hydradb memories list TENANT_ID` | List all user memories |
-| `hydradb memories delete TENANT_ID MEMORY_ID` | Delete a specific memory by ID |
+Knowledge ingestion is asynchronous. A successful upload means the API accepted the
+request; it does not mean the content is searchable yet.
+
+<Steps>
+  <Step title="Upload with JSON output">
+    ```bash
+    upload_json="$(hydradb -o json knowledge upload ./runbook.md)"
+    printf '%s\n' "$upload_json" | jq .
+    ```
+
+    Extract the returned source ID while accepting either response field used by
+    supported deployments:
+
+    ```bash
+    source_id="$(
+      printf '%s\n' "$upload_json" |
+        jq -r 'first(.results[]? | .source_id // .id) // empty'
+    )"
+
+    test -n "$source_id" || {
+      printf '%s\n' "Upload did not return a source ID" >&2
+      exit 1
+    }
+    ```
+  </Step>
+
+  <Step title="Validate response-level failures">
+    A server can accept the HTTP request while reporting failed items in the JSON body.
+    Validate both the process exit code and the response:
+
+    ```bash
+    printf '%s\n' "$upload_json" | jq -e '
+      (type == "object") and
+      ((.success // true) != false) and
+      ((.failed_count // 0) == 0) and
+      all(.results[]?;
+        ((.status // "") | ascii_downcase) as $status |
+        ($status != "failed" and $status != "error" and $status != "errored") and
+        (.error? == null or .error == "")
+      )
+    ' >/dev/null || {
+      printf '%s\n' "$upload_json" | jq . >&2
+      exit 1
+    }
+    ```
+
+    <Note>
+      Do not rely on `$?` alone for response-level partial failures. CLI validation,
+      network, and HTTP errors return non-zero, but behavior for a `2xx` response that
+      contains failed items can vary by CLI version. Body validation keeps the script
+      correct across those versions.
+    </Note>
+  </Step>
+
+  <Step title="Poll until indexing is terminal">
+    `knowledge verify` performs one status check. Put it in a bounded loop for
+    automation:
+
+    ```bash
+    ready=false
+
+    for attempt in $(seq 1 60); do
+      status_json="$(hydradb -o json knowledge verify "$source_id")"
+      status="$(
+        printf '%s\n' "$status_json" |
+          jq -r '(.statuses // .results // [])[0]
+            | .indexing_status // .status // "unknown"'
+      )"
+
+      case "$status" in
+        indexed|completed|graph_creation)
+          ready=true
+          break
+          ;;
+        failed|errored|error)
+          printf '%s\n' "$status_json" | jq . >&2
+          exit 1
+          ;;
+        *)
+          sleep 2
+          ;;
+      esac
+    done
+
+    "$ready" || {
+      printf '%s\n' "Timed out waiting for $source_id" >&2
+      exit 1
+    }
+    ```
+
+    `graph_creation` is searchable while graph construction continues. Wait for
+    `completed` instead if your workflow requires the finished graph.
+  </Step>
+
+  <Step title="Recall the indexed knowledge">
+    ```bash
+    hydradb -o json recall full \
+      "How do we rotate credentials?" \
+      --mode thinking \
+      --max-results 5 |
+      jq '.chunks'
+    ```
+
+    `--mode fast` is the default and uses a single query for lower latency.
+    `--mode thinking` expands the query and reranks the combined results for higher
+    quality at higher latency. Both `recall full` and `recall preferences` accept these
+    modes; `recall keyword` does not. See [Recall modes](/essentials/recall#4-how-recall-works).
+  </Step>
+</Steps>
+
+## A reusable CI script
+
+This example combines the safeguards into one Bash workflow. It requires `jq` and uses
+environment variables so no API key is written to disk.
 
 ```bash
-# Store a memory
-hydradb memories add my-tenant "The user prefers dark mode and uses VS Code"
+#!/usr/bin/env bash
+set -euo pipefail
 
-# List all memories
-hydradb memories list my-tenant
+: "${HYDRA_DB_API_KEY:?Set HYDRA_DB_API_KEY}"
+: "${HYDRA_DB_TENANT_ID:?Set HYDRA_DB_TENANT_ID}"
 
-# Delete a memory
-hydradb memories delete my-tenant mem_abc123
+if ! upload_json="$(
+  hydradb -o json knowledge upload ./runbook.md --upsert
+)"; then
+  printf '%s\n' "Knowledge upload failed" >&2
+  printf '%s\n' "$upload_json" >&2
+  exit 1
+fi
+
+printf '%s\n' "$upload_json" | jq -e '
+  (type == "object") and
+  ((.success // true) != false) and
+  ((.failed_count // 0) == 0) and
+  ((.results // []) | type == "array" and length > 0) and
+  all(.results[]?;
+    ((.status // "") | ascii_downcase) as $status |
+    ($status != "failed" and $status != "error" and $status != "errored") and
+    (.error? == null or .error == "")
+  )
+' >/dev/null || {
+  printf '%s\n' "Upload response validation failed" >&2
+  printf '%s\n' "$upload_json" >&2
+  exit 1
+}
+
+if ! source_id="$(
+  printf '%s\n' "$upload_json" |
+    jq -er 'first(.results[]? | .source_id // .id)'
+)"; then
+  printf '%s\n' "Upload response did not contain a source ID" >&2
+  printf '%s\n' "$upload_json" >&2
+  exit 1
+fi
+
+for attempt in $(seq 1 60); do
+  if ! status_json="$(
+    hydradb -o json knowledge verify "$source_id"
+  )"; then
+    printf '%s\n' "Status check failed for $source_id" >&2
+    printf '%s\n' "$status_json" >&2
+    exit 1
+  fi
+
+  if ! status="$(
+    printf '%s\n' "$status_json" |
+      jq -er '(.statuses // .results // [])[0]
+        | .indexing_status // .status // "unknown"'
+  )"; then
+    printf '%s\n' "Could not parse status for $source_id" >&2
+    printf '%s\n' "$status_json" >&2
+    exit 1
+  fi
+
+  case "$status" in
+    indexed|completed|graph_creation) break ;;
+    failed|errored|error)
+      printf '%s\n' "Indexing failed for $source_id" >&2
+      printf '%s\n' "$status_json" >&2
+      exit 1
+      ;;
+    *)
+      if [ "$attempt" -eq 60 ]; then
+        printf '%s\n' "Indexing timed out for $source_id" >&2
+        exit 1
+      fi
+      sleep 2
+      ;;
+  esac
+done
+
+if ! recall_json="$(
+  hydradb -o json recall full "credential rotation" --max-results 5
+)"; then
+  printf '%s\n' "Recall command failed" >&2
+  printf '%s\n' "$recall_json" >&2
+  exit 1
+fi
+
+printf '%s\n' "$recall_json" | jq -e '
+  ((.chunks // []) | type == "array" and length > 0)
+' >/dev/null || {
+  printf '%s\n' "Recall response validation failed" >&2
+  printf '%s\n' "$recall_json" >&2
+  exit 1
+}
 ```
 
-### Knowledge Base
+## Command map
 
-| Command | Description |
+The default tenant comes from `hydradb login`, `hydradb config`, or
+`HYDRA_DB_TENANT_ID`. Pass `--tenant-id` to a data command only when overriding it.
+
+### Authentication and configuration
+
+| Command | Purpose |
 |---|---|
-| `hydradb knowledge upload TENANT_ID FILES...` | Upload files to the knowledge base |
-| `hydradb knowledge upload-text TENANT_ID TEXT` | Upload text content directly |
-| `hydradb knowledge verify TENANT_ID SOURCE_ID` | Check processing status of uploaded content |
-| `hydradb knowledge delete TENANT_ID SOURCE_IDS...` | Delete knowledge sources by ID |
+| `hydradb login --tenant-id TENANT_ID` | Prompt for an API key and save credentials |
+| `hydradb logout` | Delete the saved config file |
+| `hydradb whoami` | Show resolved, masked authentication and scope |
+| `hydradb config show` | Show resolved configuration and value sources |
+| `hydradb config set KEY VALUE` | Persist `api_key`, `tenant_id`, `sub_tenant_id`, or `base_url` |
+
+### Memories
+
+| Command | Purpose |
+|---|---|
+| `hydradb memories add --text TEXT [--user-name NAME]` | Add a memory; optional `--user-name` identifies the user for personalization; also accepts piped stdin |
+| `hydradb memories list` | List memories in the resolved scope |
+| `hydradb memories delete MEMORY_ID` | Delete one memory; add `--yes` to skip confirmation |
 
 ```bash
-# Upload a document
-hydradb knowledge upload my-tenant ./docs/architecture.md
-
-# Upload inline text
-hydradb knowledge upload-text my-tenant "Project uses PostgreSQL 15 with pgvector"
-
-# Check processing status
-hydradb knowledge verify my-tenant src_abc123
+printf '%s\n' "User prefers dark mode" | hydradb memories add
+hydradb memories list
+hydradb memories delete mem_abc123 --yes
 ```
 
-### Context Retrieval (Recall)
+### Knowledge
 
-| Command | Description |
+| Command | Purpose |
 |---|---|
-| `hydradb recall full TENANT_ID QUERY` | Search over indexed knowledge (documents, files) |
-| `hydradb recall preferences TENANT_ID QUERY` | Search over user memories (preferences, conversations) |
-| `hydradb recall keyword TENANT_ID QUERY` | Deterministic keyword/boolean search |
+| `hydradb knowledge upload FILES...` | Upload one or more files asynchronously |
+| `hydradb knowledge upload-text --text TEXT` | Upload inline text as shared knowledge |
+| `hydradb knowledge verify SOURCE_IDS...` | Check processing status once |
+| `hydradb knowledge delete SOURCE_IDS...` | Delete sources; add `--yes` to skip confirmation |
 
 ```bash
-# Semantic search over knowledge
-hydradb recall full my-tenant "How is authentication implemented?"
-
-# Search user memories
-hydradb recall preferences my-tenant "What IDE does the user prefer?"
-
-# Keyword search
-hydradb recall keyword my-tenant "PostgreSQL migration"
+hydradb knowledge upload ./architecture.md ./runbook.pdf
+hydradb knowledge upload-text \
+  --text "Production deploys require two approvals" \
+  --title "Deployment policy" \
+  --source-id deployment_policy
+hydradb knowledge verify source_abc123 source_def456
 ```
 
-### Data Inspection
+### Recall
 
-| Command | Description |
+| Command | Purpose |
 |---|---|
-| `hydradb fetch sources TENANT_ID` | List all ingested sources (knowledge and memories) |
-| `hydradb fetch content TENANT_ID SOURCE_ID` | Fetch the full content of a source |
-| `hydradb fetch relations TENANT_ID SOURCE_ID` | Fetch knowledge graph relations for a source |
-
-### CLI Configuration
-
-| Command | Description |
-|---|---|
-| `hydradb config show` | Show current CLI configuration |
-| `hydradb config set KEY VALUE` | Set a configuration value (e.g., `output`, `api_url`) |
-
-## Scripting & Automation
-
-The CLI is designed for both interactive use and scripting. Use `--output json` to
-get machine-readable output that pipes cleanly into `jq`, Python, or other tools:
+| `hydradb recall full QUERY [--mode fast\|thinking]` | Semantic search over knowledge; `fast` is lower latency, while `thinking` reranks multiple queries |
+| `hydradb recall preferences QUERY [--mode fast\|thinking]` | Semantic search over memories with the same mode choices |
+| `hydradb recall keyword QUERY` | Exact/boolean search over sources or memories |
 
 ```bash
-# List memories as JSON and filter with jq
-hydradb -o json memories list my-tenant | jq '.[] | .id'
-
-# Recall context and pipe to another tool
-hydradb -o json recall preferences my-tenant "user preferences" | jq '.results'
-
-# Batch upload files
-find ./docs -name "*.md" -exec hydradb knowledge upload my-tenant {} +
+hydradb recall full "How is authentication implemented?" --mode thinking
+hydradb recall preferences "What IDE does the user prefer?"
+hydradb recall keyword "PostgreSQL migration" --operator phrase --search-mode sources
 ```
 
-## Source & Show Support
+### Inspect data
 
-<Note>
-If HydraDB CLI makes your workflow faster, please star the open-source repo that
-powers it. It helps keep it discoverable and motivates maintainers to keep shipping
-improvements.
-  <Card
-    title="hydradb-cli"
-    icon="star"
-    href="https://github.com/usecortex/hydradb-cli"
-  >
-    Star on GitHub if you found it useful.
-  </Card>
-</Note>
+| Command | Purpose |
+|---|---|
+| `hydradb fetch sources` | List source IDs; filter with `--kind knowledge` or `--kind memories` |
+| `hydradb fetch content SOURCE_ID` | Return content, a presigned URL, or both |
+| `hydradb fetch relations SOURCE_ID` | Show extracted graph relations |
+
+```bash
+hydradb fetch sources --kind knowledge --page-size 20
+hydradb fetch content source_abc123 --mode both
+hydradb fetch relations source_abc123 --is-knowledge
+```
+
+### Tenant management
+
+| Command | Purpose |
+|---|---|
+| `hydradb tenant create TENANT_ID` | Create a tenant/database |
+| `hydradb tenant monitor [TENANT_ID]` | Show infrastructure status and statistics |
+| `hydradb tenant list-sub-tenants [TENANT_ID]` | List sub-tenants/collections |
+| `hydradb tenant delete TENANT_ID` | Permanently delete the tenant and its data |
+
+<Warning>
+  `hydradb tenant delete` permanently removes the tenant, its memories, knowledge,
+  and graph data. The operation cannot be undone.
+</Warning>
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `No tenant ID specified` | No default or command override | Run `hydradb config set tenant_id TENANT_ID`, set `HYDRA_DB_TENANT_ID`, or pass `--tenant-id` |
+| `No such option: --output` | Global option placed after a command group | Use `hydradb -o json ...` or set `HYDRADB_OUTPUT=json` |
+| A documented positional text argument is rejected | Text is an option for add/upload-text | Use `--text "..."` or pipe stdin |
+| Upload succeeds but recall is empty | Indexing is still asynchronous | Extract the returned ID and poll `hydradb knowledge verify` |
+| Memory recall is empty | Ingestion and recall used different sub-tenants | Use the same sub-tenant/collection on both commands |
+| Script exits `0` but items failed | Failure was reported inside a successful HTTP response | Use JSON mode and validate `failed_count`, item statuses, and item errors |
+| Rerun creates another source | The job used an automatically generated ID | Supply a stable `--source-id` where supported and choose the intended upsert behavior |
+
+## Source and support
+
+<Card
+  title="hydradb-cli"
+  icon="github"
+  href="https://github.com/usecortex/hydradb-cli"
+>
+  Read the source, inspect release notes, or report a CLI issue.
+</Card>
