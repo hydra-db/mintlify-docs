@@ -555,6 +555,208 @@ try {
 
 For the full list of error codes and retry patterns, see [Error Responses](/api-reference/v2/error-responses).
 
+## Production hardening
+
+The default client is ready for development. For production, configure timeouts, retries, connection reuse, and error-handling discipline explicitly.
+
+### Timeouts
+
+Set a client-level timeout so a slow or stalled request does not block your application indefinitely.
+
+<CodeGroup>
+```python Python SDK
+import os
+from hydra_db import HydraDB, AsyncHydraDB
+
+# Synchronous — every call waits at most 30 seconds.
+client = HydraDB(
+    token=os.environ["HYDRA_DB_API_KEY"],
+    timeout=30,
+)
+
+# Asynchronous — same parameter.
+async_client = AsyncHydraDB(
+    token=os.environ["HYDRA_DB_API_KEY"],
+    timeout=30,
+)
+```
+```typescript TypeScript SDK
+import { HydraDBClient } from "@hydradb/sdk";
+
+const client = new HydraDBClient({
+  token: process.env.HYDRA_DB_API_KEY,
+  timeout: 30_000, // milliseconds
+});
+```
+</CodeGroup>
+
+<Info>
+**Choose your timeout by operation type.** User-facing search calls should use a short timeout (5–10 s) to fail fast rather than hang a UI. Background ingestion or status-polling loops can use a longer timeout (30–60 s) so a transient blip does not abort the whole batch.
+</Info>
+
+### Retry configuration
+
+The SDK retries transient failures (429, 500, 503) with exponential backoff and jitter. You can control how many times it tries and how long it waits between attempts.
+
+<CodeGroup>
+```python Python SDK
+import os
+from hydra_db import HydraDB
+
+client = HydraDB(
+    token=os.environ["HYDRA_DB_API_KEY"],
+    max_retries=3,
+    retry_delay=1.0,  # base delay in seconds
+)
+```
+```typescript TypeScript SDK
+const client = new HydraDBClient({
+  token: process.env.HYDRA_DB_API_KEY,
+  maxRetries: 3,
+  retryDelay: 1_000, // base delay in milliseconds
+});
+```
+</CodeGroup>
+
+The first retry waits roughly `retry_delay` (with jitter), the second waits ~2×, the third ~4×, and so on up to `max_retries`. The defaults (3 retries, 1 s delay) work well for most workloads.
+
+| Scenario | Recommended `max_retries` | Reason |
+|---|---|---|
+| User-facing query | 1–2 | Fail fast rather than keep the user waiting |
+| Background ingestion | 3–5 | Transient outages are common during indexing |
+| Batch or offline processing | 5–7 | Maximise throughput at the cost of elapsed time |
+
+### Connection reuse
+
+Creating a new network connection for every request wastes latency and resources. The SDK reuses connections inside a single client instance. Create one client at startup and share it across your application.
+
+<CodeGroup>
+```python Python SDK
+import os
+from hydra_db import HydraDB
+
+# Good — create once, reuse everywhere.
+client = HydraDB(token=os.environ["HYDRA_DB_API_KEY"])
+
+def search(query: str):
+    return client.query(database="my_db", query=query)
+
+# Bad — creates a new connection pool on every call.
+def bad_search(query: str):
+    c = HydraDB(token=os.environ["HYDRA_DB_API_KEY"])
+    return c.query(database="my_db", query=query)
+```
+```typescript TypeScript SDK
+// Good — create once, reuse everywhere.
+const client = new HydraDBClient({ token: process.env.HYDRA_DB_API_KEY });
+
+async function search(query: string) {
+  return client.query({ database: "my_db", query });
+}
+
+// Bad — creates a new connection on every call.
+async function badSearch(query: string) {
+  const c = new HydraDBClient({ token: process.env.HYDRA_DB_API_KEY });
+  return c.query({ database: "my_db", query });
+}
+```
+</CodeGroup>
+
+For high-throughput TypeScript applications, configure an agent with keep-alive so the SDK reuses HTTP connections across requests:
+
+```typescript TypeScript SDK
+import { Agent } from "node:https";
+
+const client = new HydraDBClient({
+  token: process.env.HYDRA_DB_API_KEY,
+  httpAgent: new Agent({ keepAlive: true }),
+});
+```
+
+### Error-handling checklist
+
+1. **Use typed exceptions** (`NotFoundError`, `TooManyRequestsError`, etc.) in catch blocks instead of parsing the status code manually — they carry `status_code` and the parsed `body`.
+2. **Log `request_id`** from `meta` on every failure so you can correlate errors with server-side traces when contacting support.
+3. **Never forward raw error messages to end users.** HydraDB error payloads may include internal details useful for debugging but inappropriate to show in a UI or API response. Log them server-side and return a generic message.
+4. **Apply a circuit-breaker for sustained failures.** If the client returns five consecutive 429 or 503 errors, stop making requests for 30 seconds before retrying. A simple implementation:
+
+```python Python SDK
+import time
+from hydra_db.errors import TooManyRequestsError, ServiceUnavailableError
+
+class CircuitBreaker:
+    def __init__(self, threshold=5, cooldown=30):
+        self.threshold = threshold
+        self.cooldown = cooldown
+        self.failures = 0
+        self.open_until = 0.0
+
+    def __call__(self, fn):
+        if time.monotonic() < self.open_until:
+            raise RuntimeError("circuit breaker open")
+        try:
+            result = fn()
+            self.failures = 0
+            return result
+        except (TooManyRequestsError, ServiceUnavailableError):
+            self.failures += 1
+            if self.failures >= self.threshold:
+                self.open_until = time.monotonic() + self.cooldown
+            raise
+
+breaker = CircuitBreaker(threshold=5, cooldown=30)
+results = breaker(lambda: client.query(database="my_db", query="..."))
+```
+
+```typescript TypeScript SDK
+class CircuitBreaker {
+  private failures = 0;
+  private openUntil = 0;
+  constructor(
+    private threshold = 5,
+    private cooldownMs = 30_000,
+  ) {}
+
+  async call<T>(fn: () => Promise<T>): Promise<T> {
+    if (Date.now() < this.openUntil) {
+      throw new Error("circuit breaker open");
+    }
+    try {
+      const result = await fn();
+      this.failures = 0;
+      return result;
+    } catch (error) {
+      if (
+        error instanceof HydraDBError &&
+        [429, 503].includes(error.statusCode)
+      ) {
+        this.failures++;
+        if (this.failures >= this.threshold) {
+          this.openUntil = Date.now() + this.cooldownMs;
+        }
+      }
+      throw error;
+    }
+  }
+}
+
+const breaker = new CircuitBreaker();
+const results = await breaker.call(() =>
+  client.query({ database: "my_db", query: "..." }),
+);
+```
+
+### Configuration reference
+
+| Parameter | Python | TypeScript | Default |
+|---|---|---|---|
+| Timeout (seconds / ms) | `timeout` | `timeout` | 30 s |
+| Max retries | `max_retries` | `maxRetries` | 3 |
+| Retry base delay (seconds / ms) | `retry_delay` | `retryDelay` | 1 s |
+| Connection pool size | `pool_connections` | — | 10 |
+| Max pool connections | `pool_maxsize` | — | 20 |
+| Custom HTTP agent | — | `httpAgent` | default |
+
 ## IDE-driven discovery
 
 Whether you're using TypeScript, Python, VS Code, PyCharm, or any modern IDE, the workflow is the same:
@@ -568,7 +770,9 @@ This works because the SDKs are fully typed with comprehensive parameter docs so
 ## Related sections
 
 - [API Reference](/api-reference/v2)  -  complete endpoint documentation
+- [Authentication](/api-reference/v2/authentication)  -  API key storage, headers, SDK init, troubleshooting
 - [Error Responses](/api-reference/v2/error-responses)  -  HTTP codes, error codes, retry patterns
+- [Rate Limits and Backoff](/essentials/v2/rate-limits)  -  avoid rate limits in production
 - [Quickstart](/get-started/v2/quickstart)  -  build your first integration in five minutes
 - [Query](/essentials/v2/query)  -  conceptual overview of `POST /query`
 - [Knowledge](/essentials/v2/knowledge) and [Memories](/essentials/v2/memories)  -  ingestion deep-dives
