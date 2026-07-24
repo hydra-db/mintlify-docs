@@ -1,0 +1,263 @@
+---
+title: "Troubleshooting Retrieval"
+description: "Start from the symptom you are seeing - empty results, leaked data, ignored settings - and jump straight to the cause and the fix."
+---
+
+Most HydraDB support questions are not "how do I choose a primitive?" - they are "I built it, and something is *wrong*." The result is empty, or it is somebody else's data, or the setting you passed did nothing.
+
+The other guides are organized around **concepts**. This one is organized around **symptoms**. Find the row that matches what you are seeing, jump to the section, and you get the cause and the fix.
+
+<Info>
+  Every cause and fix below is grounded in the canonical pages ([Query](/essentials/v2/query), [Memories](/essentials/v2/memories), [Knowledge](/essentials/v2/knowledge), [Multi-tenancy](/essentials/v2/multi-tenant), [Metadata](/essentials/v2/metadata)) and the [OpenAPI spec](/api-reference/v2/openapi.json). A machine check that keeps this page honest ships in `checks/verify_troubleshooting_contract.py`.
+</Info>
+
+## Symptom index
+
+| What you are seeing | Most likely cause | Jump to |
+|---|---|---|
+| Query returns an empty result set right after ingesting | Ingestion is async - not indexed yet | [Empty results](#empty-results) |
+| Query returns nothing even though the data is indexed | Wrong `type` for the store | [Empty results](#empty-results) |
+| `type: "all"` returns memories but not shared Knowledge | Knowledge written under a different `collection` than you query | [The type all scoping trap](#the-type-all-scoping-trap) |
+| A user sees another user's memories, or none of their own | Unstable or omitted `collection` | [Data isolation](#data-isolation) |
+| `custom_instructions` had no effect | `infer` was `false` | [Ignored settings](#ignored-settings) |
+| Raw conversation got stored verbatim, no preference extracted | `infer` defaults to `false` | [Ignored settings](#ignored-settings) |
+| `metadata_filters` returns nothing, or does not narrow at all | Undeclared key, wrong namespace, or value mismatch | [Metadata filters](#metadata-filters) |
+| `response.chunks` is `undefined` / `KeyError` | Payload lives under the response envelope's `data` | [Response shape](#response-shape) |
+| `client.tenants.create(...)` raises `AttributeError` | v2 namespace is `client.databases` | [SDK and request shape](#sdk-and-request-shape) |
+| `400 INVALID_INPUT` when ingesting memories | `memories` must be a JSON-stringified array | [SDK and request shape](#sdk-and-request-shape) |
+| `query_paths` / graph relations always empty | `graph_context` off, or `mode: "auto"` | [Graph and relations](#graph-and-relations) |
+| Forceful relations never expand | Cross-store link, or `mode: "fast"` | [Graph and relations](#graph-and-relations) |
+| App threads/IDs not resolving in query | `query_apps` not enabled | [App sources](#app-sources) |
+| `Deprecation: true` header on every response | Legacy `tenant_id` / `sub_tenant_id` in use | [Deprecation warnings](#deprecation-warnings) |
+
+---
+
+## Empty results
+
+The single most common symptom, with two very different causes.
+
+### Cause 1 - you queried before indexing finished
+
+Ingestion is **asynchronous**. [`POST /context/ingest`](/api-reference/v2/endpoint/ingest-context) returns `202 Accepted` with IDs, but the content is not retrievable until it has been processed.
+
+<Steps>
+  <Step title="Confirm the state">
+    Poll [`GET /context/status`](/api-reference/v2/endpoint/source-status) with the IDs you got back. Content becomes queryable once `indexing_status` reaches `graph_creation`; wait for `completed` only if you need full graph traversal.
+  </Step>
+  <Step title="Fix">
+    Do not query on a fixed timer. Poll until the status is terminal, or [register a webhook](/essentials/v2/webhooks) and query on the completion event.
+  </Step>
+</Steps>
+
+### Cause 2 - you queried the wrong store
+
+Memories and Knowledge live in **separate stores**. A query only reads the store named by `type`:
+
+- `type: "knowledge"` reads shared documents and app sources only.
+- `type: "memory"` reads per-user memories only.
+- `type: "all"` reads both, merged and re-ranked.
+
+<Warning>
+  Querying Knowledge with `type: "memory"` (or the reverse) returns nothing - it is not an error, just an empty set from the wrong store. When unsure, use `type: "all"`.
+</Warning>
+
+---
+
+## The type all scoping trap
+
+**Symptom:** you run one `POST /query` with `type: "all"`, you get the user's memories back, but the shared company Knowledge is missing - even though you know it is indexed.
+
+This is the footgun that the concept pages do not connect for you. It comes from two rules that are each individually correct:
+
+1. Shared Knowledge is often written with **no `collection`**, so it lands in the database's **default** collection.
+2. A query only returns data written under the **same `collection`** you query with. ([Multi-tenancy](/essentials/v2/multi-tenant#4-how-scoping-works): "A query request with one `collection` should not be expected to retrieve data written under a different `collection`.")
+
+Put them together and the trap appears: a `type: "all"` query scoped to `collection: "user_123"` searches the **`user_123`** scope in *both* stores. The memories are there - but the Knowledge you wrote to the **default** collection is not in `user_123`, so it silently drops out.
+
+<Warning>
+  `type: "all"` does not widen the scope. It searches **both stores at the one scope you pass**. If your shared Knowledge and your user memories live in different collections, a single-collection query can never see both.
+</Warning>
+
+### Fix - name every scope the query must cover
+
+Use the `collections` selector to include **both** the shared scope and the user scope in one call:
+
+<CodeGroup>
+```bash cURL
+curl -X POST 'https://api.hydradb.com/query' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "database": "acme_corp",
+    "collections": ["default", "user_123"],
+    "query": "refund policy for my plan",
+    "type": "all",
+    "mode": "thinking"
+  }'
+```
+```python Python SDK
+result = client.query(
+    database="acme_corp",
+    collections=["default", "user_123"],  # shared scope + user scope
+    query="refund policy for my plan",
+    type="all",
+    mode="thinking",
+)
+```
+</CodeGroup>
+
+Three ways to avoid the trap, in order of preference:
+
+1. **Query `collections` covering both scopes** (above) - the shared collection plus the user's. Pass an object like `{"default": 1, "user_123": 2}` if you want to weight the user's scope higher.
+2. **Write shared Knowledge into the same collection you query.** Consistent, but duplicates shared content per collection - only sensible for small shared sets.
+3. **Query the stores separately** - one `type: "knowledge"` call at the shared scope, one `type: "memory"` call at the user scope - and merge client-side. Use this when you also want to format the two streams differently in the prompt.
+
+<Note>
+  Decide your scope convention **before** you ingest. The cheapest fix is writing shared Knowledge and per-user Memories to a scope layout you can query together later.
+</Note>
+
+---
+
+## Data isolation
+
+**Symptom:** a user sees memories that are not theirs, or none of the memories they should have.
+
+Memories are partitioned by `collection`. Both failure directions come from the `collection` value:
+
+| You are seeing | Cause | Fix |
+|---|---|---|
+| User A sees User B's memories | Both written under the same `collection` (often omitted, so both landed in `default`) | Write each user's memories with a **stable per-user** `collection`, e.g. `user_123` |
+| A user's own memories never appear | Read `collection` differs from the write `collection` | Use the **same** identifier on write and read for the same user |
+| Isolation breaks after a rename | `collection` was a display name or email that changed | Use an immutable internal ID as the `collection`, never a mutable label |
+
+<Warning>
+  Never use a shared default `collection` for per-user memories in a multi-user app. Anything written without a `collection` is visible to every query that also omits it.
+</Warning>
+
+---
+
+## Ignored settings
+
+**Symptom:** you passed a field and nothing changed. Almost always `infer`.
+
+`infer` defaults to **`false`**. With `infer: false`, HydraDB stores your text verbatim and does **no** extraction.
+
+| You expected | You got | Cause | Fix |
+|---|---|---|---|
+| A preference extracted from a chat log | The raw log stored word-for-word | `infer` omitted, so defaulted to `false` | Set `infer: true` on the memory item |
+| `custom_instructions` to steer extraction | No effect at all | `custom_instructions` is ignored unless `infer: true` | Set `infer: true`, then the instructions apply |
+| A clean fact stored exactly as written | HydraDB reworded it | `infer: true` on already-structured input | Use `infer: false` for finished facts |
+
+See [Memories - infer](/essentials/v2/memories#choose-whether-hydradb-should-infer-the-memory) for the full decision.
+
+---
+
+## Metadata filters
+
+**Symptom:** `metadata_filters` returns nothing, or returns unfiltered results as if the filter were absent. There are two distinct failure modes - and they look different.
+
+<AccordionGroup>
+  <Accordion title="Filter matches zero results (empty set)">
+    The filter is being applied, but nothing matches. Check, in order: the value matches exactly (filters are exact, not fuzzy); the key is declared in the database metadata schema with `enable_match: true`; the value's type matches what you ingested. A correctly-applied filter that matches nothing returns an empty set **by design**.
+  </Accordion>
+  <Accordion title="Filter is silently ignored (unfiltered results come back)">
+    Worse and more confusing: you get results, but the filter did nothing. This happens when the key is **not declared** in the schema, or when a free-form field is filtered at the top level instead of under `additional_metadata`. Undeclared top-level keys are dropped silently. Fix: declare hot filter keys in the [database schema](/api-reference/v2/endpoint/create-tenant) with `enable_match: true`, or nest free-form keys: `{"metadata_filters": {"additional_metadata": {"author": "Alice"}}}`.
+  </Accordion>
+</AccordionGroup>
+
+See [Metadata](/essentials/v2/metadata) for the `metadata` vs `additional_metadata` rule.
+
+---
+
+## Response shape
+
+**Symptom:** `response.chunks` is `undefined`, or Python raises `KeyError: 'chunks'`.
+
+Every endpoint returns the standard envelope. The payload is under `data`, not at the top level:
+
+```json
+{
+  "success": true,
+  "data": { "chunks": [], "sources": [] },
+  "error": null,
+  "meta": { "request_id": "...", "latency_ms": 12.3 }
+}
+```
+
+**Fix:** read `response.data.chunks`, not `response.chunks`.
+
+<Note>
+  **SDK field-name shift.** On the wire, a chunk's free-form fields are under `additional_metadata`. The Python/TS SDK exposes that same data on the chunk object as **`.metadata`** (for example `chunk.metadata`), not `.additional_metadata`. See [How to Use API Results](/essentials/v2/api-results).
+</Note>
+
+---
+
+## SDK and request shape
+
+**Symptom:** `AttributeError`/`TypeError` on an SDK call, or `400 INVALID_INPUT` on ingest.
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `client.tenants.create(...)` fails | The v1 `tenants` namespace does not exist in v2 | Use `client.databases.create(...)` / `client.databases.status(...)` |
+| `400 INVALID_INPUT` on memory ingest | `memories` sent as a raw array | JSON-stringify it: `json.dumps([...])` / `JSON.stringify([...])` |
+| `400` on a memory item's `metadata` | Memory `metadata` sent as an object | Encode it as a JSON string per item: `"metadata": "{\"dept\":\"support\"}"` |
+| Values echoed back unchanged but ignored | Field name typo (for example `memory` instead of `memories`) | Match the exact field names in [`POST /context/ingest`](/api-reference/v2/endpoint/ingest-context) |
+
+<Warning>
+  For **memory** ingestion, `memories` is a JSON-stringified field and each item's `metadata` must itself be a JSON string. For **knowledge** file uploads, `document_metadata` is stringified but its inner `metadata` is a plain object. The two paths encode metadata differently - do not copy one into the other.
+</Warning>
+
+---
+
+## Graph and relations
+
+**Symptom:** `graph_context` / `query_paths` come back empty, or declared forceful relations never expand.
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `query_paths` / `chunk_relations` empty | `graph_context` not set, or `mode: "auto"` overrode it | Set `graph_context: true` **and** `mode: "thinking"` |
+| Empty even with `graph_context: true` | No relations exist for this result set | Empty arrays are normal when there is nothing to return |
+| Forceful relations never appear | The relation points across stores (memory to knowledge) | Relations only resolve **within the same store** |
+| Forceful relations ignored in `fast` mode | Expansion runs only in `thinking` mode | Set `mode: "thinking"`; in `fast` mode the flag is silently ignored (not an error) |
+
+---
+
+## App sources
+
+**Symptom:** ingested Slack/Notion/Gmail data does not resolve threads, actors, or exact IDs at query time.
+
+**Cause:** app-aware retrieval is off by default.
+
+**Fix:** set `query_apps: true` and `mode: "thinking"` on the query to enable thread reconstruction, parent/child traversal, and exact ID/actor lookups. This adds an app-aware lane on top of normal retrieval - it does not restrict the query to app sources only. See [App Sources](/essentials/v2/app-sources).
+
+---
+
+## Deprecation warnings
+
+**Symptom:** every response carries a `Deprecation: true` header, or `meta.deprecation` is non-empty.
+
+**Cause:** the request used a legacy name (`tenant_id`, `sub_tenant_id`, `sub_tenant_ids`) or a legacy `/tenants` route. This is a **non-breaking nudge**, never an error - the status code is unchanged.
+
+**Fix:** migrate to `database`, `collection`, `collections`, and the `/databases` routes. Once you send only canonical names, the header and `meta.deprecation` disappear. See the full contract in [Multi-tenancy - Migrating](/essentials/v2/multi-tenant#7-migrating-from-the-legacy-tenant-and-sub-tenant-fields).
+
+<Warning>
+  Do not send a canonical field and its legacy alias with **different** values (for example `database: "acme"` and `tenant_id: "other"`). That returns `400` - the two names refer to the same thing and must agree.
+</Warning>
+
+---
+
+## Still stuck?
+
+1. Read `meta.request_id` from the response envelope and include it when you contact support - it identifies the exact call.
+2. Re-check scope first: `database`, then `collection` / `collections`, then `type`. Most empty-result bugs are scope bugs.
+3. Confirm indexing reached `graph_creation` via [`GET /context/status`](/api-reference/v2/endpoint/source-status) before assuming a query is wrong.
+
+## Related
+
+- [Multi-tenancy](/essentials/v2/multi-tenant) - how `database` and `collection` scope every read and write
+- [Query](/essentials/v2/query) - retrieval parameters and their defaults
+- [Memories](/essentials/v2/memories) - the `infer` flag and per-user scoping
+- [Knowledge](/essentials/v2/knowledge) - shared documents and app sources
+- [Metadata](/essentials/v2/metadata) - declaring filterable fields
+- [How to Use API Results](/essentials/v2/api-results) - unwrapping the response envelope
