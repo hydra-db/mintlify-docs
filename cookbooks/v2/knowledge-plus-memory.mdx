@@ -1,0 +1,242 @@
+---
+title: "Knowledge + Memory: One Query, One Answer"
+description: "The smallest possible end-to-end example: ingest one shared fact as Knowledge, one private preference as a Memory, retrieve both in a single POST /query call, and turn the merged result into one grounded, personalized answer."
+---
+
+Every other cookbook here builds a full agent. This one doesn't  -  it's deliberately the smallest thing in this section. If [Knowledge](/essentials/v2/knowledge) and [Memories](/essentials/v2/memories) still feel like two separate features instead of one system, this is the fastest way to see them work together: one shared fact, one private preference, one query, one answer that uses both.
+
+<Note>
+  Prerequisites: a HydraDB API key, `pip install hydradb-sdk` or `npm install @hydradb/sdk`, and an LLM client for the last step (any provider works  -  the example below uses a generic `chat.completions`-style call).
+</Note>
+
+---
+
+## The scenario
+
+A support agent needs to answer: **"What's your refund policy?"**  -  asked by a customer named Alex.
+
+- The policy itself is the same for every customer. That's **Knowledge**.
+- How the answer should be phrased is specific to Alex, who's told support before that they want short, direct answers. That's a **Memory**.
+
+A good answer needs both at once: the right fact, delivered the way this specific customer wants it.
+
+---
+
+## 1. Ingest the shared fact (Knowledge)
+
+There's no file on disk here, so upload the text in memory as a `.txt` file  -  see [Upload in-memory text](/api-reference/v2/endpoint/ingest-context#upload-in-memory-text-as-a-txt-file) for the full pattern.
+
+<CodeGroup>
+```python Python SDK
+import io, json
+from hydra_db import HydraDB
+
+client = HydraDB(token="YOUR_API_KEY")
+
+policy_text = "Our refund policy is 30 days from purchase, no questions asked."
+policy_file = io.BytesIO(policy_text.encode("utf-8"))
+
+client.context.ingest(
+    type="knowledge",
+    database="acme_corp",
+    documents=[("refund-policy.txt", policy_file, "text/plain")],
+    document_metadata=json.dumps([
+        {"id": "refund_policy", "metadata": {"document_type": "policy"}}
+    ]),
+)
+```
+```typescript TypeScript SDK
+import { HydraDBClient } from "@hydradb/sdk";
+
+const client = new HydraDBClient({ token: process.env.HYDRA_DB_API_KEY });
+
+const policyText = "Our refund policy is 30 days from purchase, no questions asked.";
+
+await client.context.ingest({
+  type: "knowledge",
+  database: "acme_corp",
+  documents: [
+    { filename: "refund-policy.txt", contentType: "text/plain", data: Buffer.from(policyText, "utf-8") },
+  ],
+  documentMetadata: JSON.stringify([
+    { id: "refund_policy", metadata: { document_type: "policy" } },
+  ]),
+});
+```
+```bash cURL
+curl -X POST 'https://api.hydradb.com/context/ingest' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -F "type=knowledge" \
+  -F "database=acme_corp" \
+  -F "documents=@refund-policy.txt;type=text/plain" \
+  -F 'document_metadata=[{"id": "refund_policy", "metadata": {"document_type": "policy"}}]'
+```
+</CodeGroup>
+
+This is available to every user who queries `acme_corp`  -  it isn't scoped to Alex.
+
+---
+
+## 2. Ingest the private preference (Memory)
+
+Alex's preference comes from something they said, not a fact you already extracted  -  so this is a job for `infer: true`. Send it scoped to Alex's `collection`.
+
+<CodeGroup>
+```python Python SDK
+result = client.context.ingest(
+    type="memory",
+    database="acme_corp",
+    collection="user_alex_492",
+    memories=json.dumps([
+        {
+            "text": "I always want short, direct answers - no fluff.",
+            "infer": True,
+        }
+    ]),
+)
+```
+```typescript TypeScript SDK
+await client.context.ingest({
+  type: "memory",
+  database: "acme_corp",
+  collection: "user_alex_492",
+  memories: JSON.stringify([
+    { text: "I always want short, direct answers - no fluff.", infer: true },
+  ]),
+});
+```
+```bash cURL
+curl -X POST 'https://api.hydradb.com/context/ingest' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -F "type=memory" \
+  -F "database=acme_corp" \
+  -F "collection=user_alex_492" \
+  -F 'memories=[{"text": "I always want short, direct answers - no fluff.", "infer": true}]'
+```
+</CodeGroup>
+
+With `infer: true`, HydraDB doesn't store that sentence verbatim  -  it extracts the underlying preference (something like *"prefers short, direct answers"*). See [Choosing infer: true vs false](/essentials/v2/memories#choose-whether-hydradb-should-infer-the-memory) for why that matters.
+
+---
+
+## 3. Confirm both finished indexing
+
+Both calls above return `202 Accepted` immediately  -  ingestion is asynchronous. Poll [`GET /context/status`](/api-reference/v2/endpoint/source-status) with the `id`s from both responses until `indexing_status` reaches at least `graph_creation` for each. The full polling loop is in [Verifying processing](/essentials/v2/knowledge#5-verifying-processing)  -  it's identical for knowledge and memory items, so it isn't repeated here.
+
+---
+
+## 4. One query, two stores
+
+Now ask the actual question, scoped to Alex, with `type: "all"` so a single call searches Knowledge and Memories together:
+
+<CodeGroup>
+```python Python SDK
+result = client.query(
+    database="acme_corp",
+    collection="user_alex_492",
+    query="What's your refund policy?",
+    type="all",
+    query_by="hybrid",
+    mode="thinking",
+)
+```
+```typescript TypeScript SDK
+const result = await client.query({
+  database: "acme_corp",
+  collection: "user_alex_492",
+  query: "What's your refund policy?",
+  type: "all",
+  queryBy: "hybrid",
+  mode: "thinking",
+});
+```
+</CodeGroup>
+
+`result.data.chunks` comes back with both pieces of context, ranked together:
+
+```json
+{
+  "chunks": [
+    {
+      "chunk_uuid": "refund_policy_chunk_0",
+      "source_title": "refund-policy.txt",
+      "chunk_content": "Our refund policy is 30 days from purchase, no questions asked.",
+      "relevancy_score": 1.12
+    },
+    {
+      "chunk_uuid": "mem_9f21_chunk_0",
+      "source_title": "Memory",
+      "chunk_content": "Prefers short, direct answers.",
+      "relevancy_score": 0.74
+    }
+  ]
+}
+```
+
+Notice `chunks[]` doesn't include a field telling you which store each item came from. That's not an omission  -  `type: "all"` exists specifically so you get one ranked list ready for a prompt, not two lists you have to reconcile yourself. See [How to Use API Results](/essentials/v2/api-results) for the full response shape.
+
+---
+
+## 5. Turn it into one grounded, personalized answer
+
+Convert the result into a prompt string with the SDK's `build_string` helper, then let the LLM do what neither store does on its own: produce one answer that's both factually correct and phrased the way Alex wants.
+
+<CodeGroup>
+```python Python SDK
+from hydra_db.helpers import build_string
+from openai import OpenAI
+
+context = build_string(result)
+llm = OpenAI(api_key="YOUR_OPENAI_API_KEY")
+
+completion = llm.chat.completions.create(
+    model="gpt-4o",
+    messages=[
+        {"role": "system", "content": "Answer using only the provided context. Match the user's known preferences."},
+        {"role": "user", "content": f"{context}\n\nQuestion: What's your refund policy?"},
+    ],
+)
+
+print(completion.choices[0].message.content)
+```
+```typescript TypeScript SDK
+import { buildString } from "@hydradb/sdk";
+
+const context = buildString(result);
+
+const completion = await openai.chat.completions.create({
+  model: "gpt-4o",
+  messages: [
+    { role: "system", content: "Answer using only the provided context. Match the user's known preferences." },
+    { role: "user", content: `${context}\n\nQuestion: What's your refund policy?` },
+  ],
+});
+```
+</CodeGroup>
+
+A plausible output:
+
+> 30-day, no-questions-asked refund window. *(Keeping this short  -  I know that's how you like it.)*
+
+That one sentence is the whole point: the fact came from Knowledge, the phrasing came from Memory, and it took exactly one `POST /query` call to get both.
+
+---
+
+## What just happened
+
+- **Knowledge** held the refund policy  -  the same for every customer, ingested once, queried with no `collection` restriction.
+- **Memory** held Alex's preference  -  private to `user_alex_492`, ingested with `infer: true` so raw phrasing became a reusable trait.
+- **One `type: "all"` query** retrieved both, already merged and ranked  -  no client-side reconciliation.
+- **One LLM call** turned the merged context into a single answer that's both correct and personalized.
+
+---
+
+## Related
+
+- [Knowledge](/essentials/v2/knowledge)  -  shared, database-wide context
+- [Memories](/essentials/v2/memories)  -  per-user context, with or without `infer`
+- [Query](/essentials/v2/query)  -  the full `type`, `mode`, and merge-behavior reference
+- [How to Use API Results](/essentials/v2/api-results)  -  turning `chunks[]` into a prompt
+- [Knowledge vs. Memory playground](/essentials/v2/knowledge#try-it-live)  -  the same idea, interactive, no API key required
