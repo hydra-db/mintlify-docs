@@ -1,0 +1,275 @@
+---
+title: "Real Production Examples"
+description: "End-to-end HydraDB context architectures for coding, healthcare, support, CRM, legal, sales, and research assistants — with Mermaid diagrams."
+---
+
+Each example is an **architecture walk**, not a full cookbook. Implementation recipes live under [Cookbooks](/cookbooks/v2/index). APIs referenced here are real v2 surfaces only.
+
+---
+
+## 1. AI Coding Assistant
+
+**Goal:** Answer with repo/runbook Knowledge plus per-developer Memories (style, prior decisions).
+
+```mermaid
+flowchart TB
+  Dev[Developer]
+  Agent[Coding agent]
+  subgraph H["HydraDB database: product_acme"]
+    K[Knowledge: ADRs · runbooks · service docs]
+    M[Memories: collection=dev_id]
+    G[Context Graph]
+  end
+  LLM[LLM]
+
+  Dev --> Agent
+  Agent -->|POST /query type=all graph_context=true| H
+  H --> Agent --> LLM --> Agent --> Dev
+  Agent -->|ingest memory infer=true| M
+  CI[CI / docs pipeline] -->|ingest knowledge upsert| K
+```
+
+| Layer | Choice |
+| --- | --- |
+| Database | Per product or per customer (B2B IDE) |
+| Collections | `dev_id` for Memories; shared docs in team/default |
+| Knowledge | ADRs, runbooks; upsert on merge |
+| Memories | Style prefs + decisions; debug notes with `expiry_time` |
+| Query | `type: "all"`, `mode: "thinking"` for hard bugs |
+| Graph | On for ownership / dependency questions |
+
+**Related:** [Choosing Strategy → Coding Agents](/essentials/v2/context-architecture/choosing-strategy) · [Plugins](/plugins/claude-code)
+
+---
+
+## 2. Healthcare Assistant
+
+**Goal:** Protocol-grounded answers with narrow partitions and strict filters.
+
+```mermaid
+flowchart TB
+  Clinician[Clinician app]
+  API[Your authorized backend]
+  subgraph H["database: healthsystem_prod"]
+    K[Knowledge: approved protocols only]
+    M[Memories: encounter-scoped TTL]
+  end
+  LLM[LLM]
+
+  Clinician --> API
+  API -->|resolve facility + role| API
+  API -->|query + metadata_filters status=approved| H
+  H --> API --> LLM --> API --> Clinician
+```
+
+| Layer | Choice |
+| --- | --- |
+| Database | Per health system / environment |
+| Collections | Narrowest safe clinical partition your product defines |
+| Knowledge | Approved guidelines only (`status=approved`) |
+| Memories | Encounter notes with aggressive `expiry_time` where appropriate |
+| Metadata | `facility`, `specialty`, `document_class` |
+| Query | Always filtered; never semantic-only for access |
+
+<Warning>
+  Application-layer authorization, consent, and retention policies are mandatory. HydraDB scopes and filters support isolation design — they do not replace a compliance program.
+</Warning>
+
+---
+
+## 3. Customer Support Assistant
+
+**Goal:** Help-center Knowledge + per-customer Memories on every ticket.
+
+```mermaid
+sequenceDiagram
+  participant C as Customer
+  participant S as Support service
+  participant H as HydraDB
+  participant L as LLM
+
+  C->>S: new message
+  S->>H: POST /query type=knowledge (macros, FAQs)
+  S->>H: POST /query type=memory collection=customer_id
+  H-->>S: docs + history/prefs
+  S->>L: merged prompt
+  L-->>S: reply
+  S-->>C: reply
+  S->>H: ingest memory infer=true (turn + outcome)
+```
+
+| Layer | Choice |
+| --- | --- |
+| Knowledge | Articles, macros, resolved-ticket write-ups |
+| Memories | Plan, channel prefs, prior failures |
+| Metadata | `product_area`, `severity`, `language` |
+| Lifecycle | Upsert macros; TTL on temporary holds |
+
+**Cookbook:** [Customer Support Agent](/cookbooks/v2/customer-support-agent)
+
+---
+
+## 4. CRM Copilot
+
+**Goal:** Account Knowledge (CRM records, call notes as app sources) + rep Memories.
+
+```mermaid
+flowchart LR
+  CRM[Salesforce / HubSpot events]
+  Ingest[App source ingest type=knowledge]
+  K[Knowledge accounts · opportunities]
+  Rep[collection: rep_id Memories]
+  Q[POST /query type=all query_apps=true]
+  Copilot[CRM copilot UI]
+
+  CRM --> Ingest --> K
+  Rep --> Q
+  K --> Q --> Copilot
+  Copilot -->|write-back| Rep
+```
+
+| Layer | Choice |
+| --- | --- |
+| Database | Per CRM customer org (B2B) or one DB with strict collections |
+| Knowledge | Accounts, opportunities, notes as app sources |
+| Memories | Rep preferences, "don't pitch X", last strategy |
+| Query | `query_apps: true` for CRM object traversal behavior |
+| Relations | Link opportunity ↔ account ↔ note via forceful relations when known |
+
+**Related:** [App Sources](/essentials/v2/app-sources)
+
+---
+
+## 5. Legal Assistant
+
+**Goal:** Versioned policies and contracts with hard metadata gates.
+
+```mermaid
+flowchart TB
+  Counsel[Counsel]
+  App[Legal AI service]
+  subgraph H["database: legal_prod"]
+    K[Knowledge: contracts · policies · playbooks]
+    M[Memories: attorney prefs / matter notes]
+  end
+
+  Counsel --> App
+  App -->|metadata_filters: status=effective, jurisdiction=...| H
+  H --> App
+```
+
+| Layer | Choice |
+| --- | --- |
+| Versioning | `policy_vN` ids + `status=effective` / `superseded` |
+| Metadata | `jurisdiction`, `practice_area`, `confidentiality` |
+| Memories | Matter-scoped collections; careful TTL |
+| Graph | Clause ↔ definition links; BYO graph when extraction is weak |
+| Delete | Matter close → retention job |
+
+**Related:** [Lifecycle → Versioning](/essentials/v2/context-architecture/lifecycle#3-versioning) · [BYOG](/essentials/v2/bring-your-own-graph)
+
+---
+
+## 6. Sales Assistant
+
+**Goal:** Battle cards + account context + rep personalization.
+
+```mermaid
+flowchart TB
+  Rep[Sales rep]
+  Assist[Sales assistant]
+  K[Knowledge: battle cards · pricing · case studies]
+  A[Knowledge: account notes via CRM sync]
+  M[Memories: rep style · territory prefs]
+  Q[type=all + filters on segment/region]
+  LLM[LLM]
+
+  Rep --> Assist --> Q
+  K --> Q
+  A --> Q
+  M --> Q
+  Q --> LLM --> Assist --> Rep
+```
+
+| Layer | Choice |
+| --- | --- |
+| Knowledge | Battle cards (upsert on enablement publish) + account corpus |
+| Memories | Rep collection |
+| Metadata | `segment`, `region`, `product_line`, `stage` |
+| Query | Filter by account segment; personalize with Memories |
+
+Enablement refresh is a Knowledge lifecycle problem — treat battle card titles as stable ids.
+
+---
+
+## 7. Research Assistant
+
+**Goal:** Long-horizon synthesis across a growing corpus.
+
+```mermaid
+stateDiagram-v2
+  [*] --> IngestCorpus: PDFs / clips → Knowledge
+  IngestCorpus --> Steer: user hypotheses → Memories
+  Steer --> Synthesize: query thinking + graph
+  Synthesize --> Cite: return sources
+  Cite --> Learn: write-back findings as memories
+  Learn --> Steer
+  IngestCorpus --> Archive: stale project prune
+  Archive --> [*]
+```
+
+| Layer | Choice |
+| --- | --- |
+| Collections | Per research project |
+| Metadata | `trust_tier`, `year`, `source_type` |
+| Query | `mode: "thinking"`, `graph_context: true` |
+| Lifecycle | Archive/delete dead projects; TTL on scratch notes |
+
+**Related:** [Reference Architecture #5](/essentials/v2/context-architecture/reference-architectures#5-research-corpus-synthesizer)
+
+---
+
+## Cross-example comparison
+
+| Example | DB pattern | Memory collection | Knowledge emphasis | Graph | Special flag |
+| --- | --- | --- | --- | --- | --- |
+| Coding | product / customer | developer | runbooks, ADRs | high | — |
+| Healthcare | health system | encounter / patient* | approved protocols | medium | hard filters |
+| Support | app or tenant | customer | macros, FAQs | medium | write-back |
+| CRM | customer org | rep | CRM app sources | medium | `query_apps` |
+| Legal | legal org | matter / attorney | versioned policies | medium–high | version filters |
+| Sales | company / tenant | rep | battle cards + accounts | low–medium | segment filters |
+| Research | workspace | project + user | corpus PDFs | high | trust_tier |
+
+\*Use the narrowest partition your product and policy allow.
+
+---
+
+## Shared sequence (all examples)
+
+```mermaid
+sequenceDiagram
+  participant U as User
+  participant A as Your app
+  participant H as HydraDB
+  participant L as LLM
+
+  U->>A: task
+  A->>A: authorize → database + collection
+  A->>H: POST /query (type, filters, graph)
+  H-->>A: chunks + sources + optional graph
+  A->>L: formatted context
+  L-->>A: completion
+  A-->>U: answer + citations
+  opt learning
+    A->>H: POST /context/ingest type=memory
+  end
+```
+
+---
+
+## Next
+
+- [Production Checklist](/essentials/v2/context-architecture/checklist) — ship gate
+- [Decision Matrix](/essentials/v2/context-architecture/decision-matrix) — primitive picker
+- [Playbook home](/essentials/v2/context-architecture/index) — full map

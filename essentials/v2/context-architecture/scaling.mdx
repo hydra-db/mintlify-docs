@@ -1,0 +1,200 @@
+---
+title: "Scaling Context"
+description: "How HydraDB context architecture changes from 10 users to 100K users and 10M documents — databases, collections, metadata, and isolation."
+---
+
+Scale changes **boundaries**, not the API. The same primitives ([databases](/essentials/v2/multi-tenant), collections, Knowledge, Memories, metadata, query) recompose as user count and corpus size grow.
+
+---
+
+## Scale ladder
+
+```mermaid
+flowchart LR
+  S1["10 users"] --> S2["100 users"]
+  S2 --> S3["1,000 users"]
+  S3 --> S4["100K users"]
+  S4 --> S5["10M documents"]
+
+  style S1 fill:#1e293b,stroke:#334155,color:#f8fafc
+  style S5 fill:#FF571A,stroke:#FF571A,color:#f8fafc
+```
+
+| Stage | Dominant constraint | Architecture move |
+| --- | --- | --- |
+| 10 users | Correctness of the model | One DB; learn ID + scope discipline |
+| 100 users | Preference isolation | `collection` per user; stop using default for Memories |
+| 1,000 users | Shared Knowledge quality | Metadata schema; upsert sync; graph for "who owns" |
+| 100K users | Tenant + workspace fanout | DB-per-customer (B2B) or careful B2C partitions; weighted `collections` sparingly |
+| 10M documents | Retrieval precision + ops | Strict filters, lifecycle prune, connector-driven refresh, eval harness |
+
+---
+
+## 10 users — establish the spine
+
+**Organization boundary:** Usually one `database` for the product (plus staging).
+
+**Collections:** Introduce `collection = user_id` even if it feels early — retrofitting is painful.
+
+**Metadata:** Declare the 3–5 filters you know you will need (`status`, `doc_type`).
+
+**Isolation:** Still mostly social trust; practice as if you already have tenants.
+
+```mermaid
+flowchart TB
+  DB["database: app_prod"]
+  K["Knowledge: shared seed docs"]
+  U1["collection: user_1"]
+  U2["collection: user_2"]
+  DB --> K
+  DB --> U1
+  DB --> U2
+```
+
+---
+
+## 100 users — personalization becomes real
+
+**What changes:** Memory write-back volume rises. Cross-user leakage shows up if collections were sloppy.
+
+| Do | Don't |
+| --- | --- |
+| Memory ingest/query with explicit user collection | Stuff `user_id` only into metadata and share one collection |
+| `type: "all"` for personalized features | Query Knowledge-only and hope the LLM "knows" the user |
+| `expiry_time` on session notes | Keep every chat forever |
+
+---
+
+## 1,000 users — Knowledge ops dominate
+
+**What changes:** Human uploads cannot keep the corpus fresh. Connectors / app sources matter. Duplicate IDs appear without upsert discipline.
+
+**Architecture upgrades:**
+
+1. Stable IDs from upstream keys
+2. Scheduled or event-driven refresh ([Connectors](/essentials/v2/connectors))
+3. `metadata_filters` on every productized query path
+4. Graph enabled for relational internal questions; disabled on hot low-latency paths when unused
+
+```mermaid
+flowchart LR
+  Apps["Slack · Notion · Drive"]
+  Sync["Sync worker"]
+  Ingest["ingest upsert"]
+  Q["POST /query + filters"]
+  Apps --> Sync --> Ingest --> Q
+```
+
+---
+
+## 100K users — organization boundaries harden
+
+### B2B SaaS
+
+```mermaid
+flowchart TB
+  subgraph Platform
+    Router["Tenant router in your app"]
+  end
+  Router --> A["database: cust_a"]
+  Router --> B["database: cust_b"]
+  Router --> C["database: cust_c"]
+  A --> AC["collections: workspace / user"]
+  B --> BC["collections: workspace / user"]
+```
+
+- **One database per customer organization** — hard isolation ([Multi-tenant](/essentials/v2/multi-tenant))
+- Collections for workspaces and seats inside the customer
+- Provision on signup; gate traffic on [database status](/api-reference/v2/endpoint/tenant-status)
+- Never "filter" your way across customers in one DB
+
+### B2C at this scale
+
+- Still often one app `database` (or sharded by region/environment as *your* ops require)
+- `collection` per user remains the personalization boundary
+- Shared Knowledge stays in a well-known collection (often default) queried with `type: "knowledge"` or `"all"`
+
+### Query fanout
+
+[`collections`](/essentials/v2/query) can search multiple partitions (list or weighted object, max 100). Use for intentional workspace fanout — not as a substitute for missing tenancy design.
+
+---
+
+## 10M documents — precision and lifecycle
+
+At this corpus size, **architecture is mostly negative space**: what you refuse to retrieve.
+
+| Pressure | Response |
+| --- | --- |
+| Semantic collisions | Strong `metadata_filters`; prefer schema-backed `metadata` for hot gates |
+| Stale content | Upsert refresh + archive status + delete jobs |
+| Graph payload size | `graph_context: false` when unused; `mode: "fast"` on simple lookups |
+| Eval blindness | Replay harness with golden citations ([Lifecycle → Replay](/essentials/v2/context-architecture/lifecycle#8-replay)) |
+| Cost | Prune ephemeral memories; drop duplicate sources |
+
+```mermaid
+flowchart TD
+  Corpus["10M docs"]
+  Filter["metadata_filters + collection"]
+  Rank["hybrid / thinking"]
+  Cap["max_results budget"]
+  LLM["LLM context window"]
+  Corpus --> Filter --> Rank --> Cap --> LLM
+```
+
+---
+
+## Organization boundaries cheat sheet
+
+| Boundary | Prefer | Example |
+| --- | --- | --- |
+| Legal / billing customer | `database` | `acme_corp` vs `globex` |
+| Environment | `database` | `acme_prod` vs `acme_staging` |
+| Workspace / team | `collection` | `ws_42` |
+| End user prefs | `collection` | `user_9f3a` |
+| Doc attributes | `metadata` | `department=legal` |
+| Citation / external ids | `additional_metadata` | `notion_page_id` |
+
+**Collections** partition. **Metadata** narrows. **Databases** isolate. Mixing these responsibilities is the most common scaling failure — see [Anti-Patterns](/essentials/v2/context-architecture/anti-patterns).
+
+---
+
+## Isolation levels
+
+```mermaid
+flowchart TB
+  L1["Level 1 — Soft<br/>metadata only"]
+  L2["Level 2 — Partition<br/>collections"]
+  L3["Level 3 — Hard<br/>separate databases"]
+  L1 --> L2 --> L3
+  note1["Not enough for customers"]
+  L1 -.-> note1
+
+  style L3 fill:#FF571A,stroke:#FF571A,color:#f8fafc
+```
+
+| Level | Mechanism | Use when |
+| --- | --- | --- |
+| Soft | `metadata_filters` | Attributes inside a trusted tenant |
+| Partition | `collection` | Users/teams inside one org |
+| Hard | `database` | Separate customers or environments |
+
+---
+
+## Scaling query posture
+
+| Stage | Typical `mode` | Graph | Notes |
+| --- | --- | --- | --- |
+| Early | `thinking` OK | on | Optimize for quality |
+| Mid | Split paths | selective | Fast FAQ vs deep research |
+| Large | Explicit `fast` / `thinking` | opt-in | Avoid auto surprises on SLOs |
+
+Parameter reference: [Query](/essentials/v2/query)
+
+---
+
+## Next
+
+- [Production Checklist](/essentials/v2/context-architecture/checklist)
+- [Reference Architectures](/essentials/v2/context-architecture/reference-architectures)
+- [Multi-tenant](/essentials/v2/multi-tenant)

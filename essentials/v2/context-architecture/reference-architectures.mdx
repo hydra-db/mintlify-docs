@@ -1,0 +1,256 @@
+---
+title: "Reference Architectures"
+description: "Six production HydraDB context architectures with Mermaid diagrams — Slack RAG, support, coding agents, enterprise SaaS, research, and internal knowledge."
+---
+
+These are **complete system shapes**, not endpoint tutorials. Each architecture shows how sources flow through ingestion, stores, graph, query, and the LLM — using only real HydraDB surfaces: [`POST /context/ingest`](/api-reference/v2/endpoint/ingest-context), [`POST /query`](/api-reference/v2/endpoint/query), databases/collections, metadata, and graph context.
+
+---
+
+## 1. Slack → Knowledge → Graph → Query → LLM
+
+Canonical team-knowledge loop for channels that hold decisions.
+
+```mermaid
+flowchart TB
+  Slack["Slack channels / threads"]
+  Conn["Connector sync or App Source ingest"]
+  Ingest["POST /context/ingest<br/>type=knowledge"]
+  Know["Knowledge store"]
+  Graph["Context Graph"]
+  Q["POST /query<br/>type=knowledge<br/>query_apps=true"]
+  LLM["Your LLM"]
+  Resp["Answer + citations"]
+
+  Slack --> Conn --> Ingest
+  Ingest --> Know
+  Ingest --> Graph
+  Know --> Q
+  Graph --> Q
+  Q --> LLM --> Resp
+
+  style Graph fill:#FF571A,stroke:#FF571A,color:#f8fafc
+  style Ingest fill:#1e293b,stroke:#334155,color:#f8fafc
+  style Q fill:#1e293b,stroke:#334155,color:#f8fafc
+```
+
+| Concern | Design |
+| --- | --- |
+| IDs | Stable `id` / `external_id` per message or thread snapshot |
+| Scope | Company `database`; optional channel → `collection` or metadata `channel` |
+| Query | `query_apps: true`, `mode: "thinking"` for thread reconstruction |
+| Refresh | Re-ingest upserts on edit; [`DELETE /context`](/api-reference/v2/endpoint/delete-source) on delete events |
+
+Related: [App Sources](/essentials/v2/app-sources) · [Connectors](/essentials/v2/connectors)
+
+---
+
+## 2. Personalized Support Desk
+
+Help Knowledge is shared; customer state is Memories.
+
+```mermaid
+flowchart LR
+  Ticket["Incoming ticket"]
+  Agent["Support agent service"]
+  QK["POST /query<br/>type=knowledge"]
+  QM["POST /query<br/>type=memory<br/>collection=customer_id"]
+  Merge["Merge context"]
+  LLM["LLM reply"]
+  WB["POST /context/ingest<br/>type=memory infer=true"]
+
+  Ticket --> Agent
+  Agent --> QK
+  Agent --> QM
+  QK --> Merge
+  QM --> Merge
+  Merge --> LLM
+  LLM --> Agent
+  Agent --> WB
+```
+
+Alternatively use a single `type: "all"` query scoped to the customer `collection` when prompt formatting can be unified — see [Query](/essentials/v2/query).
+
+Cookbook: [Customer Support Agent](/cookbooks/v2/customer-support-agent)
+
+---
+
+## 3. Enterprise SaaS Multi-Tenant Brain
+
+Hard isolation per customer org; collections for workspaces and seats.
+
+```mermaid
+flowchart TB
+  subgraph Control["Control plane"]
+    Prov["POST /databases per customer"]
+    Status["GET /databases/status"]
+  end
+
+  subgraph CustA["database: customer_a"]
+    KA["Knowledge: their Notion/Slack"]
+    WA["collection: workspace_*"]
+    UA["collection: user_* Memories"]
+  end
+
+  subgraph CustB["database: customer_b"]
+    KB["Knowledge"]
+    UB["Memories"]
+  end
+
+  App["Your SaaS backend"]
+  Prov --> Status
+  Status --> CustA
+  Status --> CustB
+  App --> CustA
+  App --> CustB
+  CustA -.->|no read path| CustB
+
+  style CustA fill:#1e293b,stroke:#334155,color:#f8fafc
+  style CustB fill:#0f172a,stroke:#334155,color:#f8fafc
+```
+
+| Concern | Design |
+| --- | --- |
+| Isolation | Never put two customers in one `database` |
+| Env | `customer_a_prod` vs `customer_a_staging` as separate databases |
+| Metadata | Per-customer schema fields: `department`, `region`, `classification` |
+| AuthZ | Resolve `database` + `collection` from your session before any HydraDB call |
+
+Related: [Multi-tenant](/essentials/v2/multi-tenant) · [Create Database](/api-reference/v2/endpoint/create-tenant)
+
+---
+
+## 4. Coding Agent with Repo Knowledge + Dev Memory
+
+```mermaid
+sequenceDiagram
+  participant Dev as Developer
+  participant Agent as Coding agent
+  participant H as HydraDB
+  participant LLM as LLM
+
+  Dev->>Agent: "Why is checkout failing?"
+  Agent->>H: POST /query type=all<br/>collection=dev_id<br/>graph_context=true
+  H-->>Agent: runbooks + ADRs + prefs + graph paths
+  Agent->>LLM: prompt with chunks + relations
+  LLM-->>Agent: diagnosis
+  Agent-->>Dev: answer
+  Agent->>H: POST /context/ingest type=memory<br/>infer=true (decision / preference)
+```
+
+| Store | Content |
+| --- | --- |
+| Knowledge | ADRs, runbooks, service docs (upsert on merge to main) |
+| Memories | Style prefs, prior incident conclusions, tool constraints |
+| Graph | Service ownership and dependency questions |
+| Ephemeral | Debug paste memories with `expiry_time` |
+
+---
+
+## 5. Research Corpus Synthesizer
+
+```mermaid
+flowchart TB
+  Papers["PDFs · HTML clips · notes"]
+  Ingest["ingest type=knowledge<br/>metadata: trust_tier, year"]
+  Know["Knowledge corpus"]
+  Graph["Citation / entity graph"]
+  Mem["Memories: hypotheses, steering"]
+  Q["POST /query mode=thinking<br/>type=all graph_context=true"]
+  Synth["Synthesis agent"]
+
+  Papers --> Ingest --> Know
+  Ingest --> Graph
+  Mem --> Q
+  Know --> Q
+  Graph --> Q
+  Q --> Synth
+```
+
+**Design notes:** Prefer `metadata_filters` for `trust_tier` / year gates. Use `recency_bias` when newer literature should win. Archive dead projects by isolating or deleting the project `collection`'s sources.
+
+---
+
+## 6. Internal Knowledge Assistant (Notion + Slack + Drive)
+
+```mermaid
+flowchart TB
+  subgraph Sources
+    N[Notion]
+    S[Slack]
+    D[Drive / PDFs]
+  end
+
+  subgraph HydraDB["Company database"]
+    Conn[Connectors / App Sources]
+    K[Knowledge]
+    G[Context Graph]
+    M[Employee Memories]
+  end
+
+  Q["POST /query type=all<br/>query_apps=true"]
+  UI["Search / chat UI"]
+  LLM["LLM"]
+
+  N --> Conn
+  S --> Conn
+  D --> Conn
+  Conn --> K
+  Conn --> G
+  M --> Q
+  K --> Q
+  G --> Q
+  UI --> Q --> LLM --> UI
+```
+
+| Concern | Design |
+| --- | --- |
+| ACL-shaped data | Encode visibility in `metadata` (`department`, `confidentiality`) and always filter |
+| Personalization | Employee `collection` Memories for role and search prefs |
+| Sync | Connector-driven refresh; treat `external_id` as upsert key |
+
+Related: [Glean Clone](/cookbooks/v2/glean-clone) · [Connectors](/essentials/v2/connectors)
+
+---
+
+## Architecture selection matrix
+
+| If you need… | Start from architecture |
+| --- | --- |
+| Channel decision search | #1 Slack → Knowledge → Graph |
+| Ticket personalization | #2 Support Desk |
+| Multi-customer SaaS | #3 Enterprise Multi-Tenant |
+| IDE / coding agent | #4 Coding Agent |
+| Long-form synthesis | #5 Research Corpus |
+| Company-wide search | #6 Internal Assistant |
+
+---
+
+## Shared production spine
+
+Every architecture above shares the same operational spine from [Architecture](/essentials/v2/architecture):
+
+```mermaid
+stateDiagram-v2
+  [*] --> Provisioned: POST /databases + status ready
+  Provisioned --> Ingesting: POST /context/ingest
+  Ingesting --> Indexing: queued → processing → graph_creation
+  Indexing --> Queryable: completed
+  Queryable --> Serving: POST /query
+  Serving --> Learning: memory write-back
+  Learning --> Ingesting
+  Queryable --> Refreshing: upsert same id
+  Refreshing --> Indexing
+  Queryable --> Deleted: DELETE /context
+  Deleted --> [*]
+```
+
+Poll [`GET /context/status`](/api-reference/v2/endpoint/source-status) (or use [webhooks](/essentials/v2/webhooks)) before treating new sources as fully graph-ready.
+
+---
+
+## Next
+
+- [Context Lifecycle](/essentials/v2/context-architecture/lifecycle) — months-long evolution
+- [Anti-Patterns](/essentials/v2/context-architecture/anti-patterns) — how these architectures go wrong
+- [Production Examples](/essentials/v2/context-architecture/production-examples) — domain walkthroughs
