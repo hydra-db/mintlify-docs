@@ -16,27 +16,31 @@ flowchart TB
   Dev[Developer]
   Agent[Coding agent]
   subgraph H["HydraDB database: product_acme"]
-    K[Knowledge: ADRs · runbooks · service docs]
+    K[Knowledge: ADRs · runbooks in team/default]
     M[Memories: collection=dev_id]
     G[Context Graph]
   end
   LLM[LLM]
 
   Dev --> Agent
-  Agent -->|POST /query type=all graph_context=true| H
-  H --> Agent --> LLM --> Agent --> Dev
-  Agent -->|ingest memory infer=true| M
+  Agent -->|POST /query type=knowledge shared collection| K
+  Agent -->|POST /query type=memory collection=dev_id| M
+  K --> Agent
+  M --> Agent
+  G --> Agent
+  Agent --> LLM --> Agent --> Dev
+  Agent -->|ingest memory infer=true collection=dev_id| M
   CI[CI / docs pipeline] -->|ingest knowledge upsert| K
 ```
 
 | Layer | Choice |
 | --- | --- |
 | Database | Per product or per customer (B2B IDE) |
-| Collections | `dev_id` for Memories; shared docs in team/default |
+| Collections | Shared docs in team/default; `dev_id` for Memories only |
 | Knowledge | ADRs, runbooks; upsert on merge |
 | Memories | Style prefs + decisions; debug notes with `expiry_time` |
-| Query | `type: "all"`, `mode: "thinking"` for hard bugs |
-| Graph | On for ownership / dependency questions |
+| Query | Dual query (or `type: "all"` with `collections` = [shared, `dev_id`]); never `type: "all"` with only `dev_id` if Knowledge is shared |
+| Graph | On for ownership / dependency questions on the Knowledge call |
 
 **Related:** [Choosing Strategy → Coding Agents](/essentials/v2/context-architecture/choosing-strategy) · [Plugins](/plugins/claude-code)
 
@@ -119,21 +123,22 @@ flowchart LR
   Ingest[App source ingest type=knowledge]
   K[Knowledge accounts · opportunities]
   Rep[collection: rep_id Memories]
-  Q[POST /query type=all query_apps=true]
+  QK[POST /query type=knowledge query_apps=true]
+  QM[POST /query type=memory collection=rep_id]
   Copilot[CRM copilot UI]
 
   CRM --> Ingest --> K
-  Rep --> Q
-  K --> Q --> Copilot
+  K --> QK --> Copilot
+  Rep --> QM --> Copilot
   Copilot -->|write-back| Rep
 ```
 
 | Layer | Choice |
 | --- | --- |
 | Database | Per CRM customer org (B2B) or one DB with strict collections |
-| Knowledge | Accounts, opportunities, notes as app sources |
-| Memories | Rep preferences, "don't pitch X", last strategy |
-| Query | `query_apps: true` for CRM object traversal behavior |
+| Knowledge | Accounts, opportunities, notes as app sources (shared / account collection) |
+| Memories | Rep preferences under `collection = rep_id` |
+| Query | Dual query (or `type: "all"` with both collections); `query_apps: true` on the Knowledge call |
 | Relations | Link opportunity ↔ account ↔ note via forceful relations when known |
 
 **Related:** [App Sources](/essentials/v2/app-sources)
@@ -181,22 +186,27 @@ flowchart TB
   K[Knowledge: battle cards · pricing · case studies]
   A[Knowledge: account notes via CRM sync]
   M[Memories: rep style · territory prefs]
-  Q[type=all + filters on segment/region]
+  QK[type=knowledge + segment/region filters]
+  QM[type=memory collection=rep_id]
   LLM[LLM]
 
-  Rep --> Assist --> Q
-  K --> Q
-  A --> Q
-  M --> Q
-  Q --> LLM --> Assist --> Rep
+  Rep --> Assist
+  Assist --> QK
+  Assist --> QM
+  K --> QK
+  A --> QK
+  M --> QM
+  QK --> LLM
+  QM --> LLM
+  LLM --> Assist --> Rep
 ```
 
 | Layer | Choice |
 | --- | --- |
-| Knowledge | Battle cards (upsert on enablement publish) + account corpus |
+| Knowledge | Battle cards (upsert on enablement publish) + account corpus in shared collections |
 | Memories | Rep collection |
 | Metadata | `segment`, `region`, `product_line`, `stage` |
-| Query | Filter by account segment; personalize with Memories |
+| Query | Dual query; filter Knowledge by account segment; personalize via Memories |
 
 Enablement refresh is a Knowledge lifecycle problem — treat battle card titles as stable ids.
 
@@ -255,17 +265,21 @@ sequenceDiagram
   participant L as LLM
 
   U->>A: task
-  A->>A: authorize → database + collection
-  A->>H: POST /query (type, filters, graph)
+  A->>A: authorize → database + collections + ACL filters
+  A->>H: POST /query type=knowledge (shared scope + filters)
+  A->>H: POST /query type=memory (user/customer collection)
   H-->>A: chunks + sources + optional graph
   A->>L: formatted context
   L-->>A: completion
   A-->>U: answer + citations
   opt learning
-    A->>H: POST /context/ingest type=memory
+    A->>H: POST /context/ingest type=memory (same user collection)
   end
 ```
 
+<Note>
+  When shared Knowledge and user Memories use different collections, prefer dual query (shown above) or one `type: "all"` with `collections` covering both. Do not pass only the user collection and expect default-collection Knowledge to appear.
+</Note>
 ---
 
 ## Next

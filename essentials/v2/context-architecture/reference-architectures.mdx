@@ -14,17 +14,19 @@ Canonical team-knowledge loop for channels that hold decisions.
 ```mermaid
 flowchart TB
   Slack["Slack channels / threads"]
+  AuthZ["Your app: resolve caller ACLs<br/>allowed channels / workspaces"]
   Conn["Connector sync or App Source ingest"]
-  Ingest["POST /context/ingest<br/>type=knowledge"]
+  Ingest["POST /context/ingest<br/>type=knowledge<br/>+ visibility metadata / collection"]
   Know["Knowledge store"]
   Graph["Context Graph"]
-  Q["POST /query<br/>type=knowledge<br/>query_apps=true"]
+  Q["POST /query type=knowledge<br/>query_apps=true<br/>+ ACL metadata_filters or collections"]
   LLM["Your LLM"]
   Resp["Answer + citations"]
 
   Slack --> Conn --> Ingest
   Ingest --> Know
   Ingest --> Graph
+  AuthZ --> Q
   Know --> Q
   Graph --> Q
   Q --> LLM --> Resp
@@ -32,16 +34,22 @@ flowchart TB
   style Graph fill:#FF571A,stroke:#FF571A,color:#f8fafc
   style Ingest fill:#1e293b,stroke:#334155,color:#f8fafc
   style Q fill:#1e293b,stroke:#334155,color:#f8fafc
+  style AuthZ fill:#0f172a,stroke:#ef4444,color:#f8fafc
 ```
 
 | Concern | Design |
 | --- | --- |
 | IDs | Stable `id` / `external_id` per message or thread snapshot |
-| Scope | Company `database`; optional channel → `collection` or metadata `channel` |
-| Query | `query_apps: true`, `mode: "thinking"` for thread reconstruction |
+| Ingest scope | Stamp every source with visibility you can filter later — e.g. schema `metadata.channel_id` / `visibility`, or a workspace `collection` that matches Slack ACLs |
+| Query scope | **Required:** derive `metadata_filters` and/or `collection`/`collections` from the caller's allowed channels. Never run an unfiltered company-wide `query_apps: true` over mixed public + private channels |
+| Query extras | `query_apps: true`, `mode: "thinking"` for thread reconstruction — only *after* ACL filters are applied |
 | Refresh | Re-ingest upserts on edit; [`DELETE /context`](/api-reference/v2/endpoint/delete-source) on delete events |
 
-Related: [App Sources](/essentials/v2/app-sources) · [Connectors](/essentials/v2/connectors)
+<Warning>
+  HydraDB does not infer Slack channel membership. If the connector indexes private channels into a shared company `database`, an unscoped Knowledge query can surface them. Enforce ACLs in **your app** via collections and/or `metadata_filters` on every request.
+</Warning>
+
+Related: [App Sources](/essentials/v2/app-sources) · [Connectors](/essentials/v2/connectors) · [Metadata](/essentials/v2/metadata)
 
 ---
 
@@ -53,11 +61,11 @@ Help Knowledge is shared; customer state is Memories.
 flowchart LR
   Ticket["Incoming ticket"]
   Agent["Support agent service"]
-  QK["POST /query<br/>type=knowledge"]
-  QM["POST /query<br/>type=memory<br/>collection=customer_id"]
+  QK["POST /query type=knowledge<br/>shared / default collection"]
+  QM["POST /query type=memory<br/>collection=customer_id"]
   Merge["Merge context"]
   LLM["LLM reply"]
-  WB["POST /context/ingest<br/>type=memory infer=true"]
+  WB["POST /context/ingest<br/>type=memory infer=true<br/>collection=customer_id"]
 
   Ticket --> Agent
   Agent --> QK
@@ -69,7 +77,9 @@ flowchart LR
   Agent --> WB
 ```
 
-Alternatively use a single `type: "all"` query scoped to the customer `collection` when prompt formatting can be unified — see [Query](/essentials/v2/query).
+**Why two queries (default):** Shared help articles live in the default (or team) Knowledge collection; customer Memories live under `collection = customer_id`. A single `type: "all"` call with only the customer collection **does not** retrieve Knowledge written under a different collection — see [Multi-tenant](/essentials/v2/multi-tenant).
+
+**One-call alternative:** If you want a single [`POST /query`](/api-reference/v2/endpoint/query), pass `type: "all"` with `collections` covering **both** partitions (e.g. shared Knowledge collection + `customer_id`), or ingest shared macros into every customer collection (usually worse). Prefer dual query when Knowledge and Memories need different prompt formatting — see [Query](/essentials/v2/query).
 
 Cookbook: [Customer Support Agent](/cookbooks/v2/customer-support-agent)
 
@@ -130,19 +140,22 @@ sequenceDiagram
   participant LLM as LLM
 
   Dev->>Agent: "Why is checkout failing?"
-  Agent->>H: POST /query type=all<br/>collection=dev_id<br/>graph_context=true
-  H-->>Agent: runbooks + ADRs + prefs + graph paths
+  Agent->>H: POST /query type=knowledge<br/>team/default collection graph_context=true
+  Agent->>H: POST /query type=memory<br/>collection=dev_id
+  H-->>Agent: runbooks + ADRs
+  H-->>Agent: prefs + prior decisions
   Agent->>LLM: prompt with chunks + relations
   LLM-->>Agent: diagnosis
   Agent-->>Dev: answer
-  Agent->>H: POST /context/ingest type=memory<br/>infer=true (decision / preference)
+  Agent->>H: POST /context/ingest type=memory<br/>collection=dev_id infer=true
 ```
 
 | Store | Content |
 | --- | --- |
-| Knowledge | ADRs, runbooks, service docs (upsert on merge to main) |
-| Memories | Style prefs, prior incident conclusions, tool constraints |
-| Graph | Service ownership and dependency questions |
+| Knowledge | ADRs, runbooks, service docs in the **shared** team/default collection (upsert on merge to main) |
+| Memories | Style prefs, prior incident conclusions, tool constraints under `collection = dev_id` |
+| Query | Dual query (recommended) or one `type: "all"` with `collections` listing **both** the shared Knowledge collection and `dev_id` |
+| Graph | Service ownership and dependency questions on the Knowledge query |
 | Ephemeral | Debug paste memories with `expiry_time` |
 
 ---
@@ -156,7 +169,7 @@ flowchart TB
   Know["Knowledge corpus"]
   Graph["Citation / entity graph"]
   Mem["Memories: hypotheses, steering"]
-  Q["POST /query mode=thinking<br/>type=all graph_context=true"]
+  Q["POST /query mode=thinking<br/>dual or type=all with both collections<br/>graph_context=true"]
   Synth["Synthesis agent"]
 
   Papers --> Ingest --> Know
@@ -167,7 +180,7 @@ flowchart TB
   Q --> Synth
 ```
 
-**Design notes:** Prefer `metadata_filters` for `trust_tier` / year gates. Use `recency_bias` when newer literature should win. Archive dead projects by isolating or deleting the project `collection`'s sources.
+**Design notes:** Prefer `metadata_filters` for `trust_tier` / year gates. Keep corpus Knowledge and steering Memories in explicit collections — dual query or `collections` fanout when they differ. Use `recency_bias` when newer literature should win. Archive dead projects by isolating or deleting the project `collection`'s sources.
 
 ---
 
@@ -183,12 +196,14 @@ flowchart TB
 
   subgraph HydraDB["Company database"]
     Conn[Connectors / App Sources]
-    K[Knowledge]
+    K[Knowledge + visibility metadata]
     G[Context Graph]
-    M[Employee Memories]
+    M[Employee Memories per collection]
   end
 
-  Q["POST /query type=all<br/>query_apps=true"]
+  AuthZ["Session → allowed depts / channels"]
+  QK["POST /query type=knowledge<br/>query_apps=true + ACL filters"]
+  QM["POST /query type=memory<br/>collection=employee_id"]
   UI["Search / chat UI"]
   LLM["LLM"]
 
@@ -197,19 +212,25 @@ flowchart TB
   D --> Conn
   Conn --> K
   Conn --> G
-  M --> Q
-  K --> Q
-  G --> Q
-  UI --> Q --> LLM --> UI
+  AuthZ --> QK
+  AuthZ --> QM
+  K --> QK
+  G --> QK
+  M --> QM
+  UI --> QK --> LLM
+  UI --> QM --> LLM
+  LLM --> UI
+
+  style AuthZ fill:#0f172a,stroke:#ef4444,color:#f8fafc
 ```
 
 | Concern | Design |
 | --- | --- |
-| ACL-shaped data | Encode visibility in `metadata` (`department`, `confidentiality`) and always filter |
-| Personalization | Employee `collection` Memories for role and search prefs |
+| ACL-shaped data | Encode visibility at ingest (`department`, `confidentiality`, `channel_id`) and **always** apply matching `metadata_filters` (and/or allowed `collections`) from the session — never an unfiltered company-wide query |
+| Personalization | Employee Memories under `collection = employee_id`; query Memories separately (or `type: "all"` with `collections` that include both the shared Knowledge partition and the employee collection) |
 | Sync | Connector-driven refresh; treat `external_id` as upsert key |
 
-Related: [Glean Clone](/cookbooks/v2/glean-clone) · [Connectors](/essentials/v2/connectors)
+Related: [Glean Clone](/cookbooks/v2/glean-clone) · [Connectors](/essentials/v2/connectors) · [Metadata](/essentials/v2/metadata)
 
 ---
 
