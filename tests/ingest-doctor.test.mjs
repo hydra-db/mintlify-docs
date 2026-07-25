@@ -672,6 +672,57 @@ test("memory additional_metadata also accepts encoded object form", () => {
   );
 });
 
+test("shared acyclic document descriptors are not reported as cycles", () => {
+  const sharedDocument = { filename: "shared.pdf" };
+  const result = validateIngestManifest(
+    knowledge({ documents: [sharedDocument, sharedDocument] }),
+  );
+
+  assert.equal(result.status, "pass");
+  assert.equal(codes(result).includes("E_CYCLIC_VALUE"), false);
+});
+
+test("cyclic programmatic manifests still fail safely", () => {
+  const manifest = knowledge();
+  manifest.self = manifest;
+
+  const result = validateIngestManifest(manifest);
+  assert.equal(result.status, "fail");
+  assert.ok(codes(result).includes("E_CYCLIC_VALUE"));
+});
+
+test("shared subtrees count against the depth limit at every path", () => {
+  const chain = (depth, tail = {}) => {
+    let value = tail;
+    for (let index = 0; index < depth; index += 1) {
+      value = { child: value };
+    }
+    return value;
+  };
+
+  const shared = chain(80);
+  const result = validateIngestManifest(
+    knowledge({
+      a_shallow: shared,
+      z_deep: chain(80, shared),
+    }),
+  );
+
+  assert.equal(result.status, "fail");
+  assert.ok(codes(result).includes("E_STRUCTURE_DEPTH_LIMIT"));
+});
+
+test("shared DAG expansion counts against the node limit", () => {
+  let shared = { leaf: true };
+  for (let depth = 0; depth < 18; depth += 1) {
+    shared = { left: shared, right: shared };
+  }
+
+  const result = validateIngestManifest(knowledge({ shared }));
+  assert.equal(result.status, "fail");
+  assert.ok(codes(result).includes("E_STRUCTURE_NODE_LIMIT"));
+});
+
 test("deep structures fail safely instead of overflowing the stack", () => {
   const manifest = knowledge();
   let cursor = manifest;

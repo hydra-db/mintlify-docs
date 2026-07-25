@@ -95,13 +95,22 @@ function createCollector() {
 }
 
 function scanUnsafeKeys(value, path, collector) {
-  const pending = [{ value, path, depth: 0 }];
-  const seen = new WeakSet();
+  const pending = [{ value, path, depth: 0, exiting: false }];
+  // Active ancestors detect back-edges while shared DAG nodes are charged
+  // once per path against the depth and expanded-node safety limits.
+  const active = new WeakSet();
+  let queuedNodes = 1;
   let scannedNodes = 0;
   let safe = true;
 
   while (pending.length > 0) {
     const current = pending.pop();
+    if (current.exiting) {
+      active.delete(current.value);
+      continue;
+    }
+
+    queuedNodes -= 1;
     scannedNodes += 1;
     if (scannedNodes > MAX_SCANNED_NODES) {
       collector.add(
@@ -126,7 +135,7 @@ function scanUnsafeKeys(value, path, collector) {
       continue;
     }
 
-    if (seen.has(current.value)) {
+    if (active.has(current.value)) {
       collector.add(
         "error",
         "E_CYCLIC_VALUE",
@@ -136,11 +145,12 @@ function scanUnsafeKeys(value, path, collector) {
       safe = false;
       continue;
     }
-    seen.add(current.value);
+    active.add(current.value);
+    pending.push({ value: current.value, exiting: true });
 
     if (Array.isArray(current.value)) {
       if (
-        scannedNodes + pending.length + current.value.length >
+        scannedNodes + queuedNodes + current.value.length >
         MAX_SCANNED_NODES
       ) {
         collector.add(
@@ -156,14 +166,16 @@ function scanUnsafeKeys(value, path, collector) {
           value: current.value[index],
           path: `${current.path}[${index}]`,
           depth: current.depth + 1,
+          exiting: false,
         });
       }
+      queuedNodes += current.value.length;
       continue;
     }
 
     const entries = sortedEntries(current.value);
     if (
-      scannedNodes + pending.length + entries.length >
+      scannedNodes + queuedNodes + entries.length >
       MAX_SCANNED_NODES
     ) {
       collector.add(
@@ -174,6 +186,7 @@ function scanUnsafeKeys(value, path, collector) {
       );
       return false;
     }
+    let queuedChildren = 0;
     for (let index = entries.length - 1; index >= 0; index -= 1) {
       const [key, child] = entries[index];
       const childPath = `${current.path}.*`;
@@ -190,9 +203,12 @@ function scanUnsafeKeys(value, path, collector) {
           value: child,
           path: childPath,
           depth: current.depth + 1,
+          exiting: false,
         });
+        queuedChildren += 1;
       }
     }
+    queuedNodes += queuedChildren;
   }
 
   return safe;
