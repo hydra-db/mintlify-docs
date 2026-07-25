@@ -49,15 +49,38 @@ flowchart LR
 
 ## Pattern 2 — Parallel equality filters + union
 
-**When:** everything already lives in one shared collection with `metadata.channel_id` (or `department`).
+**When:** everything already lives in one shared collection with schema-backed `metadata.channel_id` (or `department`).
 
-`metadata_filters` cannot express `channel_id IN (C01,C02)` — arrays are **exact set equality**, not OR/IN ([semantics](/essentials/v2/metadata#filter-semantics)).
+**Prefer Pattern 1 for authorization.** Use Pattern 2 only when you cannot remap to per-boundary collections — and only after the schema prerequisites below are met.
 
-**Do this instead:**
+### Schema prerequisite (mandatory)
+
+Undeclared top-level `metadata_filters` keys are **silently ignored** at query time ([Metadata](/essentials/v2/metadata)). If `channel_id` is missing from `database_metadata_schema` or lacks `enable_match: true`, a filter like `{ "channel_id": "C01" }` does **nothing** — the query searches the **entire** shared collection and can return unauthorized channels.
+
+Before any ACL-shaped ingest or query:
+
+1. Declare the field on the database (at [`POST /databases`](/api-reference/v2/endpoint/create-tenant) or additive [`PATCH .../metadata-schema`](/api-reference/v2/endpoint/update-metadata-schema)):
+
+```json
+{
+  "name": "channel_id",
+  "data_type": "VARCHAR",
+  "enable_match": true
+}
+```
+
+2. Ingest every source with schema `metadata.channel_id` set to that channel’s id (not only `additional_metadata`).
+3. **Verify** in a non-prod database: query with a channel id that has **no** sources → expect **empty** results. If you still see other channels’ content, the filter is not active — stop and fix the schema before shipping.
+
+`metadata_filters` also cannot express `channel_id IN (C01,C02)` — arrays are **exact set equality**, not OR/IN ([semantics](/essentials/v2/metadata#filter-semantics)).
+
+### Query shape
 
 ```mermaid
 flowchart TD
+  Schema["Schema: channel_id enable_match=true"]
   ACL["Allowed: C01, C02"]
+  Schema --> ACL
   ACL --> Q1["query filter channel_id=C01"]
   ACL --> Q2["query filter channel_id=C02"]
   Q1 --> U["Union + re-rank in app"]
@@ -74,7 +97,11 @@ flowchart TD
 }
 ```
 
-Repeat per allowed id; merge results client-side.
+Repeat per allowed id; merge results client-side. Never omit `metadata_filters` on these calls.
+
+<Warning>
+  **Silent-filter hazard:** An undeclared or non-`enable_match` ACL field turns Pattern 2 into an unscoped shared-collection search. Treat schema + empty-result verification as part of the security boundary — same severity as forgetting the filter entirely.
+</Warning>
 
 ---
 
@@ -91,6 +118,7 @@ If the UI is already inside one channel / workspace / dept, pass that one collec
 | Unscoped company-wide `query_apps: true` | Private channels in the same DB surface |
 | One workspace collection for all channels with mixed membership | Over-shares private channels |
 | `metadata_filters: { "channel_id": ["C01","C02"] }` as OR | Exact set match; won’t match single-id sources |
+| ACL field not in schema / `enable_match` false | Filter **silently ignored** → full shared collection searched |
 | Filter in UI after broad query | Authorization bypass if any code path skips the filter |
 
 ---
@@ -99,8 +127,8 @@ If the UI is already inside one channel / workspace / dept, pass that one collec
 
 Same recipes:
 
-- **Dept = collection** → fan out allowed depts with `collections`
-- **Dept = metadata** on a shared collection → parallel equality queries + union
+- **Dept = collection** → fan out allowed depts with `collections` (preferred for ACL)
+- **Dept = metadata** on a shared collection → declare `department` with `enable_match: true`, verify empty-result behavior, then parallel equality queries + union
 - **Project + user Memories** → dual-store composition ([Dual-Store Scope](/essentials/v2/scope-composition/dual-store))
 
 ---
