@@ -137,8 +137,8 @@ curl -X DELETE 'https://api.hydradb.com/context' \
   "success": false,
   "data": null,
   "error": {
-    "code": "SOURCE_NOT_FOUND",
-    "message": "Source not found"
+    "code": "NOT_FOUND",
+    "message": "No sources were deleted"
   },
   "meta": {
     "request_id": "9d13aef4-02f4-4e73-8c62-4c2601d04f9d",
@@ -149,9 +149,72 @@ curl -X DELETE 'https://api.hydradb.com/context' \
 
 </ResponseExample>
 
+## Status codes
+
+The status code tells you whether the delete happened. `200` means at least one
+source was removed; a delete that did not happen never returns `200`.
+
+| Status | Code | Meaning |
+| --- | --- | --- |
+| `200` | n/a | At least one source was deleted. Check `results[]` for per-ID outcomes. |
+| `404` | `NOT_FOUND` | None of the given `ids` matched anything to delete. |
+| `409` | `SOURCE_PROCESSING` | A source is still indexing. Retry after ingestion completes - see the `Retry-After` header. |
+| `500` | `INTERNAL_ERROR` | A store failed to remove the source. The delete is retryable. |
+
+<Warning>
+  Deleting a source that is still indexing is the case worth handling. Ingestion
+  is asynchronous, so an ingest-then-delete sequence - what most teardown and
+  test scripts do - can reach the source before it finishes indexing. That
+  returns `409`, and the source is **not** deleted. Retry once indexing
+  completes, or poll [Source Status](/api-reference/v2/endpoint/source-status)
+  first.
+</Warning>
+
+On `404`, `409`, and `500` the response `data` still carries the same
+`results` / `deleted_count` payload a `200` carries, so you can read per-ID
+outcomes on a failure exactly as you would on success:
+
+```json 409 - still indexing
+{
+  "success": false,
+  "data": {
+    "success": false,
+    "message": "Source is still processing; retry deletion after ingestion completes",
+    "results": [
+      {
+        "id": "policy_main",
+        "deleted": false,
+        "error": "Source is still processing; retry deletion after ingestion completes"
+      }
+    ],
+    "deleted_count": 0
+  },
+  "error": {
+    "code": "SOURCE_PROCESSING",
+    "message": "Source is still processing; retry deletion after ingestion completes"
+  },
+  "meta": {
+    "request_id": "9d13aef4-02f4-4e73-8c62-4c2601d04f9d",
+    "latency_ms": 8.1
+  }
+}
+```
+
+<Note>
+  **Previously this endpoint returned `200` for every outcome**, with the real
+  result only in the nested `data.success`. If your integration checks
+  `response.ok` or `status == 200`, it was silently treating blocked deletes as
+  successful - that is the bug this change fixes, and you should now see those
+  failures surface.
+
+  If you need time to adapt, send `X-HydraDB-Delete-Status: legacy` to restore
+  the old unconditional `200` for a transition period. This header is temporary
+  and will be removed; prefer reading the status code.
+</Note>
+
 ## Some additional notes
 
-- **Partial-success semantics:** For `type=knowledge`, each ID is reported independently in `results[]`. A failure on one ID does not stop the rest. For `type=memory`, the response reports an aggregate `user_memory_deleted` reflecting _all_ listed IDs.
+- **Partial-success semantics:** For `type=knowledge`, each ID is reported independently in `results[]`. A failure on one ID does not stop the rest. For `type=memory`, the response reports an aggregate `user_memory_deleted` reflecting _all_ listed IDs. One exception: if any source in the request is still indexing, the whole request is refused with `409` and nothing is deleted.
 - **Retrieval drops the source immediately:** Even before background cleanup finishes, deleted IDs disappear from `/query` and `/context/list` responses.
 - **Mixed deletes need two calls:** To delete both knowledge and memory items, send two requests  -  one with `type=knowledge`, one with `type=memory`.
 
