@@ -10,7 +10,7 @@ This document is a self-contained reference designed for AI coding agents. It co
 ### TL;DR: Critical endpoints
 
 1. **`POST /databases`** (`client.databases.create()`): Provision an isolated database workspace.
-2. **`GET /databases/status`** (`client.databases.status()`): Poll until `infra.ready_for_ingestion` is true.
+2. **`GET /databases/status`** (`client.databases.status()`): Poll until the scheduler, graph, and both vector stores report ready.
 3. **`POST /context/ingest`** (`client.context.ingest()`): Ingest documents, app records, or memories under `type="knowledge"` or `type="memory"`.
 4. **`GET /context/status`** (`client.context.status()`): Poll status using `ids` until `indexing_status` is `completed` or `graph_creation`.
 5. **`POST /query`** (`client.query()`): Retrieve context via `type: "knowledge"`, `"memory"`, or `"all"`.
@@ -29,9 +29,9 @@ This document is a self-contained reference designed for AI coding agents. It co
 - Official SDKs set `API-Version: 2` automatically.
 - Use `HYDRA_DB_API_KEY` as the environment variable in examples.
 
-### Response envelope
+### Response shapes
 
-Core raw HTTP responses (`/databases`, `/context/*`, and `/query`) are wrapped:
+Many core v2 handlers use this success envelope:
 
 ```json
 {
@@ -45,11 +45,12 @@ Core raw HTTP responses (`/databases`, `/context/*`, and `/query`) are wrapped:
 }
 ```
 
-- Parse core raw HTTP payloads from `data`.
-- The SDKs return the full envelope object; read the payload from its `data` field (e.g. `response.data`). On failure they raise a typed exception rather than returning an envelope with `error` set.
-- Log `meta.request_id` for failed requests.
-- `meta` may also carry an optional `deprecation` list (with a `Deprecation: true` response header) when a request uses a legacy `/tenants` route or a deprecated field (`tenant_id`/`sub_tenant_id`, or `sub_tenant_ids` on `/query`). Each entry has `deprecated`, `deprecated_field`, `preferred_field`, `message`, and `deprecated_since`. It is a non-breaking nudge. The status code is unchanged. Prefer the `/databases` routes and `database`/`collection`/`collections` fields to avoid it. Treat `meta` as an open object: ignore keys you do not recognize.
-- Exception: webhook management endpoints (`/webhooks/indexing*`) return their documented response object directly, without the `{ success, data, error, meta }` envelope.
+- For an operation whose OpenAPI 2xx schema or SDK return type is a handler envelope, parse the resource payload from `data`. Core database, context, query, and webhook-management methods use this shape.
+- Do not assume every v2 response has `data`. Connector catalog, discovery, and resource operations, plus database metadata-schema updates, can return direct objects. Follow the endpoint's 2xx schema or the SDK method's return type.
+- On failure, SDK methods raise a typed exception rather than returning a success envelope with `error` set.
+- Authentication or gateway middleware can reject a request before the handler and return a `detail` error shape. Branch on HTTP status before parsing a success envelope.
+- Log a request or correlation ID when the response provides one.
+- `meta` may also carry an optional `deprecation` list (with a `Deprecation: true` response header) when a request uses a legacy tenant route or a deprecated field (`tenant_id`/`sub_tenant_id`, or `sub_tenant_ids` on `/query`). Each entry has `deprecated`, `deprecated_field`, `preferred_field`, `message`, and `deprecated_since`. It is a non-breaking nudge. The status code is unchanged. Prefer the `/databases` routes and `database`/`collection`/`collections` fields to avoid it. Treat `meta` as an open object: ignore keys you do not recognize.
 
 ### Core endpoints
 
@@ -97,10 +98,10 @@ Use the same `type` enum across context lifecycle APIs and search. Search additi
 
 ### Metadata naming
 
-- `tenant_metadata`: schema-aligned, declared at database creation, fast filter path.
+- `metadata`: schema-aligned source metadata, declared in the database schema, fast filter path.
 - `additional_metadata`: canonical free-form per-document metadata.
 - `document_metadata`: multipart field carrying per-document metadata for file uploads; use `additional_metadata` inside each item for free-form metadata.
-- `metadata_filters` top-level keys match `tenant_metadata`.
+- `metadata_filters` top-level keys match schema-backed `metadata`.
 - `metadata_filters.additional_metadata` scopes free-form metadata.
 
 ### Do not mix scopes accidentally
@@ -135,7 +136,7 @@ Knowledge is shared context: documents, PDFs, Markdown, CSVs, Slack threads, Not
 - Ingest with `POST /context/ingest`, `type=knowledge`.
 - Search with `POST /query`, `type: "knowledge"`.
 - Use for content that should be reusable across users.
-- Mutability is explicit: re-ingest with the same ID and `upsert: true`, or delete.
+- Mutability is explicit: re-ingest with the same ID and `upsert: "true"`, or delete.
 
 ### Memories
 
@@ -239,7 +240,7 @@ SDK naming:
 
 - Python methods and fields: snake_case, e.g. `client.databases.collections()`, `database`, `collection`, `page_size`, `query_by`.
 - TypeScript methods and fields: camelCase, e.g. `client.databases.collections()`, `database`, `collection`, `pageSize`, `queryBy`.
-- Both SDKs return a `{ success, data, error, meta }` envelope; the payload is under `.data` (e.g. `response.data.infra`, `response.data.statuses`, `response.data.results`).
+- For methods whose generated return type is a `{ success, data, error, meta }` envelope, read the payload under `.data` (e.g. `response.data.infra`, `response.data.statuses`, `response.data.results`). Connector catalog, discovery, and resource methods, plus database metadata-schema updates, can return direct objects instead.
 - Values that are passed as JSON strings (`memories`, `app_knowledge`, `document_metadata`) keep snake_case keys inside the stringified payload in both SDKs, since that is raw wire data.
 
 ---
@@ -263,7 +264,14 @@ client.databases.create(database=database)
 # 2. Wait until the database can accept data.
 while True:
     status = client.databases.status(database=database)
-    if status.data.infra.ready_for_ingestion:
+    infra = status.data.infra
+    vectorstore = infra.vectorstore_status
+    if (
+        infra.scheduler_status
+        and infra.graph_status
+        and vectorstore.knowledge
+        and vectorstore.memories
+    ):
         break
     time.sleep(5)
 
@@ -326,7 +334,13 @@ await client.databases.create({ database: database });
 
 while (true) {
   const status = await client.databases.status({ database: database });
-  if (status.data.infra.readyForIngestion) break;
+  const infra = status.data?.infra;
+  if (
+    infra?.schedulerStatus === true &&
+    infra.graphStatus === true &&
+    infra.vectorstoreStatus?.knowledge === true &&
+    infra.vectorstoreStatus.memories === true
+  ) break;
   await new Promise((resolve) => setTimeout(resolve, 5_000));
 }
 
@@ -344,14 +358,17 @@ const ingest = await client.context.ingest({
   ]),
 });
 
-const ingestId = ingest.data.results[0].id;
+const ingestId = ingest.data?.results?.find((item) => item.id && !item.error)?.id;
+if (!ingestId) throw new Error("Ingestion returned no context ID");
 
 while (true) {
-  const status = (await client.context.status({
+  const statusEnvelope = await client.context.status({
     database: database,
     collection: "user_alex",
     ids: [ingestId],
-  })).data.statuses[0];
+  });
+  const status = statusEnvelope.data?.statuses?.[0];
+  if (!status) throw new Error("Status response contained no item");
 
   if (["graph_creation", "completed"].includes(status.indexingStatus as string)) break;
   if (["errored", "failed"].includes(status.indexingStatus as string)) {
@@ -370,7 +387,7 @@ const result = await client.query({
   mode: "thinking",
 });
 
-console.log(result.data.chunks);
+console.log(result.data?.chunks ?? []);
 ```
 
 ---
@@ -401,21 +418,21 @@ Notes:
 
 - Database creation is async.
 - `database` should be stable; docs recommend lowercase letters, numbers, and underscores for portability.
-- `database_metadata_schema` is effectively planned up front. If you need to change filterable metadata fields, expect to create a new database or re-ingest under a new schema.
+- Plan `database_metadata_schema` up front. You can add exact-match fields later with [Update Metadata Schema](/api-reference/v2/endpoint/update-metadata-schema); new semantic/BM25 metadata lanes for existing data may still require migration or re-ingestion.
 - `POST /databases` may return `409 DATABASE_ALREADY_EXISTS` for duplicate database IDs and `403 FORBIDDEN` when the API key or plan cannot create more databases.
 
 ### Check readiness
 
 `GET /databases/status?database=...` · `client.databases.status()`
 
-Ready when infrastructure reports usable status. Current docs show `infra.ready_for_ingestion`; SDK examples also check:
+Ready when all four infrastructure signals are true:
 
 - `infra.scheduler_status`
 - `infra.graph_status`
 - `infra.vectorstore_status.knowledge`
 - `infra.vectorstore_status.memories`
 
-Use SDK autocomplete/returned object shape for the exact field spelling.
+Python uses the snake_case spellings above; TypeScript uses `schedulerStatus`, `graphStatus`, and `vectorstoreStatus`.
 
 ### Other database endpoints
 
@@ -456,11 +473,11 @@ with open("policy.pdf", "rb") as f:
     result = client.context.ingest(
         type="knowledge",
         database="acme_corp",
-        documents=[("policy.pdf", f, "application/pdf")],
+        documents=("policy.pdf", f, "application/pdf"),
         document_metadata=json.dumps([
             {
                 "id": "policy_v2",
-                "tenant_metadata": {"department": "support", "status": "approved"},
+                "metadata": {"department": "support", "status": "approved"},
                 "additional_metadata": {"author": "Alice", "version": 2},
                 "title": "Refund Policy v2",
                 "url": "https://example.com/policies/refunds",
@@ -474,7 +491,7 @@ with open("policy.pdf", "rb") as f:
 | Field | Purpose |
 |---|---|
 | `id` | stable ID / upsert key |
-| `tenant_metadata` | schema-aligned filterable fields |
+| `metadata` | schema-aligned filterable fields |
 | `additional_metadata` | free-form display/bookkeeping fields |
 | `title`, `type`, `url`, `timestamp` | source display and citation fields |
 | `relations` | explicit forceful relations, e.g. `{ "ids": [...] }` |
@@ -494,22 +511,22 @@ await client.context.ingest({
       collection: "default",
       title: "Pricing discussion - Slack #product",
       type: "slack",
+      kind: "message",
+      provider: "slack",
+      external_id: "1715012345.000100",
       url: "https://slack.com/archives/C123/p1715012345000100",
       timestamp: "2025-01-15T12:30:00Z",
-      content: {
-        text: "We agreed on three tiers: Starter, Pro, and Enterprise."
+      fields: {
+        kind: "message",
+        body: "We agreed on three tiers: Starter, Pro, and Enterprise.",
+        author: "alice",
+        thread_id: "1715012345.000100"
       },
-      tenant_metadata: {
+      metadata: {
         channel: "product",
         workspace: "acme"
       },
-      additional_metadata: {
-        author: "alice",
-        slack_ts: "1715012345.000100"
-      },
-      relations: {
-        ids: ["slack_thread_root_001"]
-      }
+      additional_metadata: { slack_ts: "1715012345.000100" }
     }
   ]),
 });
@@ -522,23 +539,21 @@ Recommended app-source fields:
 | `id` | stable HydraDB ID and upsert key |
 | `title` | readable result/citation title |
 | `type` | category such as `slack`, `gmail`, `jira`, `notion`, `webpage` |
-| `content.text` / `content.markdown` | primary searchable content |
-| `tenant_metadata` | fast filters such as channel, project, region, workspace |
+| `kind`, `provider`, `external_id` | app-native identity and provider namespace |
+| `fields` | primary searchable content in the kind-specific shape |
+| `metadata` | fast filters such as channel, project, region, workspace |
 | `additional_metadata` | provider IDs, author, status, assignee, timestamps |
 | `url` | citation / navigation link |
 | `timestamp` | freshness and chronology |
-| `relations.ids` | thread, parent/child, linked issue, related source expansion |
+| `relations`, `attachments`, `comments` | optional app-native connected context |
 
-App-source object kinds in OpenAPI include:
+On retrieval, the v2 OpenAPI exposes three app-source identity fields:
 
-- `email`
-- `message`
-- `ticket`
-- `knowledge_base`
-- `comment`
-- `custom`
+- `app_kind`: free-form string; the OpenAPI does not define an enum.
+- `app_provider`: provider name such as `slack` or `github`.
+- `app_external_id`: provider-assigned source identifier.
 
-Modern docs show both a generic `content` shape and a richer app shape with `kind`, `provider`, `external_id`, `fields`, `attachments`, `comments`, and `relations`. Use the richer shape when building app-aware search; at minimum provide stable IDs, content, source type, metadata, and relations.
+The v2 OpenAPI types `app_knowledge` only as a JSON string, so it cannot validate the nested item schema. For ingestion, follow the [App Sources](/essentials/v2/app-sources) guide's `kind` / `provider` / `external_id` / `fields` shape. On retrieval, treat `app_kind` as free-form rather than deriving a closed enum from the response schema.
 
 ### Memories
 
@@ -558,7 +573,7 @@ client.context.ingest(
             "text": "User prefers dark mode and concise answers.",
             "infer": True,
             "user_name": "Alex",
-            "tenant_metadata": json.dumps({"team": "engineering"}),
+            "metadata": json.dumps({"team": "engineering"}),
             "additional_metadata": {"source": "onboarding"},
             "relations": {"ids": ["pref_concise"]}
         }
@@ -579,7 +594,7 @@ Memory item fields:
 | `custom_instructions` | guide inference when `infer: true` |
 | `user_name` | helps inference |
 | `expiry_time` | TTL in seconds |
-| `tenant_metadata` | schema-aligned fields; for memory items, encode as a JSON string inside the JSON-stringified `memories` field |
+| `metadata` | schema-aligned fields; for memory items, encode as a JSON string inside the JSON-stringified `memories` field |
 | `additional_metadata` | free-form fields; keep as objects |
 | `relations` | explicit memory-to-memory links |
 
@@ -611,10 +626,12 @@ Pattern:
 
 ```ts
 while (true) {
-  const status = (await client.context.status({
+  const envelope = await client.context.status({
     database: "acme_corp",
     ids: ["policy_v2"],
-  })).data.statuses[0];
+  });
+  const status = envelope.data?.statuses?.[0];
+  if (!status) throw new Error("Status response contained no item");
 
   if (["graph_creation", "completed"].includes(status.indexingStatus as string)) break;
   if (["errored", "failed"].includes(status.indexingStatus as string)) {
@@ -688,7 +705,7 @@ Rules:
 | `type` | `knowledge`, `memory`, `all` | store selector for knowledge, memories, or both |
 | `query_by` | `hybrid`, `text` | default hybrid |
 | `operator` | `or`, `and`, `phrase` | only for `query_by: "text"` |
-| `mode` | `fast`, `thinking` | applies to hybrid; thinking improves quality but adds latency |
+| `mode` | `fast`, `thinking`, `auto` | applies to hybrid; thinking improves quality but adds latency; auto lets the service choose |
 | `max_results` | integer/null | default around 10; max documented as 50 |
 | `alpha` | `0.0`–`1.0` or `auto` | hybrid weight; `1.0` semantic, `0.0` BM25 |
 | `recency_bias` | `0.0`–`1.0` | boost newer content |
@@ -831,7 +848,7 @@ Practical guidance from `essentials/v2/api-results.mdx`:
 Use the SDK helper from `essentials/v2/api-results.mdx`:
 
 - Python: `build_string(result)` from `hydra_db.helpers`
-- TypeScript: `buildString(result)` from `@hydradb/sdk`
+- TypeScript: `buildString(result)` from `@hydradb/sdk/helpers`
 
 Python:
 
@@ -839,10 +856,8 @@ Python:
 import os
 from hydra_db import HydraDB
 from hydra_db.helpers import build_string
-from openai import OpenAI
 
 hydra = HydraDB(token=os.environ["HYDRA_DB_API_KEY"])
-openai = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
 question = "How does authentication work?"
 
@@ -872,11 +887,10 @@ messages = [
 TypeScript:
 
 ```ts
-import { HydraDBClient, buildString } from "@hydradb/sdk";
-import OpenAI from "openai";
+import { HydraDBClient } from "@hydradb/sdk";
+import { buildString } from "@hydradb/sdk/helpers";
 
 const hydra = new HydraDBClient({ token: process.env.HYDRA_DB_API_KEY });
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const question = "How does authentication work?";
 
@@ -954,17 +968,17 @@ Field options:
 
 | Need | Put it in | Filter with |
 |---|---|---|
-| Hot-path exact filters: department, region, environment, status | `tenant_metadata` | top-level `metadata_filters` |
+| Hot-path exact filters: department, region, environment, status | `metadata` | top-level `metadata_filters` |
 | Free-form display/bookkeeping: author, provider IDs, version | `additional_metadata` | `metadata_filters.additional_metadata` |
-| Provider app fields for UI/citations | `additional_metadata` or app `fields` | usually not filtered unless needed |
+| Provider-specific values for UI/citations | `additional_metadata` | usually not filtered unless needed |
 | User/workspace partition | `collection` | not metadata |
 
 Rules:
 
 - Plan hot filter fields before first ingest; undeclared scope keys can be ignored.
 - Use exact equality filters; range/contains/fuzzy matching should be in the query or downstream reranker.
-- To change metadata on an indexed context item, re-ingest with the same `id` and `upsert: true`.
-- Do not rename metadata keys without re-ingesting affected sources.
+- For source metadata-only edits, use [Update Source Metadata](/api-reference/v2/endpoint/update-source-metadata); re-ingest with the same ID and `upsert: "true"` when content changes.
+- Treat a metadata-key rename as a migration: add the schema field, update or re-ingest affected sources, then update queries.
 
 ---
 
@@ -981,9 +995,9 @@ const sources = await client.context.list({
   page: 1,
   pageSize: 50,
   filters: {
-    tenant_metadata: { department: "support" },
-    additional_metadata: { author: "alice" },
-    source_fields: { type: "slack" },
+    metadata: { department: "support" },
+    additionalMetadata: { author: "alice" },
+    sourceFields: { type: "slack" },
   },
 });
 ```
@@ -995,9 +1009,9 @@ Parameters:
 - `type: "knowledge" | "memory"`
 - `ids`
 - `page`, `page_size` (1–100)
-- `filters.tenant_metadata`
-- `filters.additional_metadata`
-- `filters.source_fields`
+- `filters.metadata` / TypeScript `filters.metadata`
+- `filters.additional_metadata` / TypeScript `filters.additionalMetadata`
+- `filters.source_fields` / TypeScript `filters.sourceFields`
 - `include_fields` for projection
 
 ### Fetch original content
@@ -1066,6 +1080,7 @@ Use `type: "memory"` to delete memory IDs.
 | `422` | semantic validation failure | No |
 | `429` | rate limited | Yes with backoff |
 | `500` | internal error | Yes with backoff |
+| `502` | upstream provider/dependency error | Yes with backoff for idempotent operations |
 | `503` | temporary unavailability | Yes with backoff |
 
 ### Common error codes
@@ -1083,16 +1098,12 @@ Use `type: "memory"` to delete memory IDs.
 | `INTERNAL_ERROR` | unexpected server error |
 | `SERVICE_UNAVAILABLE` | dependency unavailable / under load |
 
-Retry only `429`, `500`, `503`; use bounded exponential backoff with jitter.
+Retry only `429` and transient `5xx` responses such as `500`, `502`, and `503`; retry writes only when they are idempotent. Use bounded exponential backoff with jitter.
 
 SDK errors:
 
 ```python
-from hydra_db.errors import (
-    InternalServerError,
-    ServiceUnavailableError,
-    TooManyRequestsError,
-)
+from hydra_db.core.api_error import ApiError
 
 try:
     result = client.query(
@@ -1100,13 +1111,14 @@ try:
         query="pricing tiers",
         type="knowledge",
     )
-except (TooManyRequestsError, InternalServerError, ServiceUnavailableError) as exc:
-    # retryable (429 / 500 / 503) — back off and retry; exc.status_code has the code
-    pass
+except ApiError as exc:
+    if exc.status_code != 429 and exc.status_code < 500:
+        raise
+    # Retryable: back off with jitter, keep attempts bounded, then retry.
 ```
 
 ```ts
-import { HydraDBError } from "@hydradb/sdk";
+import { HydraDB, HydraDBError } from "@hydradb/sdk";
 
 try {
   const result = await client.query({
@@ -1116,9 +1128,8 @@ try {
   });
 } catch (error) {
   if (error instanceof HydraDBError) {
-    const code = error.body?.error?.code;
-    const requestId = error.body?.meta?.request_id;
-    console.error({ code, requestId });
+    const body = error.body as HydraDB.HandlerErrorResponse | undefined;
+    console.error({ code: body?.detail?.errorCode, statusCode: error.statusCode });
   }
   throw error;
 }
@@ -1160,7 +1171,7 @@ Common architecture across cookbooks:
 
 - [ ] Forgetting `API-Version: 2` in raw HTTP calls.
 - [ ] Parsing raw HTTP response from the top level instead of `data`.
-- [ ] Assuming SDK responses include the raw envelope; SDKs unwrap `data`.
+- [ ] Reading an SDK response payload from the top level instead of the envelope's `.data` field.
 - [ ] Searching immediately after database creation without polling readiness.
 - [ ] Searching immediately after ingestion without polling `context.status` or using webhooks.
 - [ ] Treating `processing`/`queued` content as searchable.
@@ -1168,7 +1179,7 @@ Common architecture across cookbooks:
 - [ ] Omitting `collection` for user memories.
 - [ ] Writing with one `collection` and reading with another.
 - [ ] Using metadata filters for user partitioning instead of `collection`.
-- [ ] Using undeclared `tenant_metadata` keys in `metadata_filters`.
+- [ ] Using undeclared schema-backed `metadata` keys in `metadata_filters`.
 - [ ] Putting hot filters in free-form metadata instead of database schema.
 - [ ] Expecting `query_forceful_relations` to work in `mode: "fast"`.
 - [ ] Setting `graph_context: false` and expecting graph fields.
@@ -1233,7 +1244,7 @@ curl -s -X POST 'https://api.hydradb.com/databases' \
   -H "Content-Type: application/json" \
   -d "{\"database\":\"${DATABASE}\"}"
 
-# 2. Check readiness. Poll this until .data.infra.ready_for_ingestion is true.
+# 2. Check readiness. Poll until scheduler, graph, and both vector stores are true.
 curl -s "https://api.hydradb.com/databases/status?database=${DATABASE}" \
   -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
   -H "API-Version: 2" | jq '.data.infra'
@@ -1283,23 +1294,22 @@ curl -s -X POST 'https://api.hydradb.com/context/ingest' \
       "collection": "default",
       "title": "Pricing discussion - Slack #product",
       "type": "slack",
+      "kind": "message",
+      "provider": "slack",
+      "external_id": "1715012345.000100",
       "url": "https://slack.com/archives/C123/p1715012345000100",
       "timestamp": "2025-01-15T12:30:00Z",
-      "content": {
-        "text": "We agreed on three tiers: Starter at $29, Pro at $79, Enterprise at $199."
+      "fields": {
+        "kind": "message",
+        "body": "We agreed on three tiers: Starter at $29, Pro at $79, Enterprise at $199.",
+        "author": "alice",
+        "thread_id": "1715012345.000100"
       },
-      "tenant_metadata": {
+      "metadata": {
         "channel": "product",
         "workspace": "acme"
       },
-      "additional_metadata": {
-        "author": "alice",
-        "slack_ts": "1715012345.000100"
-      },
-      "relations": {
-        "ids": ["slack_thread_root_001"],
-        "properties": { "relation": "same_thread" }
-      }
+      "additional_metadata": { "slack_ts": "1715012345.000100" }
     }
   ]'
 ```
