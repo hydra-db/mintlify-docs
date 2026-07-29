@@ -137,7 +137,7 @@ curl -X DELETE 'https://api.hydradb.com/context' \
 }
 ```
 
-```json 404 - nothing matched
+```json 404 - nothing matched (strict mode)
 {
   "success": false,
   "data": {
@@ -168,8 +168,35 @@ curl -X DELETE 'https://api.hydradb.com/context' \
 
 ## Status codes
 
-The status code tells you whether the delete happened. `200` means at least one
-source was removed; a delete that did not happen never returns `200`.
+**By default, every outcome returns `200`** - including a delete that removed
+nothing. The real result is in the body, so check `data.deleted_count` and
+`data.results[]` rather than the status code.
+
+```bash Default - always 200
+curl -X DELETE 'https://api.hydradb.com/context' \
+  -H "Authorization: Bearer <your_api_key>" \
+  -H "API-Version: 2" \
+  -H "Content-Type: application/json" \
+  -d '{ "database": "acme_corp", "ids": ["policy_main"], "type": "knowledge" }'
+```
+
+### Opt in to honest status codes
+
+Send `X-HydraDB-Delete-Status: strict` and a delete that did not happen returns
+`404`, `409`, or `500` instead of `200`. **This is the recommended mode for new
+integrations** - it is the only way to detect a failed delete from the status
+code alone.
+
+```bash Strict - honest status codes
+curl -X DELETE 'https://api.hydradb.com/context' \
+  -H "Authorization: Bearer <your_api_key>" \
+  -H "API-Version: 2" \
+  -H "X-HydraDB-Delete-Status: strict" \
+  -H "Content-Type: application/json" \
+  -d '{ "database": "acme_corp", "ids": ["policy_main"], "type": "knowledge" }'
+```
+
+In strict mode:
 
 | Status | Code | Meaning |
 | --- | --- | --- |
@@ -179,19 +206,22 @@ source was removed; a delete that did not happen never returns `200`.
 | `500` | `INTERNAL_ERROR` | A store failed to remove the source. The delete is retryable. |
 
 <Warning>
-  Deleting a source that is still indexing is the case worth handling. Ingestion
-  is asynchronous, so an ingest-then-delete sequence - what most teardown and
-  test scripts do - can reach the source before it finishes indexing. That
-  returns `409`, and the source is **not** deleted. Retry once indexing
-  completes, or poll [Source Status](/api-reference/v2/endpoint/source-status)
-  first.
+  Deleting a source that is still indexing is the case worth handling, and the
+  main reason to turn strict mode on. Ingestion is asynchronous, so an
+  ingest-then-delete sequence - what most teardown and test scripts do - can
+  reach the source before it finishes indexing. The source is **not** deleted.
+
+  In the default mode that comes back as a `200` with `deleted_count: 0`, which
+  is exactly the silent failure that leaves data behind. In strict mode it is a
+  `409`. Retry once indexing completes, or poll
+  [Source Status](/api-reference/v2/endpoint/source-status) first.
 </Warning>
 
 On `404`, `409`, and `500` the response `data` still carries the same
 `results` / `deleted_count` payload a `200` carries, so you can read per-ID
 outcomes on a failure exactly as you would on success:
 
-```json 409 - still indexing
+```json 409 - still indexing (strict mode)
 {
   "success": false,
   "data": {
@@ -217,21 +247,32 @@ outcomes on a failure exactly as you would on success:
 }
 ```
 
-<Note>
-  **Previously this endpoint returned `200` for every outcome**, with the real
-  result only in the nested `data.success`. If your integration checks
-  `response.ok` or `status == 200`, it was silently treating blocked deletes as
-  successful - that is the bug this change fixes, and you should now see those
-  failures surface.
+### Which mode you get
 
-  If you need time to adapt, send `X-HydraDB-Delete-Status: legacy` to restore
-  the old unconditional `200` for a transition period. This header is temporary
-  and will be removed; prefer reading the status code.
+The header always wins. Without it, the server default applies.
+
+| Request | Behaviour |
+| --- | --- |
+| No header | The server default - currently `legacy`, so `200` for every outcome. |
+| `X-HydraDB-Delete-Status: strict` | Honest `404` / `409` / `500`. |
+| `X-HydraDB-Delete-Status: legacy` | `200` for every outcome, whatever the server default. |
+
+<Note>
+  **The default is expected to become `strict` in a future release.** Adopting
+  `strict` now means that change is a no-op for you.
+
+  When it happens, `X-HydraDB-Delete-Status: legacy` keeps the unconditional
+  `200` for any integration that is not ready. Both header values are supported
+  and neither has a removal date - if that ever changes, we will announce it.
+
+  If your integration checks `response.ok` or `status == 200` today, it is
+  treating blocked deletes as successful. That is the failure strict mode
+  surfaces.
 </Note>
 
 ## Some additional notes
 
-- **Partial-success semantics:** For `type=knowledge`, each ID is reported independently in `results[]`. A failure on one ID does not stop the rest. For `type=memory`, the response reports an aggregate `user_memory_deleted` reflecting _all_ listed IDs. One exception: if any source in the request is still indexing, the whole request is refused with `409` and nothing is deleted.
+- **Partial-success semantics:** For `type=knowledge`, each ID is reported independently in `results[]`. A failure on one ID does not stop the rest. For `type=memory`, the response reports an aggregate `user_memory_deleted` reflecting _all_ listed IDs. One exception: if any source in the request is still indexing, the whole request is refused and nothing is deleted - reported as `409` in strict mode, and as a `200` with `deleted_count: 0` by default.
 - **Retrieval drops the source immediately:** Even before background cleanup finishes, deleted IDs disappear from `/query` and `/context/list` responses.
 - **Mixed deletes need two calls:** To delete both knowledge and memory items, send two requests  -  one with `type=knowledge`, one with `type=memory`.
 
