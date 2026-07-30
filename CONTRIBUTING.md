@@ -158,22 +158,27 @@ Every commit must include the DCO sign-off.
 
 ### Code snippet convention
 
-Readers copy-paste individual blocks, so every fenced code block must be one of:
+Readers copy-paste individual blocks, so every fenced **executable** code block (code a
+reader would run: Python/TypeScript/etc. making SDK or API calls) must be one of:
 
 1. **Standalone** — includes its imports and client construction, and runs as-is when
-   pasted into a fresh file. The **first** code block on a page (and the first block of
-   each language in a `CodeGroup`) must be standalone.
-2. **Continuation** — depends on a variable (usually `client`) defined in an earlier
-   block on the same page. It must say so on its **first line** with a
-   language-appropriate marker comment:
+   pasted into a fresh file. The **first** executable block on a page (and the first
+   block of each language in a `CodeGroup`) must be standalone.
+2. **Continuation** — depends on state (usually `client`) defined in an **earlier block
+   on the page** — not necessarily the immediately preceding one. It must say so on its
+   **first line** with a language-appropriate marker comment naming what it assumes:
 
    ```ts
-   // Continues from the previous block (assumes `client`)
+   // Continues from an earlier block (assumes `client`)
    ```
 
    ```python
-   # Continues from the previous block (assumes `client`)
+   # Continues from an earlier block (assumes `client`)
    ```
+
+**Non-executable blocks are exempt**: Mermaid diagrams, JSON/JSONC payloads, YAML/config
+fragments, shell commands, and `requirements.txt`-style listings need no marker — the
+rule applies to code a reader is expected to paste into a program and run.
 
 Never publish a block that silently depends on earlier state — the DX audit found 217
 such fragments, and they are the main reason documented snippets fail when readers run
