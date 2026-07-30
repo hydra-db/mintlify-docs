@@ -1,0 +1,221 @@
+---
+title: "Build a personalized company assistant"
+description: "Combine Slack and Notion knowledge with per-user memories in one safe retrieval flow."
+---
+
+This cookbook builds an assistant that answers company questions from shared Slack and Notion content while adapting the answer to the current user's saved preferences.
+
+It demonstrates the complete HydraDB lifecycle:
+
+1. Create and wait for a database.
+2. Ingest shared app content as Knowledge.
+3. Ingest a user preference as Memory.
+4. Wait until both sources are searchable.
+5. Query the two stores together with the user's collection.
+
+## Design the scopes first
+
+For a B2B product, use one database per customer and one collection per retrieval scope. This example keeps shared company content in `company_shared` and each user's memories in a user-specific collection.
+
+| Context | Database | Collection | Store |
+| --- | --- | --- | --- |
+| Slack and Notion content available to the company | `acme` | `company_shared` | Knowledge |
+| Alex's answer-format preference | `acme` | `user_alex` | Memory |
+
+At query time, use `collections` to read both scopes. This is deliberate: querying only `user_alex` would not include the shared company content, and querying only `company_shared` would not include Alex's preference.
+
+<Warning>
+  Make this scope map match your authorization model. Do not add a collection to a query unless the current caller is allowed to read it.
+</Warning>
+
+## 1. Create the database
+
+```typescript
+import { HydraDBClient } from "@hydradb/sdk";
+
+const client = new HydraDBClient({
+  token: process.env.HYDRA_DB_API_KEY,
+});
+
+const database = "acme";
+
+await client.databases.create({ database });
+
+while (true) {
+  const status = await client.databases.status({ database });
+  if (status.data.infra.readyForIngestion) break;
+  await new Promise((resolve) => setTimeout(resolve, 5_000));
+}
+```
+
+In a production integration, make database creation idempotent and handle an existing database before polling its status.
+
+## 2. Ingest Slack and Notion as Knowledge
+
+Your connector should normalize each external record into a stable ID, useful title, canonical URL, searchable content, and metadata. Reuse the same ID when the external record changes so `upsert: true` can replace the prior version.
+
+```typescript
+const knowledge = await client.context.ingest({
+  type: "knowledge",
+  database,
+  collection: "company_shared",
+  upsert: true,
+  appKnowledge: JSON.stringify([
+    {
+      id: "slack_C123_1715012345_000100",
+      database,
+      collection: "company_shared",
+      title: "Pricing discussion — #product",
+      type: "slack",
+      url: "https://acme.slack.com/archives/C123/p1715012345000100",
+      timestamp: "2026-07-01T12:30:00Z",
+      content: {
+        text: "The approved tiers are Starter at $29, Pro at $79, and Enterprise at $199.",
+      },
+      metadata: { department: "product" },
+      additional_metadata: {
+        channel: "product",
+        author: "alice",
+        external_id: "1715012345.000100",
+      },
+    },
+    {
+      id: "notion_pricing_faq_2026_07",
+      database,
+      collection: "company_shared",
+      title: "Pricing FAQ",
+      type: "notion",
+      url: "https://www.notion.so/acme/pricing-faq",
+      timestamp: "2026-07-02T09:00:00Z",
+      content: {
+        text: "Enterprise pricing is quote-based when a customer requires custom terms or procurement review.",
+      },
+      metadata: { department: "sales" },
+      additional_metadata: {
+        page_id: "pricing-faq",
+        source: "notion",
+      },
+    },
+  ]),
+});
+```
+
+See [App sources](/essentials/v2/app-sources) for thread relations, attachments, incremental updates, and per-provider field patterns.
+
+## 3. Ingest a user preference as Memory
+
+Alex's input is already an explicit durable preference, so use `infer: false`. If the input were raw feedback or a conversation transcript from which you wanted HydraDB to derive a preference, use `infer: true` instead.
+
+```typescript
+const memory = await client.context.ingest({
+  type: "memory",
+  database,
+  collection: "user_alex",
+  upsert: true,
+  memories: JSON.stringify([
+    {
+      id: "alex_answer_style",
+      text: "Alex prefers concise, bulleted commercial summaries with prices called out.",
+      infer: false,
+      additional_metadata: { source: "onboarding" },
+    },
+  ]),
+});
+```
+
+## 4. Wait for both requests
+
+Both ingestion calls return queued IDs. Wait for each source before querying it. `graph_creation` is searchable; `completed` also means graph processing is complete.
+
+```typescript
+async function waitUntilSearchable(ids: string[], collection: string) {
+  while (true) {
+    const response = await client.context.status({
+      database,
+      collection,
+      ids,
+    });
+
+    const statuses = response.data.statuses;
+    if (statuses.some((item) => ["errored", "failed"].includes(item.indexingStatus))) {
+      throw new Error("HydraDB could not index one or more sources");
+    }
+    if (statuses.every((item) => ["graph_creation", "completed"].includes(item.indexingStatus))) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 2_000));
+  }
+}
+
+await waitUntilSearchable(
+  knowledge.data.results.map((item) => item.id),
+  "company_shared",
+);
+await waitUntilSearchable(
+  memory.data.results.map((item) => item.id),
+  "user_alex",
+);
+```
+
+For event-driven applications, replace this polling loop with [indexing webhooks](/essentials/v2/webhooks).
+
+## 5. Retrieve shared context and personal context together
+
+Use `type: "all"` and give `collections` the shared scope plus the authenticated user's scope. `query_apps: true` makes a hybrid knowledge query app-aware; it does not limit results to app sources.
+
+```typescript
+const result = await client.query({
+  database,
+  collections: ["company_shared", "user_alex"],
+  query: "What pricing tiers should I explain to a prospect?",
+  type: "all",
+  queryBy: "hybrid",
+  mode: "thinking",
+  queryApps: true,
+  maxResults: 8,
+});
+
+const contextForModel = result.data.chunks.map((chunk) => ({
+  text: chunk.content,
+  title: chunk.title,
+  url: chunk.url,
+}));
+```
+
+Pass the ranked chunks to your model in their returned order. When you show the final answer, retain the `title` and `url` data so users can open the Slack message or Notion page that supported it.
+
+## Expected result
+
+For the sample sources and query above, the assistant should produce a concise, commercial answer that uses Alex's saved preference and cites the company sources. For example:
+
+> - **Starter:** $29
+> - **Pro:** $79
+> - **Enterprise:** $199; use quote-based pricing when custom terms or procurement review is needed.
+>
+> Sources: *Pricing discussion — #product* and *Pricing FAQ*.
+
+The exact wording is your model's responsibility, but a correct integration should retrieve both the pricing information from Knowledge and the preference for a concise, bulleted format from Memory. The final answer should retain source titles and URLs from `result.data.chunks` for citations.
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| The query returns no Slack or Notion content | The Knowledge sources are still queued, failed indexing, or were written to a different collection. | Check `GET /context/status` for each returned ID and query the same `company_shared` collection used during ingestion. |
+| The answer has pricing facts but ignores Alex's preferred format | The Memory was not indexed, `user_alex` was omitted from `collections`, or the query used `type: "knowledge"`. | Wait for the Memory's status, include `user_alex` in `collections`, and use `type: "all"`. |
+| The assistant returns another user's Memory | Your application added an unauthorized collection to the query. | Derive the user collection from the authenticated caller on the server; never accept an arbitrary collection ID from the client. |
+
+## Operational checklist
+
+- Use stable external IDs and `upsert: true` for Slack and Notion syncs.
+- Keep personal Memory and shared Knowledge in separate collections.
+- Authorize requested collections in your application before calling `/query`.
+- Wait for source status or receive a webhook before making newly ingested context visible.
+- Use `infer: false` for explicit facts and `infer: true` only for raw signals that need extraction.
+- Keep your original source of record; HydraDB retrieval context is not a replacement for your audit log or permissions system.
+
+## Next steps
+
+- [Choose Memory or Knowledge](/essentials/v2/memory-or-knowledge)
+- [App sources](/essentials/v2/app-sources)
+- [Query](/essentials/v2/query)
+- [How to use API results](/essentials/v2/api-results)
