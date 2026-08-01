@@ -63,15 +63,81 @@ That means a valid filter with no matching sources returns an empty result set; 
 | --- | --- |
 | Multiple keys | AND logic. Every provided key/value must match. |
 | Database + additional metadata | AND logic across both layers. |
-| Values | Exact equality for scalar values. |
-| Lists | Exact set equality for supported list-shaped comparisons, not OR/IN. For example, `tags: ["alpha", "beta"]` matches a stored `"alpha,beta"` set, but `tags: ["alpha"]` does not. |
+| Scalar values | Exact equality. |
+| List values (OR / ANY) | A list means **match ANY** of the listed values. `tags: ["alpha", "beta"]` matches a source tagged `alpha`, a source tagged `beta`, or a source tagged both. Supported on `VARCHAR` fields only. |
+| List values on non-`VARCHAR` fields | Rejected with `400 VALIDATION_ERROR`. Pass a single scalar instead. |
+| ALL / AND within one key | **Not supported.** See [Matching several values on one field](#matching-several-values-on-one-field). |
 | Range / contains / fuzzy | Not supported in user `metadata_filters`. Put fuzzy concepts in `query`, use semantic metadata fields, or post-process client-side. |
-| OR | Run multiple queries and union client-side. |
 | Graph context | Respects metadata filters; graph paths from excluded sources are removed. |
+
+<Note>
+  **A list is OR, not AND.** Passing several values for one key widens the result set  -  it never narrows it. Different keys still AND together, so `{ "department": ["legal", "finance"], "status": "published" }` reads as *(department is legal OR finance) AND status is published*.
+</Note>
 
 <Warning>
   `metadata_filters` are hard constraints, not semantic hints. A filter like `{ "mood": "happy" }` requires an exact stored value; it does not expand to related values like "joyful" or "cheerful". To search metadata text semantically, declare a `VARCHAR` field with `enable_dense_embedding` and include the concept in the main `query`.
 </Warning>
+
+### Filtering on several values at once (ANY)
+
+Give a key a list to match a source holding **any one** of those values. This is the only list behavior HydraDB implements.
+
+Two sources, ingested separately  -  one with `department: "finance"`, one with `department: "legal"`:
+
+```json
+{
+  "database": "acme",
+  "query": "What is our Q3 spending policy?",
+  "metadata_filters": {
+    "department": ["finance", "legal"]
+  }
+}
+```
+
+Both sources are candidates. A single-element list behaves the same as the scalar form, so `["finance"]` and `"finance"` are interchangeable.
+
+The same applies to free-form fields nested under `additional_metadata`:
+
+```json
+{
+  "metadata_filters": {
+    "additional_metadata": {
+      "author": ["alice", "bob"]
+    }
+  }
+}
+```
+
+If a source stores a multi-valued field as a comma-joined string (for example `tags: "alpha,beta"`), a list filter matches when **any** requested value is present in that set  -  `["alpha"]`, `["beta"]`, and `["beta", "gamma"]` all match it.
+
+#### Matching several values on one field
+
+There is **no ALL / AND operator for a single key**. You cannot ask for "sources tagged both `alpha` and `beta`" through `metadata_filters`  -  a list always means ANY.
+
+If you need AND across values, pick one of these:
+
+- **Model the combination as its own field.** Declare a dedicated key (for example `tier: "alpha_beta"`) and set it at ingest. This keeps the fast pre-filter path.
+- **Split across different keys.** Separate keys AND together, so `{ "language": "en", "status": "published" }` requires both.
+- **Intersect client-side.** Query once per value and keep the source IDs present in every result set.
+
+<Warning>
+  A list filter never means ALL. `tags: ["alpha", "beta"]` returns sources tagged only `alpha` as well  -  it does not restrict results to sources carrying both values.
+</Warning>
+
+#### Lists are `VARCHAR`-only
+
+List values are implemented for `VARCHAR` fields. A list against a field declared as `INT8`, `INT16`, `INT32`, `INT64`, `FLOAT`, `DOUBLE`, or `BOOL` is rejected outright rather than silently returning nothing:
+
+```json
+{
+  "error": {
+    "code": "VALIDATION_ERROR",
+    "message": "metadata_filters.priority: list/array values are not supported for INT64 fields (only VARCHAR); pass a single scalar value instead"
+  }
+}
+```
+
+Fields you never declared in `database_metadata_schema`, and everything under `additional_metadata`, are treated as `VARCHAR`  -  lists work there as normal.
 
 ---
 
@@ -81,7 +147,7 @@ Most of the time the defaults are right. When they aren't, here's where to start
 
 - **Plan scoping fields before first ingest.** Schema is immutable, and undeclared scope keys are silently ignored at query time. If you'll scope on it more than once, declare it.
 - **Pick `metadata` for hot paths, `additional_metadata` for cold ones.** Database-level scopes are pre-applied in the vector store; document-level scopes force a post-retrieval pass with over-fetch.
-- **Use exact-equality only.** `metadata_filters` are equality constraints across all categories. Range, contains, or fuzzy matching belong in the query, query mode, or downstream reranking  -  not here.
+- **Use equality and ANY-of-a-list only.** A scalar is exact equality; a list on a `VARCHAR` field matches any one of its values. Range, contains, fuzzy matching, and ALL-of-a-list belong in the query, query mode, or downstream reranking  -  not here.
 - **Keep keys stable.** Renaming a metadata key requires re-ingesting affected sources. Same goes for changing `enable_match` flags.
 - **Ingested metadata is immutable.** Once a source is indexed, its `metadata` and `additional_metadata` values are locked. To change them, re-ingest the source with the new values (use `upsert: true` and the same `id`).
 - **Don't substitute `metadata_filters` for `collection`.** `metadata_filters` scopes results *inside* a partition. For partitioning by user, team, or workspace, use [`collection`](/essentials/v2/multi-tenant).
@@ -414,7 +480,9 @@ Use [`POST /context/list`](/api-reference/v2/endpoint/list-documents) when you w
 | Schema field changes don't take effect | Schema is immutable after database creation | Create a new database with the corrected schema. There's no in-place schema migration. |
 | Metadata values on a source don't update | Ingested metadata is immutable | Re-ingest the source with `upsert: true` and the same `id`. |
 | Query returns 0 results after adding a scope | Over-scoping  -  combined constraints exclude everything | Start with the minimum hard constraints; add scopes one at a time and re-check counts. |
-| Range / contains / fuzzy scope doesn't work | `metadata_filters` is equality-only | Move that constraint into the `query` text, use a different `query_by`, or apply it in your own post-scoping. |
+| Range / contains / fuzzy scope doesn't work | `metadata_filters` supports equality and ANY-of-a-list only | Move that constraint into the `query` text, use a different `query_by`, or apply it in your own post-scoping. |
+| A list filter returns *more* sources than expected | Lists are ANY (OR), not ALL | Expected  -  `["alpha", "beta"]` matches sources holding either value. There is no ALL operator; see [Matching several values on one field](#matching-several-values-on-one-field). |
+| `400 VALIDATION_ERROR` naming a field and its type | A list was passed for a non-`VARCHAR` declared field | Lists are `VARCHAR`-only. Pass a single scalar for `INT*`/`FLOAT`/`DOUBLE`/`BOOL` fields. |
 | Fields used in `metadata` but missing from response objects | Field declared as embedding-only without `enable_match` | Embedding-enabled doesn't imply scoping-enabled. Add `enable_match: true` to use it in `metadata_filters`. |
 | `additional_metadata` scope feels slow | It is  -  over-fetches ~3× to compensate for post-retrieval matching | Move the hot field into `metadata` and declare it in the schema. |
 | Metadata edit returns 400 | Unknown key, wrong type, over-size value, too-deep nesting, reserved key, or missing `collection` | Check schema and validation limits; send only `tenant_metadata` / `additional_metadata`. |
