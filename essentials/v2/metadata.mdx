@@ -68,6 +68,7 @@ That means a valid filter with no matching sources returns an empty result set; 
 | Range / contains / fuzzy | Not supported in user `metadata_filters`. Put fuzzy concepts in `query`, use semantic metadata fields, or post-process client-side. |
 | OR | Within one key, pass a list of values. Across different keys, run multiple queries and union client-side. |
 | Graph context | Respects metadata filters; graph paths from excluded sources are removed. |
+| Size | Each list holds at most **500** values, and the whole `metadata_filters` object is capped at **64 KiB**. See [Filter size limits](#filter-size-limits). |
 
 <Warning>
   `metadata_filters` are hard constraints, not semantic hints. A filter like `{ "mood": "happy" }` requires an exact stored value; it does not expand to related values like "joyful" or "cheerful". To search metadata text semantically, declare a `VARCHAR` field with `enable_dense_embedding` and include the concept in the main `query`.
@@ -164,7 +165,7 @@ await client.databases.create({
 | --- | --- | --- |
 | `name` | string | Metadata key. Must start with a letter or `_`, contain only letters/numbers/underscores, and not use reserved system names such as `source_id`, `chunk_id`, or `metadata`. |
 | `data_type` | `VARCHAR`, `BOOL`, `INT8`, `INT16`, `INT32`, `INT64`, `FLOAT`, `DOUBLE`, `JSON`, `ARRAY` or friendly aliases `string`, `boolean`, `integer`, `float`, `object`, `array` | Defaults to `VARCHAR`. |
-| `max_length` | integer | Max length for `VARCHAR`. Default `1024`, maximum `65535`. |
+| `max_length` | integer | Max length for `VARCHAR`. Default `1024`, maximum `65535`. This sizes one declared schema field, and is **not** the limit on how much metadata you can send per request — for that see [Size limits](#size-limits). |
 | `enable_match` | boolean | Creates the intended fast exact-match/filtering path for this field. Use this for top-level `metadata_filters` keys. |
 | `enable_dense_embedding` | boolean | Adds a dense semantic-search lane for a `VARCHAR` metadata field. |
 | `enable_sparse_embedding` | boolean | Adds a sparse/BM25 keyword-search lane for a `VARCHAR` metadata field. |
@@ -178,6 +179,106 @@ Limits and guardrails:
 - Dense/sparse embedding flags are only valid on `VARCHAR` fields.
 - Runtime `metadata` values must match the declared type when the tenant has a schema.
 - Unknown `metadata` keys are rejected on ingest/edit when a non-empty tenant schema exists.
+- Each metadata layer has a byte budget per request — see [Size limits](#size-limits).
+
+### Size limits
+
+Every request that attaches metadata is checked against two caps, on ingest and on
+metadata edit alike:
+
+| Layer | Send as | Cap |
+| --- | --- | --- |
+| Database (tenant) metadata | `metadata` at ingest, `database_metadata` on edit | **16 KiB** (16,384 bytes) |
+| Document metadata | `additional_metadata` | **1 KiB** (1,024 bytes) |
+
+Older spellings are still accepted, but **not uniformly** — which one works
+depends on the endpoint:
+
+| Alias | On `/context/ingest` | On `PATCH /context/{id}/metadata` |
+| --- | --- | --- |
+| `tenant_metadata` | accepted | accepted (`database_metadata` wins if both are sent) |
+| `document_metadata` | accepted | **rejected with `400`** — send `additional_metadata` |
+
+Where an alias is accepted it is held to exactly the same cap as the canonical
+field. Use the canonical names above and this never comes up.
+
+The cap applies to the **whole map**, not to any one value, and it is measured on
+the map's compact JSON encoding in UTF-8 bytes. Three consequences worth planning
+around:
+
+- **Keys and punctuation count.** Quotes, colons, commas and braces are all part of
+  the payload you are billed for.
+- **Bytes, not characters.** Accented Latin characters cost 2 bytes, most CJK
+  characters 3, and emoji 4.
+- **Budget in bytes from the start.** A 950-character summary sounds comfortably
+  under a 1 KiB cap, but with two small sibling keys it serializes to 1,015
+  bytes — 65 bytes of that is structure alone. Push the summary to 1,000
+  characters and the request is rejected at 1,065 bytes.
+
+```json Document metadata: 1,015 bytes, just inside the 1 KiB cap
+{"title":"Q3 Board Deck","author":"ada@example.com","summary":"<950 characters>"}
+```
+
+Exceeding either cap fails the whole request with `400` before anything is
+ingested. The message names the offending field and reports both numbers, so you
+can see exactly how far over you are:
+
+```json
+{
+  "success": false,
+  "data": null,
+  "error": {
+    "code": "INVALID_INPUT",
+    "message": "additional_metadata is too large (1065 bytes when serialized; the maximum is 1024). Reduce the number or size of metadata fields."
+  }
+}
+```
+
+On [`PATCH /context/{id}/metadata`](/api-reference/v2/endpoint/update-source-metadata)
+the same message is prefixed with `invalid metadata edit:`.
+
+<Tip>
+  If a document needs more than 1 KiB of descriptive metadata, put the long text
+  in the document body where it gets chunked and embedded, and keep
+  `additional_metadata` for the short values you actually filter on.
+</Tip>
+
+### Filter size limits
+
+The caps above bound the metadata you **store**. `metadata_filters` on
+[`/query`](/api-reference/v2/endpoint/query) has its own, separate pair — these
+bound what you **send at query time** and are unrelated to how much metadata a
+source carries:
+
+| Limit | Cap |
+| --- | --- |
+| Values in any one list | **500** |
+| Whole `metadata_filters` object | **64 KiB** (65,536 bytes) |
+
+Measured the same way — compact JSON, UTF-8 bytes, keys and punctuation counted —
+and the object total includes the nested `additional_metadata` dict.
+
+Both exist because every value in a list is expanded into the filter expression
+sent to the vector store. The per-list cap catches one runaway list; the object
+cap catches many individually-legal lists adding up. Twenty lists of 500 values
+are each within the element cap but total roughly 127 KiB, so the object cap is
+what rejects them.
+
+Over either limit returns `400` before the query runs, naming the offending key
+or the actual byte count:
+
+```
+metadata_filters.customer_id (got 743) must contain at most 500 values
+
+metadata_filters is too large (130251 bytes when serialized; the maximum is 65536).
+Reduce the number or size of filter values.
+```
+
+<Tip>
+  Needing far more than 500 values in one filter usually means the constraint
+  belongs in the data rather than the query — add a metadata field that groups
+  those values (a segment, tier, or cohort key) and filter on that instead.
+</Tip>
 
 ### Add schema fields later
 
@@ -417,7 +518,7 @@ Use [`POST /context/list`](/api-reference/v2/endpoint/list-documents) when you w
 | Range / contains / fuzzy scope doesn't work | `metadata_filters` is equality-only | Move that constraint into the `query` text, use a different `query_by`, or apply it in your own post-scoping. |
 | Fields used in `metadata` but missing from response objects | Field declared as embedding-only without `enable_match` | Embedding-enabled doesn't imply scoping-enabled. Add `enable_match: true` to use it in `metadata_filters`. |
 | `additional_metadata` scope feels slow | It is  -  over-fetches ~3× to compensate for post-retrieval matching | Move the hot field into `metadata` and declare it in the schema. |
-| Metadata edit returns 400 | Unknown key, wrong type, over-size value, too-deep nesting, reserved key, or missing `collection` | Check schema and validation limits; send only `tenant_metadata` / `additional_metadata`. |
+| Metadata edit returns 400 | Unknown key, wrong type, over-size payload (16 KiB database metadata / 1 KiB document metadata), too-deep nesting, reserved key, or missing `collection` | Check schema and [size limits](#size-limits); send only `tenant_metadata` / `additional_metadata`. |
 | Dense/sparse metadata edit rejects `null` | Null would leave stale semantic metadata vectors | Set a non-null value or re-ingest with the desired metadata. |
 | New schema field does not participate in semantic metadata search | Additive schema update does not alter/backfill existing Milvus fields yet | Create the desired schema before ingesting, or migrate/re-ingest into a database with the final schema. |
 
