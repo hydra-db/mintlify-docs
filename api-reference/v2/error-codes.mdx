@@ -1,0 +1,117 @@
+---
+title: "Error Code Reference"
+description: "The canonical catalog of every HydraDB error code — transport codes on the response envelope and pipeline codes on ingestion status entries — mapped to a canonical name, meaning, and what to do."
+---
+
+HydraDB surfaces error codes in **two** places, and they are drawn from two different code spaces. This page is the single, canonical mapping of every code to its meaning.
+
+| Where you see it | Field | Code space | Example |
+| --- | --- | --- | --- |
+| A failed API request | `error.code` (on the [response envelope](/api-reference/v2/error-responses)) | **Transport / request codes** — `SCREAMING_SNAKE_CASE` | `DATABASE_NOT_FOUND` |
+| An ingestion item that failed to process | `error_code` (on a `/context/status` [status item](/api-reference/v2/endpoint/source-status#status-item-fields)) | **Pipeline / status codes** — an `E`-number, plus symbolic aliases | `E1002` / `UNSUPPORTED_FORMAT` |
+
+<Info>
+Always branch on the **code**, never on the human-readable message — messages are localized/reworded over time, codes are stable. Handle unknown codes gracefully: new codes are added as the platform evolves.
+</Info>
+
+## Transport error codes
+
+These appear as `error.code` on the response envelope of a failed request. The **Typical status** is the HTTP status that usually accompanies the code (the [status table](/api-reference/v2/error-responses#http-status-codes) is authoritative for the class of failure).
+
+| Code | Typical status | Meaning |
+| --- | --- | --- |
+| `INVALID_INPUT` | `400` / `409` | A parameter is missing, malformed, wrongly encoded, or incompatible with another parameter. Also returned for a `409` conflict on the legacy `/tenants` create. |
+| `VALIDATION_ERROR` | `422` | The request was well-formed (valid JSON/form data) but failed semantic validation. |
+| `UNAUTHORIZED` | `401` | The `Authorization: Bearer <api_key>` header is missing, malformed, duplicated, or invalid — the request never authenticated. |
+| `FORBIDDEN` | `403` | Authenticated, but not permitted: the API key cannot access the resource, or an account/plan limit blocks the operation. |
+| `NOT_FOUND` | `404` | Generic "not found". Returned by the deprecated `/tenants` routes where the canonical routes return `DATABASE_NOT_FOUND`. |
+| `DATABASE_NOT_FOUND` | `404` | The requested database does not exist or is not visible to the current API key. |
+| `DATABASE_ALREADY_EXISTS` | `409` | A create received a `database` (formerly `tenant_id`) that is already in use. Returned by both `POST /databases` and `POST /byog/databases`. |
+| `SOURCE_NOT_FOUND` | `404` | The requested source or memory ID does not exist in the selected `database`/`collection`. |
+| `FILE_NOT_FOUND` | `404` | A referenced source/file could not be located for the operation (e.g. inspect/fetch of an unknown id). |
+| `RATE_LIMITED` | `429` | The API key exceeded its current rate limit. Retry with backoff. |
+| `TENANT_INFRA_NOT_READY` | `503` / `422` | Database provisioning is still in progress. Poll `GET /databases/status` until it is ready, then retry. |
+| `PROCESSING_FAILED` | `500` | A request-time processing step failed unexpectedly. |
+| `PARSE_ERROR` | `400` | The request payload could not be parsed. |
+| `BACKEND_ERROR` | `502` | An upstream/backend dependency returned an error. |
+| `SERVICE_UNAVAILABLE` | `503` | A dependency is temporarily unavailable or the service is under load. Retry with backoff. |
+| `INTERNAL_ERROR` | `500` | An unexpected server-side error. Retry with backoff; include `meta.request_id` if you contact support. |
+
+<Note>
+**Deprecated / alias codes.** These may still appear on legacy surfaces or in older SDKs; prefer the canonical code:
+
+| Legacy / alias | Canonical code | Notes |
+| --- | --- | --- |
+| `TENANT_NOT_FOUND` | `DATABASE_NOT_FOUND` (canonical) / `NOT_FOUND` (legacy `/tenants`) | Pre-rename name from the `tenant_id` era. The live API returns `DATABASE_NOT_FOUND` on `/databases` and the generic `NOT_FOUND` on the deprecated `/tenants` routes. |
+| `TENANT_ALREADY_EXISTS` | `DATABASE_ALREADY_EXISTS` (canonical) / `INVALID_INPUT` (legacy `/tenants`) | Same condition; the deprecated `/tenants` create keeps `INVALID_INPUT` for backward compatibility. |
+| `INVALID_PARAMETERS` | `INVALID_INPUT` | Older docs used `INVALID_PARAMETERS`; the API emits `INVALID_INPUT`. |
+| `INTERNAL_SERVER_ERROR` | `INTERNAL_ERROR` | Interchangeable 500 code; treat both as a retryable server fault. |
+
+See [Migrating from `tenant_id` and `sub_tenant_id`](/essentials/v2/multi-tenant#7-migrating-from-the-legacy-tenant-and-sub-tenant-fields).
+</Note>
+
+## Ingestion and status error codes
+
+Because ingestion is asynchronous, a per-item processing failure is **not** reported on the request envelope — it is reported later on the [`/context/status`](/api-reference/v2/endpoint/source-status) entry for that item, in its `error_code` field (empty string on non-errored items).
+
+Two of these codes describe a **caller** problem rather than a pipeline failure — this is the distinction that lets you tell a typo apart from a real failure:
+
+| `error_code` | Meaning | What to do |
+| --- | --- | --- |
+| `FILE_NOT_FOUND` | No source with this `id` exists in the given scope — typically a typo, an id that was never ingested, or one whose status expired. | Fix the `id` or (re-)ingest. Not a processing failure; retrying the status call won't change it. |
+| `INVALID_FILE_ID` | The `id` was empty or blank. | Send a non-empty `id`. |
+
+### Pipeline codes
+
+Every genuine processing failure carries a stable **E-code** (stored on the status item) with a symbolic canonical name. **Retry?** reflects the code's severity: *Recoverable* codes are transient — the pipeline retries them and a re-ingest usually succeeds; *Critical* codes are terminal for that input (fix the input; retrying the same content won't help).
+
+| E-code | Canonical name | Stage | Retry? | Meaning |
+| --- | --- | --- | --- | --- |
+| `E1001` | `PARSE_FAILED` | Parse | Recoverable | The file could not be processed; check the format and try again. |
+| `E1002` | `UNSUPPORTED_FORMAT` | Parse | Critical | Unsupported file format. Upload a PDF, DOCX, TXT, MD, or JSON file. |
+| `E1003` | `CORRUPTED_DOCUMENT` | Parse | Critical | The file appears corrupted or unreadable. Try a different file. |
+| `E1004` | `PARSE_OUTPUT_WRITE_FAILED` | Parse | Recoverable | Internal error saving the parsed file. Try again. |
+| `E2001` | `CHUNK_FAILED` | Chunk | Recoverable | Content could not be split for processing. Try again. |
+| `E2002` | `EMPTY_PARSED_CONTENT` | Chunk | Critical | No text could be extracted (empty or image-only file). |
+| `E2003` | `EMPTY_RAW_TEXT` | Chunk | Critical | No text content was provided in the request. |
+| `E2004` | `NO_PAIRS_CHUNKED` | Chunk | Critical | The conversation pairs could not be processed. Check the format. |
+| `E2005` | `CHUNK_OUTPUT_WRITE_FAILED` | Chunk | Recoverable | Internal error preparing content. Try again. |
+| `E3001` | `INFERENCE_FAILED` | Infer | Recoverable | Enrichment failed; data was stored but enrichment did not complete. |
+| `E3002` | `INFERENCE_QUOTA_TIMEOUT` | Infer | Recoverable | Enrichment capacity is busy. Retry in a few minutes. |
+| `E3003` | `INFERENCE_CIRCUIT_OPEN` | Infer | Recoverable | Enrichment service temporarily unavailable. Retry shortly. |
+| `E4001` | `EMBEDDING_FAILED` | Embed | Recoverable | Failed to index content for search. Re-upload. |
+| `E4002` | `EMBEDDING_QUOTA_TIMEOUT` | Embed | Recoverable | Indexing capacity is busy. Retry in a few minutes. |
+| `E4003` | `EMBEDDING_CIRCUIT_OPEN` | Embed | Recoverable | Indexing service temporarily unavailable. Retry shortly. |
+| `E5001` | `GRAPH_EXTRACTION_FAILED` | Graph extraction | Recoverable | Knowledge-graph creation errored; document was partially processed. |
+| `E5002` | `GRAPH_EXTRACTION_QUOTA_TIMEOUT` | Graph extraction | Recoverable | Graph capacity is busy. Retry in a few minutes. |
+| `E5003` | `GRAPH_EXTRACTION_CIRCUIT_OPEN` | Graph extraction | Recoverable | Graph service temporarily unavailable. Retry shortly. |
+| `E5004` | `MALFORMED_GRAPH_INPUT` | Graph extraction | Critical | The bring-your-own-graph payload was malformed. Fix and re-ingest. |
+| `E6001` | `VECTORSTORE_INDEXING_FAILED` | Sink | Recoverable | Failed to store the processed data. Try again. |
+| `E6002` | `TENANT_INFRA_NOT_READY` | Sink | Critical | Database infrastructure is still provisioning. Poll `GET /databases/status`, then retry. |
+| `E6003` | `GRAPH_INDEXING_FAILED` | Sink | Recoverable | Failed to write to the knowledge-graph store. Try again. |
+| `E7001` | `SOURCE_DOCUMENT_UPSERT_FAILED` | Orchestrator | Recoverable | Failed to register the document in the source catalog. Try again. |
+| `E7002` | `INDEXING_STATE_WRITE_FAILED` | Orchestrator | Recoverable | Internal tracking write failed. Try again. |
+| `E7003` | `MISSING_STAGE_OUTPUT` | Orchestrator | Critical | A required pipeline-stage output was missing. Re-ingest the source. |
+| `E9001` | `INGESTION_DISPATCH_ERROR` | Dispatch | Recoverable | Internal processing/dispatch error. Re-upload. |
+| `E9002` | `KAFKA_PUBLISH_FAILED` | Dispatch | Recoverable | Internal queuing error. Retry shortly. |
+| `E9003` | `DUPLICATE_SOURCE` | Dispatch | Critical | A source with this file already exists. Set `upsert=true` to replace it. |
+| `E9004` | `INGESTION_INCOMPLETE` | Orchestrator | Recoverable | Ingestion did not complete before its status expired. Upload the file again. |
+
+### Legacy symbolic status codes
+
+Older ingestion paths may store a symbolic name instead of an E-code. They are accepted and mapped to the same user-facing messages:
+
+| Symbolic code | Closest E-code | Meaning |
+| --- | --- | --- |
+| `PROCESSING_FAILED` | — | Generic processing failure; verify the file format is supported. |
+| `INGESTION_ERROR` | `E9001` | Unexpected error during ingestion. Re-upload. |
+| `INDEXING_DISPATCH_ERROR` | `E9001` | Internal processing error. Re-upload. |
+| `NO_CHUNKS_GENERATED` | `E2002` | No content could be extracted from the input. |
+| `CHUNKS_MISSING_DATA` | `E2002` | Content could not be split into processable chunks. |
+| `GRAPH_MISSING_DATA` | — | No processable content was found for knowledge-graph creation. |
+| `TOKEN_LIMIT_EXCEEDED` | — | The plan's ingestion limit was reached. Upgrade or wait for the reset. |
+
+## Related
+
+- [Error Responses](/api-reference/v2/error-responses) — the envelope shape, HTTP status classes, and retry patterns.
+- [Ingestion Status](/api-reference/v2/endpoint/source-status) — where `error_code` appears and how to poll for it.
