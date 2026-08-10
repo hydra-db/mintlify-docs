@@ -243,14 +243,14 @@ All endpoints return this envelope shape. Access the payload via `response.data`
 
 ## 5. Verifying processing
 
-Ingestion is async, so you need to confirm each source actually finished before it'll show up in [query](/essentials/v2/query). Poll [`GET /context/status`](/api-reference/v2/endpoint/source-status) with the `id`s you got back from ingestion. The snippets below loop until every item reaches a terminal state (`completed` or `errored`):
+Ingestion is async, so you need to confirm each source actually finished before it'll show up in [query](/essentials/v2/query). Poll [`GET /context/status`](/api-reference/v2/endpoint/source-status) with the `id`s you got back from ingestion. The snippets below loop until every item reaches a terminal state (`completed`, its legacy alias `success`, or `errored`):
 
 <CodeGroup>
 ```python Python SDK
 import time
 
 ids = ["policy_v2", "runbook_deploy"]
-terminal = {"completed", "errored"}
+terminal = {"completed", "errored", "success"}  # "success" = legacy alias for completed
 
 while True:
     status = client.context.status(
@@ -264,7 +264,7 @@ while True:
 ```
 ```typescript TypeScript SDK
 const ids = ["policy_v2", "runbook_deploy"];
-const terminal = new Set(["completed", "errored"]);
+const terminal = new Set(["completed", "errored", "success"]); // "success" = legacy alias for completed
 
 let status;
 while (true) {
@@ -313,7 +313,7 @@ done
 }
 ```
 
-Status values move forward through `queued` → `processing` → `graph_creation` → `completed` (or land in `errored` on failure). Poll every few seconds; most documents complete in 1–5 minutes. The full table  -  including the `success` alias that occasionally appears for `completed`  -  is on [Ingestion Status](/api-reference/v2/endpoint/source-status).
+Status values move forward through `queued` → `processing` → `graph_creation` → `completed` (or land in `errored` on failure). Poll every few seconds; most documents complete in 1–5 minutes. The full table  -  including the legacy `success` alias some responses return in place of `completed` (treat it exactly as `completed`)  -  is on [Ingestion Status](/api-reference/v2/endpoint/source-status).
 
 <Info>
 **`graph_creation` is already queryable.** Items in this state are retrievable via [`POST /query`](/api-reference/v2/endpoint/query). Wait for `completed` only when you specifically need full graph traversal (`graph_context: true`).
@@ -326,6 +326,10 @@ Status values move forward through `queued` → `processing` → `graph_creation
 The full schema lives on [`POST /context/ingest`](/api-reference/v2/endpoint/ingest-context). Below are the fields you'll touch most often, grouped by where they live in the request.
 
 ### File metadata (`document_metadata` array items)
+
+<Note>
+`document_metadata` here is the **per-file ingest parameter** (one entry per uploaded file). It is unrelated to the legacy `document_metadata` *filter* alias for `additional_metadata` — see [one name, three meanings](/essentials/v2/metadata).
+</Note>
 
 | Field | Description |
 |---|---|
@@ -371,110 +375,7 @@ The full schema lives on [`POST /context/ingest`](/api-reference/v2/endpoint/ing
 
 ## 7. Forceful relations
 
-Forceful relations let you **declare** links between Knowledge sources at ingestion time. When a query matches a source that has forceful relations attached, HydraDB pulls the linked sources into the `additional_context` field of the query response alongside the primary chunks.
-
-This is separate from the entity and relationship [context graph](/essentials/v2/context-graphs) HydraDB builds automatically. Graph extraction is *derived* from content; forceful relations are *declared* by you  -  useful when you know two documents belong together (a contract and its addendum, a runbook and its troubleshooting guide) but the text doesn't make the connection explicit. Forceful relations link whole **sources**; to declare the full entity/relation graph *within* a single document (replacing extraction for it), use [Bring Your Own Graph](/essentials/v2/bring-your-own-graph).
-
-For file uploads, set `relations.ids` on the matching `document_metadata` item. For app sources, prefer the app-native `relations[]` shape so each link can carry a predicate and provider-aware target:
-
-```json
-{
-  "relations": [
-    {
-      "predicate": "linked_to",
-      "target": {
-        "id": "auth-troubleshooting"
-      }
-    },
-    {
-      "predicate": "related_to",
-      "target": {
-        "external_id": "AUTH-FAQ",
-        "provider": "notion"
-      }
-    }
-  ]
-}
-```
-
-<CodeGroup>
-```python Python SDK
-client.context.ingest(
-    type="knowledge",
-    database="acme_corp",
-    app_knowledge=json.dumps([
-        {
-            "database": "acme_corp",
-            "collection": "default",
-            "id": "auth-guide",
-            "title": "Authentication Guide",
-            "type": "notion",
-            "kind": "knowledge_base",
-            "provider": "notion",
-            "external_id": "AUTH-GUIDE",
-            "fields": {"kind": "knowledge_base", "title": "Authentication Guide", "body": "..."},
-            "relations": [
-                {"predicate": "linked_to", "target": {"id": "auth-troubleshooting"}},
-                {"predicate": "related_to", "target": {"external_id": "AUTH-FAQ", "provider": "notion"}},
-            ],
-        }
-    ]),
-)
-```
-```typescript TypeScript SDK
-await client.context.ingest({
-  type: "knowledge",
-  database: "acme_corp",
-  appKnowledge: JSON.stringify([
-    {
-      id: "auth-guide",
-      title: "Authentication Guide",
-      type: "notion",
-      kind: "knowledge_base",
-      provider: "notion",
-      external_id: "AUTH-GUIDE",
-      fields: { kind: "knowledge_base", title: "Authentication Guide", body: "..." },
-      relations: [
-        { predicate: "linked_to", target: { id: "auth-troubleshooting" } },
-        { predicate: "related_to", target: { external_id: "AUTH-FAQ", provider: "notion" } },
-      ],
-    },
-  ]),
-});
-```
-```bash cURL
-curl -X POST 'https://api.hydradb.com/context/ingest' \
-  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
-  -H "API-Version: 2" \
-  -F "type=knowledge" \
-  -F "database=acme_corp" \
-  -F 'app_knowledge=[
-    {
-      "id": "auth-guide",
-      "title": "Authentication Guide",
-      "type": "notion",
-      "kind": "knowledge_base",
-      "provider": "notion",
-      "external_id": "AUTH-GUIDE",
-      "fields": { "kind": "knowledge_base", "title": "Authentication Guide", "body": "..." },
-      "relations": [
-        { "predicate": "linked_to", "target": { "id": "auth-troubleshooting" } },
-        { "predicate": "related_to", "target": { "external_id": "AUTH-FAQ", "provider": "notion" } }
-      ]
-    }
-  ]'
-```
-</CodeGroup>
-
-At query time, linked sources are returned in the `additional_context` field of the [query response](/api-reference/v2/endpoint/query). `query_forceful_relations` defaults to `true`  -  you only need to set it explicitly if you want to disable forceful-relation expansion.
-
-<Warning>
-**Knowledge items only.** Forceful relations work within the same store. Pointing a Knowledge item at a Memory ID (or vice versa) will silently return nothing at query time.
-</Warning>
-
-<Warning>
-**`thinking` mode only.** Forceful-relation context is fetched only when `mode: "thinking"` is set on the query request. In `fast` mode, `query_forceful_relations` is ignored even if set to `true`.
-</Warning>
+Forceful relations let you **declare** links between Knowledge sources at ingestion time — when a query matches a source, its declared relations ride along in `additional_context` (in `mode: "thinking"`). Because they shape query responses as much as ingestion, they have their own concepts page: **[Forceful Relations](/essentials/v2/forceful-relations)**.
 
 ## 8. Metadata on knowledge
 
