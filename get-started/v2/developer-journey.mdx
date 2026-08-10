@@ -1,0 +1,1154 @@
+---
+title: "From Raw Data to Working AI — The Complete HydraDB Journey"
+sidebarTitle: "Developer Journey"
+description: "A single end-to-end walkthrough: ingest Slack, Notion, PDFs, and user conversations, then query them with one call."
+---
+
+<Info>
+**What you'll build:** An internal assistant that knows your company's Slack, Notion, and PDFs — and remembers each user's preferences. By the end, one query call returns personalized, grounded answers ready for your LLM.
+
+You'll follow one scenario all the way through: Acme Corp, one user (Alice), real data.
+</Info>
+
+Here's what the finished system looks like before you write a single line:
+
+```
+User asks: "What's our refund policy?"
+                    │
+                    ▼
+         HydraDB  POST /query  (type: "all")
+         ┌──────────────────────────────────┐
+         │  Knowledge store                 │  shared — Slack, Notion, PDFs
+         ├──────────────────────────────────┤
+         │  Memory store  (collection:      │  per-user — Alice's preferences
+         │  user_alice)                     │  and history
+         └──────────────────────────────────┘
+                    │
+                    ▼
+          build_string()  →  LLM prompt  →  Personalized answer
+```
+
+This guide takes you through each piece: what to ingest, how to wait for it, and how to query it. Five sections, one working system at the end.
+
+---
+
+## Section 0: Before You Write Any Code
+
+> You have data. HydraDB has two stores: Knowledge and Memory.
+> Every piece of data you own belongs in exactly one of them.
+> Get this wrong and your queries return nothing.
+> This section tells you which is which.
+
+| Data you have | Store | Why | `type` at query |
+|---|---|---|---|
+| Slack messages (org-wide) | Knowledge | Shared across all users | `"knowledge"` |
+| Notion pages / wikis | Knowledge | Shared reference docs | `"knowledge"` |
+| PDF files, runbooks, policies | Knowledge | Shared, versioned content | `"knowledge"` |
+| User's chat history with your AI | Memory + `infer: true` | Per-user, behavioral signal | `"memory"` |
+| User's stated preference ("I like bullet points") | Memory + `infer: false` | Already structured fact | `"memory"` |
+| CRM contact notes per user | Memory | User-scoped context | `"memory"` |
+| You need both for one query | Both | Personalized + grounded | `"all"` |
+
+<Note>
+**The one question:** "Should every user in this database be able to retrieve this?"
+Yes → Knowledge. No → Memory.
+</Note>
+
+---
+
+## Section 1: Set Up Your Database
+
+*Store decided. Now create the database and wait until it's ready.*
+
+One database = one organization. One collection = one user.
+
+```
+Database: acme_corp
+├── Knowledge store (shared across all users)
+│   ├── Slack export
+│   ├── Notion pages
+│   └── Policy PDFs
+└── Collections (per-user Memory)
+    ├── collection: user_alice → her preferences, her chat history
+    ├── collection: user_bob  → his preferences, his chat history
+    └── collection: user_carol → ...
+```
+
+<Note>
+In API requests, a database is set with the **`database`** field (formerly `tenant_id`) and a collection with the **`collection`** field (formerly `sub_tenant_id`). The old names still work as deprecated aliases.
+</Note>
+
+Create the database and wait until it's ready for ingestion:
+
+<CodeGroup>
+```python Python SDK
+import os
+import time
+from hydra_db import HydraDB
+
+client = HydraDB(token=os.environ["HYDRA_DB_API_KEY"])
+
+try:
+    client.databases.create(database="acme_corp")
+except Exception as e:
+    if "already exists" not in str(e).lower():
+        raise
+
+while True:
+    infra = client.databases.status(database="acme_corp").data.infra
+    if infra.ready_for_ingestion:
+        break
+    time.sleep(5)
+```
+```typescript TypeScript SDK
+import { HydraDBClient } from "@hydradb/sdk";
+
+const client = new HydraDBClient({ token: process.env.HYDRA_DB_API_KEY });
+
+try {
+  await client.databases.create({ database: "acme_corp" });
+} catch (e: any) {
+  if (!e?.message?.toLowerCase().includes("already exists")) throw e;
+}
+
+while (true) {
+  const { data } = await client.databases.status({ database: "acme_corp" });
+  if (data?.infra.readyForIngestion) break;
+  await new Promise((r) => setTimeout(r, 5_000));
+}
+```
+```bash cURL
+export HYDRA_DB_API_KEY="your_api_key"
+
+STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST 'https://api.hydradb.com/databases' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -H "Content-Type: application/json" \
+  -d '{"database":"acme_corp"}')
+if [ "$STATUS" != "200" ] && [ "$STATUS" != "409" ]; then
+  echo "ERROR: database create returned HTTP $STATUS" >&2; exit 1
+fi
+
+until RESP=$(curl -sf "https://api.hydradb.com/databases/status?database=acme_corp" \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2") && echo "$RESP" | jq -e '.data.infra.ready_for_ingestion' > /dev/null; do
+  sleep 5
+done
+```
+</CodeGroup>
+
+---
+
+## Section 2: Ingest Your Knowledge (Shared Data)
+
+*Database is ready. Now load the shared data — Slack, Notion, PDFs — that every user can query.*
+
+### 2a: Files (PDFs, DOCX, Markdown)
+
+Use Path A — binary file upload — when HydraDB should parse the document for you.
+
+The `id` in `document_metadata` is your upsert key. When you update a policy PDF, re-ingest it with the same `id` and HydraDB replaces the old chunks without duplicating them.
+
+<CodeGroup>
+```python Python SDK
+import json
+
+with open("policy.pdf", "rb") as f:
+    result = client.context.ingest(
+        type="knowledge",
+        database="acme_corp",
+        documents=[("policy.pdf", f, "application/pdf")],
+        document_metadata=json.dumps([
+            {
+                "id": "policy_refund_v3",
+                "metadata": {"document_type": "policy", "status": "approved"},
+                "additional_metadata": {"owner": "legal@acme.com"},
+            }
+        ]),
+    )
+
+ids = [r.id for r in result.data.results]
+```
+```typescript TypeScript SDK
+const result = await client.context.ingest({
+  type: "knowledge",
+  database: "acme_corp",
+  documents: [{ path: "policy.pdf", filename: "policy.pdf", contentType: "application/pdf" }],
+  documentMetadata: JSON.stringify([
+    {
+      id: "policy_refund_v3",
+      metadata: { document_type: "policy", status: "approved" },
+      additional_metadata: { owner: "legal@acme.com" },
+    },
+  ]),
+});
+
+const ids = result.data.results.map((r) => r.id);
+```
+```bash cURL
+curl -sf -X POST 'https://api.hydradb.com/context/ingest' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -F "type=knowledge" \
+  -F "database=acme_corp" \
+  -F "documents=@policy.pdf" \
+  -F 'document_metadata=[
+    {
+      "id": "policy_refund_v3",
+      "metadata": { "document_type": "policy", "status": "approved" },
+      "additional_metadata": { "owner": "legal@acme.com" }
+    }
+  ]' || { echo "ERROR: knowledge file ingest failed" >&2; exit 1; }
+```
+</CodeGroup>
+
+### 2b: App Sources (Slack, Notion, Gmail)
+
+App sources use Path B — pass pre-extracted records via the `app_knowledge` parameter. You supply app-native fields and HydraDB preserves app structure at query time.
+
+| App | `provider` | `kind` | Primary content field |
+|---|---|---|---|
+| Slack | `"slack"` | `"message"` | `fields.body` |
+| Notion | `"notion"` | `"knowledge_base"` | `fields.body` |
+| Gmail | `"gmail"` | `"email"` | `fields.body` |
+| Jira | `"jira"` | `"ticket"` | `fields.description` |
+| Generic / custom | your choice | `"custom"` | `fields.data` |
+
+<Warning>
+`kind` selects the app parser. Wrong `kind` = content parsed incorrectly.
+Always match `kind` to what the record actually is.
+</Warning>
+
+Ingest Slack and Notion in the same call using `app_knowledge`:
+
+<CodeGroup>
+```python Python SDK
+import json
+
+result = client.context.ingest(
+    type="knowledge",
+    database="acme_corp",
+    app_knowledge=json.dumps([
+        {
+            "database": "acme_corp",
+            "id": "slack_pricing_2026_0520",
+            "title": "Pricing discussion — Slack #product",
+            "type": "slack",
+            "kind": "message",
+            "provider": "slack",
+            "external_id": "1716213600.000100",
+            "fields": {
+                "kind": "message",
+                "body": "We agreed on three tiers: Starter at $29, Pro at $79, Enterprise at $199. No annual discount for Starter.",
+                "author": "alice",
+                "thread_id": "1716213600.000100",
+                "created_at": "2026-05-20T10:00:00Z",
+            },
+            "metadata": {"channel": "product", "status": "finalized"},
+        },
+        {
+            "database": "acme_corp",
+            "id": "notion_onboarding_wiki",
+            "title": "Employee Onboarding — Notion Wiki",
+            "type": "notion",
+            "kind": "knowledge_base",
+            "provider": "notion",
+            "external_id": "page_abc123",
+            "fields": {
+                "kind": "knowledge_base",
+                "title": "Employee Onboarding",
+                "body": "## Week 1\n- Set up your dev environment using the engineering runbook.\n- Complete security training by EOD Friday.\n- Schedule 1:1s with your team lead and skip-level.",
+            },
+            "metadata": {"department": "hr", "status": "approved"},
+        },
+    ]),
+)
+
+ids = [r.id for r in result.data.results]
+```
+```typescript TypeScript SDK
+const result = await client.context.ingest({
+  type: "knowledge",
+  database: "acme_corp",
+  appKnowledge: JSON.stringify([
+    {
+      database: "acme_corp",
+      id: "slack_pricing_2026_0520",
+      title: "Pricing discussion — Slack #product",
+      type: "slack",
+      kind: "message",
+      provider: "slack",
+      external_id: "1716213600.000100",
+      fields: {
+        kind: "message",
+        body: "We agreed on three tiers: Starter at $29, Pro at $79, Enterprise at $199. No annual discount for Starter.",
+        author: "alice",
+        thread_id: "1716213600.000100",
+        created_at: "2026-05-20T10:00:00Z",
+      },
+      metadata: { channel: "product", status: "finalized" },
+    },
+    {
+      database: "acme_corp",
+      id: "notion_onboarding_wiki",
+      title: "Employee Onboarding — Notion Wiki",
+      type: "notion",
+      kind: "knowledge_base",
+      provider: "notion",
+      external_id: "page_abc123",
+      fields: {
+        kind: "knowledge_base",
+        title: "Employee Onboarding",
+        body: "## Week 1\n- Set up your dev environment using the engineering runbook.\n- Complete security training by EOD Friday.\n- Schedule 1:1s with your team lead and skip-level.",
+      },
+      metadata: { department: "hr", status: "approved" },
+    },
+  ]),
+});
+
+const ids = result.data.results.map((r) => r.id);
+```
+```bash cURL
+curl -sf -X POST 'https://api.hydradb.com/context/ingest' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -F "type=knowledge" \
+  -F "database=acme_corp" \
+  -F 'app_knowledge=[
+    {
+      "database": "acme_corp",
+      "id": "slack_pricing_2026_0520",
+      "title": "Pricing discussion — Slack #product",
+      "type": "slack",
+      "kind": "message",
+      "provider": "slack",
+      "external_id": "1716213600.000100",
+      "fields": {
+        "kind": "message",
+        "body": "We agreed on three tiers: Starter at $29, Pro at $79, Enterprise at $199. No annual discount for Starter.",
+        "author": "alice",
+        "thread_id": "1716213600.000100",
+        "created_at": "2026-05-20T10:00:00Z"
+      },
+      "metadata": { "channel": "product", "status": "finalized" }
+    },
+    {
+      "database": "acme_corp",
+      "id": "notion_onboarding_wiki",
+      "title": "Employee Onboarding — Notion Wiki",
+      "type": "notion",
+      "kind": "knowledge_base",
+      "provider": "notion",
+      "external_id": "page_abc123",
+      "fields": {
+        "kind": "knowledge_base",
+        "title": "Employee Onboarding",
+        "body": "## Week 1\n- Set up your dev environment using the engineering runbook.\n- Complete security training by EOD Friday.\n- Schedule 1:1s with your team lead and skip-level."
+      },
+      "metadata": { "department": "hr", "status": "approved" }
+    }
+  ]' || { echo "ERROR: knowledge app-source ingest failed" >&2; exit 1; }
+```
+</CodeGroup>
+
+### 2c: Wait for Indexing
+
+Poll [`GET /context/status`](/api-reference/v2/endpoint/source-status) until each item reaches a terminal state.
+
+Status stages: `queued → processing → graph_creation → completed`
+
+<Note>
+Items at `graph_creation` are already queryable. Wait for `completed` only if you need full graph traversal.
+</Note>
+
+<CodeGroup>
+```python Python SDK
+import time
+
+terminal = {"completed", "graph_creation", "errored", "failed", "success"}
+failure_states = {"errored", "failed"}
+
+while True:
+    statuses = client.context.status(
+        database="acme_corp",
+        ids=ids,
+    ).data.statuses
+    if not statuses:
+        raise RuntimeError("Status request returned no source statuses")
+    if all(s.indexing_status in terminal for s in statuses):
+        break
+    time.sleep(5)
+
+failed = [s for s in statuses if s.indexing_status in failure_states]
+if failed:
+    raise RuntimeError(f"Indexing failed for: {[s.id for s in failed]}")
+```
+```typescript TypeScript SDK
+const terminal = new Set(["completed", "graph_creation", "errored", "failed", "success"]);
+const failureStates = new Set(["errored", "failed"]);
+
+let statuses: { id: string; indexingStatus: string }[] = [];
+while (true) {
+  const { data } = await client.context.status({ database: "acme_corp", ids });
+  statuses = data.statuses;
+  if (!statuses.length) throw new Error("Status request returned no source statuses");
+  if (statuses.every((s) => terminal.has(s.indexingStatus))) break;
+  await new Promise((r) => setTimeout(r, 5_000));
+}
+
+const failed = statuses.filter((s) => failureStates.has(s.indexingStatus));
+if (failed.length) throw new Error(`Indexing failed for: ${failed.map((s) => s.id)}`);
+```
+```bash cURL
+while true; do
+  RESP=$(curl -sf -G 'https://api.hydradb.com/context/status' \
+    -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+    -H "API-Version: 2" \
+    --data-urlencode "database=acme_corp" \
+    --data-urlencode "ids=slack_pricing_2026_0520" \
+    --data-urlencode "ids=notion_onboarding_wiki") || {
+    echo "ERROR: status request failed" >&2; exit 1
+  }
+  STATUSES=$(echo "$RESP" | jq -r '.data.statuses[].indexing_status')
+  [ -z "$STATUSES" ] && { echo "ERROR: empty status response" >&2; exit 1; }
+  if ! echo "$STATUSES" | grep -qvE '^(completed|graph_creation|errored|failed|success)$'; then break; fi
+  sleep 5
+done
+
+if echo "$STATUSES" | grep -qE '^(errored|failed)$'; then
+  echo "ERROR: one or more sources failed indexing" >&2; exit 1
+fi
+```
+</CodeGroup>
+
+---
+
+## Section 3: Ingest User Memories (Per-User Data)
+
+*Shared data is indexed. Now write Alice's personal context — her communication style, her plan tier.*
+
+### 3a: The `infer` Decision
+
+`infer` is the most important flag on memory ingestion. It controls whether HydraDB extracts a preference from raw signal, or stores exactly what you send.
+
+```
+Do you have raw, unstructured signal?
+(conversation logs, UI events, feedback)
+        │
+       YES → infer: true  → HydraDB extracts the preference
+        │
+        NO
+        │
+Do you already have a structured fact?
+("User is on Pro plan", "prefers dark mode")
+        │
+       YES → infer: false → HydraDB stores exactly what you send
+```
+
+Same user (Alice), same topic (communication style), two different inputs. The first is raw dialogue — HydraDB extracts the preference. The second is a fact you've already written out — HydraDB stores it verbatim:
+
+<CodeGroup>
+```python Python SDK
+import json
+
+# Path 1: raw chat log → infer: true
+result1 = client.context.ingest(
+    type="memory",
+    database="acme_corp",
+    collection="user_alice",
+    memories=json.dumps([
+        {
+            "user_assistant_pairs": [
+                {"user": "Can you make that shorter?", "assistant": "Sure, here's a shorter version..."},
+                {"user": "Perfect, I like it that way.", "assistant": "Noted."},
+            ],
+            "infer": True,
+            "custom_instructions": "Focus on communication style preferences.",
+            "user_name": "Alice",
+        }
+    ]),
+)
+memory_ids = [r.id for r in result1.data.results]
+
+# Path 2: pre-extracted fact → infer: false
+result2 = client.context.ingest(
+    type="memory",
+    database="acme_corp",
+    collection="user_alice",
+    memories=json.dumps([
+        {
+            "id": "alice_plan_tier",
+            "text": "User is on the Pro plan. Renewal date: 2027-01-15.",
+            "infer": False,
+        }
+    ]),
+)
+memory_ids += [r.id for r in result2.data.results]
+
+# Wait for memory indexing before querying
+terminal = {"completed", "graph_creation", "errored", "failed", "success"}
+failure_states = {"errored", "failed"}
+while True:
+    statuses = client.context.status(
+        database="acme_corp",
+        collection="user_alice",
+        ids=memory_ids,
+    ).data.statuses
+    if not statuses:
+        raise RuntimeError("Status request returned no source statuses")
+    if all(s.indexing_status in terminal for s in statuses):
+        break
+    time.sleep(5)
+
+failed = [s for s in statuses if s.indexing_status in failure_states]
+if failed:
+    raise RuntimeError(f"Memory indexing failed for: {[s.id for s in failed]}")
+```
+```typescript TypeScript SDK
+// Path 1: raw chat log → infer: true
+const { data: d1 } = await client.context.ingest({
+  type: "memory",
+  database: "acme_corp",
+  collection: "user_alice",
+  memories: JSON.stringify([
+    {
+      user_assistant_pairs: [
+        { user: "Can you make that shorter?", assistant: "Sure, here's a shorter version..." },
+        { user: "Perfect, I like it that way.", assistant: "Noted." },
+      ],
+      infer: true,
+      custom_instructions: "Focus on communication style preferences.",
+      user_name: "Alice",
+    },
+  ]),
+});
+
+// Path 2: pre-extracted fact → infer: false
+const { data: d2 } = await client.context.ingest({
+  type: "memory",
+  database: "acme_corp",
+  collection: "user_alice",
+  memories: JSON.stringify([
+    {
+      id: "alice_plan_tier",
+      text: "User is on the Pro plan. Renewal date: 2027-01-15.",
+      infer: false,
+    },
+  ]),
+});
+
+const memoryIds = [...d1.results.map((r) => r.id), ...d2.results.map((r) => r.id)];
+
+// Wait for memory indexing before querying
+const memTerminal = new Set(["completed", "graph_creation", "errored", "failed", "success"]);
+const memFailureStates = new Set(["errored", "failed"]);
+let memStatuses: { id: string; indexingStatus: string }[] = [];
+while (true) {
+  const { data } = await client.context.status({ database: "acme_corp", collection: "user_alice", ids: memoryIds });
+  memStatuses = data.statuses;
+  if (!memStatuses.length) throw new Error("Status request returned no source statuses");
+  if (memStatuses.every((s) => memTerminal.has(s.indexingStatus))) break;
+  await new Promise((r) => setTimeout(r, 5_000));
+}
+const memFailed = memStatuses.filter((s) => memFailureStates.has(s.indexingStatus));
+if (memFailed.length) throw new Error(`Memory indexing failed for: ${memFailed.map((s) => s.id)}`);
+```
+```bash cURL
+# Path 1: raw chat log → infer: true
+RESP1=$(curl -sf -X POST 'https://api.hydradb.com/context/ingest' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -F "type=memory" \
+  -F "database=acme_corp" \
+  -F "collection=user_alice" \
+  -F 'memories=[
+    {
+      "user_assistant_pairs": [
+        { "user": "Can you make that shorter?", "assistant": "Sure, here is a shorter version..." },
+        { "user": "Perfect, I like it that way.", "assistant": "Noted." }
+      ],
+      "infer": true,
+      "custom_instructions": "Focus on communication style preferences.",
+      "user_name": "Alice"
+    }
+  ]') || { echo "ERROR: memory ingest (path 1) failed" >&2; exit 1; }
+
+# Path 2: pre-extracted fact → infer: false
+RESP2=$(curl -sf -X POST 'https://api.hydradb.com/context/ingest' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -F "type=memory" \
+  -F "database=acme_corp" \
+  -F "collection=user_alice" \
+  -F 'memories=[
+    {
+      "id": "alice_plan_tier",
+      "text": "User is on the Pro plan. Renewal date: 2027-01-15.",
+      "infer": false
+    }
+  ]') || { echo "ERROR: memory ingest (path 2) failed" >&2; exit 1; }
+
+MEMORY_IDS=$(printf '%s\n%s' \
+  "$(echo "$RESP1" | jq -r '.data.results[].id')" \
+  "$(echo "$RESP2" | jq -r '.data.results[].id')")
+
+# Wait for memory indexing before querying
+while true; do
+  ID_ARGS=()
+  for ID in $MEMORY_IDS; do ID_ARGS+=(--data-urlencode "ids=$ID"); done
+  RESP=$(curl -sf -G "https://api.hydradb.com/context/status" \
+    -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+    -H "API-Version: 2" \
+    --data-urlencode "database=acme_corp" \
+    --data-urlencode "collection=user_alice" \
+    "${ID_ARGS[@]}") || {
+    echo "ERROR: memory status request failed" >&2; exit 1
+  }
+  MEM_STATUSES=$(echo "$RESP" | jq -r '.data.statuses[].indexing_status')
+  [ -z "$MEM_STATUSES" ] && { echo "ERROR: empty memory status response" >&2; exit 1; }
+  if ! echo "$MEM_STATUSES" | grep -qvE '^(completed|graph_creation|errored|failed|success)$'; then break; fi
+  sleep 5
+done
+if echo "$MEM_STATUSES" | grep -qE '^(errored|failed)$'; then
+  echo "ERROR: one or more memory sources failed indexing" >&2; exit 1
+fi
+```
+</CodeGroup>
+
+<Warning>
+Always use the user's ID as `collection`. If you skip it, memories land in the default collection and can surface for the wrong user. `collection` is the new name for `sub_tenant_id` — both work in the API, but `collection` is preferred in v2.
+</Warning>
+
+Both calls use `collection="user_alice"` — that's what scopes the memories to Alice and not to every user in the database. When Alice logs in and asks a question, her query uses the same collection value to retrieve only her context.
+
+For a deeper reference on `infer`, see [Infer Guide](/essentials/v2/infer-guide).
+
+---
+
+## Section 4: Querying — One Endpoint, Three Modes
+
+*Both stores are indexed. Alice's memories are ready. Now query them together.*
+
+<Warning>
+**Poll before querying — both stores.**
+
+`type: "all"` merges Knowledge and Memory at query time. If either store hasn't reached at least `graph_creation`, those chunks will be missing from your results with no error returned.
+
+Run the status loop from Section 2c for your Knowledge sources **and** your Memory sources before issuing any query. Querying immediately after `ingest` is the most common cause of empty results.
+</Warning>
+
+The four endpoints form one loop:
+
+```
+POST /context/ingest   ← write data in
+GET  /context/status   ← wait for indexing
+POST /query            ← read data out  ← THIS is where your agent lives
+```
+
+Pick the query mode based on what you need:
+
+| You want… | Use `type:` | When |
+|---|---|---|
+| Only shared docs | `"knowledge"` | Lookup, RAG, search |
+| Only this user's memory | `"memory"` | Personalization, preferences |
+| Both merged in one call | `"all"` | Production agents (use this by default) |
+
+### 4a: `type: "all"` — The Production Pattern
+
+`type: "all"` + `collection` = personalized answers grounded in shared docs. HydraDB runs both stores in parallel and merges results into one ranked list.
+
+<CodeGroup>
+```python Python SDK
+result = client.query(
+    database="acme_corp",
+    collection="user_alice",    # scopes memories to Alice
+    query="What is our refund policy?",
+    type="all",                 # hits Knowledge + Memory together
+    query_by="hybrid",
+    mode="thinking",
+    max_results=10,
+)
+```
+```typescript TypeScript SDK
+const result = await client.query({
+  database: "acme_corp",
+  collection: "user_alice",
+  query: "What is our refund policy?",
+  type: "all",
+  queryBy: "hybrid",
+  mode: "thinking",
+  maxResults: 10,
+});
+```
+```bash cURL
+curl -sf -X POST 'https://api.hydradb.com/query' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "database": "acme_corp",
+    "collection": "user_alice",
+    "query": "What is our refund policy?",
+    "type": "all",
+    "query_by": "hybrid",
+    "mode": "thinking",
+    "max_results": 10
+  }' || { echo "ERROR: query failed" >&2; exit 1; }
+```
+</CodeGroup>
+
+The response looks like this (truncated):
+
+```json
+{
+  "data": {
+    "chunks": [
+      {
+        "chunk_content": "Refund policy: customers may request a full refund within 30 days...",
+        "relevancy_score": 0.94,
+        "source_type": "knowledge",
+        "metadata": { "document_type": "policy", "status": "approved" }
+      },
+      {
+        "chunk_content": "User prefers concise, direct answers with no preamble.",
+        "relevancy_score": 0.87,
+        "source_type": "memory"
+      }
+    ]
+  }
+}
+```
+
+Knowledge and Memory chunks are ranked together in one list. Pass this directly to `build_string()` — don't re-sort it.
+
+<Warning>
+**Knowledge is database-wide. Memory is collection-scoped.**
+
+When you ingest Knowledge (PDFs, Slack, Notion), do NOT pass a
+`collection` — it makes that knowledge available to all users.
+
+When you query with `type="all"` and `collection="user_alice"`,
+HydraDB returns:
+- Memory chunks scoped to `user_alice` ✓
+- Knowledge chunks available to the whole database ✓
+
+If your Knowledge chunks are not surfacing in `type="all"` results,
+check that you ingested them WITHOUT a `collection` parameter.
+Knowledge ingested into a specific collection is only visible
+to queries scoped to that same collection.
+
+To verify: run the same query with `type="knowledge"` and no
+`collection`. If chunks appear there but not in `type="all"`,
+this is the cause.
+</Warning>
+
+<Note>
+Always pass `collection` when using `type: "all"` or `type: "memory"`.
+Without it, the memory store queries the default collection, not your user's.
+</Note>
+
+### 4b: When to Query Separately
+
+If you need to label Knowledge and Memory results differently in your prompt, run two queries in parallel:
+
+<CodeGroup>
+```python Python SDK
+import os, asyncio
+from hydra_db import AsyncHydraDB
+from hydra_db.helpers import build_string
+
+hydra = AsyncHydraDB(token=os.environ["HYDRA_DB_API_KEY"])
+
+knowledge_result, memory_result = await asyncio.gather(
+    hydra.query(
+        database="acme_corp",
+        query="refund policy",
+        type="knowledge",
+        query_by="hybrid",
+        mode="thinking",
+    ),
+    hydra.query(
+        database="acme_corp",
+        collection="user_alice",
+        query="communication style preferences",
+        type="memory",
+        query_by="hybrid",
+    ),
+)
+
+prompt_context = (
+    f"User preferences:\n{build_string(memory_result)}\n\n"
+    f"Relevant company knowledge:\n{build_string(knowledge_result)}"
+)
+```
+```typescript TypeScript SDK
+import { HydraDBClient, buildString } from "@hydradb/sdk";
+
+const [knowledgeResult, memoryResult] = await Promise.all([
+  hydra.query({
+    database: "acme_corp",
+    query: "refund policy",
+    type: "knowledge",
+    queryBy: "hybrid",
+    mode: "thinking",
+  }),
+  hydra.query({
+    database: "acme_corp",
+    collection: "user_alice",
+    query: "communication style preferences",
+    type: "memory",
+    queryBy: "hybrid",
+  }),
+]);
+
+const promptContext =
+  `User preferences:\n${buildString(memoryResult)}\n\n` +
+  `Relevant company knowledge:\n${buildString(knowledgeResult)}`;
+```
+```bash cURL
+KNOWLEDGE_FILE=$(mktemp)
+MEMORY_FILE=$(mktemp)
+
+curl -sf -X POST 'https://api.hydradb.com/query' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -H "Content-Type: application/json" \
+  -d '{"database":"acme_corp","query":"refund policy","type":"knowledge","query_by":"hybrid","mode":"thinking"}' \
+  -o "$KNOWLEDGE_FILE" & K_PID=$!
+
+curl -sf -X POST 'https://api.hydradb.com/query' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -H "Content-Type: application/json" \
+  -d '{"database":"acme_corp","collection":"user_alice","query":"communication style preferences","type":"memory","query_by":"hybrid"}' \
+  -o "$MEMORY_FILE" & M_PID=$!
+
+wait $K_PID || { echo "ERROR: knowledge query failed" >&2; exit 1; }
+wait $M_PID || { echo "ERROR: memory query failed" >&2; exit 1; }
+
+KNOWLEDGE_CONTEXT=$(jq -r '[.data.chunks[].chunk_content] | join("\n---\n")' "$KNOWLEDGE_FILE")
+MEMORY_CONTEXT=$(jq -r '[.data.chunks[].chunk_content] | join("\n---\n")' "$MEMORY_FILE")
+rm -f "$KNOWLEDGE_FILE" "$MEMORY_FILE"
+```
+</CodeGroup>
+
+---
+
+## Section 5: From Query Result to LLM Prompt
+
+*You have ranked chunks from HydraDB. Now turn them into a prompt your LLM can use.*
+
+Use `build_string` / `buildString` from the SDK to convert the query response into a clean string for your LLM. It strips IDs and metadata noise, preserves chunk order, and includes graph context.
+
+<CodeGroup>
+```python Python SDK
+from hydra_db.helpers import build_string
+from openai import OpenAI
+
+openai_client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+
+user_question = "What is our refund policy?"
+
+result = client.query(
+    database="acme_corp",
+    collection="user_alice",
+    query=user_question,
+    type="all",
+    query_by="hybrid",
+    mode="thinking",
+)
+
+context = build_string(result)
+
+# context contains both Knowledge and Memory merged — from the type="all" query above.
+# If you ran parallel queries (Section 4b), substitute build_string(memory_result) and
+# build_string(knowledge_result) for the two labeled sections instead.
+completion = openai_client.chat.completions.create(
+    model="gpt-4o",
+    messages=[
+        {
+            "role": "system",
+            "content": (
+                "You are an internal assistant for Acme Corp.\n"
+                "Answer using only the context provided.\n"
+                "Match the user's preferred communication style if indicated in their preferences.\n"
+                "If the answer is not in the context, say you don't know.\n\n"
+                f"Context:\n{context}"
+            ),
+        },
+        {"role": "user", "content": user_question},
+    ],
+)
+```
+```typescript TypeScript SDK
+import { buildString } from "@hydradb/sdk";
+import OpenAI from "openai";
+
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+const userQuestion = "What is our refund policy?";
+
+const result = await client.query({
+  database: "acme_corp",
+  collection: "user_alice",
+  query: userQuestion,
+  type: "all",
+  queryBy: "hybrid",
+  mode: "thinking",
+});
+
+const context = buildString(result);
+
+const completion = await openai.chat.completions.create({
+  model: "gpt-4o",
+  messages: [
+    {
+      role: "system",
+      content:
+        "You are an internal assistant for Acme Corp.\n" +
+        "Answer using only the context provided.\n" +
+        "Match the user's preferred communication style if indicated in their preferences.\n" +
+        "If the answer is not in the context, say you don't know.\n\n" +
+        `Context:\n${context}`,
+    },
+    { role: "user", content: userQuestion },
+  ],
+});
+```
+```bash cURL
+# Build string manually — see api-results page for the full helper
+RESP=$(curl -sf -X POST 'https://api.hydradb.com/query' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "database": "acme_corp",
+    "collection": "user_alice",
+    "query": "What is our refund policy?",
+    "type": "all",
+    "query_by": "hybrid",
+    "mode": "thinking"
+  }') || { echo "ERROR: query failed" >&2; exit 1; }
+CONTEXT=$(echo "$RESP" | jq -r '[.data.chunks[].chunk_content] | join("\n---\n")')
+```
+</CodeGroup>
+
+Prompt template:
+
+> *For `type: "all"` (single call), replace both placeholders with a single `{context}` variable. The template below applies to the parallel-query pattern from Section 4b.*
+
+```
+System: You are an internal assistant for Acme Corp.
+Answer using only the context provided.
+Match the user's preferred communication style if indicated in their preferences.
+If the answer is not in the context, say you don't know.
+
+User preferences:
+{memory_context}
+
+Relevant company knowledge:
+{knowledge_context}
+
+Question: {user_question}
+```
+
+<Info>
+
+- Preserve server-returned chunk order — don't re-sort
+- Start with `max_results: 10`
+- Always include a grounding instruction in system prompt
+- `type: "all"` is the simplest path for production
+
+</Info>
+
+---
+
+## Section 6: Common Mistakes
+
+| Mistake | What goes wrong | Fix |
+|---|---|---|
+| Storing shared docs as Memories | They won't surface on `type: "knowledge"` queries | Use Knowledge ingestion for any content all users should see |
+| Storing per-user data as Knowledge | Data bleeds across users | Use Memory with `collection` set to the user's ID |
+| Missing `collection` for memory queries | Default collection is queried; wrong user's memories surface | Always pass `collection` matching ingestion `collection` |
+| Querying before indexing completes | Empty results | Poll `/context/status` until `graph_creation` or `completed` |
+| Using `infer: true` for structured facts | HydraDB re-derives the memory, phrasing may change | Use `infer: false` for facts you've already extracted |
+| Using `infer: false` for raw conversation logs | Noise is stored verbatim, not as insight | Use `infer: true` for raw signal |
+| Setting `custom_instructions` with `infer: false` | Instructions are silently ignored | Only `custom_instructions` + `infer: true` does anything |
+| Using `query_forceful_relations` with `mode: "fast"` | Flag is rejected with HTTP 422 | Set `mode: "thinking"` or remove the flag |
+| Pointing forceful relations across stores | Knowledge→Memory or Memory→Knowledge silently returns nothing | Relations work within the same store only |
+| Not using `build_string` | Raw JSON is passed to LLM, wasting tokens | Use `build_string` / `buildString` from the SDK |
+| Re-sorting chunks client-side | Overrides HydraDB's relevance ranking | Preserve server-returned order |
+
+---
+
+## Section 7: What You Have Built
+
+```
+Your Data
+    │
+    ├── Shared? → Knowledge store
+    │   ├── Files → Path A (binary upload)
+    │   └── Apps → Path B (app-source schema)
+    │
+    └── Per-user? → Memory store
+        ├── Raw signal → infer: true
+        └── Structured fact → infer: false
+            │
+            ↓
+    POST /context/ingest → GET /context/status → POST /query
+                                                      │
+                                              type: "all" + collection: user_id
+                                                      │
+                                              build_string() → LLM prompt
+                                                      │
+                                              Personalized answer
+```
+
+### Complete script (Python)
+
+Copy this, add your API key, and run it end to end against a real HydraDB database.
+
+<Accordion title="Show complete Python script">
+```python
+import os, time, json
+from hydra_db import HydraDB
+from hydra_db.helpers import build_string
+from openai import OpenAI
+
+client = HydraDB(token=os.environ["HYDRA_DB_API_KEY"])
+openai_client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+
+# ── Section 1: Create database ──────────────────────────────────────────────
+try:
+    client.databases.create(database="acme_corp")
+except Exception as e:
+    if "already exists" not in str(e).lower():
+        raise
+
+while True:
+    infra = client.databases.status(database="acme_corp").data.infra
+    if infra.ready_for_ingestion:
+        break
+    time.sleep(5)
+
+# ── Section 2: Ingest Knowledge ─────────────────────────────────────────────
+result = client.context.ingest(
+    type="knowledge",
+    database="acme_corp",
+    app_knowledge=json.dumps([
+        {
+            "database": "acme_corp",
+            "id": "slack_pricing_2026_0520",
+            "title": "Pricing discussion — Slack #product",
+            "type": "slack", "kind": "message", "provider": "slack",
+            "external_id": "1716213600.000100",
+            "fields": {
+                "kind": "message",
+                "body": "We agreed on three tiers: Starter $29, Pro $79, Enterprise $199.",
+                "author": "alice", "thread_id": "1716213600.000100",
+                "created_at": "2026-05-20T10:00:00Z",
+            },
+            "metadata": {"channel": "product", "status": "finalized"},
+        }
+    ]),
+)
+ids = [r.id for r in result.data.results]
+
+terminal = {"completed", "graph_creation", "errored", "failed", "success"}
+failure_states = {"errored", "failed"}
+while True:
+    statuses = client.context.status(database="acme_corp", ids=ids).data.statuses
+    if not statuses:
+        raise RuntimeError("Empty status response")
+    if all(s.indexing_status in terminal for s in statuses):
+        break
+    time.sleep(5)
+failed = [s for s in statuses if s.indexing_status in failure_states]
+if failed:
+    raise RuntimeError(f"Knowledge indexing failed: {[s.id for s in failed]}")
+
+# ── Section 3: Ingest Memory ─────────────────────────────────────────────────
+r1 = client.context.ingest(
+    type="memory", database="acme_corp", collection="user_alice",
+    memories=json.dumps([{
+        "user_assistant_pairs": [
+            {"user": "Can you make that shorter?", "assistant": "Sure..."},
+            {"user": "Perfect, I like it that way.", "assistant": "Noted."},
+        ],
+        "infer": True,
+        "custom_instructions": "Focus on communication style preferences.",
+        "user_name": "Alice",
+    }]),
+)
+r2 = client.context.ingest(
+    type="memory", database="acme_corp", collection="user_alice",
+    memories=json.dumps([{
+        "id": "alice_plan_tier",
+        "text": "User is on the Pro plan. Renewal date: 2027-01-15.",
+        "infer": False,
+    }]),
+)
+memory_ids = [r.id for r in r1.data.results] + [r.id for r in r2.data.results]
+
+while True:
+    statuses = client.context.status(
+        database="acme_corp", collection="user_alice", ids=memory_ids
+    ).data.statuses
+    if not statuses:
+        raise RuntimeError("Empty memory status response")
+    if all(s.indexing_status in terminal for s in statuses):
+        break
+    time.sleep(5)
+failed = [s for s in statuses if s.indexing_status in failure_states]
+if failed:
+    raise RuntimeError(f"Memory indexing failed: {[s.id for s in failed]}")
+
+# ── Section 4: Query ──────────────────────────────────────────────────────────
+user_question = "What is our refund policy?"
+
+query_result = client.query(
+    database="acme_corp",
+    collection="user_alice",
+    query=user_question,
+    type="all",
+    query_by="hybrid",
+    mode="thinking",
+    max_results=10,
+)
+
+# ── Section 5: Build prompt and call LLM ─────────────────────────────────────
+context = build_string(query_result)
+
+completion = openai_client.chat.completions.create(
+    model="gpt-4o",
+    messages=[
+        {
+            "role": "system",
+            "content": (
+                "You are an internal assistant for Acme Corp.\n"
+                "Answer using only the context provided.\n"
+                "Match the user's preferred communication style if indicated.\n"
+                "If the answer is not in the context, say you don't know.\n\n"
+                f"Context:\n{context}"
+            ),
+        },
+        {"role": "user", "content": user_question},
+    ],
+)
+
+print(completion.choices[0].message.content)
+```
+</Accordion>
+
+---
+
+### Where to go next
+
+| If you want to… | Read… |
+|---|---|
+| Understand how content gets stored and retrieved | [Architecture](/essentials/v2/architecture) |
+| Design a filterable metadata schema | [Metadata](/essentials/v2/metadata) |
+| Scope data per user or workspace | [Multi-Tenant](/essentials/v2/multi-tenant) |
+| Traverse entity relationships at query time | [Context Graphs](/essentials/v2/context-graphs) |
+| Format the LLM prompt from `RetrievalResult` | [How to Use API Results](/essentials/v2/api-results) |
+| See real-world recipes | [Cookbooks](/cookbooks/v2/index) |
