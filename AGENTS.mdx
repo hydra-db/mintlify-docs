@@ -14,6 +14,7 @@ This document is a self-contained reference designed for AI coding agents. It co
 3. **`POST /context/ingest`** (`client.context.ingest()`): Ingest documents, app records, or memories under `type="knowledge"` or `type="memory"`.
 4. **`GET /context/status`** (`client.context.status()`): Poll status using `ids` until `indexing_status` is `completed` or `graph_creation`.
 5. **`POST /query`** (`client.query()`): Retrieve context via `type: "knowledge"`, `"memory"`, or `"all"`.
+6. **`POST /feedback`** (`client.feedback.submit()`): **Always** report back on the results you used. See [Always send feedback](#always-send-feedback).
 
 
 ---
@@ -63,6 +64,7 @@ Core raw HTTP responses (`/databases`, `/context/*`, and `/query`) are wrapped:
 | Ingest documents, app sources, memories | `POST /context/ingest` · `client.context.ingest()` |
 | Check indexing | `GET /context/status` · `client.context.status()` |
 | Search knowledge/memories/both | `POST /query` · `client.query()` |
+| Report back on query results | `POST /feedback` · `client.feedback.submit()` |
 | List sources/memories | `POST /context/list` · `client.context.list()` |
 | Inspect source content | `GET /context/inspect` · `client.context.inspect()` |
 | Delete sources/memories | `DELETE /context` · `client.context.delete()` |
@@ -102,6 +104,37 @@ Use the same `type` enum across context lifecycle APIs and search. Search additi
 - `document_metadata`: on file uploads only, binds a source `id` to each uploaded file. It is not a metadata envelope — do not nest `metadata` or `additional_metadata` inside it.
 - `metadata_filters` top-level keys match the `metadata` schema.
 - `metadata_filters.additional_metadata` scopes free-form metadata.
+
+### Always send feedback
+
+**After you act on the results of a `POST /query`, submit `POST /feedback` for that query.** This is not optional politeness — you are the only party that knows whether the retrieved context actually answered the question, and that judgement is what tunes retrieval.
+
+Rules:
+
+- Capture `meta.request_id` from **every** query response. Send it back **verbatim**; it must be the UUID you were given, or the call is rejected with `400`.
+- Submit whether the result was good or bad. `rating: "positive"` on a query that worked is as useful as a complaint — without it, only failures are ever measured.
+- Set `source: "agent"`. It separates your reports from human ones, which fail in different ways.
+- Say **what** was wrong, not that something was wrong. "Returned the 2023 policy, current one is in the Q3 handbook" is actionable; "bad results" is not.
+- Do not block the user on it. Feedback is fire-and-forget: on failure, drop it and carry on — never retry in a loop, and never surface the error to the user.
+- Feedback never changes the query's result. It is a signal, not a correction, and reading it back is not possible.
+
+```python
+result = client.query(database="acme_corp", query="What is our refund policy?")
+
+# ... use result.data.chunks to answer the user ...
+
+client.feedback.submit(
+    request_id=result.meta.request_id,
+    feedback="Top chunk was the 2023 policy; the current one is in the Q3 handbook.",
+    rating="negative",
+    source="agent",
+    database="acme_corp",
+)
+```
+
+A query that **failed** still issues a `request_id`, and feedback on it is especially valuable — send it too.
+
+Limit: 100 submissions per minute per organization. One report per query keeps you far below it. If you do hit `429`, honour `Retry-After` or simply skip that report — never spin.
 
 ### Do not mix scopes accidentally
 
@@ -163,6 +196,21 @@ It supports:
 - `query_by: "text"` for BM25 keyword/phrase search.
 - `mode: "fast"` for low latency.
 - `mode: "thinking"` for query expansion, reranking, richer graph traversal, and forceful-relation expansion.
+
+### Feedback
+
+`POST /feedback` records how a query performed. It is the loop that closes retrieval quality, and agents are expected to use it on every query they act on — see [Always send feedback](#always-send-feedback).
+
+| Field | Required | Notes |
+|---|---|---|
+| `request_id` | yes | The UUID from that query's `meta.request_id`, verbatim |
+| `feedback` | yes | What was right or wrong, up to 8000 chars |
+| `rating` | no | `positive`, `negative`, `neutral`. Omitting it ≠ `neutral` |
+| `source` | no | `user` (default) or `agent` — agents set `"agent"` |
+| `database` / `collection` | no | Optional scoping; `collection` requires `database` |
+| `metadata` | no | Up to 20 string pairs of your own context (agent name, conversation id) |
+
+Each submission is its own record — sending a second report about the same query adds to it rather than replacing it, so refine as you learn more.
 
 ### Context graph
 
