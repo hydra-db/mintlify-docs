@@ -101,7 +101,7 @@ Use the same `type` enum across context lifecycle APIs and search. Search additi
 
 - `metadata`: schema-aligned, declared at database creation, fast filter path. Sent as a top-level request field on `/context/ingest`.
 - `additional_metadata`: canonical free-form metadata; anything not present in the `metadata` schema. Also a top-level request field.
-- `document_metadata`: on file uploads only, binds a source `id` to each uploaded file. It is not a metadata envelope — do not nest `metadata` or `additional_metadata` inside it.
+- `document_metadata`: on file uploads only, binds a source `id` to each uploaded file. It is not a metadata envelope  -  do not nest `metadata` or `additional_metadata` inside it.
 - `metadata_filters` top-level keys match the `metadata` schema.
 - `metadata_filters.additional_metadata` scopes free-form metadata.
 
@@ -132,35 +132,41 @@ client.feedback.submit(
 )
 ```
 
-A query that **failed** still issues a `request_id`, and feedback on it is especially valuable  -  send it too. The SDKs raise on failure rather than returning an envelope, so read the id off the exception body:
+A query that **failed** still issues a `request_id`, and feedback on it is especially valuable  -  send it too. Getting hold of that id on the failure path differs by language:
+
+**Generate the id yourself.** The most reliable option, and the only one that works identically in both SDKs: pass your own UUID as `X-Request-ID` and the API adopts it, so you already hold the id whether the call succeeds or throws. It must be a UUID  -  any other value is replaced by a server-generated one.
 
 ```python
-from hydra_db.errors import ApiError
+import uuid
+from hydra_db import HydraDBError
+
+request_id = str(uuid.uuid4())
 
 try:
-    result = client.query(database="acme_corp", query=question)
-    request_id = result.meta.request_id
-except ApiError as exc:
-    # exc.body is the parsed error envelope; meta.request_id is present on it
-    request_id = (exc.body or {}).get("meta", {}).get("request_id")
-    if request_id:
-        client.feedback.submit(
-            request_id=request_id,
-            source="agent",
-            feedback=f"query failed: {(exc.body or {}).get('error', {}).get('code')}",
-        )
+    result = client.query(
+        database="acme_corp",
+        query=question,
+        request_options={"additional_headers": {"X-Request-ID": request_id}},
+    )
+except HydraDBError as exc:
+    client.feedback.submit(
+        request_id=request_id,          # known up front, no exception introspection
+        source="agent",
+        feedback=f"query failed: {exc.error_code} (HTTP {exc.status_code})",
+    )
     raise
 ```
+
+In **TypeScript** the error also carries the response body, so you can read the id off a thrown error instead:
 
 ```typescript
 try {
   const result = await client.query({ database: "acme_corp", query: question });
-  var requestId = result.meta.request_id;
 } catch (error) {
   const requestId = error?.body?.meta?.request_id;
   if (requestId) {
     await client.feedback.submit({
-      request_id: requestId,
+      requestId,
       source: "agent",
       feedback: `query failed: ${error?.body?.error?.code}`,
     });
@@ -169,7 +175,9 @@ try {
 }
 ```
 
-Guard on the id being present  -  a transport-level failure (timeout, DNS) never reached the API and has no `request_id` to report against.
+The Python `HydraDBError` exposes `error_code` and `status_code` but not the response body, which is why the pre-generated id is the recommended path there.
+
+Guard on having an id at all: a transport-level failure (timeout, DNS) never reached the API, so there is no request to report against.
 
 **If you know the right answer, send it as `ground_truth`.** When you are running against a labelled set, or you know which document should have been returned, that is a far stronger signal than a comment  -  it can be scored without a human reading it. With `ground_truth` present, `feedback` prose is optional:
 
