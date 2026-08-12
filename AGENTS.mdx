@@ -14,6 +14,7 @@ This document is a self-contained reference designed for AI coding agents. It co
 3. **`POST /context/ingest`** (`client.context.ingest()`): Ingest documents, app records, or memories under `type="knowledge"` or `type="memory"`.
 4. **`GET /context/status`** (`client.context.status()`): Poll status using `ids` until `indexing_status` is `completed` or `graph_creation`.
 5. **`POST /query`** (`client.query()`): Retrieve context via `type: "knowledge"`, `"memory"`, or `"all"`.
+6. **`POST /feedback`** (`client.feedback.submit()`): Tell us when a query did not give you what you needed. See [Sending feedback](#sending-feedback).
 
 
 ---
@@ -48,7 +49,7 @@ Core raw HTTP responses (`/databases`, `/context/*`, and `/query`) are wrapped:
 - Parse core raw HTTP payloads from `data`.
 - The SDKs return the full envelope object; read the payload from its `data` field (e.g. `response.data`). On failure they raise a typed exception rather than returning an envelope with `error` set.
 - Log `meta.request_id` for failed requests.
-- `meta` may also carry an optional `deprecation` list (with a `Deprecation: true` response header) when a request uses a legacy `/tenants` route or a deprecated field (`tenant_id`/`sub_tenant_id`, or `sub_tenant_ids` on `/query`). Each entry has `deprecated`, `deprecated_field`, `preferred_field`, `message`, and `deprecated_since`. It is a non-breaking nudge. The status code is unchanged. Prefer the `/databases` routes and `database`/`collection`/`collections` fields to avoid it. Treat `meta` as an open object: ignore keys you do not recognize.
+- `meta` may also carry an optional `deprecation` list (with a `Deprecation: true` response header) when a request uses a legacy `/tenants` route or a deprecated field (`tenant_id`/`sub_tenant_id`, or `sub_tenant_ids` on `/query`). Every entry has `deprecated`, `message`, and `deprecated_since`. `deprecated_field` and `preferred_field` are **optional**: the `sub_tenant_ids` notice on `/query` carries them, the `tenant_id`/`sub_tenant_id` notice does not. Read `message` for the migration, and do not key logic off the two optional fields. It is a non-breaking nudge. The status code is unchanged. Prefer the `/databases` routes and `database`/`collection`/`collections` fields to avoid it. Treat `meta` as an open object: ignore keys you do not recognize.
 - Exception: webhook management endpoints (`/webhooks/indexing*`) return their documented response object directly, without the `{ success, data, error, meta }` envelope.
 
 ### Core endpoints
@@ -63,6 +64,7 @@ Core raw HTTP responses (`/databases`, `/context/*`, and `/query`) are wrapped:
 | Ingest documents, app sources, memories | `POST /context/ingest` · `client.context.ingest()` |
 | Check indexing | `GET /context/status` · `client.context.status()` |
 | Search knowledge/memories/both | `POST /query` · `client.query()` |
+| Report back on query results | `POST /feedback` · `client.feedback.submit()` |
 | List sources/memories | `POST /context/list` · `client.context.list()` |
 | Inspect source content | `GET /context/inspect` · `client.context.inspect()` |
 | Delete sources/memories | `DELETE /context` · `client.context.delete()` |
@@ -99,9 +101,64 @@ Use the same `type` enum across context lifecycle APIs and search. Search additi
 
 - `metadata`: schema-aligned, declared at database creation, fast filter path. Sent as a top-level request field on `/context/ingest`.
 - `additional_metadata`: canonical free-form metadata; anything not present in the `metadata` schema. Also a top-level request field.
-- `document_metadata`: on file uploads only, binds a source `id` to each uploaded file. It is not a metadata envelope — do not nest `metadata` or `additional_metadata` inside it.
+- `document_metadata`: on file uploads only, binds a source `id` to each uploaded file. It is not a metadata envelope  -  do not nest `metadata` or `additional_metadata` inside it.
 - `metadata_filters` top-level keys match the `metadata` schema.
 - `metadata_filters.additional_metadata` scopes free-form metadata.
+
+### Sending feedback
+
+**If a query did not give you what you needed  -  nothing relevant came back, the top result was wrong, or you had to fall back to another source  -  please tell us with `POST /feedback`.** You are the only party that knows whether the retrieved context actually answered the question, and that judgement is what tunes retrieval.
+
+It is entirely optional, and there is no penalty for skipping it. Send it when you have something specific to report; a report on a query that disappointed you is worth far more than a stream of routine ones. If a query worked well and you want to say so, `rating: "positive"` is welcome too  -  it tells us what to preserve.
+
+Rules, when you do send it:
+
+- **Take `request_id` from the query's own response  -  never invent one.** It is in `meta.request_id`, and in the `X-Request-ID` response header. Send it back **verbatim**: an id you made up, or one from another query, correlates to nothing.
+- Set `source: "agent"`. It separates your reports from human ones, which fail in different ways.
+- Say **what** was wrong, not that something was wrong. "Returned the 2023 policy, current one is in the Q3 handbook" is actionable; "bad results" is not.
+- Do not block the user on it. Feedback is fire-and-forget: if the **feedback call itself** fails, drop it and carry on  -  never retry in a loop, and never surface that error to the user.
+- Feedback never changes the query's result. It is a signal, not a correction, and reading it back is not possible.
+
+```python
+result = client.query(database="acme_corp", query="What is our refund policy?")
+
+# ... use result.data.chunks to answer the user ...
+
+try:
+    client.feedback.submit(
+        request_id=result.meta.request_id,
+        feedback="Top chunk was the 2023 policy; the current one is in the Q3 handbook.",
+        rating="negative",
+        source="agent",
+        database="acme_corp",
+    )
+except Exception:
+    pass  # fire-and-forget: a failed report must never reach the user
+```
+
+Catch broadly. The point is that **nothing** escapes  -  narrowing to the SDK error type would still let a timeout or a DNS failure surface an error the user cannot act on, from a call they did not ask for.
+
+**"Did not give me what I needed" is not the same as "errored".** A query that returned `200` with unhelpful results is exactly what this endpoint is for. A query that never returned  -  `4xx`/`5xx`, or the SDK raised  -  is not: handle the error and move on rather than reporting it. Feedback is a judgement about retrieval quality, and a query that produced no results has no retrieval to judge. Fix the request instead: a `404` means the database name is wrong, a `429` means back off, a `400` means the body was malformed.
+
+**If you know the right answer, send it as `ground_truth`.** When you are running against a labelled set, or you know which document should have been returned, that is a far stronger signal than a comment  -  it can be scored without a human reading it. With `ground_truth` present, `feedback` prose is optional:
+
+```python
+try:
+    client.feedback.submit(
+        request_id=result.meta.request_id,
+        source="agent",
+        ground_truth={
+            "answer": expected_answer,          # what a correct response looks like
+            "source_ids": ["policy_2024"],      # sources that actually contain it
+        },
+    )
+except Exception:
+    pass
+```
+
+Send `answer`, `source_ids`, or both. Do **not** guess: only send ground truth you actually have. A fabricated answer key is worse than none, because it is scored as if it were true.
+
+Limit: 100 submissions per minute per organization  -  far above what reporting only the queries that fell short will ever reach. If you do hit `429`, honour `Retry-After` or simply skip that report  -  never spin.
 
 ### Do not mix scopes accidentally
 
@@ -163,6 +220,22 @@ It supports:
 - `query_by: "text"` for BM25 keyword/phrase search.
 - `mode: "fast"` for low latency.
 - `mode: "thinking"` for query expansion, reranking, richer graph traversal, and forceful-relation expansion.
+
+### Feedback
+
+`POST /feedback` records how a query performed. It is the loop that closes retrieval quality, and it is open to agents whenever a query falls short  -  see [Sending feedback](#sending-feedback).
+
+| Field | Required | Notes |
+|---|---|---|
+| `request_id` | yes | The UUID from that query's `meta.request_id`, verbatim |
+| `feedback` | yes* | What was right or wrong, up to 8000 chars. *Optional if `ground_truth` is sent |
+| `rating` | no | `positive`, `negative`, `neutral`. Omitting it ≠ `neutral` |
+| `source` | no | `user` (default) or `agent`  -  agents set `"agent"` |
+| `database` / `collection` | no | Optional scoping; `collection` requires `database` |
+| `ground_truth` | no | `{ answer, source_ids }`  -  what the right answer was, when you know it. Makes `feedback` optional |
+| `metadata` | no | Up to 20 string pairs of your own context (agent name, conversation id) |
+
+Each submission is its own record  -  sending a second report about the same query adds to it rather than replacing it, so refine as you learn more.
 
 ### Context graph
 
@@ -295,7 +368,11 @@ while True:
     if status.indexing_status in ("graph_creation", "completed"):
         break
     if status.indexing_status in ("errored", "failed"):
-        raise RuntimeError(status.error_message or "Indexing failed")
+        # A wrong database/collection reports "errored" too, with FILE_NOT_FOUND.
+        # error_message is "" in that case, so branch on the code, not the text.
+        if status.error_code == "FILE_NOT_FOUND":
+            raise RuntimeError("No such id in this scope: check database/collection match ingestion")
+        raise RuntimeError(status.error_message or status.message or "Indexing failed")
     time.sleep(2)
 
 # 5. Search memories.
@@ -355,7 +432,9 @@ while (true) {
 
   if (["graph_creation", "completed"].includes(status.indexingStatus as string)) break;
   if (["errored", "failed"].includes(status.indexingStatus as string)) {
-    throw new Error((status.errorMessage as string) ?? "Indexing failed");
+    // || rather than ??: errorMessage is "" (not null) on some failures, and ??
+    // would pass the empty string through and throw an error with no message.
+    throw new Error(status.errorMessage || status.message || "Indexing failed");
   }
 
   await new Promise((resolve) => setTimeout(resolve, 2_000));
@@ -594,7 +673,7 @@ Parameters:
 
 - `database` required
 - `ids` required array
-- `collection` optional, but should match ingestion scope
+- `collection`  -  **required if you ingested into one.** The lookup is scoped: omitting `collection`, or sending the wrong one, returns `indexing_status: "errored"` with `error_code: "FILE_NOT_FOUND"` and `message: "ID not found"` for a source that exists and is fully searchable. That is a scope miss, not an indexing failure, and it is indistinguishable from one unless you read `error_code`.
 
 Status meanings from docs:
 
@@ -612,12 +691,19 @@ Pattern:
 while (true) {
   const status = (await client.context.status({
     database: "acme_corp",
+    collection: "support_docs", // must match the ingestion scope, or you get FILE_NOT_FOUND
     ids: ["policy_v2"],
   })).data.statuses[0];
 
   if (["graph_creation", "completed"].includes(status.indexingStatus as string)) break;
   if (["errored", "failed"].includes(status.indexingStatus as string)) {
-    throw new Error((status.errorMessage as string) ?? (status.message as string) ?? "Indexing failed");
+    // A scope miss reports errored too, so name the cause rather than guessing.
+    if (status.errorCode === "FILE_NOT_FOUND") {
+      throw new Error(`No such id in this scope: check database/collection match ingestion`);
+    }
+    // Use ||, not ??: errorMessage comes back as "" (not null) on some failures,
+    // and ?? passes an empty string straight through to an empty error.
+    throw new Error(status.errorMessage || status.message || "Indexing failed");
   }
   await new Promise((r) => setTimeout(r, 2_000));
 }
@@ -1062,25 +1148,35 @@ Use `type: "memory"` to delete memory IDs.
 | `403` | authenticated but not permitted | No |
 | `404` | database/context item/memory not found | No |
 | `409` | conflict, e.g. existing database or context item ID | Usually no |
-| `422` | semantic validation failure | No |
+| `413` | upload too large | No |
+| `422` | semantic validation failure, including `TENANT_INFRA_NOT_READY` | Only for `TENANT_INFRA_NOT_READY`, after polling readiness |
 | `429` | rate limited | Yes with backoff |
 | `500` | internal error | Yes with backoff |
+| `502` | upstream dependency error (`BACKEND_ERROR`) | Yes with backoff |
 | `503` | temporary unavailability | Yes with backoff |
 
 ### Common error codes
 
 | Code | Meaning |
 |---|---|
-| `INVALID_PARAMETERS` | required, malformed, or conflicting parameter |
+| `INVALID_INPUT` | required, malformed, or conflicting parameter. This is the code for essentially every `400`  -  branch on it, not on a generic name |
+| `VALIDATION_ERROR` | request shape valid but failed validation |
 | `UNAUTHORIZED` | missing/invalid bearer token |
 | `FORBIDDEN` | key lacks access |
 | `DATABASE_ALREADY_EXISTS` | duplicate database ID |
 | `DATABASE_NOT_FOUND` | database missing/not visible |
-| `SOURCE_NOT_FOUND` | context item or memory missing in selected scope |
-| `VALIDATION_ERROR` | request shape valid but failed validation |
+| `TENANT_INFRA_NOT_READY` | `422`  -  the database exists but its infrastructure is still provisioning. This is what querying before polling readiness returns |
+| `FILE_NOT_FOUND` | id not found **in the selected scope**  -  usually a `collection` mismatch rather than a missing source |
+| `SOURCE_PROCESSING` | the source is still indexing and cannot serve this request yet |
+| `NOT_FOUND` | requested resource does not exist |
+| `PARSE_ERROR` | a document could not be parsed |
+| `PROCESSING_FAILED` | indexing failed for a source |
 | `RATE_LIMITED` | rate limit exceeded |
 | `INTERNAL_ERROR` | unexpected server error |
+| `BACKEND_ERROR` | `502`  -  an upstream dependency returned an error |
 | `SERVICE_UNAVAILABLE` | dependency unavailable / under load |
+
+There is no `INVALID_PARAMETERS` and no `SOURCE_NOT_FOUND`  -  earlier revisions of this guide listed both, and no HydraDB response has ever carried either. Match on `INVALID_INPUT` and `FILE_NOT_FOUND` instead.
 
 Retry only `429`, `500`, `503`; use bounded exponential backoff with jitter.
 
@@ -1164,6 +1260,8 @@ Common architecture across cookbooks:
 - [ ] Searching immediately after ingestion without polling `context.status` or using webhooks.
 - [ ] Treating `processing`/`queued` content as searchable.
 - [ ] Not handling both `errored` and `failed` as failure statuses.
+- [ ] Omitting `collection` on `context.status` and reading the resulting `FILE_NOT_FOUND` as a genuine indexing failure.
+- [ ] Using `??` on `errorMessage`, which is `""` rather than null on some failures, so the fallback never fires.
 - [ ] Omitting `collection` for user memories.
 - [ ] Writing with one `collection` and reading with another.
 - [ ] Using metadata filters for user partitioning instead of `collection`.
