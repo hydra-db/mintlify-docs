@@ -367,7 +367,11 @@ while True:
     if status.indexing_status in ("graph_creation", "completed"):
         break
     if status.indexing_status in ("errored", "failed"):
-        raise RuntimeError(status.error_message or "Indexing failed")
+        # A wrong database/collection reports "errored" too, with FILE_NOT_FOUND.
+        # error_message is "" in that case, so branch on the code, not the text.
+        if status.error_code == "FILE_NOT_FOUND":
+            raise RuntimeError("No such id in this scope: check database/collection match ingestion")
+        raise RuntimeError(status.error_message or status.message or "Indexing failed")
     time.sleep(2)
 
 # 5. Search memories.
@@ -427,7 +431,9 @@ while (true) {
 
   if (["graph_creation", "completed"].includes(status.indexingStatus as string)) break;
   if (["errored", "failed"].includes(status.indexingStatus as string)) {
-    throw new Error((status.errorMessage as string) ?? "Indexing failed");
+    // || rather than ??: errorMessage is "" (not null) on some failures, and ??
+    // would pass the empty string through and throw an error with no message.
+    throw new Error(status.errorMessage || status.message || "Indexing failed");
   }
 
   await new Promise((resolve) => setTimeout(resolve, 2_000));
@@ -666,7 +672,7 @@ Parameters:
 
 - `database` required
 - `ids` required array
-- `collection` optional, but should match ingestion scope
+- `collection`  -  **required if you ingested into one.** The lookup is scoped: omitting `collection`, or sending the wrong one, returns `indexing_status: "errored"` with `error_code: "FILE_NOT_FOUND"` and `message: "ID not found"` for a source that exists and is fully searchable. That is a scope miss, not an indexing failure, and it is indistinguishable from one unless you read `error_code`.
 
 Status meanings from docs:
 
@@ -684,12 +690,19 @@ Pattern:
 while (true) {
   const status = (await client.context.status({
     database: "acme_corp",
+    collection: "support_docs", // must match the ingestion scope, or you get FILE_NOT_FOUND
     ids: ["policy_v2"],
   })).data.statuses[0];
 
   if (["graph_creation", "completed"].includes(status.indexingStatus as string)) break;
   if (["errored", "failed"].includes(status.indexingStatus as string)) {
-    throw new Error((status.errorMessage as string) ?? (status.message as string) ?? "Indexing failed");
+    // A scope miss reports errored too, so name the cause rather than guessing.
+    if (status.errorCode === "FILE_NOT_FOUND") {
+      throw new Error(`No such id in this scope: check database/collection match ingestion`);
+    }
+    // Use ||, not ??: errorMessage comes back as "" (not null) on some failures,
+    // and ?? passes an empty string straight through to an empty error.
+    throw new Error(status.errorMessage || status.message || "Indexing failed");
   }
   await new Promise((r) => setTimeout(r, 2_000));
 }
@@ -1134,25 +1147,35 @@ Use `type: "memory"` to delete memory IDs.
 | `403` | authenticated but not permitted | No |
 | `404` | database/context item/memory not found | No |
 | `409` | conflict, e.g. existing database or context item ID | Usually no |
-| `422` | semantic validation failure | No |
+| `413` | upload too large | No |
+| `422` | semantic validation failure, including `TENANT_INFRA_NOT_READY` | Only for `TENANT_INFRA_NOT_READY`, after polling readiness |
 | `429` | rate limited | Yes with backoff |
 | `500` | internal error | Yes with backoff |
+| `502` | upstream dependency error (`BACKEND_ERROR`) | Yes with backoff |
 | `503` | temporary unavailability | Yes with backoff |
 
 ### Common error codes
 
 | Code | Meaning |
 |---|---|
-| `INVALID_PARAMETERS` | required, malformed, or conflicting parameter |
+| `INVALID_INPUT` | required, malformed, or conflicting parameter. This is the code for essentially every `400`  -  branch on it, not on a generic name |
+| `VALIDATION_ERROR` | request shape valid but failed validation |
 | `UNAUTHORIZED` | missing/invalid bearer token |
 | `FORBIDDEN` | key lacks access |
 | `DATABASE_ALREADY_EXISTS` | duplicate database ID |
 | `DATABASE_NOT_FOUND` | database missing/not visible |
-| `SOURCE_NOT_FOUND` | context item or memory missing in selected scope |
-| `VALIDATION_ERROR` | request shape valid but failed validation |
+| `TENANT_INFRA_NOT_READY` | `422`  -  the database exists but its infrastructure is still provisioning. This is what querying before polling readiness returns |
+| `FILE_NOT_FOUND` | id not found **in the selected scope**  -  usually a `collection` mismatch rather than a missing source |
+| `SOURCE_PROCESSING` | the source is still indexing and cannot serve this request yet |
+| `NOT_FOUND` | requested resource does not exist |
+| `PARSE_ERROR` | a document could not be parsed |
+| `PROCESSING_FAILED` | indexing failed for a source |
 | `RATE_LIMITED` | rate limit exceeded |
 | `INTERNAL_ERROR` | unexpected server error |
+| `BACKEND_ERROR` | `502`  -  an upstream dependency returned an error |
 | `SERVICE_UNAVAILABLE` | dependency unavailable / under load |
+
+There is no `INVALID_PARAMETERS` and no `SOURCE_NOT_FOUND`  -  earlier revisions of this guide listed both, and no HydraDB response has ever carried either. Match on `INVALID_INPUT` and `FILE_NOT_FOUND` instead.
 
 Retry only `429`, `500`, `503`; use bounded exponential backoff with jitter.
 
@@ -1236,6 +1259,8 @@ Common architecture across cookbooks:
 - [ ] Searching immediately after ingestion without polling `context.status` or using webhooks.
 - [ ] Treating `processing`/`queued` content as searchable.
 - [ ] Not handling both `errored` and `failed` as failure statuses.
+- [ ] Omitting `collection` on `context.status` and reading the resulting `FILE_NOT_FOUND` as a genuine indexing failure.
+- [ ] Using `??` on `errorMessage`, which is `""` rather than null on some failures, so the fallback never fires.
 - [ ] Omitting `collection` for user memories.
 - [ ] Writing with one `collection` and reading with another.
 - [ ] Using metadata filters for user partitioning instead of `collection`.
