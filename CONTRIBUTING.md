@@ -66,7 +66,7 @@ cd mintlify-docs
 1. Add the upstream remote:
 
 ```bash
-git remote add upstream https://github.com/usecortex/mintlify-docs.git
+git remote add upstream https://github.com/hydra-db/mintlify-docs.git
 ```
 
 ### Set up the development environment
