@@ -16,7 +16,7 @@ Live site: [https://docs.hydradb.com](https://docs.hydradb.com)
 ## Quick Start
 
 ```bash
-git clone https://github.com/usecortex/mintlify-docs.git
+git clone https://github.com/hydra-db/mintlify-docs.git
 cd mintlify-docs
 make bootstrap   # installs dependencies
 make dev         # starts local dev server at http://localhost:3000
