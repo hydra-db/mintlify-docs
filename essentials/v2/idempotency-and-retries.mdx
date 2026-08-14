@@ -1,0 +1,147 @@
+---
+title: "Idempotency & Safe Retries"
+description: "Retry any HydraDB operation without creating duplicates or losing data. Which calls are safe to repeat, and how to make the rest safe."
+---
+
+Networks fail, timeouts fire, and clients retry. [Error Responses](/api-reference/v2/error-responses) tells you **when** to retry (`429`, `500`, `503`, with backoff). This page answers the question that comes next: **is it safe to retry?**
+
+A retry is only safe if repeating the call produces the same end state as making it once. For a read that is automatic. For a write it depends entirely on how you send the request - and getting it wrong silently doubles your data or erases fields you meant to keep.
+
+<Info>
+  The short version: **give every write a stable `id` and let `upsert` do its job.** A retried write keyed by the same `id` replaces, it does not duplicate. A write with no `id` creates a brand-new item every time it runs.
+</Info>
+
+## Which operations are safe to retry
+
+| Operation | Idempotent by default? | What makes a retry safe |
+|---|---|---|
+| [`POST /query`](/api-reference/v2/endpoint/query) | **Yes** | Read-only. It changes nothing, so repeat it freely. |
+| [`POST /context/ingest`](/api-reference/v2/endpoint/ingest-context) | **Only with a stable `id`** | Same `id` + `upsert: true` replaces the item. No `id` means a new item per attempt. |
+| [`GET /context/status`](/api-reference/v2/endpoint/source-status) | **Yes** | Read-only status poll. |
+| [`PATCH` source metadata](/api-reference/v2/endpoint/update-source-metadata) | **Yes** (same body) | Applying the same metadata twice lands the same state. |
+| [`DELETE /context`](/api-reference/v2/endpoint/delete-source) | **Yes** | Deleting an already-deleted `id` is a no-op - treat the follow-up `SOURCE_NOT_FOUND` as success. |
+| [`POST /databases`](/api-reference/v2/endpoint/create-tenant) | **Effectively yes** | A retry of an existing database returns `409 DATABASE_ALREADY_EXISTS` - treat it as "already done." |
+
+---
+
+## The duplicate-ingestion trap
+
+This is the failure that bites people. You ingest, the network drops the response, your client retries - and now you have the same document or memory stored twice.
+
+The cause: ingestion is **asynchronous**. [`POST /context/ingest`](/api-reference/v2/endpoint/ingest-context) returns `202 Accepted` immediately, before indexing runs. If the response is lost in transit, your item may still be processing successfully on the server. A blind retry with no `id` ingests it a second time.
+
+<Warning>
+  A timeout is **not** proof the write failed. With async ingestion the item may be indexing fine while your client saw no response. Retrying without a stable `id` is how you get duplicates.
+</Warning>
+
+### Fix - own the `id`
+
+Supply your own stable `id` on every ingested item and keep `upsert: true` (the default). A retry then targets the same item and replaces it instead of adding a new one.
+
+<CodeGroup>
+```python Python SDK
+import json
+
+# Deterministic id derived from your source system - same input, same id.
+client.context.ingest(
+    type="knowledge",
+    database="acme_corp",
+    documents=[("policy.pdf", open("policy.pdf", "rb"), "application/pdf")],
+    document_metadata=json.dumps([
+        {"id": "policy_refund_v2", "metadata": {"document_type": "policy"}}
+    ]),
+    upsert=True,  # default; a retry with the same id replaces, never duplicates
+)
+```
+```typescript TypeScript SDK
+await client.context.ingest({
+  type: "memory",
+  database: "acme_corp",
+  collection: "user_123",
+  upsert: true, // default
+  memories: JSON.stringify([
+    { id: "pref_theme", text: "Prefers dark mode.", infer: false },
+  ]),
+});
+```
+```bash cURL
+curl -X POST 'https://api.hydradb.com/context/ingest' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -F "type=memory" \
+  -F "database=acme_corp" \
+  -F "collection=user_123" \
+  -F "upsert=true" \
+  -F 'memories=[{ "id": "pref_theme", "text": "Prefers dark mode.", "infer": false }]'
+```
+</CodeGroup>
+
+Derive the `id` from something stable in your own system - a database row ID, a content hash, a source-system key like `slack_<channel>_<ts>`. The same input must always produce the same `id`, so a replay lands on the same item.
+
+<Note>
+  `id` doubles as the key for [status](/api-reference/v2/endpoint/source-status), [delete](/api-reference/v2/endpoint/delete-source), and [forceful relations](/essentials/v2/knowledge#7-forceful-relations). Owning it is what makes the whole lifecycle addressable, not just retries.
+</Note>
+
+---
+
+## The other half of the trap: `upsert` replaces the whole item
+
+Idempotency has a sharp edge. When a retry (or any re-ingest) lands on an existing `id` with `upsert: true`, HydraDB replaces the **entire** source, not just the fields you sent.
+
+<Warning>
+  `upsert` is replace, not merge. Re-ingesting an item with only some of its original fields **drops the fields you left out**. If you want to change one metadata value, send the complete item, or use [`PATCH` source metadata](/api-reference/v2/endpoint/update-source-metadata) instead of re-ingesting.
+</Warning>
+
+| You want to | Do this | Not this |
+|---|---|---|
+| Retry a failed ingest safely | Re-send the **complete** item with its stable `id` | Re-send a partial item (loses omitted fields) |
+| Update one metadata field | [`PATCH` source metadata](/api-reference/v2/endpoint/update-source-metadata) | Re-ingest with only that field |
+| Replace a document's content | Re-ingest the full item with the same `id` | Rely on merge semantics (there are none) |
+
+---
+
+## Retrying creates and deletes
+
+Two operations that look risky but are safe when you handle the "already in that state" response:
+
+**Create database.** A retried [`POST /databases`](/api-reference/v2/endpoint/create-tenant) for a name that already exists returns `409 DATABASE_ALREADY_EXISTS`. That is the success case for a retry - the database is there. Catch the `409` and continue.
+
+**Delete.** A retried [`DELETE /context`](/api-reference/v2/endpoint/delete-source) for an `id` already removed returns `SOURCE_NOT_FOUND` (`404`). Also the success case - the item is gone. Treat both "deleted it" and "already deleted" as done.
+
+```python
+from hydra_db import HydraDBError
+
+def ensure_database(client, name):
+    try:
+        client.databases.create(database=name)
+    except HydraDBError as exc:
+        if exc.error_code == "DATABASE_ALREADY_EXISTS":
+            return  # retry-safe: it already exists, that is the goal
+        raise
+```
+
+<Warning>
+  Do **not** blindly retry `400`, `401`, `403`, `404`, `422`, or `409` as failures. They are permanent for the same request - retrying wastes calls and, for non-idempotent shapes, risks duplicates. Retry only `429`, `500`, and `503`. See the [retry pattern](/api-reference/v2/error-responses#retry-pattern).
+</Warning>
+
+---
+
+## A safe-retry checklist
+
+Before you put a write behind a retry loop:
+
+1. **Every ingested item carries a stable `id`** you derive deterministically. No `id` means duplicates on replay.
+2. **`upsert: true`** (the default) so a replayed `id` replaces instead of appends.
+3. **Re-send the complete item**, never a partial - `upsert` replaces the whole source.
+4. **Retry only `429` / `500` / `503`**, with exponential backoff and jitter.
+5. **Treat `409 DATABASE_ALREADY_EXISTS` and `SOURCE_NOT_FOUND` as success** inside create/delete retries.
+6. **Log `meta.request_id`** on every attempt so you can trace a replayed call end to end.
+7. **A timeout is not a failure** - confirm real state with [`GET /context/status`](/api-reference/v2/endpoint/source-status) before deciding to re-ingest.
+
+## Related
+
+- [Error Responses](/api-reference/v2/error-responses) - status codes, error codes, and the backoff retry pattern
+- [Ingest Content](/api-reference/v2/endpoint/ingest-context) - the `id` and `upsert` fields
+- [Ingestion Status](/api-reference/v2/endpoint/source-status) - confirm state after a timeout
+- [Update Source Metadata](/api-reference/v2/endpoint/update-source-metadata) - change fields without a full re-ingest
+- [Multi-tenancy](/essentials/v2/multi-tenant) - scoping writes and reads consistently
