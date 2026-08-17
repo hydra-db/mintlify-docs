@@ -1,0 +1,95 @@
+---
+title: "Three Scope Layers"
+description: "Database vs collection vs metadata_filters — when each HydraDB scope layer applies and how they stack on ingest and query."
+---
+
+HydraDB gives you three nesting layers. Mixing their jobs is the most common production footgun.
+
+Related: [Multi-tenant](/essentials/v2/multi-tenant) · [Metadata](/essentials/v2/metadata)
+
+---
+
+## Layer cheat sheet
+
+| Layer | Field | Isolates | Cross-read? |
+| --- | --- | --- | --- |
+| Hard | `database` | Customers, prod vs staging | **Never** across databases |
+| Partition | `collection` (write) / `collection` or `collections` (query) | Users, workspaces, channels, projects | Only if you fan out explicitly |
+| Filter | `metadata_filters` | Attributes inside a partition (`status`, `dept`) | N/A — narrows candidates |
+
+```mermaid
+flowchart TB
+  subgraph DB["database: acme_prod"]
+    D["collection: default<br/>shared Knowledge"]
+    U1["collection: user_a"]
+    U2["collection: user_b"]
+    W["collection: ws_sales"]
+  end
+  Other["database: other_customer"]
+  DB -.->|no path| Other
+  W --> F["metadata_filters<br/>region=eu"]
+```
+
+---
+
+## Decision tree
+
+```mermaid
+flowchart TD
+  Start["What am I separating?"]
+  Start --> Cust{"Different customers<br/>or environments?"}
+  Cust -->|yes| DB["Separate database"]
+  Cust -->|no| Part{"Different users,<br/>teams, or channels?"}
+  Part -->|yes| Col["Separate collection<br/>on write + matching query scope"]
+  Part -->|no| Attr{"Different labels<br/>inside same partition?"}
+  Attr -->|yes| Meta["metadata_filters<br/>exact equality<br/>+ schema enable_match"]
+  Attr -->|no| Same["Same scope on write and read"]
+
+  style DB fill:#FF571A,stroke:#FF571A,color:#f8fafc
+  style Col fill:#1e293b,stroke:#334155,color:#f8fafc
+  style Meta fill:#0f172a,stroke:#334155,color:#f8fafc
+```
+
+---
+
+## Write-time vs query-time
+
+| Operation | Scope fields |
+| --- | --- |
+| Ingest | `database` + optional `collection` (omit → default collection) |
+| Query | `database` + `collection` **or** preferred `collections` + optional `metadata_filters` |
+
+**Invariant:** data written under collection `A` is not expected when you query only collection `B`. See [Multi-tenant → How scoping works](/essentials/v2/multi-tenant#4-how-scoping-works).
+
+---
+
+## Product shapes
+
+| Product | `database` | `collection` map |
+| --- | --- | --- |
+| B2B SaaS | One per customer org (+ env DBs) | Workspace / team / user inside the org |
+| B2C app | One app DB (or per region/env) | Usually `user_id` for Memories |
+| Internal tools | One company DB | Dept / project; employee for Memories |
+| Connector corpora | Company or customer DB | Prefer **one collection per ACL boundary** (e.g. Slack channel) |
+
+---
+
+## Metadata is not a partition
+
+`metadata_filters` run **inside** the selected collection scope. They use **exact equality** (list values are exact set match, not `IN` / `OR`). For OR across values, run multiple queries and union client-side — [Metadata filter semantics](/essentials/v2/metadata#filter-semantics).
+
+**Authorization metadata must be schema-backed** with `enable_match: true`. Undeclared keys are silently ignored — the query behaves as if you sent no filter ([Metadata](/essentials/v2/metadata)). Never use a filter field for ACL until you have verified empty results for a non-matching value.
+
+| Need | Use |
+| --- | --- |
+| User A must never see user B prefs | `collection` |
+| Only `status=approved` docs | `metadata_filters` (+ `enable_match` on `status`) |
+| Customer A must never see customer B | `database` |
+| Multi-channel ACL | Prefer per-channel `collections`; metadata path only with match-enabled schema — [ACL Partitions](/essentials/v2/scope-composition/acl-partitions) |
+
+---
+
+## Next
+
+- [Collections Fanout](/essentials/v2/scope-composition/collections-fanout)
+- [Dual-Store Scope](/essentials/v2/scope-composition/dual-store)
