@@ -16,12 +16,13 @@ Mintlify is a hosted, config-driven platform — it can't mount a React componen
 
 ## Verification harness
 
-`footer-harness/` screenshot-diffs the local footer against the live Framer footer at all 5 breakpoints. Run:
+`footer-harness/` screenshot-diffs the local footer against the live Framer footer at all 5 breakpoints. It requires **Node.js 20 or newer** (Playwright 1.6x). Run:
 
 ```bash
 python3 -m http.server 8799            # from the repo root
 cd footer-harness && npm install && npx playwright install chromium
 node diff.mjs                          # pixel diff → footer-harness/out/
+node styles.mjs                        # computed-style node diff (type/color) vs live
 node measure.mjs                       # dump live footer geometry per breakpoint
 ```
 
@@ -58,7 +59,7 @@ Remaining delta is confined to text anti-aliasing and the two per-breakpoint lay
 
 ## Flagged items (need your call)
 
-1. **`http://` Trust Centre** — ported as-is per your note; it 301-redirects to `https://trust.hydradb.com/`. Recommend switching the source to `https://` to drop the redirect.
+1. **Trust Centre** — Framer authored this as `http://trust.hydradb.com/`. It 301-redirects to `https://`, so we ship it as **`https://trust.hydradb.com/`** (drops the redirect and closes the plaintext-navigation risk flagged in review). Same destination.
 2. **Benchmark host mismatch** — the *Benchmark* header → `benchmarks.hydradb.com/` (200), but its 3 children → `research.hydradb.com/…`, which **301-redirects to `benchmarks.hydradb.com/…`**. Ported exactly as-is; do you want them normalized to one host?
 3. **`Aeonik TRIAL Regular` licensing** — **moot for the footer** (not used). Only the two Geist Pixel faces are self-hosted here. Flagging since the brief raised it.
 4. **`Geist Pixel` (Google)** wasn't in the brief's font list but *is* used by the live footer — now self-hosted.

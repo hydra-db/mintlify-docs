@@ -54,7 +54,7 @@
       header: null,
       ariaLabel: "Legal and compliance",
       links: [
-        { label: "Trust Centre", href: "http://trust.hydradb.com/", external: true },
+        { label: "Trust Centre", href: "https://trust.hydradb.com/", external: true },
         { label: "Privacy Policy", href: "https://hydradb.com/privacy-policy" },
         { label: "Terms of Service", href: "https://hydradb.com/terms-of-service" }
       ]
