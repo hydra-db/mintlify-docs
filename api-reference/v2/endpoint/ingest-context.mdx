@@ -319,6 +319,7 @@ response.raise_for_status()
 | <Field name="document_metadata" type="string (JSON array)" /> | One entry per file in `documents`, in the same order. If omitted, documents index with inferred defaults such as filename/title. See the item shape below. |
 | <Field name="app_knowledge" type="string (JSON object or array)" /> | Pre-extracted source objects (Slack, Notion, web pages, etc.), **knowledge only**. See the `app_knowledge` item shape below. |
 | <Field name="graph_payload" type="string (JSON map)" /> | Map of source id → your own entities + relations - replaces LLM graph extraction for each keyed source. Works for `type=knowledge` (key = a `document_metadata` id or `app_knowledge` item id) and `type=memory` (key = a memory `id`). See [Bring Your Own Graph](/essentials/v2/bring-your-own-graph) and the shape below. |
+| <Field name="chunks_payload" type="string (JSON map)" /> | Map of source id → your own pre-split chunks - replaces HydraDB's chunker for each keyed source. Same keying as `graph_payload`; works for `type=knowledge` and `type=memory`. Chunks are still embedded and enriched. See [Bring Your Own Chunks](/essentials/v2/bring-your-own-chunks) and the shape below. |
 | <Field name="memories" type="string (JSON array)" /> | Memory items, **memory only**. Required and non-empty when `type=memory`. Use plural `memories` for the form field, even though `type` is singular `memory`. See the `memories` item shape below. |
 
 <Note>
@@ -699,9 +700,86 @@ Per-document metadata (`id`, `metadata`, `additional_metadata`, `relations`) can
   | <Field name="relations[].predicate" type="string" required /> | Relationship label, any plain string. ≤ 256 chars. |
   | <Field name="relations[].context" type="string" /> | Optional sentence supporting the edge. ≤ 2,000 chars. |
   | <Field name="relations[].temporal_details" type="string" /> | Optional timing info (e.g. "since 2021", "in Q3"). |
+  | <Field name="relations[].chunk_ids" type="string[]" /> | Optional [Bring Your Own Chunks](/essentials/v2/bring-your-own-chunks) mapping: your own `chunk_id`s the relation is evidenced by. Requires a `chunks_payload` for the same source; every id must be declared there (dangling returns `400`). When set, HydraDB links the relation to exactly those chunks and skips its chunk search. ≤ 100 per relation. |
 
   <Note>
   **Per-source replace mode.** Each top-level key must match a `document_metadata` id or `app_knowledge` item id for `type=knowledge`, or a memory `id` for `type=memory`, in the same request; attach graphs to multiple sources at once. Extraction is skipped for keyed sources. Caps per graph: ≤ 5,000 entities, ≤ 10,000 relations, ≤ 500 relations per entity; over-cap returns `400`. Graphs survive re-ingest (re-upload or connector re-sync re-applies the stored graph).
+  </Note>
+</Accordion>
+
+<Accordion title="Bring your own chunks - supply pre-split chunks">
+  `chunks_payload` is a **map of source id → chunks** that **replaces HydraDB's chunker** for each keyed source. Same keying as `graph_payload`: for `type=knowledge` the key is a `document_metadata` id or an `app_knowledge` item id; for `type=memory` it is a memory `id`. Keyed sources are still embedded and enriched, so they stay searchable. See [Bring Your Own Chunks](/essentials/v2/bring-your-own-chunks) for the full guide.
+
+  <CodeGroup>
+
+  ```bash cURL
+  curl -X POST 'https://api.hydradb.com/context/ingest' \
+    -H "Authorization: Bearer <your_api_key>" \
+    -H "API-Version: 2" \
+    -F "type=knowledge" \
+    -F "database=acme_corp" \
+    -F "documents=@/path/to/policy.pdf" \
+    -F 'document_metadata=[{ "id": "billing-policy-doc" }]' \
+    -F 'chunks_payload={
+      "billing-policy-doc": {
+        "chunks": [
+          { "chunk_id": "billing-0", "content": "Invoices are issued on the first of each month." },
+          { "chunk_id": "billing-1", "content": "Late payments incur a 2% monthly fee." }
+        ]
+      }
+    }'
+  ```
+
+  ```python Python SDK
+  import json
+
+  with open("/path/to/policy.pdf", "rb") as f:
+      client.context.ingest(
+          type="knowledge",
+          database="acme_corp",
+          documents=[("policy.pdf", f, "application/pdf")],
+          document_metadata=json.dumps([{"id": "billing-policy-doc"}]),
+          chunks_payload=json.dumps({
+              "billing-policy-doc": {
+                  "chunks": [
+                      {"chunk_id": "billing-0", "content": "Invoices are issued on the first of each month."},
+                      {"chunk_id": "billing-1", "content": "Late payments incur a 2% monthly fee."},
+                  ],
+              }
+          }),
+      )
+  ```
+
+  ```typescript TypeScript SDK
+  await client.context.ingest({
+    type: "knowledge",
+    database: "acme_corp",
+    documents: [{ path: "/path/to/policy.pdf", filename: "policy.pdf", contentType: "application/pdf" }],
+    documentMetadata: JSON.stringify([{ id: "billing-policy-doc" }]),
+    chunksPayload: JSON.stringify({
+      "billing-policy-doc": {
+        chunks: [
+          { chunk_id: "billing-0", content: "Invoices are issued on the first of each month." },
+          { chunk_id: "billing-1", content: "Late payments incur a 2% monthly fee." },
+        ],
+      },
+    }),
+  });
+  ```
+
+  </CodeGroup>
+
+  | Field | Description |
+  | --- | --- |
+  | <Field name="<source_id>" type="object" /> | Top-level key: a `document_metadata` id or `app_knowledge` item id for `type=knowledge`, or a memory `id` for `type=memory`. Value is that source's chunk set. A key matching no source returns `400`. |
+  | <Field name="chunks" type="array" required /> | Non-empty list of chunks, in index order. |
+  | <Field name="chunks[].chunk_id" type="string" required /> | Your id for the chunk. Unique within the source; the handle a relation's `chunk_ids` references. Stored as supplied. ≤ 512 chars. |
+  | <Field name="chunks[].content" type="string" required /> | Chunk text. Whitespace-only is rejected. ≤ 100,000 chars. |
+  | <Field name="chunks[].source_id" type="string" /> | Optional; defaults to the source's id. |
+  | <Field name="chunks[].node_type" type="string" /> | Optional label carried onto the vector record (for example `attachment`). |
+
+  <Note>
+  **Per-source replace mode.** Each top-level key must match a source in the same request; attach chunks to multiple sources at once. HydraDB's chunker is skipped for keyed sources, but each chunk is still embedded and enriched (you supply content only - any `inferred_content` is ignored and regenerated). Caps per source: ≤ 50,000 chunks, ≤ 100,000 chars per chunk, ≤ 32 MiB total content; over-cap or an empty/whitespace chunk set returns `400`. Chunks survive re-ingest (re-upload or connector re-sync re-applies the stored chunks).
   </Note>
 </Accordion>
 
