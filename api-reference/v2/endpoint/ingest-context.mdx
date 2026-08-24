@@ -8,7 +8,7 @@ import { Field } from "/snippets/field.jsx";
 
 When context is of `type=knowledge`:
 
-1. **Documents** - Use the `documents` field for binary uploads (PDF, DOCX, CSV, MD, TXT) that HydraDB should parse.
+1. **Documents** - Use the `documents` field for binary uploads that HydraDB should parse: PDFs, Office and iWork files, spreadsheets, images and plain text. See [Supported file formats](#supported-file-formats) for the full list.
 2. **App Sources** - Use `app_knowledge` for pre-extracted JSON content (Slack threads, Notion pages, emails, tickets). Read more about [ingesting knowledge from your apps](/essentials/v2/app-sources).
 
 When context is of `type=memory`
@@ -315,7 +315,7 @@ response.raise_for_status()
 | <Field name="database" type="string" required /> | Target database. Formerly `tenant_id`; the `tenant_id` alias is still accepted (deprecated). |
 | <Field name="collection" type="string" /> | Logical partition inside the database. Formerly `sub_tenant_id`; the `sub_tenant_id` alias is still accepted (deprecated). (default=`""`  -  default collection) |
 | <Field name="upsert" type="boolean" /> | Replace existing sources with the same ID. Set to `false` to error on conflict. (default=`true`) |
-| <Field name="documents" type="file[]" /> | Binary uploads, **knowledge only**. Required when `type=knowledge` and you want HydraDB to parse documents. Omit when ingesting memories. (default=`[]`) |
+| <Field name="documents" type="file[]" /> | Binary uploads, **knowledge only**. Required when `type=knowledge` and you want HydraDB to parse documents. Omit when ingesting memories. See [Supported file formats](#supported-file-formats). (default=`[]`) |
 | <Field name="document_metadata" type="string (JSON array)" /> | One entry per file in `documents`, in the same order. If omitted, documents index with inferred defaults such as filename/title. See the item shape below. |
 | <Field name="app_knowledge" type="string (JSON object or array)" /> | Pre-extracted source objects (Slack, Notion, web pages, etc.), **knowledge only**. See the `app_knowledge` item shape below. |
 | <Field name="graph_payload" type="string (JSON map)" /> | Map of source id → your own entities + relations - replaces LLM graph extraction for each keyed source. Works for `type=knowledge` (key = a `document_metadata` id or `app_knowledge` item id) and `type=memory` (key = a memory `id`). See [Bring Your Own Graph](/essentials/v2/bring-your-own-graph) and the shape below. |
@@ -325,6 +325,95 @@ response.raise_for_status()
 1. **`id` must not contain a comma (`,`).** The comma is reserved as the id separator on [Ingestion Status](/api-reference/v2/endpoint/source-status) (`GET /context/status?ids=a,b`), so an `id` containing a comma cannot be looked up unambiguously. This applies to every `id` you supply  -  `document_metadata`, `app_knowledge`, and `memories` items. Ingesting an item whose `id` contains a comma is rejected with a `400`.
 
 2. **`202 Accepted` means queued, not indexed.** Ingestion is asynchronous. A successful response only confirms your sources were accepted, not that they are ready to query. Before querying, poll [`GET /context/status`](/api-reference/v2/endpoint/source-status) with the returned IDs until each source reaches `completed` or `errored`. Alternatively, register a webhook for `indexing.status_changed` events (see [Webhooks](/essentials/v2/webhooks)). 
+</Note>
+
+
+## Supported file formats
+
+Anything in this table can be uploaded through `documents` and HydraDB will read it.
+
+| Type | Formats |
+| --- | --- |
+| Documents | `.pdf` `.doc` `.docx` `.docm` `.dot` `.dotx` `.odt` `.ott` `.rtf` |
+| Spreadsheets | `.xls` `.xlsx` `.xlsm` `.xlsb` `.ods` `.ots` `.csv` `.tsv` |
+| Presentations | `.ppt` `.pptx` `.pptm` `.odp` `.otp` |
+| Apple iWork | `.pages` `.numbers` `.key` |
+| Images | `.png` `.jpg` `.jpeg` `.tif` `.tiff` `.webp` `.gif` `.bmp` |
+| Plain text | `.txt` `.md` `.markdown` `.json` |
+
+What HydraDB extracts differs by type, and it is worth knowing which one you are uploading:
+
+| Type | What gets indexed |
+| --- | --- |
+| Documents and presentations | The text, in reading order. Slide titles and body text both come through. |
+| Spreadsheets | Cell values rendered as a table, one per sheet. Formulas are indexed as their computed result, not the formula itself. |
+| Images and scans | Text read out of the picture with OCR. A photo of a page and a scan of a page both work. |
+| Plain text | The file as-is. |
+
+A scanned page with nothing readable on it, or a photo that happens to contain no text, will index as an empty document rather than fail.
+
+### Formats we cannot read
+
+These are rejected the moment you upload them, before anything is queued. You get the answer in the upload response rather than minutes later.
+
+| Format | Upload this instead |
+| --- | --- |
+| `.heic` `.heif` `.avif` | Export the photo as JPEG or PDF |
+| `.svg` `.ico` | Export as PNG or JPEG |
+| `.html` `.htm` `.xml` | Save the page as PDF |
+| `.eml` `.msg` | Save the message as PDF, or send it as an app source |
+| `.epub` `.wpd` | Convert to PDF or DOCX |
+| `.zip` | Upload the files individually |
+
+<Note>
+`.heic` is the format iPhones use for photos by default, so it is the one people hit most often without realizing. On iOS you can change this under **Settings > Camera > Formats > Most Compatible**, which makes the camera save JPEGs instead. Or export the photo as JPEG or PDF before uploading.
+</Note>
+
+### How we decide the format
+
+The file extension is what counts. `report.pdf` is treated as a PDF because of the `.pdf`, not because of what is inside it.
+
+If the filename has no extension at all, the `Content-Type` you send with that part is used instead, so a file with no extension in its name, sent as `application/pdf`, is accepted.
+
+<Note>
+Renaming a file does not convert it. A `.heic` photo renamed to `photo.pdf` passes this check, because the check reads the name, then fails later during parsing and comes back as `errored` on [`GET /context/status`](/api-reference/v2/endpoint/source-status). Upload files under their real extension.
+</Note>
+
+### Size limit
+
+Each file in `documents` can be up to **50 MB**. A larger file is rejected with `413` and a message naming the file, and no part of the request is processed. Split large documents, or upload them separately.
+
+## When a file is not supported
+
+A rejected file does not stop the rest of your upload. Each file is checked on its own, so a batch of ten with one bad file still indexes the other nine.
+
+The request returns `202` as usual. The rejected file comes back with `status: "failed"` and `error_code: "E1002"`, and every other file is queued normally:
+
+```json
+{
+  "success": true,
+  "data": {
+    "success": false,
+    "message": "Upload completed with some failures.",
+    "results": [
+      { "id": "6cc7bcd185b044cd", "filename": "report.pdf", "status": "queued", "error": null, "error_code": null },
+      { "id": "f47411c736447126", "filename": "photo.heic", "status": "failed", "error": "This file format isn't supported. Please upload a PDF, Office document (Word, Excel, PowerPoint), image, CSV or text file.", "error_code": "E1002" },
+      { "id": "d0c919bdec196a8d", "filename": "notes.txt", "status": "queued", "error": null, "error_code": null }
+    ],
+    "success_count": 2,
+    "failed_count": 1
+  },
+  "error": null,
+  "meta": { "request_id": "bcd03673-174d-4a73-83e6-73bfcdc16061", "api_version": "2.0.1" }
+}
+```
+
+<Note>
+`results`, `success_count` and `failed_count` sit inside `data`, not at the top level, like every other v2 response. The outer `success: true` means the request was accepted; `data.success` is what tells you whether every file in it was queued.
+</Note>
+
+<Note>
+**Do not poll [`GET /context/status`](/api-reference/v2/endpoint/source-status) for a file rejected with `E1002`.** The file never entered the pipeline, so it has no status record, and looking it up returns `FILE_NOT_FOUND` rather than the format error you were given. The upload response is the only place `E1002` appears. Read `error_code` on each item in `data.results` and act on it there.
 </Note>
 
 
