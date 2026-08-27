@@ -70,11 +70,15 @@ curl -X DELETE 'https://api.hydradb.com/databases/collections?database=my_first_
 
 </ResponseExample>
 
-## Deletion completion
+## While cleanup is running
 
-Deletion is asynchronous. A `200` response means cleanup was scheduled, not that it finished. There is no collection-level completion endpoint, and a later `DELETE` `200` is also not a completion signal - the call is idempotent while cleanup is still running.
+Deletion is asynchronous: a `200` means cleanup was accepted, not that it finished. From the moment the API accepts the call, the collection is fenced:
 
-Do not reuse the collection name. Do not resume writes or queries against it after calling this API.
+- Every ingest, query, and read addressed to it returns `404`, so nothing can write into a collection that is being purged. Sibling collections in the same database, and the database itself, are unaffected and keep serving normally.
+- Ingestion already in flight for this collection is cancelled before any store is purged, so a job that started before the delete cannot repopulate it afterwards.
+- The collection disappears from [List Collections](/api-reference/v2/endpoint/list-sub-tenants) once its records are dropped, which happens before the slower vector, graph, and object-store cleanup completes.
+
+There is no collection-level completion endpoint, and a repeated `DELETE` returning `200` is not a completion signal either. The observable signal that cleanup has finished is that the collection stops returning `404` and accepts writes again, at which point the name is free to reuse.
 
 ## Behavior notes
 
@@ -82,9 +86,9 @@ Do not reuse the collection name. Do not resume writes or queries against it aft
 **Irreversible action.** Ingested documents, memories, embeddings, graph nodes, and storage objects for this collection are permanently removed. Other collections in the same database are not touched. There is no recovery window.
 </Warning>
 
-- **Stop in-flight work first:** Stop ingestion, polling, query, and background jobs targeting this collection before deleting. An in-flight ingest can write data after cleanup starts.
-- **Async cleanup:** The endpoint returns immediately after accepting the request. Infrastructure cleanup of vector stores, graphs, and storage objects runs in the background.
-- **Repeat calls:** Deleting an already-deleted collection is idempotent - cleanup runs again against empty stores and still returns `200`.
+- **Async cleanup:** The endpoint returns immediately after accepting the request. Cleanup of vector stores, graphs, and storage objects runs in the background.
+- **Repeat calls are the retry path:** Deleting the same collection again is idempotent. If a background cleanup fails part-way, the collection stays fenced and re-issuing the same `DELETE` re-runs cleanup from where it left off.
+- **Stopping work first is still kinder:** The API cancels this collection's in-flight ingestion for you, but a job cancelled mid-run is reported as failed to whatever started it. Draining your own writers first avoids that noise.
 - **Dashboard:** Owners can also expand a database on the Databases page and delete a collection from the inline list.
 
 ## Errors
