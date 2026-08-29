@@ -1,0 +1,147 @@
+---
+title: "Production Operations"
+description: "Run HydraDB in production: the signals to emit, what to alert on, how to trace a request, and a symptom-to-action incident runbook."
+---
+
+Getting a HydraDB integration working and keeping it healthy are different jobs. Once real traffic depends on it, you need to see what it is doing, catch degradation before users do, and know what to do at 3am when a query path goes quiet.
+
+HydraDB hands you the raw signals in every response and every status poll. This page turns those signals into an operations practice: what to log, what to alert on, and how to run an incident.
+
+<Info>
+  HydraDB does not push metrics to you. The signals below all come from data you already receive - the response envelope's `meta`, the ingestion [status endpoint](/api-reference/v2/endpoint/source-status), and the [database status endpoint](/api-reference/v2/endpoint/tenant-status). Operations is about **emitting and watching** what is already in hand.
+</Info>
+
+## The four signal sources
+
+| Source | Where it comes from | What it tells you |
+|---|---|---|
+| **Response `meta`** | Every core API response envelope | Per-call latency, a trace ID, and deprecation notices |
+| **Ingestion status** | [`GET /context/status`](/api-reference/v2/endpoint/source-status) | Where each item is in the async pipeline, and why it failed |
+| **Database status** | [`GET /databases/status`](/api-reference/v2/endpoint/tenant-status) | Whether a database is ready to serve reads and writes |
+| **Error envelope** | Any failed request | A machine code (`error.code`) and HTTP status class to branch on |
+
+---
+
+## Golden signals to emit
+
+Log these on every call from your client. They are the backbone of every dashboard and alert below.
+
+| Signal | Field | Emit as | Alert when |
+|---|---|---|---|
+| Request latency | `meta.latency_ms` | Histogram, tagged by endpoint + `type` | p95 rises against your own baseline |
+| Trace ID | `meta.request_id` | Structured log field on every call | Always log; never alert |
+| HTTP status class | response status | Counter by class (2xx/4xx/5xx) | 5xx rate over threshold, or any 5xx sustained |
+| Error code | `error.code` | Counter by code | `RATE_LIMITED` climbing, or auth codes appear |
+| Deprecation notice | `meta.deprecation` | Counter by `deprecated_field` / route | Any non-empty - you are on borrowed time |
+| Ingestion terminal state | `indexing_status` | Counter by state | `errored` rate over threshold |
+
+<Note>
+  `meta.latency_ms` is HydraDB's server-side processing time, not your end-to-end wall time. Track both: a gap between them is network or client overhead, not HydraDB.
+</Note>
+
+---
+
+## Trace a request end to end
+
+Every core response carries `meta.request_id`. It is the single most useful field in an incident.
+
+```json
+{
+  "success": true,
+  "data": { "...": "..." },
+  "error": null,
+  "meta": {
+    "request_id": "9d13aef4-02f4-4e73-8c62-4c2601d04f9d",
+    "latency_ms": 12.3
+  }
+}
+```
+
+**Log `meta.request_id` as a structured field on every request, success or failure.** Then:
+
+- When a user reports a bad result, find the call by `request_id` in your logs instead of guessing from timestamps.
+- Include the `request_id` verbatim when you contact `support@hydradb.com` - it identifies the exact call server-side.
+- Correlate a slow user action to its `latency_ms` and endpoint without re-deriving the request.
+
+---
+
+## Monitor the async ingestion pipeline
+
+Ingestion is asynchronous, so "the ingest call returned 202" is not "the content is live." The pipeline is where silent backlog builds up. Watch it explicitly.
+
+Each item moves `queued` -> `processing` -> `graph_creation` -> `completed`, or lands in `errored`. Query becomes possible at `graph_creation`. Poll [`GET /context/status`](/api-reference/v2/endpoint/source-status) and emit:
+
+- **Time-to-queryable** - ingest acceptance to `graph_creation`. This is your ingestion SLI; alert when it drifts up.
+- **Terminal `errored` rate** - the real failure signal.
+- **Backlog age** - oldest item still `queued` / `processing`. A growing backlog is an early warning.
+
+<Warning>
+  **A numeric `error_code` on an in-flight item is not a failure.** Many ingestion errors are transient and retried automatically by the pipeline. `E6001` (vector-store storage) normally clears within minutes on its own. Only count an item as failed once it reaches the terminal `errored` status - alerting on transient `error_code` values will page you for events that self-heal. See [Ingestion error codes](/api-reference/v2/error-responses#ingestion-error-codes).
+</Warning>
+
+---
+
+## Readiness gates
+
+A freshly created database is not immediately serveable - database creation is asynchronous. Before your app routes traffic to a new database, gate on readiness.
+
+Poll [`GET /databases/status`](/api-reference/v2/endpoint/tenant-status) until the infrastructure flags report ready:
+
+- `infra.scheduler_status`
+- `infra.graph_status`
+- `infra.vectorstore_status.knowledge`
+- `infra.vectorstore_status.memories`
+
+Treat "all ready" as the gate for serving. Wire the same check into a shallow health probe so an unready or degraded database surfaces in your monitoring rather than as user-facing empty results.
+
+---
+
+## Detect deprecation drift
+
+`meta.deprecation` is a free early-warning system for breakage you would otherwise discover during an upgrade.
+
+When a request uses a legacy field or route (`tenant_id`, `sub_tenant_id`, the `/tenants` routes), HydraDB adds a `Deprecation: true` header and a structured entry under `meta.deprecation` - never an error, just a nudge. In production:
+
+1. **Count** `meta.deprecation` entries by `deprecated_field` and route.
+2. **Alert** on any non-zero count - it means live code is on a deprecated path.
+3. **Burn it down** to zero, then the signal stays quiet and future notices stand out. See [Multi-tenancy - Deprecation signals](/essentials/v2/multi-tenant#7-migrating-from-the-legacy-tenant-and-sub-tenant-fields).
+
+---
+
+## Incident runbook
+
+When something breaks, start from the symptom. Each row points at the signal to check first and the first action to take.
+
+| Symptom | Check this signal first | First action |
+|---|---|---|
+| Query latency spiking | `meta.latency_ms` vs baseline, by endpoint | Confirm it is server-side (compare to wall time); if so, shed load and open a support ticket with sample `request_id`s |
+| Rising `5xx` / `SERVICE_UNAVAILABLE` | HTTP status counter, `error.code` | Back off with the [retry pattern](/api-reference/v2/error-responses#retry-pattern); do not hammer |
+| `429 RATE_LIMITED` climbing | `error.code` counter | Add backoff, coalesce calls, prefer one `type: "all"` query over two |
+| New content not appearing in queries | `indexing_status` backlog + terminal rate | Check the pipeline is draining; confirm items reach `graph_creation` |
+| Ingestion `errored` rate up | `error_code` on terminal items | Only act on `errored` (not transient); inspect the code and re-ingest the complete item |
+| Auth failures appear | `UNAUTHORIZED` / `FORBIDDEN` counts | Rotate/verify the API key; confirm `API-Version: 2` header on raw HTTP |
+| A user sees empty or wrong results | `request_id` for that call | Trace the call; check scope (`database`/`collection`/`type`) - see [Multi-tenancy](/essentials/v2/multi-tenant#4-how-scoping-works) |
+| Deprecation notices appear | `meta.deprecation` | Locate the legacy field/route and migrate before it is removed |
+
+---
+
+## Define SLOs from your own numbers
+
+HydraDB does not publish a single latency figure, and you should not assume one - latency depends on `mode` (a `fast` query and a `thinking` query are not comparable), `query_by`, result size, and payload. Build SLOs from **your** measured `meta.latency_ms` distribution instead:
+
+1. Measure p50/p95/p99 of `meta.latency_ms` per endpoint and per `mode` over a representative week.
+2. Set the SLO target slightly above your observed p95, not an aspirational round number.
+3. Set request timeouts generously for `thinking` and tightly for `fast`; for `mode: "auto"`, size the timeout for the `thinking` case since it can route either way.
+4. Re-baseline after any change to `mode`, `max_results`, or ingestion volume.
+
+<Note>
+  Tuning the query itself (picking `mode`, `alpha`, `max_results`) is covered in [Query](/essentials/v2/query#3-tuning-heuristics). This page is about watching what those choices do in production, not choosing them.
+</Note>
+
+## Related
+
+- [Error Responses](/api-reference/v2/error-responses) - status codes, error codes, retry pattern, ingestion `E####` codes
+- [Ingestion Status](/api-reference/v2/endpoint/source-status) - the async pipeline states to monitor
+- [Database Status](/api-reference/v2/endpoint/tenant-status) - readiness flags for health checks
+- [Multi-tenancy](/essentials/v2/multi-tenant) - deprecation signals and the migration contract
+- [Query](/essentials/v2/query) - the parameters whose latency you are watching
