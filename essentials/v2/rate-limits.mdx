@@ -1,0 +1,68 @@
+---
+title: "Rate Limits and Backoff"
+description: "How HydraDB rate limits work, how to design bulk ingestion and query traffic around them, and how to retry correctly when you hit one."
+---
+
+Every API key has a rate limit. This page covers what actually happens when you exceed it, how to shape traffic so you rarely do, and how to retry correctly when you do. For the retry code itself, see [Error Responses → Retry pattern](/api-reference/v2/error-responses#retry-pattern) - this page focuses on the design decisions around it.
+
+<Info>
+  Rate limits apply **per API key** and are enforced independently of `database` or `collection`. Current limit values aren't published in these docs - contact [founders@hydradb.com](mailto:founders@hydradb.com) if you need the number for capacity planning. What's true regardless of the exact value is covered below.
+</Info>
+
+---
+
+## 1. What a rate-limited request looks like
+
+A request over the limit returns:
+
+- **HTTP `429`**
+- `error.code: "RATE_LIMITED"` on the [response envelope](/api-reference/v2/error-responses)
+
+There is no separate `Retry-After` or `X-RateLimit-*` header documented for this API - the `429` status and `RATE_LIMITED` code are the only signal. That means your retry logic should be driven by **status code**, not by parsing rate-limit headers.
+
+```json
+{
+  "success": false,
+  "data": null,
+  "error": { "code": "RATE_LIMITED", "message": "..." },
+  "meta": { "request_id": "..." }
+}
+```
+
+`429` is one of the three retryable statuses HydraDB documents (alongside `500` and `503`) - see [Error Responses → Retry pattern](/api-reference/v2/error-responses#retry-pattern) for the exponential-backoff-with-jitter implementation in Python, TypeScript, and fetch. Reuse that pattern directly; don't write a second one.
+
+---
+
+## 2. Design traffic to avoid hitting the limit
+
+Reactive retries handle occasional spikes. For sustained bulk work - backfills, large document sets, high-QPS query traffic - design around the limit instead of retrying through it.
+
+### Bulk ingestion
+
+- **Batch within a single call before adding parallel calls.** A single [`POST /context/ingest`](/api-reference/v2/endpoint/ingest-context) request accepts an array of `memories`, `documents`, or `app_knowledge` items - one call ingesting 50 items is one rate-limit hit, not 50. Prefer growing the array over issuing more concurrent requests.
+- **Pace concurrent requests when you do parallelize.** If you're ingesting from multiple workers or threads, cap concurrency and add a small delay between batches rather than firing every request at once. A fixed concurrency limit (start around 3-5 concurrent requests) combined with the retry pattern absorbs the occasional `429` without a thundering-herd retry storm.
+- **Make retries idempotent with `upsert` and stable `id`s.** Ingestion already supports `upsert: true` (the default) keyed on `id`. Set a stable `id` on every item you ingest so a retried request after a `429` or `500` safely replaces the same item instead of creating a duplicate. See [Memories](/essentials/v2/memories#memory-fields) and [Knowledge](/essentials/v2/knowledge#6-key-parameters) for the `id` field on each ingestion path.
+
+### High-volume querying
+
+- **Use `collections` fan-out instead of one query per collection.** [`POST /query`](/api-reference/v2/endpoint/query) accepts `collections` as an array (up to 100) to search multiple collections in one call, weighted or unweighted. Looping your own per-collection queries multiplies your request count for no retrieval benefit - see [Query → Scope](/essentials/v2/query#2-parameter-reference).
+- **Cache or de-duplicate identical queries** at the application layer when the same query text and scope repeats within a short window (e.g. repeated UI renders), instead of re-issuing it to HydraDB each time.
+- **Prefer `mode: "fast"` for latency-sensitive, high-QPS paths** and reserve `mode: "thinking"` for calls that need graph traversal or forceful relations. If graph context isn't needed, also set `graph_context: false` - it defaults to `true` regardless of `mode`, so `mode: "fast"` alone doesn't disable it. See [Query → Tuning heuristics](/essentials/v2/query#3-tuning-heuristics). Fewer expensive calls means more headroom under the same rate limit.
+
+---
+
+## 3. Retrying correctly
+
+Three rules, all already reflected in the documented retry pattern:
+
+1. **Only retry `429`, `500`, and `503`.** Every other status is a request problem (bad input, missing scope, not found) that a retry won't fix - see [Error Responses → Troubleshooting](/api-reference/v2/error-responses#troubleshooting).
+2. **Use exponential backoff with jitter, and bound the attempts.** Unbounded retries on a sustained rate-limit condition just add load. The documented pattern caps at a small number of attempts (e.g. 3) with `2^attempt` seconds of backoff plus random jitter.
+3. **Don't retry inside a request that's already async.** [Ingestion](/essentials/v2/knowledge#2-what-it-does) returns immediately with `queued` status - retrying the ingest call itself (versus polling [`GET /context/status`](/api-reference/v2/endpoint/source-status)) only makes sense if the *ingest call* returned `429`/`500`/`503`, not while you're waiting for `indexing_status` to reach `graph_creation`.
+
+---
+
+## Related
+
+- [Error Responses](/api-reference/v2/error-responses) - the retry-pattern code, the envelope shape, and which codes are retryable
+- [Query](/essentials/v2/query) - `collections` fan-out and `mode` tuning
+- [Knowledge](/essentials/v2/knowledge) and [Memories](/essentials/v2/memories) - batch ingestion and `upsert`/`id` semantics
