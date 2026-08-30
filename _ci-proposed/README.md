@@ -16,6 +16,11 @@ the two files into place.
 Then delete `_ci-proposed/`. No dependency changes are needed — `@hydradb/sdk`
 is already a dependency of this repo.
 
+> ⚠️ **`.gitignore` gotcha:** this repo's `.gitignore` has a bare `scripts` rule,
+> so `scripts/sync-docs.mjs` is ignored by default. Force-add it:
+> `git add -f scripts/sync-docs.mjs` (the existing `scripts/` files are tracked
+> the same way).
+
 ## 2. Set the secret and variables (GitHub → repo Settings)
 
 All of these belong to **this repo** (`hydra-db/mintlify-docs`), because that is
