@@ -60,6 +60,14 @@ a secret), the widget forwards it. Resolution order: `config.apiKey` →
 > ship to the browser — and with this design it never does. Those live only on the
 > gateway and in the docs-sync CI secret (see `_ci-proposed/README.md`).
 
+## Keyboard shortcut (⌘I / Ctrl+I)
+
+Press **⌘I** (macOS) or **Ctrl+I** (Windows/Linux) anywhere to open or close Ask
+AI. The widget claims this shortcut in the capture phase, so on Mintlify it takes
+over from the built-in "Ask Assistant" — and it hides that navbar button so there
+is a single Ask AI entry point. The shortcut is surfaced on the launcher (a `⌘I`
+badge + tooltip) and in the greeting message.
+
 ## Theme (inherits the host's colors)
 
 Token precedence: `config.theme.<token>` → host CSS var `--askai-<token>` on
