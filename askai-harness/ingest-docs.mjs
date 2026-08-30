@@ -34,7 +34,10 @@ const BASE = (process.env.HYDRA_BASE_URL || "https://api.hydradb.com").replace(/
 const BATCH_SIZE = Number(process.env.HYDRA_DB_SYNC_BATCH || 15);
 const WAIT_TIMEOUT_MS = Number(process.env.HYDRA_DB_SYNC_TIMEOUT_MS || 10 * 60_000);
 
-if (!KEY) die("HYDRA_DB_API_KEY is required");
+const ARGS = new Set(process.argv.slice(2));
+const DRY_RUN = ARGS.has("--dry-run");
+
+if (!KEY && !DRY_RUN) die("HYDRA_DB_API_KEY is required (or pass --dry-run)");
 
 // Match-enabled string fields → usable as /query metadata_filters. `page` lets
 // the widget scope a search to the current page; `section`/`folder`/`repo` scope
@@ -51,6 +54,42 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const isDoc = (n) => n.endsWith(".mdx") || n.endsWith(".md");
 const stripExt = (p) => p.replace(/\.mdx?$/, "");
 function die(msg) { console.error(`✗ ${msg}`); process.exit(1); }
+
+// ── .askai-ignore (paths excluded from ingestion) ─────────────────────────────
+// gitignore-ish: one route/folder per line, "#" comments, trailing "/" = folder
+// prefix, "*"/"**" globs. Matched against Mintlify routes (slug joined by "/").
+function loadIgnorePatterns() {
+  const p = path.join(ROOT, ".askai-ignore");
+  if (!fs.existsSync(p)) return [];
+  return fs.readFileSync(p, "utf-8").split("\n")
+    .map((l) => l.replace(/#.*$/, "").trim())
+    .filter(Boolean)
+    .map((l) => l.replace(/^\.?\//, "").replace(/\/+$/, ""));
+}
+const IGNORE = loadIgnorePatterns();
+function globToRe(pat) {
+  // "*" matches within a path segment, "**" across segments. Single-pass so we
+  // never need a sentinel char (keeps the file plain text / non-binary).
+  let out = "";
+  for (let i = 0; i < pat.length; i++) {
+    const c = pat[i];
+    if (c === "*") {
+      if (pat[i + 1] === "*") { out += ".*"; i++; } else { out += "[^/]*"; }
+    } else if (".+^${}()|[]\\".indexOf(c) >= 0) {
+      out += "\\" + c;
+    } else {
+      out += c;
+    }
+  }
+  return new RegExp("^" + out + "$");
+}
+// A route is ignored if a pattern matches it exactly, is a folder-prefix of it,
+// or (when it contains "*") matches as a glob.
+function isIgnored(route) {
+  return IGNORE.some((pat) =>
+    pat.includes("*") ? globToRe(pat).test(route) : route === pat || route.startsWith(pat + "/")
+  );
+}
 
 function jsonHeaders() {
   return { Authorization: `Bearer ${KEY}`, "API-Version": "2", "Content-Type": "application/json" };
@@ -225,11 +264,37 @@ async function waitIndexed(ids) {
   if (pending.size) throw new Error(`timed out indexing ${pending.size} source(s): ${[...pending].join(", ")}`);
 }
 
+const routeOf = (doc) => doc.slug.join("/");
+const idOf = (doc) => `doc--${doc.slug.join("--").toLowerCase()}`;
+
+async function deleteSources(ids) {
+  for (let i = 0; i < ids.length; i += BATCH_SIZE) {
+    const batch = ids.slice(i, i + BATCH_SIZE);
+    const res = await api("DELETE", "/context", {
+      type: "knowledge", database: DATABASE, collection: COLLECTION, ids: batch,
+    });
+    if (!res.ok) console.warn(`! prune failed (${res.status}): ${res.text.slice(0, 160)}`);
+  }
+}
+
 async function main() {
-  console.log(`HydraDB ingest → ${BASE}  database=${DATABASE}  collection=${COLLECTION}`);
-  const docs = collectDocs();
-  if (!docs.length) die("no doc pages found");
-  console.log(`found ${docs.length} published page(s) in docs.json`);
+  console.log(`HydraDB ingest → ${BASE}  database=${DATABASE}  collection=${COLLECTION}${DRY_RUN ? "  (dry-run)" : ""}`);
+  const all = collectDocs();
+  if (!all.length) die("no doc pages found");
+
+  // Split by .askai-ignore.
+  const docs = all.filter((d) => !isIgnored(routeOf(d)));
+  const ignored = all.filter((d) => isIgnored(routeOf(d)));
+  console.log(`found ${all.length} page(s) in docs.json — ingesting ${docs.length}, ignoring ${ignored.length} via .askai-ignore (${IGNORE.length} rule(s))`);
+  if (ignored.length) {
+    for (const d of ignored) console.log(`   · ignore ${routeOf(d)}`);
+  }
+  if (!docs.length) die("every page is ignored — check .askai-ignore");
+
+  if (DRY_RUN) {
+    console.log(`[dry-run] would ingest ${docs.length} page(s); would prune ${ignored.length} ignored source(s) if present`);
+    return;
+  }
 
   await ensureDatabase();
   await ensureSchema();
@@ -243,6 +308,14 @@ async function main() {
     done += batch.length;
     console.log(`  ✓ ${done}/${items.length} indexed`);
   }
+
+  // Prune any ignored pages that were ingested on a previous run, so the
+  // collection reflects .askai-ignore (deprecated v1 API leaves the corpus).
+  if (ignored.length) {
+    await deleteSources(ignored.map(idOf));
+    console.log(`✓ pruned ${ignored.length} ignored source(s) from ${DATABASE}/${COLLECTION}`);
+  }
+
   const stats = await api("GET", `/databases/stats?database=${encodeURIComponent(DATABASE)}`);
   console.log("✓ ingestion complete");
   if (stats.data?.data) console.log(JSON.stringify(stats.data.data).slice(0, 400));

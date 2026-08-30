@@ -100,6 +100,16 @@ optional `Authorization: Bearer <key>`. Response is newline-delimited JSON:
 
 The docs corpus is populated by the sync Action in `_ci-proposed/`.
 
+## Excluding pages from ingestion (`.askai-ignore`)
+
+`.askai-ignore` at the repo root lists folders / page routes that must **not** be
+ingested (so Ask AI can't retrieve, cite, or recommend them). It's gitignore-ish:
+one route per line, `#` comments, a trailing `/` matches a whole folder, and
+`*`/`**` glob. It currently excludes the **deprecated v1 API reference**
+(`api-reference/index`, `sdks`, `error-responses`, `api-reference/endpoint/`),
+keeping the v2 API (`api-reference/v2/*`). `ingest-docs.mjs` skips matches and
+prunes any that were ingested before; `--dry-run` previews the split.
+
 ## Backend: Option A (hosted) or Option B (open-source Rust binary `askai-gateway`)
 
 1. **Option A (Hosted):** Set `endpoint` to a hosted HydraDB Ask endpoint. The
@@ -139,6 +149,8 @@ node askai-harness/ingest-docs.mjs             # Cortex-style: creates the hydra
                                                # registers match-enabled metadata fields
                                                # (src_kind/section/folder/page/repo), and
                                                # ingests every docs.json page into collection=docs.
+                                               # Honors .askai-ignore (see below); pass --dry-run
+                                               # to preview what it would ingest/prune.
                                                # (askai-harness/ingest-sample.mjs is a smaller,
                                                #  8-page smoke-test variant.)
 
