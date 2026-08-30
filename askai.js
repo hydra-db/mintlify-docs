@@ -517,21 +517,51 @@
     else mount();
   }
 
-  // Hide the host site's own AI-assistant trigger (e.g. Mintlify's "Ask
-  // Assistant ⌘I" button in the navbar), so there's a single Ask AI entry point
-  // and Cmd/Ctrl+I is unambiguous. Text-based match, scoped away from our own
-  // Shadow-DOM host; runs now and again whenever the host re-renders (SPA nav).
+  // Hide the host site's own AI-assistant surfaces so there's a single Ask AI
+  // entry point (ours) and Cmd/Ctrl+I is unambiguous. Covers Mintlify's navbar
+  // "Ask Assistant ⌘I" button and its floating "Ask a question…" input.
+  // Scoped away from our own Shadow-DOM host; re-runs on host re-render (SPA nav).
+
+  // Known host-assistant containers, matched by stable selector. Each match is
+  // hidden along with a sticky/fixed wrapper ancestor (so no empty bar is left).
+  var HOST_ASSISTANT_SELECTORS = [
+    ".chat-assistant-floating-input", // Mintlify floating "Ask a question…" box
+    "#chat-assistant-textarea",
+    "[id^='chat-assistant']",
+  ];
+
+  function hide(el) {
+    if (!el || (el.closest && el.closest("#" + HOST_ID))) return; // never our widget
+    if (el.getAttribute("data-hydra-hidden") === "1") return;
+    el.setAttribute("data-hydra-hidden", "1");
+    el.style.setProperty("display", "none", "important");
+  }
+
   function hideHostAssistant() {
+    // 1. Selector-based surfaces (the floating input). Also climb to a sticky/
+    //    fixed wrapper within a few levels so its reserved space collapses too.
+    HOST_ASSISTANT_SELECTORS.forEach(function (sel) {
+      document.querySelectorAll(sel).forEach(function (el) {
+        var target = el;
+        for (var up = 0; up < 4 && target.parentElement; up++) {
+          var pos = "";
+          try { pos = getComputedStyle(target.parentElement).position; } catch (e) {}
+          if (pos === "sticky" || pos === "fixed") { target = target.parentElement; break; }
+          target = target.parentElement;
+        }
+        hide(target === el ? el : target);
+        hide(el);
+      });
+    });
+    // 2. Text-based trigger (the navbar "Ask Assistant ⌘I" button).
     var nodes = document.querySelectorAll("button, a, [role=button]");
     for (var i = 0; i < nodes.length; i++) {
       var el = nodes[i];
-      if (el.closest && el.closest("#" + HOST_ID)) continue; // never our widget
+      if (el.closest && el.closest("#" + HOST_ID)) continue;
       if (el.getAttribute("data-hydra-hidden") === "1") continue;
       var label = ((el.textContent || "") + " " + (el.getAttribute("aria-label") || "")).toLowerCase();
-      // Match the built-in assistant, but not a plain "Ask AI" launcher clone.
       if (/\bask\s*assistant\b/.test(label) || (/\bassistant\b/.test(label) && /(⌘|ctrl).?\s*i\b/.test(label))) {
-        el.setAttribute("data-hydra-hidden", "1");
-        el.style.setProperty("display", "none", "important");
+        hide(el);
       }
     }
   }
