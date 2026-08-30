@@ -14,9 +14,9 @@
  *   window.HydraAskAI = {
  *     endpoint: "https://agents.hydradb.com", // ask API base
  *     apiKey:   "pk_docs_readonly_...",        // optional, see "API key" below
+ *     logo:     "",                            // optional custom logo URL (defaults to HydraDB mark)
  *     theme:    { accent: "#FF571A" },          // optional brand override
  *     modes:    ["fast", "auto", "thinking"],  // which think-modes to show
- *     brand:    true,                            // "Powered by HydraDB" footer
  *   };
  *
  * ── API key (composable, no prop required) ─────────────────────────────────
@@ -38,13 +38,14 @@
     {
       endpoint: "https://agents.hydradb.com",
       apiKey: "",
+      logo: "",
       title: "Ask AI",
       placeholder: "Ask about the docs…",
       greeting:
         "Hi! I can answer questions from the documentation, with sources. What are you looking for?",
       modes: ["fast", "auto", "thinking"],
       defaultMode: "auto",
-      brand: true,
+      brand: true, // attribution is always shown (Kapa-style); brandUrl preserved for link
       brandUrl: "https://hydradb.com",
       position: "right", // reserved
       theme: {},
@@ -103,14 +104,16 @@
     }
     .launcher {
       position: fixed; right: 24px; bottom: 24px; z-index: 2147483000;
-      display: inline-flex; align-items: center; gap: 8px;
-      padding: 11px 16px; border: none; border-radius: 999px; cursor: pointer;
+      display: inline-flex; align-items: center; gap: 9px;
+      padding: 10px 16px; border: none; border-radius: 999px; cursor: pointer;
       background: var(--accent); color: #fff; font-size: 14px; font-weight: 600;
       box-shadow: 0 6px 24px var(--accent-line);
       transition: transform .15s ease, box-shadow .15s ease;
     }
     .launcher:hover { transform: translateY(-1px); }
-    .launcher svg { width: 17px; height: 17px; }
+    .logo-wrap { display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; }
+    .logo-img { display: block; object-fit: contain; flex-shrink: 0; }
+    .launcher-logo { width: 18px; height: 18px; border-radius: 4px; overflow: hidden; }
 
     .scrim {
       position: fixed; inset: 0; z-index: 2147483200; background: rgba(0,0,0,0.45);
@@ -130,8 +133,7 @@
 
     .head { display: flex; align-items: center; gap: 10px; padding: 15px 16px;
       border-bottom: 1px solid var(--line); flex: 0 0 auto; }
-    .head .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent);
-      box-shadow: 0 0 0 4px var(--accent-soft); }
+    .head-logo { width: 20px; height: 20px; border-radius: 4px; overflow: hidden; }
     .head h2 { margin: 0; font-size: 15px; font-weight: 600; }
     .head .spacer { flex: 1; }
     .head button.close { background: transparent; border: none; color: var(--muted);
@@ -190,11 +192,13 @@
     .composer button.send:disabled { opacity: .45; cursor: default; }
     .composer button.send svg { width: 18px; height: 18px; }
 
-    .foot { padding: 0 12px 10px; display: flex; align-items: center; justify-content: center; gap: 6px;
-      font-size: 11px; color: var(--muted); flex: 0 0 auto; }
-    .foot .brand { display: inline-flex; align-items: center; gap: 5px; color: var(--muted); text-decoration: none; font-weight: 600; }
-    .foot .brand:hover { color: var(--text); }
-    .foot .brand .mk { width: 12px; height: 12px; border-radius: 3px; background: var(--accent); display: inline-block; }
+    .foot { padding: 0 14px 10px; display: flex; align-items: center; justify-content: center; gap: 5px;
+      font-size: 11px; color: var(--muted); flex: 0 0 auto; flex-wrap: wrap; text-align: center; }
+    .foot .foot-disclaimer { color: var(--muted); opacity: 0.85; }
+    .foot .foot-powered { display: inline-flex; align-items: center; gap: 4px; }
+    .foot .brand-link { display: inline-flex; align-items: center; gap: 4px; color: var(--accent); text-decoration: none; font-weight: 600; }
+    .foot .brand-link:hover { text-decoration: underline; color: #fff; }
+    .foot-logo { width: 12px; height: 12px; border-radius: 2.5px; overflow: hidden; display: inline-flex; }
 
     /* ── Responsive ──────────────────────────────────────────────────────── */
     /* Large screens: a touch wider for comfortable reading. */
@@ -216,10 +220,23 @@
   `;
   }
 
-  var ICON_SPARK =
-    '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l1.9 5.1L19 9l-5.1 1.9L12 16l-1.9-5.1L5 9l5.1-1.9z"/></svg>';
+  var HYDRA_LOGO_SVG =
+    '<svg viewBox="0 0 1600 1600" aria-hidden="true" style="width:100%;height:100%;display:block;">' +
+    '<path fill="#000000" d="M739,1601 C492.67,1601 246.83,1601 1,1601 C1,1067.67 1,534.33 1,1 C534.33,1 1067.67,1 1601,1 C1601,534.33 1601,1067.67 1601,1601 C1313.83,1601 1026.67,1601 739,1601 M1004.5,1209 C1013.74,1209 1022.98,1209 1032.66,1209 C1032.66,1169.69 1032.66,1131.12 1032.66,1092.09 C1071.68,1092.09 1110.23,1092.09 1149.09,1092.09 C1149.09,1053.2 1149.09,1014.76 1149.09,975.75 C1188.09,975.75 1226.78,975.75 1265.41,975.75 C1265.41,858.91 1265.41,742.66 1265.41,626.02 C1226.53,626.02 1187.95,626.02 1148.92,626.02 C1148.92,587.06 1148.92,548.48 1148.92,509.48 C1109.89,509.48 1071.31,509.48 1032.29,509.48 C1032.29,470.49 1032.29,431.92 1032.29,393.35 C876.63,393.35 721.43,393.35 565.8,393.35 C565.8,432.27 565.8,470.84 565.8,509.79 C526.96,509.79 488.54,509.79 449.59,509.79 C449.59,548.72 449.59,587.28 449.59,626.23 C410.47,626.23 371.88,626.23 333.34,626.23 C333.34,743 333.34,859.39 333.34,976.19 C372.26,976.19 410.83,976.19 449.78,976.19 C449.78,1015.03 449.78,1053.45 449.78,1092.4 C488.72,1092.4 527.27,1092.4 566.22,1092.4 C566.22,1131.52 566.22,1170.11 566.22,1209 C712.24,1209 857.87,1209 1004.5,1209 z"/>' +
+    '<path fill="#FEFEFE" d="M1004,1209 C857.87,1209 712.24,1209 566.22,1209 C566.22,1170.11 566.22,1131.52 566.22,1092.4 C527.27,1092.4 488.72,1092.4 449.78,1092.4 C449.78,1053.45 449.78,1015.03 449.78,976.19 C410.83,976.19 372.26,976.19 333.34,976.19 C333.34,859.39 333.34,743 333.34,626.23 C371.88,626.23 410.47,626.23 449.59,626.23 C449.59,587.28 449.59,548.72 449.59,509.79 C488.54,509.79 526.96,509.79 565.8,509.79 C565.8,470.84 565.8,432.27 565.8,393.35 C721.43,393.35 876.63,393.35 1032.29,393.35 C1032.29,431.92 1032.29,470.49 1032.29,509.48 C1071.31,509.48 1109.89,509.48 1148.92,509.48 C1148.92,548.48 1148.92,587.06 1148.92,626.02 C1187.95,626.02 1226.53,626.02 1265.41,626.02 C1265.41,742.66 1265.41,858.91 1265.41,975.75 C1226.78,975.75 1188.09,975.75 1149.09,975.75 C1149.09,1014.76 1149.09,1053.2 1149.09,1092.09 C1110.23,1092.09 1071.68,1092.09 1032.66,1092.09 C1032.66,1131.12 1032.66,1169.69 1032.66,1209 C1022.98,1209 1013.74,1209 1004,1209 M722.5,509.7 C709.4,509.7 696.29,509.7 682.69,509.7 C682.69,548.76 682.69,587.32 682.69,626.26 C643.59,626.26 605,626.26 566,626.26 C566,665.23 566,703.81 566,742.91 C527.05,742.91 488.49,742.91 449.9,742.91 C449.9,781.85 449.9,820.28 449.9,859.21 C488.65,859.21 527.2,859.21 566.15,859.21 C566.15,898.31 566.15,936.9 566.15,976.07 C605.23,976.07 643.93,976.07 682.97,976.07 C682.97,1015.09 682.97,1053.52 682.97,1092.05 C760.72,1092.05 838.12,1092.05 916.01,1092.05 C916.01,1053.26 916.01,1014.7 916.01,975.83 C954.95,975.83 993.38,975.83 1032.44,975.83 C1032.44,936.81 1032.44,898.1 1032.44,858.98 C1071.63,858.98 1110.2,858.98 1148.63,858.98 C1148.63,820.01 1148.63,781.46 1148.63,742.5 C1109.69,742.5 1071.12,742.5 1032.1,742.5 C1032.1,703.51 1032.1,664.94 1032.1,625.86 C993.11,625.86 954.56,625.86 915.71,625.86 C915.71,586.91 915.71,548.47 915.71,509.7 C851.43,509.7 787.47,509.7 722.5,509.7 z"/>' +
+    '<path fill="#000000" d="M723,509.7 C787.47,509.7 851.43,509.7 915.71,509.7 C915.71,548.47 915.71,586.91 915.71,625.86 C954.56,625.86 993.11,625.86 1032.1,625.86 C1032.1,664.94 1032.1,703.51 1032.1,742.5 C1071.12,742.5 1109.69,742.5 1148.63,742.5 C1148.63,781.46 1148.63,820.01 1148.63,858.98 C1110.2,858.98 1071.63,858.98 1032.44,858.98 C1032.44,898.1 1032.44,936.81 1032.44,975.83 C993.38,975.83 954.95,975.83 916.01,975.83 C916.01,1014.7 916.01,1053.26 916.01,1092.05 C838.12,1092.05 760.72,1092.05 682.97,1092.05 C682.97,1053.52 682.97,1015.09 682.97,976.07 C643.93,976.07 605.23,976.07 566.15,976.07 C566.15,936.9 566.15,898.31 566.15,859.21 C527.2,859.21 488.65,859.21 449.9,859.21 C449.9,820.28 449.9,781.85 449.9,742.91 C488.49,742.91 527.05,742.91 566,742.91 C566,703.81 566,665.23 566,626.26 C605,626.26 643.59,626.26 682.69,626.26 C682.69,587.32 682.69,548.76 682.69,509.7 C696.29,509.7 709.4,509.7 723,509.7 M843.49,742.83 C809.42,742.83 775.35,742.83 741.3,742.83 C741.3,781.92 741.3,820.47 741.3,858.88 C780.17,858.88 818.73,858.88 857.33,858.88 C857.33,820.08 857.33,781.57 857.33,742.83 C852.8,742.83 848.64,742.83 843.49,742.83 z"/>' +
+    '<path fill="#FEFEFE" d="M843.99,742.83 C848.64,742.83 852.8,742.83 857.33,742.83 C857.33,781.57 857.33,820.08 857.33,858.88 C818.73,858.88 780.17,858.88 741.3,858.88 C741.3,820.47 741.3,781.92 741.3,742.83 C775.35,742.83 809.42,742.83 843.99,742.83 z"/>' +
+    '</svg>';
+
   var ICON_SEND =
     '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4z"/></svg>';
+
+  function renderLogo(cls) {
+    if (CONFIG.logo) {
+      return '<img class="logo-img ' + cls + '" src="' + escapeHtml(CONFIG.logo) + '" alt="" />';
+    }
+    return '<span class="logo-wrap ' + cls + '">' + HYDRA_LOGO_SVG + '</span>';
+  }
 
   function h(tag, cls, html) {
     var el = document.createElement(tag);
@@ -260,7 +277,7 @@
     var mode = CONFIG.modes.indexOf(CONFIG.defaultMode) >= 0 ? CONFIG.defaultMode : CONFIG.modes[0];
 
     var wrap = h("div", "wrap");
-    var launcher = h("button", "launcher", ICON_SPARK + "<span>" + escapeHtml(CONFIG.title) + "</span>");
+    var launcher = h("button", "launcher", renderLogo("launcher-logo") + "<span>" + escapeHtml(CONFIG.title) + "</span>");
     launcher.setAttribute("aria-label", "Open " + CONFIG.title);
     var scrim = h("div", "scrim");
     var panel = h("div", "panel");
@@ -269,7 +286,7 @@
     panel.setAttribute("aria-label", CONFIG.title);
 
     var head = h("div", "head",
-      '<span class="dot"></span><h2>' + escapeHtml(CONFIG.title) + '</h2><span class="spacer"></span>');
+      renderLogo("head-logo") + '<h2>' + escapeHtml(CONFIG.title) + '</h2><span class="spacer"></span>');
     var closeBtn = h("button", "close", "&times;");
     closeBtn.setAttribute("aria-label", "Close");
     head.appendChild(closeBtn);
@@ -300,10 +317,10 @@
     composer.appendChild(textarea);
     composer.appendChild(sendBtn);
 
-    var brandHtml = CONFIG.brand
-      ? '<a class="brand" href="' + escapeHtml(CONFIG.brandUrl) + '" target="_blank" rel="noopener">' +
-        '<span class="mk"></span>Powered by HydraDB</a>'
-      : "Answers are AI-generated — verify before relying on them.";
+    var brandHtml =
+      '<span class="foot-disclaimer">Answers are AI-generated ·</span>' +
+      '<span class="foot-powered">Powered by <a class="brand-link" href="' + escapeHtml(CONFIG.brandUrl || "https://hydradb.com") + '" target="_blank" rel="noopener">' +
+      renderLogo("foot-logo") + 'HydraDB</a></span>';
     var foot = h("div", "foot", brandHtml);
 
     panel.appendChild(head);

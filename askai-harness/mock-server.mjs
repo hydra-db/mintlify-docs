@@ -70,6 +70,53 @@ const server = http.createServer((req, res) => {
     });
     return res.end();
   }
+  if (req.method === "POST" && req.url === "/mock-hydra/query") {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      res.writeHead(200, {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*",
+      });
+      res.end(
+        JSON.stringify({
+          success: true,
+          data: {
+            chunks: [
+              {
+                chunk_uuid: "quickstart_chunk_0",
+                chunk_content:
+                  "You ingest documents into HydraDB by POSTing them to the /ingest endpoint with your API key. Each document is chunked, embedded, and indexed into the collection you specify.",
+                source_id: "quickstart",
+                source_title: "Quickstart — Ingesting your first documents",
+                source_url: "/quickstart",
+                relevancy_score: 0.95,
+              },
+              {
+                chunk_uuid: "ingest_chunk_1",
+                chunk_content:
+                  "POST /ingest takes JSON: { database, collection, text, title }. Ingestion is asynchronous and returns a source id you can poll for indexing status.",
+                source_id: "ingestion-api",
+                source_title: "API Reference — POST /ingest",
+                source_url: "/api-reference/ingest",
+                relevancy_score: 0.88,
+              },
+              {
+                chunk_uuid: "collections_chunk_2",
+                chunk_content:
+                  "Databases and collections provide multi-tenant isolation in HydraDB. If you omit collection, HydraDB writes to the database's default collection.",
+                source_id: "collections",
+                source_title: "Concepts — Databases & Collections",
+                source_url: "/concepts/collections",
+                relevancy_score: 0.76,
+              },
+            ],
+          },
+        })
+      );
+    });
+    return;
+  }
   if (req.method === "POST" && req.url === "/docs/ask") {
     let body = "";
     req.on("data", (c) => (body += c));

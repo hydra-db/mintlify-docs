@@ -17,17 +17,21 @@ root `.js` on every page. Configure it with a tiny inline snippet in `docs.json`
 ```html
 <script>
   window.HydraAskAI = {
-    endpoint: "https://agents.hydradb.com", // ask API base (POST /docs/ask)
+    endpoint: "https://ask.yourdomain.com",  // ask API base (POST /docs/ask)
     apiKey:   "pk_docs_readonly_xxx",        // optional — see "API key" below
+    logo:     "",                            // optional custom logo URL (defaults to HydraDB mark)
     theme:    { accent: "#FF571A" },          // optional brand override
     modes:    ["fast", "auto", "thinking"],  // think-modes to show (or one)
-    brand:    true,                            // "Powered by HydraDB" footer
   };
 </script>
 ```
 
 Everything is optional except `endpoint`. All values here are **public** — never
 put a privileged/secret key in the browser (see below).
+
+Attribution (**"Powered by HydraDB"** hyperlinked to `hydradb.com`) is always
+displayed in the footer (Kapa-style), alongside the original HydraDB logo mark in
+the launcher button and panel header.
 
 ## API key (composable — no prop required)
 
@@ -69,8 +73,23 @@ optional `Authorization: Bearer <key>`. Response is newline-delimited JSON:
 
 The docs corpus is populated by the sync Action in `_ci-proposed/`.
 
+## Backend: Option A (hosted) or Option B (open-source Rust binary `askai-gateway`)
+
+1. **Option A (Hosted):** Set `endpoint` to a hosted HydraDB Ask endpoint (`https://agents.hydradb.com`).
+2. **Option B (Self-hosted Rust binary):** Run [`askai-gateway`](https://github.com/hydra-db/findr/tree/main/askai-gateway) — a tiny, zero-dependency Axum binary built for this widget:
+   ```bash
+   export HYDRA_API_KEY=...
+   export LLM_API_KEY=... # OpenRouter or any OpenAI-compatible provider
+   ./askai-gateway        # listens on :8080, serves POST /docs/ask
+   ```
+
 ## Local demo
 
 ```bash
-node askai-harness/mock-server.mjs   # http://localhost:4599 (mock NDJSON backend)
+# 1. Pure mock server:
+node askai-harness/mock-server.mjs   # http://localhost:4599
+
+# 2. Or run the real Rust askai-gateway and point demo.html at it:
+#    ASKAI_PORT=8080 ./askai-gateway
+#    open http://localhost:4599?endpoint=http://localhost:8080
 ```
