@@ -76,12 +76,18 @@
     (navigator.platform || "") + " " + (navigator.userAgent || "")
   );
   var SHORTCUT = IS_MAC ? "⌘I" : "Ctrl+I";
-  // Touch-first devices have no physical keyboard, so the Cmd/Ctrl+I shortcut is
-  // meaningless there — we hide its launcher badge (CSS below) and drop the tip
-  // from the greeting. `pointer: coarse` = the primary input is a finger.
-  var IS_TOUCH = !!(
-    window.matchMedia && window.matchMedia("(pointer: coarse)").matches
-  );
+  // Touch-first / small screens have no usable physical-keyboard shortcut, so we
+  // hide the ⌘I/Ctrl+I launcher badge (CSS below) and drop the tip from the
+  // greeting there. We treat a device as "mobile" if ANY of these hold, so the
+  // greeting stays consistent with the badge even when a browser doesn't report
+  // `pointer: coarse`: coarse pointer, a narrow viewport (≤520px), or a touch
+  // digitizer. (Matches the launcher-kbd media query below.)
+  function mq(q) { return !!(window.matchMedia && window.matchMedia(q).matches); }
+  var IS_TOUCH =
+    mq("(pointer: coarse)") ||
+    mq("(max-width: 520px)") ||
+    "ontouchstart" in window ||
+    (navigator.maxTouchPoints || 0) > 0;
 
   var HOST_ID = "hydra-askai-root";
   var MODE_LABEL = { fast: "Fast", auto: "Auto", thinking: "Thinking" };
@@ -158,7 +164,7 @@
 
     .panel {
       position: fixed; top: 0; right: 0; height: 100%; height: 100dvh;
-      width: 440px; max-width: 100vw; z-index: 2147483201;
+      width: 440px; max-width: 100%; z-index: 2147483201;
       background: var(--panel); color: var(--text); border-left: 1px solid var(--line);
       display: flex; flex-direction: column;
       transform: translateX(100%); transition: transform .24s cubic-bezier(.4,0,.2,1);
@@ -260,7 +266,7 @@
     @media (max-width: 720px) { .panel { width: 88vw; } .launcher span { display: inline; } }
     /* Phones: full-screen sheet, compact launcher. */
     @media (max-width: 520px) {
-      .panel { width: 100vw; border-left: none; }
+      .panel { width: 100%; border-left: none; }
       .launcher { right: 16px; bottom: 16px; padding: 11px 14px; }
       .thread { padding: 14px; }
       .modes button { font-size: 11px; padding: 6px 4px; }
@@ -678,15 +684,20 @@
 
   // Hide the host site's own AI-assistant surfaces so there's a single Ask AI
   // entry point (ours) and Cmd/Ctrl+I is unambiguous. Covers Mintlify's navbar
-  // "Ask Assistant ⌘I" button and its floating "Ask a question…" input.
-  // Scoped away from our own Shadow-DOM host; re-runs on host re-render (SPA nav).
+  // "Ask Assistant ⌘I" button, its floating "Ask a question…" input, and the
+  // "Add to assistant" tooltip that pops up when you select text on the page.
+  // Scoped away from our own Shadow-DOM host; re-runs on host re-render (SPA nav)
+  // and on text selection (the tooltip is created on demand).
 
   // Known host-assistant containers, matched by stable selector. Each match is
   // hidden along with a sticky/fixed wrapper ancestor (so no empty bar is left).
   var HOST_ASSISTANT_SELECTORS = [
+    "#assistant-entry",               // Mintlify navbar "Ask Assistant ⌘I" button
+    "#text-selection-tooltip-button", // Mintlify "Add to assistant" selection popover
     ".chat-assistant-floating-input", // Mintlify floating "Ask a question…" box
     "#chat-assistant-textarea",
     "[id^='chat-assistant']",
+    "[class*='chat-assistant-sheet']", // the assistant panel itself, if it opens
   ];
 
   function hide(el) {
@@ -719,7 +730,11 @@
       if (el.closest && el.closest("#" + HOST_ID)) continue;
       if (el.getAttribute("data-hydra-hidden") === "1") continue;
       var label = ((el.textContent || "") + " " + (el.getAttribute("aria-label") || "")).toLowerCase();
-      if (/\bask\s*assistant\b/.test(label) || (/\bassistant\b/.test(label) && /(⌘|ctrl).?\s*i\b/.test(label))) {
+      if (
+        /\bask\s*assistant\b/.test(label) ||
+        /\badd to assistant\b/.test(label) ||
+        (/\bassistant\b/.test(label) && /(⌘|ctrl).?\s*i\b/.test(label))
+      ) {
         hide(el);
       }
     }
@@ -736,4 +751,14 @@
   if (document.body) mo.observe(document.body, { childList: true, subtree: true });
   // A few delayed passes cover the first hydration before the observer attaches.
   [400, 1200, 3000].forEach(function (t) { setTimeout(hideHostAssistant, t); });
+  // The "Add to assistant" tooltip is created on text selection — the observer
+  // catches the DOM insert, but listen on selection too so it's squashed the
+  // instant it would appear (before it can paint), on desktop and on mobile.
+  ["selectionchange", "mouseup", "touchend", "keyup"].forEach(function (evt) {
+    document.addEventListener(evt, function () {
+      hideHostAssistant();
+      // one more on the next frame, after the host positions/shows the tooltip
+      setTimeout(hideHostAssistant, 0);
+    }, true);
+  });
 })();
