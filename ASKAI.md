@@ -12,13 +12,26 @@ page's CSS can't leak in and the widget's can't leak out.
 root `.js` on every page. Configure it with a tiny inline snippet in `docs.json`
 (or a second root script) that sets a global **before** `askai.js` runs.
 
-## Configure
+## Configure — one line
+
+The **only** thing the widget needs is the gateway URL. Two equivalent ways:
+
+**A. Hardcode it in the component (simplest for Mintlify).** Open `askai.js` and
+change the single `DEFAULT_ENDPOINT` constant at the top:
+
+```js
+var DEFAULT_ENDPOINT = "https://ask.yourdomain.com"; // or http://localhost:8080 for local dev
+```
+
+That's it — no config file, no build step, no key. `mintlify dev` (and the hosted
+platform) auto-load root `askai.js`, so the widget just appears.
+
+**B. Or set a runtime global** (handy if you can't edit the file), before `askai.js`:
 
 ```html
 <script>
   window.HydraAskAI = {
-    endpoint: "https://ask.yourdomain.com",  // ask API base (POST /docs/ask)
-    apiKey:   "pk_docs_readonly_xxx",        // optional — see "API key" below
+    endpoint: "https://ask.yourdomain.com",  // ask API base (POST /docs/ask) — the only required field
     logo:     "",                            // optional custom logo URL (defaults to HydraDB mark)
     theme:    { accent: "#FF571A" },          // optional brand override
     modes:    ["fast", "auto", "thinking"],  // think-modes to show (or one)
@@ -26,33 +39,26 @@ root `.js` on every page. Configure it with a tiny inline snippet in `docs.json`
 </script>
 ```
 
-Everything is optional except `endpoint`. All values here are **public** — never
-put a privileged/secret key in the browser (see below).
+No API key goes here — the gateway holds all secrets (see below).
 
 Attribution (**"Powered by HydraDB"** hyperlinked to `hydradb.com`) is always
 displayed in the footer (Kapa-style), alongside the original HydraDB logo mark in
 the launcher button and panel header.
 
-## API key (composable — no prop required)
+## API key: you don't need one in the browser
 
-Resolution order: `config.apiKey` → `window.HYDRA_ASKAI_KEY` → none.
+**The browser holds no key.** The `askai-gateway` holds the real HydraDB key and
+the LLM provider key **server-side** (as env vars on the binary), so the page only
+ever sends a question to `endpoint`. This is the safest setup and the default.
 
-- **Mintlify / static hosts:** there is no build step you control and no
-  server-side env, so set the value in the runtime config object above. Use a
-  **public, read-only, docs-scoped** key (safe to expose — it's rate-limited and
-  domain-allowlisted server-side, exactly like Kapa's `data-website-id` or
-  Inkeep's `NEXT_PUBLIC_INKEEP_API_KEY`).
-- **Framework hosts (Next.js/Vite/Docusaurus):** inject a public env var into the
-  global so the key isn't hard-coded:
-  ```js
-  window.HYDRA_ASKAI_KEY = process.env.NEXT_PUBLIC_HYDRA_ASKAI_KEY; // Next.js
-  window.HYDRA_ASKAI_KEY = import.meta.env.VITE_HYDRA_ASKAI_KEY;    // Vite
-  ```
-- **If your ask endpoint injects the key server-side, omit it entirely.**
+The one optional case: if you turn on the gateway's `ASKAI_PUBLIC_KEY` (a *public*,
+rate-limited, origin-allowlisted widget token — think Kapa's `data-website-id`, not
+a secret), the widget forwards it. Resolution order: `config.apiKey` →
+`window.HYDRA_ASKAI_KEY` → none.
 
-> A real secret (a write key, an LLM provider key) must **never** ship to the
-> browser. Mintlify-hosted sites have no server, so those live only in your
-> backend / the docs-sync CI secret — see `_ci-proposed/README.md`.
+> A real secret (a HydraDB write/query key, an LLM provider key) must **never**
+> ship to the browser — and with this design it never does. Those live only on the
+> gateway and in the docs-sync CI secret (see `_ci-proposed/README.md`).
 
 ## Theme (inherits the host's colors)
 
@@ -114,13 +120,17 @@ export OPENROUTER_API_KEY=sk-or-...            # or LLM_API_KEY for any OpenAI-c
 export LLM_MODEL=openai/gpt-4o-mini
 ASKAI_PORT=8080 ./askai-gateway/target/debug/askai-gateway
 
-# 4. Serve the docs + widget and point it at the gateway — this is the ONLY wiring the page needs.
-python3 -m http.server 4599            # from the repo root, in another shell
-# open http://localhost:4599/askai-harness/demo.html?endpoint=http://localhost:8080
+# 4. Run the REAL Mintlify docs site — it auto-loads askai.js, no extra server needed.
+npm install
+npm run dev                             # → mintlify dev on http://localhost:3000
+# The Ask AI launcher appears on every page. To point it at your local gateway,
+# set DEFAULT_ENDPOINT = "http://localhost:8080" in askai.js (mintlify dev hot-reloads it).
 ```
 
-`demo.html` sets `window.HydraAskAI = { endpoint }` from the `?endpoint=` query param —
-that single value is the whole integration surface.
+`mintlify dev` serves root `askai.js` exactly like the hosted platform does, so the
+widget is live on the real docs — no `python -m http.server` and no `demo.html`
+needed. (`askai-harness/demo.html` remains only as a standalone, framework-free
+sandbox.)
 
 See [`askai-gateway/README.md`](askai-gateway/README.md) for the full environment-variable
 reference (models per mode, rate limiting, origin allowlist, public widget key, Docker).

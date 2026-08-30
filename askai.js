@@ -8,22 +8,21 @@
  * The whole widget lives in a Shadow DOM host, so the host page's CSS can't
  * leak in and the widget's can't leak out — no overrides, no !important wars.
  *
- * ── Configure ──────────────────────────────────────────────────────────────
- * Set window.HydraAskAI (or legacy window.ASKAI_CONFIG) BEFORE this script:
+ * ── Configure (one line) ────────────────────────────────────────────────────
+ * The only thing you must set is the gateway URL. Either edit DEFAULT_ENDPOINT
+ * below, or set a runtime global BEFORE this script:
  *
  *   window.HydraAskAI = {
- *     endpoint: "https://agents.hydradb.com", // ask API base
- *     apiKey:   "pk_docs_readonly_...",        // optional, see "API key" below
- *     logo:     "",                            // optional custom logo URL (defaults to HydraDB mark)
- *     theme:    { accent: "#FF571A" },          // optional brand override
- *     modes:    ["fast", "auto", "thinking"],  // which think-modes to show
+ *     endpoint: "https://ask.yourdomain.com", // ask API base — the only required field
+ *     logo:     "",                           // optional custom logo URL (defaults to HydraDB mark)
+ *     theme:    { accent: "#FF571A" },         // optional brand override
+ *     modes:    ["fast", "auto", "thinking"], // which think-modes to show
  *   };
  *
- * ── API key (composable, no prop required) ─────────────────────────────────
- * Resolution order: config.apiKey → window.HYDRA_ASKAI_KEY → none. In a build
- * step (Next.js/Vite/Docusaurus) inject a PUBLIC, read-only, docs-scoped key:
- *   window.HYDRA_ASKAI_KEY = process.env.NEXT_PUBLIC_HYDRA_ASKAI_KEY
- * If your endpoint injects the key server-side, omit it entirely.
+ * ── API key: none needed in the browser ─────────────────────────────────────
+ * The askai-gateway holds the real HydraDB + LLM keys server-side, so the page
+ * ships no secret. `apiKey` is optional and only used if your gateway enforces a
+ * public, rate-limited widget token (ASKAI_PUBLIC_KEY).
  *
  * ── Theme (takes the host's colors) ────────────────────────────────────────
  * Precedence: config.theme.<token> → host CSS var --askai-<token> on :root →
@@ -33,10 +32,21 @@
 (function () {
   "use strict";
 
+  // ┌─────────────────────────────────────────────────────────────────────┐
+  // │ SELF-HOSTING? This is the only line you must change.                 │
+  // │ Point it at your running askai-gateway and the widget just works —   │
+  // │ no keys in the browser, no build step, no config file. The gateway   │
+  // │ holds the HydraDB + LLM keys server-side.                            │
+  // │   • Local dev:   "http://localhost:8080"                             │
+  // │   • Production:  "https://ask.yourdomain.com"                        │
+  // │ (You can still override at runtime with window.HydraAskAI.endpoint.) │
+  // └─────────────────────────────────────────────────────────────────────┘
+  var DEFAULT_ENDPOINT = "https://agents.hydradb.com";
+
   var cfg = window.HydraAskAI || window.ASKAI_CONFIG || {};
   var CONFIG = Object.assign(
     {
-      endpoint: "https://agents.hydradb.com",
+      endpoint: DEFAULT_ENDPOINT,
       apiKey: "",
       logo: "",
       title: "Ask AI",
@@ -53,7 +63,9 @@
     cfg
   );
 
-  // API key: config → env-injected global → none.
+  // API key: OPTIONAL. Default is none — the gateway holds the real HydraDB and
+  // LLM keys server-side, so the browser needs no secret. Only set this if your
+  // gateway enforces a *public* widget token (ASKAI_PUBLIC_KEY) for abuse control.
   var API_KEY = CONFIG.apiKey || window.HYDRA_ASKAI_KEY || "";
 
   var HOST_ID = "hydra-askai-root";
