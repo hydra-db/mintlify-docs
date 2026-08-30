@@ -1,0 +1,59 @@
+# Syncs Mintlify docs pages into the HydraDB collection the Ask-AI widget reads.
+#
+# Copy this file to .github/workflows/sync-docs.yml and scripts/sync-docs.mjs to
+# scripts/sync-docs.mjs (see _ci-proposed/README.md). Requires one secret,
+# HYDRA_DB_API_KEY, and optionally the HYDRA_DB_* vars below.
+name: sync-docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "**/*.mdx"
+      - "**/*.md"
+      - "scripts/sync-docs.mjs"
+      - ".github/workflows/sync-docs.yml"
+  workflow_dispatch:
+    inputs:
+      full:
+        description: "Re-ingest every page (ignore the change manifest)"
+        type: boolean
+        default: false
+
+# Serialize runs so two syncs never race on the same collection.
+concurrency:
+  group: sync-docs
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      HYDRA_DB_API_KEY: ${{ secrets.HYDRA_DB_API_KEY }}
+      # Point these at the PUBLIC docs collection the Ask-AI widget queries.
+      HYDRA_DB_DATABASE: ${{ vars.HYDRA_DB_DATABASE || 'hydra_docs' }}
+      HYDRA_DB_DOCS_COLLECTION: ${{ vars.HYDRA_DB_DOCS_COLLECTION || 'docs' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so --since-ref can diff against the previous commit.
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      # Incremental on push: only pages changed since the previous commit.
+      - name: Sync changed docs
+        if: github.event_name == 'push'
+        run: node scripts/sync-docs.mjs --since-ref=${{ github.event.before }}
+
+      # Manual full re-ingest, or full when dispatched with full=true.
+      - name: Sync all docs
+        if: github.event_name == 'workflow_dispatch'
+        run: node scripts/sync-docs.mjs ${{ inputs.full && '--full' || '' }}
