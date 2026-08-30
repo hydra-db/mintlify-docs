@@ -38,10 +38,11 @@
   // │ no keys in the browser, no build step, no config file. The gateway   │
   // │ holds the HydraDB + LLM keys server-side.                            │
   // │   • Local dev:   "http://localhost:8080"                             │
+  // │   • Staging:     "https://askai.staging.hydradb.com"                 │
   // │   • Production:  "https://ask.yourdomain.com"                        │
   // │ (You can still override at runtime with window.HydraAskAI.endpoint.) │
   // └─────────────────────────────────────────────────────────────────────┘
-  var DEFAULT_ENDPOINT = "https://agents.hydradb.com";
+  var DEFAULT_ENDPOINT = "https://askai.staging.hydradb.com";
 
   var cfg = window.HydraAskAI || window.ASKAI_CONFIG || {};
   var CONFIG = Object.assign(
@@ -75,6 +76,12 @@
     (navigator.platform || "") + " " + (navigator.userAgent || "")
   );
   var SHORTCUT = IS_MAC ? "⌘I" : "Ctrl+I";
+  // Touch-first devices have no physical keyboard, so the Cmd/Ctrl+I shortcut is
+  // meaningless there — we hide its launcher badge (CSS below) and drop the tip
+  // from the greeting. `pointer: coarse` = the primary input is a finger.
+  var IS_TOUCH = !!(
+    window.matchMedia && window.matchMedia("(pointer: coarse)").matches
+  );
 
   var HOST_ID = "hydra-askai-root";
   var MODE_LABEL = { fast: "Fast", auto: "Auto", thinking: "Thinking" };
@@ -136,7 +143,9 @@
       padding: 3px 6px; border-radius: 6px; color: #fff;
       background: rgba(255,255,255,0.18); border: 1px solid rgba(255,255,255,0.25);
     }
-    @media (max-width: 520px) { .launcher-kbd { display: none; } }
+    /* Hide the ⌘I/Ctrl+I badge where it can't be used: narrow screens and any
+       touch-first (coarse-pointer) device — phones and most tablets. */
+    @media (max-width: 520px), (pointer: coarse) { .launcher-kbd { display: none; } }
     .logo-wrap { display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; }
     .logo-img { display: block; object-fit: contain; flex-shrink: 0; }
     .launcher-logo { width: 18px; height: 18px; border-radius: 4px; overflow: hidden; }
@@ -189,6 +198,22 @@
     .bubble code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
       background: rgba(255,255,255,0.07); padding: 1px 5px; border-radius: 5px; font-size: 12.5px; }
     .bubble pre code { background: none; padding: 0; }
+    .bubble h1, .bubble h2, .bubble h3, .bubble h4, .bubble h5, .bubble h6 {
+      margin: 14px 0 6px; line-height: 1.3; font-weight: 700; }
+    .bubble h1 { font-size: 18px; } .bubble h2 { font-size: 16px; }
+    .bubble h3 { font-size: 14.5px; } .bubble h4, .bubble h5, .bubble h6 { font-size: 13px; }
+    .bubble > :first-child { margin-top: 0; }
+    .bubble a:not(.cite) { color: var(--accent); text-decoration: none; }
+    .bubble a:not(.cite):hover { text-decoration: underline; }
+    .bubble em { font-style: italic; } .bubble del { opacity: .6; }
+    .bubble ol { margin: 0 0 10px; padding-left: 22px; } .bubble ol li { margin: 2px 0; }
+    .bubble blockquote { margin: 0 0 10px; padding: 3px 0 3px 12px; color: var(--muted);
+      border-left: 3px solid var(--accent-line); }
+    .bubble hr { border: none; border-top: 1px solid var(--line); margin: 12px 0; }
+    .bubble .table-wrap { overflow-x: auto; margin: 0 0 10px; }
+    .bubble table { border-collapse: collapse; width: 100%; font-size: 13px; }
+    .bubble th, .bubble td { border: 1px solid var(--line); padding: 6px 9px; text-align: left; vertical-align: top; }
+    .bubble th { background: rgba(255,255,255,0.05); font-weight: 600; }
     .cite { display: inline-flex; align-items: center; justify-content: center; min-width: 17px;
       height: 17px; padding: 0 4px; margin: 0 1px; font-size: 10px; font-weight: 700; color: var(--accent);
       background: var(--accent-soft); border-radius: 5px; cursor: pointer; text-decoration: none; }
@@ -248,10 +273,7 @@
 
   var HYDRA_LOGO_SVG =
     '<svg viewBox="0 0 1600 1600" aria-hidden="true" style="width:100%;height:100%;display:block;">' +
-    '<path fill="#ffffff" d="M739,1601 C492.67,1601 246.83,1601 1,1601 C1,1067.67 1,534.33 1,1 C534.33,1 1067.67,1 1601,1 C1601,534.33 1601,1067.67 1601,1601 C1313.83,1601 1026.67,1601 739,1601 M1004.5,1209 C1013.74,1209 1022.98,1209 1032.66,1209 C1032.66,1169.69 1032.66,1131.12 1032.66,1092.09 C1071.68,1092.09 1110.23,1092.09 1149.09,1092.09 C1149.09,1053.2 1149.09,1014.76 1149.09,975.75 C1188.09,975.75 1226.78,975.75 1265.41,975.75 C1265.41,858.91 1265.41,742.66 1265.41,626.02 C1226.53,626.02 1187.95,626.02 1148.92,626.02 C1148.92,587.06 1148.92,548.48 1148.92,509.48 C1109.89,509.48 1071.31,509.48 1032.29,509.48 C1032.29,470.49 1032.29,431.92 1032.29,393.35 C876.63,393.35 721.43,393.35 565.8,393.35 C565.8,432.27 565.8,470.84 565.8,509.79 C526.96,509.79 488.54,509.79 449.59,509.79 C449.59,548.72 449.59,587.28 449.59,626.23 C410.47,626.23 371.88,626.23 333.34,626.23 C333.34,743 333.34,859.39 333.34,976.19 C372.26,976.19 410.83,976.19 449.78,976.19 C449.78,1015.03 449.78,1053.45 449.78,1092.4 C488.72,1092.4 527.27,1092.4 566.22,1092.4 C566.22,1131.52 566.22,1170.11 566.22,1209 C712.24,1209 857.87,1209 1004.5,1209 z"/>' +
-    '<path fill="#FF571A" d="M1004,1209 C857.87,1209 712.24,1209 566.22,1209 C566.22,1170.11 566.22,1131.52 566.22,1092.4 C527.27,1092.4 488.72,1092.4 449.78,1092.4 C449.78,1053.45 449.78,1015.03 449.78,976.19 C410.83,976.19 372.26,976.19 333.34,976.19 C333.34,859.39 333.34,743 333.34,626.23 C371.88,626.23 410.47,626.23 449.59,626.23 C449.59,587.28 449.59,548.72 449.59,509.79 C488.54,509.79 526.96,509.79 565.8,509.79 C565.8,470.84 565.8,432.27 565.8,393.35 C721.43,393.35 876.63,393.35 1032.29,393.35 C1032.29,431.92 1032.29,470.49 1032.29,509.48 C1071.31,509.48 1109.89,509.48 1148.92,509.48 C1148.92,548.48 1148.92,587.06 1148.92,626.02 C1187.95,626.02 1226.53,626.02 1265.41,626.02 C1265.41,742.66 1265.41,858.91 1265.41,975.75 C1226.78,975.75 1188.09,975.75 1149.09,975.75 C1149.09,1014.76 1149.09,1053.2 1149.09,1092.09 C1110.23,1092.09 1071.68,1092.09 1032.66,1092.09 C1032.66,1131.12 1032.66,1169.69 1032.66,1209 C1022.98,1209 1013.74,1209 1004,1209 M722.5,509.7 C709.4,509.7 696.29,509.7 682.69,509.7 C682.69,548.76 682.69,587.32 682.69,626.26 C643.59,626.26 605,626.26 566,626.26 C566,665.23 566,703.81 566,742.91 C527.05,742.91 488.49,742.91 449.9,742.91 C449.9,781.85 449.9,820.28 449.9,859.21 C488.65,859.21 527.2,859.21 566.15,859.21 C566.15,898.31 566.15,936.9 566.15,976.07 C605.23,976.07 643.93,976.07 682.97,976.07 C682.97,1015.09 682.97,1053.52 682.97,1092.05 C760.72,1092.05 838.12,1092.05 916.01,1092.05 C916.01,1053.26 916.01,1014.7 916.01,975.83 C954.95,975.83 993.38,975.83 1032.44,975.83 C1032.44,936.81 1032.44,898.1 1032.44,858.98 C1071.63,858.98 1110.2,858.98 1148.63,858.98 C1148.63,820.01 1148.63,781.46 1148.63,742.5 C1109.69,742.5 1071.12,742.5 1032.1,742.5 C1032.1,703.51 1032.1,664.94 1032.1,625.86 C993.11,625.86 954.56,625.86 915.71,625.86 C915.71,586.91 915.71,548.47 915.71,509.7 C851.43,509.7 787.47,509.7 722.5,509.7 z"/>' +
-    '<path fill="#ffffff" d="M723,509.7 C787.47,509.7 851.43,509.7 915.71,509.7 C915.71,548.47 915.71,586.91 915.71,625.86 C954.56,625.86 993.11,625.86 1032.1,625.86 C1032.1,664.94 1032.1,703.51 1032.1,742.5 C1071.12,742.5 1109.69,742.5 1148.63,742.5 C1148.63,781.46 1148.63,820.01 1148.63,858.98 C1110.2,858.98 1071.63,858.98 1032.44,858.98 C1032.44,898.1 1032.44,936.81 1032.44,975.83 C993.38,975.83 954.95,975.83 916.01,975.83 C916.01,1014.7 916.01,1053.26 916.01,1092.05 C838.12,1092.05 760.72,1092.05 682.97,1092.05 C682.97,1053.52 682.97,1015.09 682.97,976.07 C643.93,976.07 605.23,976.07 566.15,976.07 C566.15,936.9 566.15,898.31 566.15,859.21 C527.2,859.21 488.65,859.21 449.9,859.21 C449.9,820.28 449.9,781.85 449.9,742.91 C488.49,742.91 527.05,742.91 566,742.91 C566,703.81 566,665.23 566,626.26 C605,626.26 643.59,626.26 682.69,626.26 C682.69,587.32 682.69,548.76 682.69,509.7 C696.29,509.7 709.4,509.7 723,509.7 M843.49,742.83 C809.42,742.83 775.35,742.83 741.3,742.83 C741.3,781.92 741.3,820.47 741.3,858.88 C780.17,858.88 818.73,858.88 857.33,858.88 C857.33,820.08 857.33,781.57 857.33,742.83 C852.8,742.83 848.64,742.83 843.49,742.83 z"/>' +
-    '<path fill="#FF571A" d="M843.99,742.83 C848.64,742.83 852.8,742.83 857.33,742.83 C857.33,781.57 857.33,820.08 857.33,858.88 C818.73,858.88 780.17,858.88 741.3,858.88 C741.3,820.47 741.3,781.92 741.3,742.83 C775.35,742.83 809.42,742.83 843.99,742.83 z"/>' +
+    '<path d="M0 0 C528 0 1056 0 1600 0 C1600 528 1600 1056 1600 1600 C1072 1600 544 1600 0 1600 C0 1072 0 544 0 0 Z " fill="#000000" transform="translate(0,0)"/> <path d="M0 0 C97.68 0 195.36 0 296 0 C296.20165675 109.74160081 296.20165675 109.74160081 296.24414062 155.63867188 C296.25330628 165.47470138 296.26267704 175.31073065 296.27262997 185.1467594 C296.27465099 187.14496785 296.27665273 189.14317631 296.2786544 191.14138478 C296.30036806 212.36151621 296.33976893 233.58157951 296.38576398 254.80167062 C296.43261333 276.59858663 296.46031329 298.3954671 296.47044247 320.19243139 C296.47728406 333.6293751 296.498849 347.06612627 296.53958233 360.50301068 C296.56612545 369.73214366 296.57397492 378.96117792 296.56750689 388.19034625 C296.56432195 393.50560182 296.56901113 398.82052226 296.59602737 404.13571739 C296.72197532 430.21332896 296.61073485 454.99044415 285 479 C284.63745117 479.75265137 284.27490234 480.50530273 283.90136719 481.28076172 C276.29914697 496.82508813 266.90569861 509.50422303 255 522 C254.26007812 522.804375 253.52015625 523.60875 252.7578125 524.4375 C241.34430134 536.47812716 225.38114034 545.88337348 210 552 C208.94683594 552.42152344 207.89367188 552.84304688 206.80859375 553.27734375 C180.45108323 563.62244173 152.95685169 562.43135086 125.08553672 562.34819686 C119.56852532 562.33510141 114.05152272 562.33963539 108.53450012 562.34190369 C99.00267996 562.34346798 89.47092196 562.33414772 79.93911743 562.31719017 C66.15815841 562.29268928 52.37722909 562.28498362 38.59625065 562.2812262 C16.23130608 562.274679 -6.13360957 562.25479113 -28.49853516 562.22631836 C-50.20914545 562.19871074 -71.91974679 562.17753741 -93.63037109 562.16479492 C-94.99851445 562.163983 -96.36665781 562.16317088 -97.73480117 562.16235858 C-108.32939449 562.15610079 -118.92398803 562.15024895 -129.51858163 562.14449489 C-181.34575142 562.1162527 -233.17283839 562.05588392 -285 562 C-285 477.19 -285 392.38 -285 305 C-157.25 304.8125 -157.25 304.8125 -116.92285156 304.79223633 C-104.98653207 304.76235823 -104.98653207 304.76235823 -93.05023193 304.72587585 C-87.73652789 304.70981192 -82.42302221 304.70727552 -77.10931396 304.71403503 C-70.32558128 304.7226125 -63.542309 304.70539481 -56.75865507 304.67198312 C-54.27265739 304.66377654 -51.78661457 304.6638871 -49.30062151 304.67339098 C-31.93481437 305.07749966 -31.93481437 305.07749966 -16 299 C-15.10199865 298.44778385 -15.10199865 298.44778385 -14.18585587 297.88441181 C-7.56717844 293.07403436 -3.08971248 284.75575635 -1 277 C-0.57823269 273.17082916 -0.5835689 269.37148033 -0.60127258 265.52197266 C-0.59131004 263.81910347 -0.59131004 263.81910347 -0.58114624 262.08183289 C-0.56249859 258.27581837 -0.56514355 254.47011765 -0.56762695 250.6640625 C-0.56017574 247.88966606 -0.54824034 245.11529301 -0.53649426 242.34091187 C-0.51082299 235.66674911 -0.50041987 228.99265042 -0.49541168 222.31844366 C-0.48895335 214.59505069 -0.4634027 206.87179785 -0.43786621 199.1484375 C-0.37987037 178.76566467 -0.34776638 158.38282483 -0.3125 138 C-0.209375 92.46 -0.10625 46.92 0 0 Z " fill="#FE5618" transform="translate(1085,238)"/> <path d="M0 0 C1.90210498 -0.00087384 3.80420972 -0.00262809 5.70631319 -0.00517833 C10.8943751 -0.00962084 16.08235342 -0.0016911 21.2704047 0.00837779 C26.87960027 0.01705494 32.48879154 0.01408912 38.09799194 0.01257324 C47.80347742 0.01152708 57.50893591 0.01777554 67.2144146 0.02904892 C81.24671931 0.04533746 95.27901104 0.05051536 109.31132419 0.0530249 C132.08056944 0.05739675 154.84979714 0.07067473 177.61903381 0.08963013 C199.73068672 0.10801676 221.84233575 0.12214143 243.95399475 0.13064575 C245.34591033 0.13118704 246.73782591 0.13172844 248.12974149 0.13226998 C258.90737733 0.13644147 269.68501326 0.14034284 280.46264923 0.14417911 C333.2446897 0.16302946 386.02669418 0.20327011 438.80873108 0.24050903 C438.80873108 84.72050903 438.80873108 169.20050903 438.80873108 256.24050903 C311.43373108 256.49050903 311.43373108 256.49050903 271.20960999 256.5383606 C259.31450588 256.57157903 259.31450588 256.57157903 247.41941833 256.6100769 C242.11982406 256.62708716 236.82034805 256.63326929 231.52073669 256.63204956 C224.75856068 256.63053469 217.99673353 256.64956685 211.23461986 256.68159819 C208.75429635 256.69011259 206.27393874 256.69195746 203.793607 256.68633318 C200.43872126 256.67968967 197.08481353 256.69760381 193.73002625 256.7215271 C192.76335211 256.71376629 191.79667797 256.70600548 190.80071068 256.69800949 C180.76041994 256.82404967 172.16136373 260.37601797 164.80873108 267.24050903 C156.37664611 276.21441472 154.35422421 284.74355645 154.41000366 296.83879089 C154.40336197 297.97489304 154.39672028 299.11099518 154.38987732 300.28152466 C154.37125298 304.08443181 154.3738731 307.88702425 154.37635803 311.68997192 C154.36890418 314.4644901 154.35696947 317.23898492 154.34522533 320.01348782 C154.31956958 326.68415015 154.30915314 333.35474839 154.30414275 340.0254547 C154.29768084 347.74591932 154.27212671 355.46624402 154.24659729 363.18667603 C154.18861697 383.55874738 154.15650126 403.9308857 154.12123108 424.30300903 C154.01810608 469.82238403 153.91498108 515.34175903 153.80873108 562.24050903 C56.12873108 562.24050903 -41.55126892 562.24050903 -142.19126892 562.24050903 C-142.31226297 453.09043468 -142.31226297 453.09043468 -142.3377533 407.47293091 C-142.34362659 397.03209418 -142.34968794 386.59125758 -142.35606384 376.15042114 C-142.35685509 374.84189885 -142.35764634 373.53337655 -142.35846156 372.18520206 C-142.37149638 351.0820028 -142.39514062 329.97882814 -142.42272731 308.87564345 C-142.45081836 287.20530544 -142.467453 265.53498027 -142.47353441 243.8646248 C-142.47764317 230.50142581 -142.49060319 217.13829638 -142.51501832 203.77511881 C-142.5309212 194.60162709 -142.535659 185.42817114 -142.53177305 176.25466665 C-142.52985859 170.9683446 -142.5327169 165.68214379 -142.54888535 160.39584351 C-142.56361682 155.5435933 -142.56413651 150.69154445 -142.55396561 145.83928446 C-142.55271086 144.09601981 -142.55640335 142.35274195 -142.56591847 140.60950281 C-142.64528145 125.15438613 -141.33527968 109.55223546 -136.19126892 94.86550903 C-135.89784607 94.01029663 -135.60442322 93.15508423 -135.30210876 92.2739563 C-124.45307511 62.08546057 -103.91076023 37.66040437 -77.19126892 20.24050903 C-76.40622986 19.70812622 -75.6211908 19.17574341 -74.81236267 18.62722778 C-52.11126826 3.98008687 -26.44706708 -0.09126187 0 0 Z " fill="#FE5618" transform="translate(361.19126892089844,799.7594909667969)"/> <path d="M0 0 C97.68 0 195.36 0 296 0 C296 127.71 296 255.42 296 387 C198.32 387 100.64 387 0 387 C0 259.29 0 131.58 0 0 Z " fill="#FE5618" transform="translate(219,238)"/> <path d="M0 0 C97.68 0 195.36 0 296 0 C296 121.77 296 243.54 296 369 C198.32 369 100.64 369 0 369 C0 247.23 0 125.46 0 0 Z " fill="#FD5618" transform="translate(1085,993)"/>' +
     '</svg>';
 
   var ICON_SEND =
@@ -275,27 +297,158 @@
       return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c];
     });
   }
-  // Minimal, safe markdown: escape first, then render a small subset. No raw HTML.
+  // ── Markdown → safe HTML ────────────────────────────────────────────────────
+  // LLMs answer in Markdown, so the widget parses a broad subset: headings,
+  // bold/italic/strikethrough, inline + fenced code, links, ordered/unordered
+  // lists, blockquotes, GFM tables, horizontal rules, and [n] citations.
+  //
+  // Safety: the source is HTML-escaped FIRST and we only ever emit tags we
+  // generate ourselves — never markup copied from the source — so a model that
+  // returns "<script>…" renders it as visible text, not live HTML.
+
+  // Inline spans, applied to already-escaped text.
+  function renderInline(s) {
+    // Protect inline code so other rules don't touch its contents.
+    var tokens = [];
+    var stash = function (html) {
+      tokens.push(html);
+      return "@@" + (tokens.length - 1) + "@@";
+    };
+    s = s.replace(/`([^`]+)`/g, function (_, c) { return stash("<code>" + c + "</code>"); });
+    // Links [text](url) — only http(s) or root-relative targets.
+    s = s.replace(
+      /\[([^\]]+)\]\((https?:\/\/[^\s)]+|\/[^\s)]*)\)/g,
+      function (_, t, u) {
+        return stash('<a href="' + u + '" target="_blank" rel="noopener">' + t + "</a>");
+      }
+    );
+    // Bare [n] citations → clickable chips wired to the sources list.
+    s = s.replace(/\[(\d+)\]/g, function (_, n) {
+      return stash('<a class="cite" data-cite="' + n + '" href="#">' + n + "</a>");
+    });
+    // Bold before italic so ** isn't consumed by the * rule.
+    s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+    s = s.replace(/__([^_]+)__/g, "<strong>$1</strong>");
+    s = s.replace(/(^|[^*])\*(?!\s)([^*\n]+?)\*/g, "$1<em>$2</em>");
+    s = s.replace(/(^|[^\w])_(?!\s)([^_\n]+?)_(?!\w)/g, "$1<em>$2</em>");
+    s = s.replace(/~~([^~]+)~~/g, "<del>$1</del>");
+    // Restore stashed spans.
+    s = s.replace(/@@(\d+)@@/g, function (_, i) { return tokens[i]; });
+    return s;
+  }
+
+  function renderTable(rows) {
+    var cells = function (r) {
+      return r
+        .replace(/^\s*\|/, "")
+        .replace(/\|\s*$/, "")
+        .split("|")
+        .map(function (c) { return c.trim(); });
+    };
+    var header = cells(rows[0]);
+    var thead =
+      "<thead><tr>" +
+      header.map(function (c) { return "<th>" + renderInline(c) + "</th>"; }).join("") +
+      "</tr></thead>";
+    var tbody =
+      "<tbody>" +
+      rows.slice(2).map(function (r) {
+        var row = cells(r);
+        return (
+          "<tr>" +
+          header
+            .map(function (_, k) { return "<td>" + renderInline(row[k] || "") + "</td>"; })
+            .join("") +
+          "</tr>"
+        );
+      }).join("") +
+      "</tbody>";
+    return '<div class="table-wrap"><table>' + thead + tbody + "</table></div>";
+  }
+
+  var LIST_RE = /^\s*(\d+[.)]|[-*+])\s+/;
+
   function renderMarkdown(src) {
-    var out = escapeHtml(src);
-    out = out.replace(/```(\w*)\n([\s\S]*?)```/g, function (_, l, code) {
-      return "<pre><code>" + code.replace(/\n$/, "") + "</code></pre>";
-    });
-    out = out.replace(/`([^`]+)`/g, "<code>$1</code>");
-    out = out.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
-    out = out.replace(/\[(\d+)\]/g, function (_, n) {
-      return '<a class="cite" data-cite="' + n + '" href="#">' + n + "</a>";
-    });
-    out = out.replace(/(^|\n)[-*] (.+)/g, "$1<li>$2</li>");
-    out = out.replace(/(<li>[\s\S]*?<\/li>)/g, "<ul>$1</ul>").replace(/<\/ul>\s*<ul>/g, "");
-    return out
-      .split(/\n{2,}/)
-      .map(function (b) {
-        b = b.trim();
-        if (/^<(pre|ul)/.test(b)) return b;
-        return b ? "<p>" + b.replace(/\n/g, "<br>") + "</p>" : "";
-      })
-      .join("");
+    var lines = escapeHtml(src).replace(/\r\n?/g, "\n").split("\n");
+    var html = [];
+    var para = [];
+    function flushPara() {
+      if (para.length) { html.push("<p>" + renderInline(para.join(" ")) + "</p>"); para = []; }
+    }
+    var i = 0;
+    while (i < lines.length) {
+      var line = lines[i];
+
+      // Fenced code block (```): verbatim, no inline formatting.
+      if (/^\s*```/.test(line)) {
+        flushPara();
+        var code = [];
+        i++;
+        while (i < lines.length && !/^\s*```\s*$/.test(lines[i])) { code.push(lines[i]); i++; }
+        i++; // consume the closing fence (or run past EOF while streaming)
+        html.push("<pre><code>" + code.join("\n") + "</code></pre>");
+        continue;
+      }
+      // Blank line ends a paragraph.
+      if (/^\s*$/.test(line)) { flushPara(); i++; continue; }
+      // ATX heading.
+      var head = line.match(/^(#{1,6})\s+(.*)$/);
+      if (head) {
+        flushPara();
+        var lvl = head[1].length;
+        html.push("<h" + lvl + ">" + renderInline(head[2].trim()) + "</h" + lvl + ">");
+        i++; continue;
+      }
+      // Horizontal rule (---, ***, ___).
+      if (/^\s*([-*_])(\s*\1){2,}\s*$/.test(line)) { flushPara(); html.push("<hr>"); i++; continue; }
+      // GFM table: header row followed by a |---|:--:| delimiter row.
+      if (
+        /\|/.test(line) &&
+        i + 1 < lines.length &&
+        /^\s*\|?\s*:?-{1,}:?\s*(\|\s*:?-{1,}:?\s*)+\|?\s*$/.test(lines[i + 1])
+      ) {
+        flushPara();
+        var rows = [line, lines[i + 1]];
+        i += 2;
+        while (i < lines.length && /\|/.test(lines[i]) && !/^\s*$/.test(lines[i])) { rows.push(lines[i]); i++; }
+        html.push(renderTable(rows));
+        continue;
+      }
+      // Blockquote. Note: the source was HTML-escaped first, so ">" is "&gt;".
+      if (/^\s*&gt;\s?/.test(line)) {
+        flushPara();
+        var quote = [];
+        while (i < lines.length && /^\s*&gt;\s?/.test(lines[i])) { quote.push(lines[i].replace(/^\s*&gt;\s?/, "")); i++; }
+        html.push("<blockquote>" + renderInline(quote.join(" ")) + "</blockquote>");
+        continue;
+      }
+      // Ordered / unordered list (one level, with wrapped-line continuation).
+      if (LIST_RE.test(line)) {
+        flushPara();
+        var ordered = /^\s*\d+[.)]\s+/.test(line);
+        var items = [];
+        while (i < lines.length && LIST_RE.test(lines[i])) {
+          items.push(lines[i].replace(LIST_RE, ""));
+          i++;
+          while (i < lines.length && /^\s{2,}\S/.test(lines[i]) && !LIST_RE.test(lines[i])) {
+            items[items.length - 1] += " " + lines[i].trim();
+            i++;
+          }
+        }
+        var tag = ordered ? "ol" : "ul";
+        html.push(
+          "<" + tag + ">" +
+          items.map(function (it) { return "<li>" + renderInline(it) + "</li>"; }).join("") +
+          "</" + tag + ">"
+        );
+        continue;
+      }
+      // Plain paragraph text (soft-wrapped lines join with a space).
+      para.push(line.trim());
+      i++;
+    }
+    flushPara();
+    return html.join("");
   }
 
   function AskAI(shadow) {
@@ -366,7 +519,13 @@
     shadow.appendChild(styleEl);
     shadow.appendChild(wrap);
 
-    addMessage("assistant", CONFIG.greeting + "\n\nTip: press **" + SHORTCUT + "** anytime to open or close Ask AI.");
+    addMessage(
+      "assistant",
+      CONFIG.greeting +
+        (IS_TOUCH
+          ? ""
+          : "\n\nTip: press **" + SHORTCUT + "** anytime to open or close Ask AI.")
+    );
 
     function open() {
       scrim.classList.add("open");
