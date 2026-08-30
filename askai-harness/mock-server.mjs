@@ -21,7 +21,9 @@ const SOURCES = [
   { index: 3, id: "collections", title: "Concepts — Databases & Collections", url: "/concepts/collections" },
 ];
 
-const ANSWER = `You ingest documents into HydraDB by **POSTing them to the \`/ingest\` endpoint** with your API key. Each document is chunked, embedded, and indexed into the collection you specify [1][2].
+const ANSWER = `## Ingesting documents
+
+You ingest documents into HydraDB by **POSTing them to the \`/ingest\` endpoint** with your API key. Each document is chunked, embedded, and indexed into the collection you specify [1][2].
 
 A minimal request looks like:
 
@@ -32,7 +34,24 @@ curl https://api.hydradb.com/ingest \\
   -d '{"database": "docs", "collection": "guides", "text": "..."}'
 \`\`\`
 
-If you omit \`collection\`, HydraDB writes to the database's default collection [3]. Ingestion is asynchronous — the response returns a source id you can poll for indexing status.`;
+The main fields:
+
+| Field | Required | Notes |
+| --- | --- | --- |
+| \`database\` | yes | The tenant scope. |
+| \`collection\` | no | Defaults to the database's default collection [3]. |
+| \`text\` | yes | Raw content; it's chunked for you. |
+
+Steps to go live:
+
+1. Create a database and pick a *collection* name.
+2. POST your documents to \`/ingest\`.
+3. Poll the returned source id for indexing status.
+
+- Ingestion is **asynchronous** — the response returns a source id.
+- Underscored keys like \`source_id\` stay literal, not italic.
+
+> Tip: see the [Quickstart](https://docs.hydradb.com/get-started/v2/quickstart) for a full walkthrough.`;
 
 function streamAsk(res) {
   res.writeHead(200, {
