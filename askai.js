@@ -54,7 +54,10 @@
       placeholder: "Ask about the docs…",
       greeting:
         "Hi! I can answer questions from the documentation, with sources. What are you looking for?",
-      modes: ["fast", "auto", "thinking"],
+      // Think-modes are disabled for now: a single "auto" mode hides the
+      // segmented control (it only renders when modes.length > 1) and every
+      // question is asked in auto. Restore ["fast","auto","thinking"] to re-enable.
+      modes: ["auto"],
       defaultMode: "auto",
       brand: true, // attribution is always shown (Kapa-style); brandUrl preserved for link
       brandUrl: "https://hydradb.com",
