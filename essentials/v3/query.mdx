@@ -1,0 +1,153 @@
+---
+title: "Query (v3)"
+description: "One endpoint, no corpus selector: how POST /v3/query decides what to return and what the response contains."
+---
+
+`POST /v3/query` retrieves context. It takes no `type`, because on v3 there is no knowledge/memory split to select between. One call returns the documents you uploaded and the conversations you saved, ranked together.
+
+For the v2 endpoint and its `type` parameter, see [Query (v2)](/essentials/v2/query).
+
+---
+
+## 1. The minimum request
+
+```json
+POST /v3/query
+{
+  "database": "acme",
+  "collection": "team-1",
+  "query": "what does the team prefer for billing?"
+}
+```
+
+Everything else has a default: hybrid retrieval, ten results, graph context on, declared relations followed.
+
+---
+
+## 2. What "no type" actually does
+
+Dropping the parameter is not the same as defaulting it. A v3 query covers **both** kinds of context, and how it does that depends on how the database was created:
+
+| Database | Behaviour |
+| --- | --- |
+| created on v3 | both kinds share one physical store, so one retrieval pass already covers everything |
+| created on v2 | the two are stored separately, so we run both and merge the results for you |
+
+Either way you get one ranked list. You do not have to know which case you are in, and the answer does not change based on it.
+
+To narrow to one kind, use an attribute filter rather than a corpus selector. This is the point of the change: what used to be a special-cased request parameter is now an ordinary filter, alongside every other attribute you ingest.
+
+---
+
+## 3. Parameters
+
+### Scope
+
+| Parameter | Type | Purpose |
+| --- | --- | --- |
+| `database` | string | The database to query. Required. |
+| `collection` | string | Single-collection scope. |
+| `collections` | `string[]` or `{ [collection]: number }` | Multi-collection scope, with optional relative ranking weights. Maximum 100. |
+
+### Retrieval
+
+| Parameter | Type | Purpose |
+| --- | --- | --- |
+| `query` | string | The question. Required. |
+| `query_by` | `"hybrid"` \| `"text"` | Dense + BM25 (default) or BM25 only. |
+| `mode` | `"fast"` \| `"thinking"` | `thinking` rewrites the query and traverses further in the graph. |
+| `max_results` | integer | Default `10`, maximum `50`. |
+| `recency_bias` | float `0.0`-`1.0` | Boost newer context. Default `0.0`. |
+| `attributes` | object | Attribute filter. See [Filtering](#5-filtering-on-attributes). |
+
+### Graph
+
+| Parameter | Type | Purpose |
+| --- | --- | --- |
+| `graph_context` | boolean | Include the `graph` object. Default `true`. |
+| `follow_forceful_relations` | boolean | Follow relations you declared at ingest. Default `true`. Only takes effect in `mode: "thinking"`. Renamed from v2's `query_forceful_relations`. |
+
+---
+
+## 4. The response
+
+There is no `{ "success": true, "data": ... }` wrapper on v3. The body is the payload.
+
+```json
+{
+  "chunks": [
+    {
+      "chunk_uuid": "doc-001_chunk_0",
+      "context_id": "doc-001",
+      "chunk_content": "Acme runs billing on the Ledger service...",
+      "source_title": "architecture.md",
+      "relevancy_score": 1.09,
+      "attributes": { "department": "eng" },
+      "custom_attributes": { "author": "Support Team" },
+      "extra_context_ids": ["doc-001_chunk_1"]
+    }
+  ],
+  "sources": [
+    {
+      "context_id": "doc-001",
+      "title": "architecture.md",
+      "received_at": "2026-08-16T10:00:00Z",
+      "attributes": { "department": "eng" },
+      "custom_attributes": { }
+    }
+  ],
+  "graph": {
+    "paths": [
+      {
+        "triplets": [
+          { "source": "Ledger", "relation": { "type": "OWNED_BY" }, "destination": "Payments team" }
+        ],
+        "relevancy_score": 0.82,
+        "combined_context": "Ledger is owned by the Payments team.",
+        "chunk_ids": ["doc-001_chunk_0"]
+      }
+    ]
+  },
+  "forceful_relations": {
+    "declared": [
+      { "via": { "from": "doc-001", "to": "doc-007" }, "chunk": { } }
+    ],
+    "inferred": []
+  }
+}
+```
+
+### Reading `graph.paths[]`
+
+One list, ordered: paths that answered the query come first, then paths reached by expanding out from a chunk that was retrieved. There is no label distinguishing them, because in practice you consume them the same way.
+
+Each path carries its own `chunk_ids`, naming the retrieved chunks that path is evidence for. On v2 you had to join `paths[].group_id` against a separate top-level `chunk_id_to_group_ids` map to work this out; both are gone, and nothing is lost. A path with an empty `chunk_ids` answered the query directly rather than being anchored to a chunk.
+
+### Reading `forceful_relations`
+
+`declared` holds relations you asserted at ingest, each with the `via` edge that produced it. v2 returned these as `additional_context`, a flat map keyed by chunk uuid, which meant you could see the related chunk but not what it was related *to*. `inferred` is reserved for relationships HydraDB derives itself; those currently come back in `graph.paths[]`, so the list is present and empty.
+
+---
+
+## 5. Filtering on attributes
+
+`attributes` accepts a MongoDB-like operator query over the attributes you ingested:
+
+```json
+{
+  "database": "acme",
+  "query": "billing incidents",
+  "attributes": {
+    "department": "eng",
+    "priority": { "$gte": 3 },
+    "$or": [
+      { "status": { "$in": ["open", "triaged"] } },
+      { "escalated": true }
+    ]
+  }
+}
+```
+
+Supported: `$eq $ne $gt $gte $lt $lte` for comparison, `$in $nin` for sets, `$exists` for presence, and `$and $or $not` for composition. A bare value is an implicit `$eq`. Values are matched against the type you declared for the field, so a filter that cannot be typed is rejected rather than silently ignored.
+
+Filtering on per-context `custom_attributes` through this language is not supported yet; use `metadata_filters` for those.

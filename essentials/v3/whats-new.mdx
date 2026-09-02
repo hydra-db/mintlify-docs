@@ -1,0 +1,151 @@
+---
+title: "What's new in v3"
+description: "v3 removes the knowledge/memory split from the API and from storage. What changes, what stays, and how to migrate."
+---
+
+v3 is a genuine contract change, not a rename of v2. The knowledge/memory fork is gone from the request, from the response, and from physical storage: a database created on v3 keeps both in one place and you no longer tell us which one you meant.
+
+<Note>
+v3 is rolling out. v2 keeps working unchanged, and no existing database is migrated. See [Compatibility](#4-compatibility) for which endpoints answer which databases.
+</Note>
+
+---
+
+## 1. There is no `type`
+
+On v2, ingest and query both took `type: "knowledge" | "memory"`, and query defaulted to `knowledge`. On v3 the field does not exist and sending it returns `400`.
+
+This is a behaviour change, not just a removed key. A v3 query searches **everything in scope**: the documents you uploaded and the conversations you saved, ranked together in one result set.
+
+```bash
+# v2: two calls, or one call with type: "all"
+curl -X POST https://api.hydradb.com/query \
+  -d '{"database":"acme","query":"what does the team prefer?","type":"all"}'
+
+# v3: one call, no corpus selector
+curl -X POST https://api.hydradb.com/v3/query \
+  -d '{"database":"acme","query":"what does the team prefer?"}'
+```
+
+If you want only one kind of context back, filter on it like any other attribute rather than selecting a corpus.
+
+---
+
+## 2. One list of contexts, one graph object
+
+### `contexts[]` replaces `items[]` and `memories[]`
+
+A context is a context. You send one array, and each element is either plain text or a conversation:
+
+```json
+POST /v3/context/ingest
+{
+  "database": "acme",
+  "collection": "team-1",
+  "contexts": [
+    {
+      "context_id": "doc-001",
+      "content": "Acme runs billing on the Ledger service, owned by the Payments team.",
+      "attributes": { "department": "eng" }
+    },
+    {
+      "context_id": "chat-001",
+      "messages": [
+        { "role": "user", "content": "I prefer dark mode.", "name": "sam" },
+        { "role": "assistant", "content": "Noted." }
+      ]
+    }
+  ]
+}
+```
+
+`messages: [{ role, content, name }]` is the shape you already send to OpenAI and Anthropic, and it replaces v2's `user_assistant_pairs`. Consecutive same-role turns are concatenated, because that is how real chats arrive. `system` turns are treated as instructions, never as facts to extract. An unknown role, an empty list, or sending both `content` and `messages` is a `400`.
+
+### `graph.paths[]` replaces `query_paths` and `chunk_relations`
+
+v2 returned the graph as two lists plus a separate `chunk_id_to_group_ids` index you had to join yourself. v3 returns one list:
+
+```json
+"graph": {
+  "paths": [
+    {
+      "triplets": [ { "source": "...", "relation": { }, "destination": "..." } ],
+      "relevancy_score": 0.82,
+      "combined_context": "...",
+      "chunk_ids": ["doc-001_chunk_0"]
+    }
+  ]
+}
+```
+
+Paths that answered the query come first, then paths reached by expanding from a retrieved chunk. Each path carries its own `chunk_ids`, so the join you used to do against `chunk_id_to_group_ids` is already done. The triplet shape itself is unchanged: `source` / `relation` / `destination`, with temporal validity inline on the relation.
+
+### `forceful_relations` replaces `additional_context`
+
+Relations you declared at ingest now come back with the edge that produced them, which v2 discarded when it flattened them into a chunk map:
+
+```json
+"forceful_relations": {
+  "declared": [
+    { "via": { "from": "doc-001", "to": "doc-007" }, "chunk": { } }
+  ],
+  "inferred": []
+}
+```
+
+`declared` is what you told us is related. `inferred` is reserved for relationships HydraDB derived itself; today those are served by `graph.paths[]`, so the list is present but empty.
+
+---
+
+## 3. Field renames
+
+| v2 | v3 |
+| --- | --- |
+| `items[]` | `contexts[]` |
+| `id` | `context_id` |
+| `metadata` | `attributes` |
+| `additional_metadata` | `custom_attributes` |
+| `observation_date` | `happened_at` |
+| `timestamp` (on a source) | `received_at` |
+| `infer` | `enrich` (per context, default `true`) |
+| `query_forceful_relations` | `follow_forceful_relations` |
+| `build_string` / `llm_context` | `prompt_text` |
+| `type` | removed, see [above](#1-there-is-no-type) |
+| `paths[].summary`, `paths[].origin`, `group_id` | removed |
+| `{ "success": true, "data": { } }` envelope | removed, the body is the payload |
+
+`happened_at` and `received_at` are deliberately different things. You supply `happened_at` (when the context is about); we set `received_at` (when we got it). Neither is `temporal.start` / `temporal.end`, which the extraction layer owns.
+
+The success envelope is gone from 2xx responses only. Errors keep the structured error contract, so your error handling does not change.
+
+---
+
+## 4. Compatibility
+
+Storage layout is a property of the database, fixed when it is created and never changed afterwards.
+
+| Database created by | v2 request | v3 request |
+| --- | --- | --- |
+| `POST /databases` (v2, every existing database) | works, unchanged | works, and returns both kinds of context |
+| `POST /v3/databases` | rejected with `409` | works |
+
+A v2 caller passing `type: "memory"` has no correct answer on a v3 database, so we return `409` pointing at v3 rather than silently answering half the question.
+
+There is no in-place migration. Existing databases keep working on v2 forever, and you adopt v3 by creating a new database.
+
+---
+
+## 5. Endpoints
+
+Every v3 endpoint lives under `/v3`:
+
+| v3 | Purpose |
+| --- | --- |
+| `POST /v3/databases` | create a unified database |
+| `GET /v3/databases`, `DELETE /v3/databases` | list, delete |
+| `GET /v3/databases/status`, `/collections`, `/stats` | provisioning state, collections, counts |
+| `POST /v3/context/ingest` | ingest `contexts[]` |
+| `GET /v3/context/status`, `/inspect`, `/relations` | indexing state, original content, graph relations |
+| `POST /v3/context/list`, `DELETE /v3/context` | list, delete |
+| `PATCH /v3/context/:id/metadata` | edit attributes |
+| `POST /v3/query` | retrieve |

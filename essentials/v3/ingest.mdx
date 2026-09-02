@@ -1,0 +1,99 @@
+---
+title: "Ingest (v3)"
+description: "One endpoint and one array: how POST /v3/context/ingest takes documents, text, and conversations without a corpus selector."
+---
+
+`POST /v3/context/ingest` takes everything you want HydraDB to remember. There is no `type`, no separate `memories` field, and no separate `items` field: one `contexts[]` array, where each element is either plain text or a conversation.
+
+For the v2 endpoint and its knowledge/memory split, see [Knowledge](/essentials/v2/knowledge) and [Memories](/essentials/v2/memories).
+
+---
+
+## 1. Text and conversations in one call
+
+```json
+POST /v3/context/ingest
+{
+  "database": "acme",
+  "collection": "team-1",
+  "contexts": [
+    {
+      "context_id": "doc-001",
+      "content": "Acme runs billing on the Ledger service, owned by the Payments team.",
+      "attributes": { "department": "eng" },
+      "custom_attributes": { "author": "sam@acme.com" }
+    },
+    {
+      "context_id": "chat-001",
+      "messages": [
+        { "role": "user", "content": "I prefer dark mode and I work at Acme.", "name": "sam" },
+        { "role": "assistant", "content": "Noted, dark mode at Acme." }
+      ],
+      "happened_at": "2026-08-16T10:00:00Z"
+    }
+  ]
+}
+```
+
+The response is `202 Accepted`. Indexing is asynchronous; poll `GET /v3/context/status` until each `context_id` reports `completed`.
+
+Files are still uploaded as `multipart/form-data` to the same endpoint.
+
+---
+
+## 2. Context fields
+
+| Field | Type | Purpose |
+| --- | --- | --- |
+| `context_id` | string | Your identifier for this context. Generated if omitted. Reusing one with `upsert: true` replaces the previous version. |
+| `content` | string | Plain text. Mutually exclusive with `messages`. |
+| `messages` | array | A conversation. Mutually exclusive with `content`. |
+| `attributes` | object | Structured attributes you filter on at query time. |
+| `custom_attributes` | object | Free-form per-context metadata, returned with results but not filterable through the `attributes` operator language. |
+| `happened_at` | string (ISO 8601) | When this context is *about*. You supply it; we set `received_at` ourselves. |
+| `enrich` | boolean | Extract entities and relations into the context graph. Default `true`. Renamed from v2's `infer`. |
+| `forceful_relations` | object | Relations you assert between contexts, followed at query time. |
+| `custom_instructions` | string | Extraction guidance for this context. |
+
+Exactly one of `content` or `messages` must be present. Sending both, or neither, is a `400`.
+
+---
+
+## 3. The `messages` shape
+
+```json
+"messages": [
+  { "role": "system",    "content": "You are a support agent for Acme." },
+  { "role": "user",      "content": "Our invoices are late again.", "name": "sam" },
+  { "role": "user",      "content": "Third time this quarter." },
+  { "role": "assistant", "content": "I've escalated this to Payments." }
+]
+```
+
+This is the shape you already build for OpenAI and Anthropic, so you can usually pass your existing message list straight through. It replaces v2's `user_assistant_pairs`.
+
+The rules:
+
+- **Consecutive same-role turns are accepted** and concatenated. Real chats arrive this way, and requiring strict alternation would force you to pre-process.
+- **`system` is context-only.** It shapes extraction but is never itself a fact we store as something the user said or believes.
+- **`name` is optional per turn.** Supplying it improves attribution when several people appear in one conversation.
+- **Unknown roles and empty lists are a `400`.** Accepted roles are `user`, `assistant`, and `system`.
+
+---
+
+## 4. Replacement semantics
+
+`upsert: true` (the default) means *replace*, not merge: re-ingesting a `context_id` deletes everything derived from the previous version, including its chunks and its graph contribution, before writing the new one. If you want to add to a context rather than replace it, ingest it as a new context and relate the two.
+
+---
+
+## 5. Fields v3 rejects
+
+These return `400` with a message naming the replacement, rather than being silently ignored:
+
+| Field | Why |
+| --- | --- |
+| `type` | there is no knowledge/memory split on v3 |
+| `infer` | renamed to per-context `enrich` |
+| `memories` | send memory as ordinary `contexts[]` |
+| `app_knowledge`, `contexts[].app` | structured app sources are an enterprise ingest path; everyone else uses a [connector](/essentials/v2/connectors) |
