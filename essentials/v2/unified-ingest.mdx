@@ -1,0 +1,111 @@
+---
+title: "Ingest on a unified database"
+description: "How POST /context/ingest takes text and conversations as one items[] array, with no corpus selector."
+---
+
+On a unified database, `POST /context/ingest` takes one `items[]` array. Each item is either plain text or a conversation; there is no `type`, no separate `memories` field and no file upload. The same array is accepted on a split database, where the items land in its memory corpus.
+
+For the split-database fields (`documents`, `app_knowledge`, `memories`), see [Knowledge](/essentials/v2/knowledge) and [Memories](/essentials/v2/memories).
+
+---
+
+## 1. Text and conversations in one call
+
+```json
+POST /context/ingest
+Content-Type: application/json
+{
+  "database": "acme",
+  "collection": "team-1",
+  "items": [
+    {
+      "context_id": "doc-001",
+      "text": "Acme runs billing on the Ledger service, owned by the Payments team.",
+      "attributes": { "department": "eng" },
+      "custom_attributes": { "author": "sam@acme.com" }
+    },
+    {
+      "context_id": "chat-001",
+      "conversation": [
+        { "role": "user", "content": "I prefer dark mode and I work at Acme.", "name": "sam" },
+        { "role": "assistant", "content": "Noted, dark mode at Acme." }
+      ],
+      "happened_at": "2026-08-16T10:00:00Z"
+    }
+  ]
+}
+```
+
+The response is `202 Accepted` with the usual `{ "success": true, "data": { "results": [...] } }` envelope. Indexing is asynchronous; poll `GET /context/status` until each `context_id` reports `completed`.
+
+### Sending `items` through the SDK
+
+The generated SDKs call the multipart form of the same endpoint. `items` is also accepted as a form field holding the JSON array, exactly like `memories` and `app_knowledge` are today:
+
+```python
+client.context.ingest(
+    database="acme",
+    collection="team-1",
+    items=json.dumps([{"context_id": "doc-001", "text": "..."}]),
+)
+```
+
+Both entry points run the same validation and write the same rows.
+
+---
+
+## 2. Item fields
+
+| Field | Type | Purpose |
+| --- | --- | --- |
+| `context_id` | string | Your identifier for this item. Generated if omitted. Reusing one with `upsert: true` replaces the previous version. |
+| `text` | string | Plain text. Mutually exclusive with `conversation`. |
+| `conversation` | array | A conversation. Mutually exclusive with `text`. |
+| `attributes` | object | Structured attributes you filter on at query time. |
+| `custom_attributes` | object | Free-form per-item metadata, returned with results but not filterable through the `attributes` operator language. |
+| `happened_at` | string (ISO 8601) | When this item is *about*. You supply it; the server records when it received the item separately. |
+| `enrich` | boolean | Extract entities and relations into the context graph. Default `true`. |
+| `forceful_relations` | object | Relations you assert between items, followed at query time. |
+| `custom_instructions` | string | Extraction guidance for this item. |
+
+Exactly one of `text` or `conversation` must be present. Sending both, or neither, is a `400`. The drafted names `contexts`, `content` and `messages` are accepted as aliases of `items`, `text` and `conversation`.
+
+---
+
+## 3. The `conversation` shape
+
+```json
+"conversation": [
+  { "role": "system",    "content": "You are a support agent for Acme." },
+  { "role": "user",      "content": "Our invoices are late again.", "name": "sam" },
+  { "role": "user",      "content": "Third time this quarter." },
+  { "role": "assistant", "content": "I've escalated this to Payments." }
+]
+```
+
+This is the shape you already build for OpenAI and Anthropic, so you can usually pass your existing message list straight through. It replaces `user_assistant_pairs`.
+
+- **Consecutive same-role turns are accepted** and concatenated.
+- **`system` is context-only.** It shapes extraction but is never stored as a fact. A conversation made only of `system` turns is a `400`.
+- **`name` is optional per turn.** Supplying it improves attribution when several people appear in one conversation.
+- **Unknown roles, empty content and empty lists are a `400`.** Accepted roles are `user`, `assistant` and `system`.
+
+---
+
+## 4. Replacement semantics
+
+`upsert: true` (the default) means *replace*, not merge: re-ingesting a `context_id` deletes everything derived from the previous version, including its chunks and its graph contribution, before writing the new one. To add to an item rather than replace it, ingest a new item and relate the two.
+
+---
+
+## 5. Fields a unified database rejects
+
+These return `400` with a message naming the replacement, rather than being silently ignored:
+
+| Field | Why |
+| --- | --- |
+| `type: "knowledge"` or `type: "memory"` | there is one corpus; omit `type` or send `unified` |
+| `documents` | files are text-only on a unified database; extract the text and send it as an item |
+| `memories` | send memory as ordinary `items[]` |
+| `app_knowledge` | structured app sources are an enterprise ingest path; everyone else uses a [connector](/essentials/v2/connectors) |
+| `items` together with `type: "knowledge"` (any database) | items are memory-shaped; omit `type` |

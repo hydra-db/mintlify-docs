@@ -1,0 +1,113 @@
+---
+title: "Unified databases"
+description: "A database created with type=unified keeps knowledge and memory in one place. What changes on the v2 API, what stays, and how to adopt it."
+---
+
+Every HydraDB database used to hold two separate corpora, knowledge and memory, and every call to the context and query endpoints took `type: "knowledge" | "memory"` to say which one you meant. A **unified** database keeps everything in one corpus. There is no third API version: the same v2 endpoints serve both kinds of database, and `type` gained one more value, `unified`.
+
+<Note>
+Existing databases are not migrated and keep working unchanged. You adopt the unified layout by creating a new database with `type: "unified"`.
+</Note>
+
+---
+
+## 1. Create a unified database
+
+```bash
+curl -X POST https://api.hydradb.com/databases \
+  -H "Authorization: Bearer $HYDRADB_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"database": "acme", "type": "unified"}'
+```
+
+`type` on `POST /databases` is `split` (the default, the layout every existing database has) or `unified`. The layout is fixed when the database is created and cannot be changed afterwards.
+
+You can always tell which kind of database you are talking to:
+
+- `GET /databases` returns `details: [{ "database": "acme", "type": "unified" }, ...]` alongside the existing `databases` list.
+- `GET /databases/status?database=acme` returns `type: "unified"` alongside the readiness flags.
+
+---
+
+## 2. What `type` means on each kind of database
+
+`type` is accepted everywhere it was before (ingest, query, list, delete, relations, subgraph, chunks). Which values a database accepts depends on its layout:
+
+| `type` sent | Split database (every existing one) | Unified database |
+| --- | --- | --- |
+| absent | `knowledge`, as before | `unified`: the whole corpus |
+| `knowledge` | the knowledge corpus | `400`, there is no separate corpus to select |
+| `memory` | the memory corpus | `400`, same reason |
+| `all` (query only) | both corpora, merged | accepted, same as `unified` |
+| `unified` | `400`, there is no single corpus to name | the whole corpus |
+
+Nothing changes for a caller that keeps using a split database: every value it sends today answers exactly as it did. The rule only bites when a client that hard-codes `type: "memory"` is pointed at a unified database, which is why the [plugins and SDK wrappers](/essentials/v2/unified-databases#5-clients) now read the database's layout first.
+
+---
+
+## 3. One list of items, one graph object
+
+On a unified database you ingest `items[]` and query without a corpus selector. The two new pages cover each side:
+
+- [Ingest on a unified database](/essentials/v2/unified-ingest): `items[]`, each item either `text` or a `conversation`.
+- [Query on a unified database](/essentials/v2/unified-query): one ranked list, `graph.paths[]`, `forceful_relations`, and the `attributes` filter with `is_memory`.
+
+The query response is **additive**. Two new top-level fields appear, and nothing you read today is removed:
+
+| Field | Status | Notes |
+| --- | --- | --- |
+| `chunks[]`, `sources[]` | unchanged | same field names as before (`id`, `metadata`, `additional_metadata`, `relevancy_score`, ...) |
+| `graph.paths[]` | new | one ordered list; each path carries its own `chunk_ids` |
+| `forceful_relations` | new | `{ declared: [{ via: { from, to }, chunk }], inferred: [] }` |
+| `graph_context` | deprecated | still returned; prefer `graph.paths[]` |
+| `additional_context` | deprecated | still returned; prefer `forceful_relations.declared` |
+
+Because the response is one shape with optional additions, every generated SDK keeps a single response type and no client breaks on a field it does not know.
+
+---
+
+## 4. Field names
+
+Unified ingest items use the names the redesign settled on. The old names are still accepted on the existing fields and appear in responses, so nothing you have written stops working; the docs use the new names.
+
+| Existing name | Name on `items[]` | Notes |
+| --- | --- | --- |
+| `memories[]`, `app_knowledge[]`, `documents` | `items[]` | one array, each item `text` or `conversation` |
+| `id` | `context_id` | your identifier; generated if omitted |
+| `text` (memory) / `content.text` (app knowledge) | `text` | plain text |
+| `user_assistant_pairs` | `conversation` | `[{ role, content, name }]` |
+| `metadata` | `attributes` | structured, filterable |
+| `additional_metadata` | `custom_attributes` | free-form |
+| `observation_date` | `happened_at` | when the item is about |
+| `infer` | `enrich` | per item, default `true` |
+| `query_paths` + `chunk_relations` + `chunk_id_to_group_ids` | `graph.paths[]` | response |
+| `additional_context` | `forceful_relations.declared` | response |
+
+Responses keep the v2 chunk and source field names (`id`, `metadata`, `additional_metadata`, `timestamp`) and the `{ "success": true, "data": ... }` envelope. `query_forceful_relations` keeps its name on the query request.
+
+---
+
+## 5. Clients
+
+The official wrappers already handle both layouts:
+
+| Client | Behaviour on a unified database |
+| --- | --- |
+| MCP server | `kind: "unified"` is the default when the database reports `type: "unified"`; ingest sends `items[]` |
+| CLI (`hydradb`) | `hydradb database create --type unified`; `query`, `list`, `delete` take `--kind unified`; `ingest` sends `items[]` |
+| Claude Code plugin | `searchMode: "unified"` and `ingestionMode: "unified"`; auto-detected from `GET /databases` |
+| OpenClaw plugin | `layout: "unified"` in config, or auto-detected; recall and capture go through `/query` and `items[]` |
+
+If you call the API directly, read `GET /databases` once and branch on `type`.
+
+---
+
+## 6. What breaks, and for whom
+
+Nothing breaks for anyone who does not create a unified database. For a unified database:
+
+- Sending `type: "knowledge"` or `type: "memory"` returns `400` instead of half the data.
+- The split-era ingest fields (`documents`, `app_knowledge`, `memories`) return `400` pointing at `items[]`. Files are text-only on a unified database: extract the text and send it as an item.
+- `is_memory` is filterable in `attributes` (it is not on a split database, where the column is absent from rows written before this change).
+
+There is no in-place conversion from split to unified. Create a unified database, re-ingest, and repoint your client.
