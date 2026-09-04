@@ -1,0 +1,177 @@
+---
+title: "Ingest on a unified database"
+description: "How POST /context/ingest takes text and conversations as one items[] array, with no corpus selector."
+---
+
+On a unified database, `POST /context/ingest` takes one `items[]` array. Each item is either plain text or a conversation; there is no `type`, no separate `memories` field and no file upload. The same array is accepted on a split database, where the items land in its memory corpus.
+
+For the split-database fields (`documents`, `app_knowledge`, `memories`), see [Knowledge](/essentials/v2/knowledge) and [Memories](/essentials/v2/memories).
+
+---
+
+## 1. Text and conversations in one call
+
+```json
+POST /context/ingest
+Content-Type: application/json
+{
+  "database": "acme",
+  "collection": "team-1",
+  "items": [
+    {
+      "context_id": "doc-001",
+      "text": "Acme runs billing on the Ledger service, owned by the Payments team.",
+      "attributes": { "department": "eng" },
+      "custom_attributes": { "author": "sam@acme.com" }
+    },
+    {
+      "context_id": "chat-001",
+      "conversation": [
+        { "role": "user", "content": "I prefer dark mode and I work at Acme.", "name": "sam" },
+        { "role": "assistant", "content": "Noted, dark mode at Acme." }
+      ],
+      "happened_at": "2026-08-16T10:00:00Z"
+    }
+  ]
+}
+```
+
+The response is `202 Accepted` with the usual `{ "success": true, "data": { "results": [...], "success_count": 2, "failed_count": 0 } }` envelope. Indexing is asynchronous; poll `GET /context/status?database=acme&ids=doc-001&ids=chat-001` until each item's `indexing_status` reaches a terminal state, which is `completed` or `errored`. A `202` says the items were accepted, not that they are queryable.
+
+### Sending `items` through the SDK
+
+The generated SDKs call the multipart form of the same endpoint. `items` is also accepted as a form field holding the JSON array, exactly like `memories` and `app_knowledge` are today:
+
+```python
+client.context.ingest(
+    database="acme",
+    collection="team-1",
+    items=json.dumps([{"context_id": "doc-001", "text": "..."}]),
+)
+```
+
+Both entry points run the same validation and write the same rows.
+
+---
+
+## 2. Item fields
+
+| Field | Type | Purpose |
+| --- | --- | --- |
+| `context_id` | string | Your identifier for this item. Generated if omitted. Reusing one with `upsert: true` replaces the previous version. |
+| `title` | string | A name for this item, on a `text` item and a `conversation` item alike. It becomes the stored context's document title, and it feeds the id HydraDB generates when you omit `context_id`, so two items with identical text and no title generate the same id and the second replaces the first. Give either a `context_id` or a distinct `title` when you ingest repeated text. |
+| `text` | string | Plain text. Mutually exclusive with `conversation`. |
+| `conversation` | array | A conversation. Mutually exclusive with `text`. |
+| `attributes` | object | Structured attributes you filter on at query time. |
+| `custom_attributes` | object | Free-form per-item metadata, returned with results but not filterable through the `attributes` operator language. |
+| `happened_at` | string (ISO 8601) | When this item is *about*. You supply it; the server records when it received the item separately. |
+| `enrich` | boolean | Extract entities and relations into the context graph. Default `true`. |
+| `is_markdown` | boolean | The text is markdown, so chunk it on its structure rather than as flat prose. Default `false`. The same field `memories[]` has always taken. |
+| `user_name` | string | Who the speaker is. On a `conversation` item the per-turn `name` wins and this only fills in when no turn named anyone; on a `text` item it is the only source. An item that names nobody either way is stored as `User`, never blank. |
+| `custom_instructions` | string | Extraction guidance for this item. |
+| `context_category` | string | What kind of context this is: `user_preference`, `business_knowledge`, `decision_trace`, or `auto` (the default, HydraDB decides). Unified databases only; validated strictly. See [Context category](#5-context-category). |
+| `acl` | array of strings | Who may retrieve this item: bare emails, `user_email:`, `group:<provider>:<id>`, `domain:` principals, or `__public__`. Omit for unrestricted; an empty list restricts it to nobody. Same contract as `app_knowledge[].acl` on a split database. A malformed principal rejects the whole request with `400`. See [Access control](/essentials/v2/access-control). |
+
+Exactly one of `text` or `conversation` must be present. Sending both, or neither, is a `400`. The drafted names `contexts`, `content` and `messages` are accepted as aliases of `items`, `text` and `conversation`.
+
+That table is the whole shape. An item has no `source` field, so put one in `custom_attributes` if you need it, and it has no way to declare relations between items: `relations` is a field of the split-database `documents` and `app_knowledge` shapes, and carrying it on `items[]` is not built yet. A key an item does not recognise is dropped without an error, so check the spelling against this table rather than expecting a `400`.
+
+### Restricting an item
+
+```json
+{
+  "database": "acme",
+  "items": [
+    {
+      "context_id": "pricing-q3",
+      "text": "The Q3 pricing plan raises the Scale tier to 499 dollars a month.",
+      "acl": ["grace@acme.com", "group:slack:C0123"]
+    }
+  ]
+}
+```
+
+Omit `acl` and the item is unrestricted; send an empty list and it is restricted to nobody; a malformed principal rejects the whole request with `400` rather than ingesting the item unprotected. This is the contract `app_knowledge[].acl` uses on a split database, and every read on a unified database takes the matching `acl` query principals. The full model is in [Access control](/essentials/v2/access-control).
+
+---
+
+## 3. The `conversation` shape
+
+```json
+"conversation": [
+  { "role": "system",    "content": "You are a support agent for Acme." },
+  { "role": "user",      "content": "Our invoices are late again.", "name": "sam" },
+  { "role": "user",      "content": "Third time this quarter." },
+  { "role": "assistant", "content": "I've escalated this to Payments." }
+]
+```
+
+This is the shape you already build for OpenAI and Anthropic, so you can usually pass your existing message list straight through. It replaces `user_assistant_pairs`.
+
+- **Consecutive same-role turns are accepted** and concatenated.
+- **`system` is context-only.** It shapes extraction but is never stored as a fact. A conversation made only of `system` turns is a `400`.
+- **`name` is optional per turn.** Supplying it improves attribution when several people appear in one conversation.
+- **Unknown roles, empty content and empty lists are a `400`.** Accepted roles are `user`, `assistant` and `system`.
+
+---
+
+## 4. Replacement semantics
+
+`upsert: true` (the default) means *replace*, not merge: re-ingesting a `context_id` deletes everything derived from the previous version, including its chunks and its graph contribution, before writing the new one. To add to an item rather than replace it, ingest a new item and relate the two.
+
+---
+
+## 5. Context category
+
+A unified database has no `knowledge` or `memory` corpus to choose between, so the question "what kind of context is this?" is answered by a label on the item instead of by where it is stored:
+
+| Value | Meaning |
+| --- | --- |
+| `user_preference` | what a person likes, decided, or asked for |
+| `business_knowledge` | documentation, policy, product and domain facts |
+| `decision_trace` | the record of an agent or a team reasoning to an outcome |
+| `auto` | the default: HydraDB decides |
+
+```json
+{
+  "database": "acme",
+  "items": [
+    { "text": "We chose Postgres over DynamoDB for the ledger because of transactional reads.", "context_category": "decision_trace" },
+    { "conversation": [{ "role": "user", "content": "I prefer dark mode." }], "context_category": "user_preference" },
+    { "text": "Refunds are processed within 5 business days." }
+  ]
+}
+```
+
+Naming a category pins it: HydraDB will not relabel a context you classified yourself. Omitting it, or sending `auto`, leaves the classification to HydraDB. The value is validated strictly: a misspelling is a `400` on the request, never a context silently filed under nothing.
+
+Pinning a category on a split database is a `400`, because there `type` already selects the corpus. It is the pin that is refused, not the field: omitting `context_category` and sending `"auto"` both behave the same way on either layout, so a client that fills the field in with `auto` for every item keeps working against a split database.
+
+That refusal carries `error.code: "CONTEXT_CATEGORY_UNSUPPORTED"`, which is deliberately not the `CORPUS_TYPE_UNSUPPORTED` a rejected `type` returns: both come from the layout rule, but this one is repaired by dropping the field, not by changing `type`.
+
+The label is stored with the context today. Nothing filters or routes on it yet; it is accepted now so that history is already classified when those features arrive, with no backfill.
+
+---
+
+## 6. Fields a unified database rejects
+
+These return `400` with a message naming the replacement, rather than being silently ignored:
+
+| Field | Why |
+| --- | --- |
+| `type: "knowledge"` or `type: "memory"` | there is one corpus; omit `type` or send `unified` |
+| `documents` | files are text-only on a unified database; extract the text and send it as an item |
+| `memories` | send memory as ordinary `items[]` |
+| `app_knowledge` | structured app sources are an enterprise ingest path; everyone else uses a [connector](/essentials/v2/connectors) |
+| no `items` at all | a unified database has no other ingest shape, so a request that carries none is a `400` naming `items` |
+
+Two rules apply on **either** layout:
+
+| Field | Why |
+| --- | --- |
+| `items` together with `type: "knowledge"` | items are memory-shaped; omit `type` |
+| `type: "all"` | `all` selects both corpora for reads and deletes, but a write has to name the one corpus it lands in. The message names the values this database will take: `knowledge` or `memory` on a split one, `unified` or nothing at all on a unified one |
+
+<Note>
+These are rules of the multipart form. `type` is a form field, so the JSON body has no `type` to reject, and a `type` key sent inside a JSON body is ignored rather than refused. Send `items` as a form field when you want the `type` conflicts above to be checked.
+</Note>
