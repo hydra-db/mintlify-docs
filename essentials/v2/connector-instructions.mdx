@@ -1,0 +1,142 @@
+---
+title: "Custom Ingestion Instructions"
+description: "Steer how a connector's data is interpreted and indexed with free-text instructions, per connector or per resource."
+---
+
+Custom ingestion instructions are free text attached to a connector that guides how its synced documents are interpreted and indexed. The text is injected into the ingestion pipeline's extraction and inference stages for every document the connector syncs, so you can tell HydraDB what the content means before it is indexed  -  not after a query comes back wrong.
+
+The canonical use case is taxonomy. Suppose your product was rebranded from *Aurora* to *Nimbus*: years of documents mention only the old name, nothing in the corpus states the rename, and a search for "Nimbus" misses all of the pre-rebrand context. One instruction fixes the interpretation at ingestion time:
+
+```text
+Aurora was renamed to Nimbus in January 2025; they are the same product.
+Index all Aurora content under the canonical name Nimbus and record
+Aurora as a former name.
+```
+
+From the next sync onward, documents that mention only Aurora are extracted under the Nimbus entity, with alias links to the old name  -  so new-name queries reach old-name content through the knowledge graph.
+
+Instructions are equally useful for focus ("prioritize decisions, owners, and deadlines; ignore social chatter"), interpretation ("threads in this workspace are incident retros; extract root cause and remediation"), and domain vocabulary ("SEV1/SEV2 are incident severities, not product names").
+
+---
+
+## Works with every existing connector
+
+Instructions are purely additive. Every connector you already have supports them today with a single `PATCH`  -  no reconnection, no reconfiguration, no migration, and no change in behavior until you set one:
+
+```bash
+curl -X PATCH 'https://api.hydradb.com/connectors/CONNECTOR_ID' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -H "Content-Type: application/json" \
+  -d '{ "custom_instructions": "Aurora was renamed to Nimbus in January 2025; they are the same product." }'
+```
+
+The connector's configuration is re-read at the start of every sync cycle, so the instruction applies from the next sync automatically. A connector with no instructions behaves exactly as before.
+
+---
+
+## Two levels: connector default and per-resource override
+
+| Level | Scope | Where to set it |
+|---|---|---|
+| Connector | every resource without its own instructions | `POST /connectors`, `PATCH /connectors/:id` |
+| Resource | documents synced from that one resource | `resources[].custom_instructions` on configure, `POST /connectors/:id/resources`, `PATCH /connectors/:id/resources/:resource_id` |
+
+A resource-level value **replaces** the connector default for that resource's documents  -  it does not append to it. An empty or absent resource value inherits the connector default. This mirrors how per-resource database and collection overrides already resolve.
+
+| Connector value | Resource value | Effective instructions |
+|---|---|---|
+| set | unset | connector's |
+| set | set | resource's |
+| unset | set | resource's |
+| unset | unset | none |
+
+Use a resource override when one connector spans materially different content: a channel of incident retros and a channel of release notes want different guidance, and a connector-wide value can only describe both badly.
+
+### Set the connector default at creation
+
+```bash
+curl -X POST 'https://api.hydradb.com/connectors' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "provider": "slack",
+    "database": "acme_corp",
+    "collection": "engineering",
+    "credentials": { "api_token": "xoxp-..." },
+    "custom_instructions": "Prioritize decisions and owners; treat threads as engineering discussions."
+  }'
+```
+
+### Set a resource override
+
+At configure time, per entry:
+
+```bash
+curl -X POST 'https://api.hydradb.com/connectors/CONNECTOR_ID/configure' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "resources": [
+      { "resource_id": "C_INCIDENTS", "name": "incidents",
+        "custom_instructions": "These are incident retros; extract root cause, impact, and owner." },
+      { "resource_id": "C_RELEASES", "name": "releases" }
+    ]
+  }'
+```
+
+`C_RELEASES` carries no value, so it inherits the connector default. Or on an already-configured resource:
+
+```bash
+curl -X PATCH 'https://api.hydradb.com/connectors/CONNECTOR_ID/resources/RESOURCE_ID' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -H "Content-Type: application/json" \
+  -d '{ "custom_instructions": "These are incident retros; extract root cause, impact, and owner." }'
+```
+
+### Clear instructions
+
+Send an explicit empty string. Omitting the field leaves the stored value unchanged; `""` removes it:
+
+```bash
+curl -X PATCH 'https://api.hydradb.com/connectors/CONNECTOR_ID/resources/RESOURCE_ID' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -H "Content-Type: application/json" \
+  -d '{ "custom_instructions": "" }'
+```
+
+Clearing a resource override returns that resource to the connector default. Re-sending a configure request without the field preserves an existing override, so routine reconfiguration never silently strips a tuned resource.
+
+### Read them back
+
+`GET /connectors/:id` returns the connector's `custom_instructions`; `GET /connectors/:id/resources` returns each resource's, absent when the resource inherits.
+
+---
+
+## From the dashboard
+
+- **At connect time**  -  the connect wizard has a dedicated *Instructions* step between resource selection and review. Set the connector default there, and click any selected resource to give it its own instructions before ingestion starts.
+- **After connecting**  -  open the connector and click **Instructions**, or click the instructions icon on any resource row. The dialog lists the connector default and every resource with its override-or-inherits state, so you can see and edit the whole hierarchy in one place. Resources with their own instructions are badged in the resource table.
+
+---
+
+## Semantics and limits
+
+- **Applies to future syncs only.** Instructions are read at sync time and stamped onto each document as it is ingested. Already-indexed documents are not re-processed; each document keeps the instructions it was ingested under, recorded in its stored metadata.
+- **Length limit: 4,000 characters**, counted in characters rather than bytes, so multi-byte scripts get the same budget. Longer values are rejected with a 400 and the stored value is left unchanged.
+- **Cost.** The text rides the extraction and inference prompts for every synced document, so a long value on a high-volume connector is a recurring processing cost. Say what matters and stop.
+- **Steering, not string rewriting.** Instructions guide the language models that build the knowledge graph. Explicit, unambiguous instructions ("X was renamed to Y; they are the same product; index under Y") get the strongest adherence; vague guidance gets vague results. State each rule directly, name the exact terms involved, and keep unrelated rules as separate sentences.
+- **No filtering or routing.** Instructions do not change which documents sync, where they are stored, or who can access them. Use resource selection, [multi-tenant routing](/essentials/v2/multi-tenant), and ACLs for those.
+
+---
+
+## Related
+
+- [Connectors](/essentials/v2/connectors)  -  creating, configuring, and syncing connectors
+- [App Sources](/essentials/v2/app-sources)  -  the ingestion model connector objects use
+- [Context Graphs](/essentials/v2/context-graphs)  -  how extracted entities and relations are stored
+- [Query](/essentials/v2/query)  -  querying connector-synced data
