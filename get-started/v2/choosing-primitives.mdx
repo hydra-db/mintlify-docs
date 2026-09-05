@@ -1,0 +1,239 @@
+---
+title: "Which Primitive Do I Use?"
+description: "A decision guide for choosing between Knowledge, Memories, app sources, and connectors - and for setting infer correctly - before you write any ingestion code."
+---
+
+Every other page in these docs explains **how** to use one primitive. This page
+answers the question you have *first*: **which one do I use?**
+
+Work through the four decisions below in order. Each one narrows the next. By the
+end you will know your `type`, your scope, your `infer` value, and your query
+shape - and you can jump straight to the reference page for the path you landed on.
+
+<Note>
+  New to HydraDB entirely? Read [Core Concepts](/get-started/v2/core-concepts)
+  first for a 5-minute tour of the primitives, then come back here to pick between
+  them.
+</Note>
+
+---
+
+## The 30-second answer
+
+If you only read one thing, read this table.
+
+| You are storing… | Store it as… | `infer` | Query with |
+| --- | --- | --- | --- |
+| A product doc, PDF, wiki page, policy | [Knowledge](/essentials/v2/knowledge) | n/a | `type: "knowledge"` |
+| Anything one specific user said, did, or prefers | [Memories](/essentials/v2/memories) | see [Decision 3](#decision-3-should-hydradb-infer-the-memory) | `type: "memory"` |
+| A Slack / Notion / Jira / Gmail record, loaded once | [App sources](/essentials/v2/app-sources) | n/a | `type: "knowledge"` |
+| The same app data, kept continuously in sync | [Connectors](/essentials/v2/connectors) | n/a | `type: "knowledge"` |
+| A personalized answer grounded in shared docs | both stores | - | `type: "all"` |
+
+Everything below is the reasoning behind that table.
+
+---
+
+## Decision 1: Knowledge or Memories?
+
+This is the decision developers get wrong most often, and it has nothing to do
+with the *format* of your content. A conversation can be Knowledge. A one-line
+PDF can be a Memory. The file type is irrelevant.
+
+Ask one question instead:
+
+> **Should every user in this database be able to retrieve this?**
+
+That is the whole rule.
+
+* **Yes, everyone should see it** → [Knowledge](/essentials/v2/knowledge). Shared,
+  database-wide context.
+* **No, this belongs to one person** → [Memories](/essentials/v2/memories).
+  Per-user, per-workspace, or per-session context.
+
+### Worked examples
+
+| Content | Answer | Why |
+| --- | --- | --- |
+| The company refund policy PDF | Knowledge | Every support agent needs the same policy |
+| "Customer #4417 is on the Pro plan" | Memory | True of exactly one customer |
+| A Slack thread debating the Postgres migration | Knowledge | Team decision record, shared |
+| A support chat where the user said "stop emailing me" | Memory | A preference held by one user |
+| Onboarding docs for new hires | Knowledge | Same for every hire |
+| "This user's last three summaries were too long" | Memory | Feedback about one user |
+
+<Warning>
+  **The trap:** conversational content feels like it belongs in Memories because
+  it is dialogue. It does not. A recorded team decision is shared context even
+  though it happened in a chat. Ask who should retrieve it, not what shape it
+  arrived in.
+</Warning>
+
+### If you get it wrong
+
+The failure is silent, which is what makes it costly. Store a shared doc as a
+Memory and it will not surface when you query `type: "knowledge"` - the call
+returns successfully with results that simply omit it. There is no error to catch.
+Verify with [`POST /query`](/api-reference/v2/endpoint/query) against the store you
+expect before you build on top of it.
+
+---
+
+## Decision 2: Where does the data come from?
+
+Once you know it is Knowledge, decide how it arrives. All three paths land in the
+same Knowledge store and are queried identically - they differ only in how content
+gets in.
+
+| Your situation | Use | Why |
+| --- | --- | --- |
+| You have files - PDFs, markdown, text | [Knowledge ingestion](/essentials/v2/knowledge) | Direct upload, you control timing |
+| You have app records and want a one-time load | [App sources](/essentials/v2/app-sources) | Field-based model preserves structure |
+| You want app data kept fresh automatically | [Connectors](/essentials/v2/connectors) | HydraDB syncs on an ongoing basis |
+
+The distinction that actually matters is **one-time versus continuous**.
+
+Use app sources when you are backfilling, migrating, or loading an export you
+already have in hand. Use connectors when the source system keeps changing and
+your agent needs to see those changes without you writing sync logic. If you find
+yourself writing a cron job to re-ingest the same Notion workspace, you want a
+connector.
+
+<Note>
+  App sources and connectors both write into the Knowledge store. Nothing about
+  your query changes based on which one you chose - `type: "knowledge"` retrieves
+  content from all three paths together.
+</Note>
+
+---
+
+## Decision 3: Should HydraDB infer the memory?
+
+This decision applies **only to Memories**. Knowledge ingestion has no `infer`
+flag.
+
+The question is whether you are sending the memory itself, or the evidence for it.
+
+> **Is what I am sending already the fact I want back?**
+
+* **Yes, it is already the fact** → `infer: false`. Stored verbatim.
+* **No, the fact has to be derived from it** → `infer: true`. HydraDB extracts it.
+
+### Side by side
+
+| | `infer: false` | `infer: true` |
+| --- | --- | --- |
+| Input | The finished fact | Raw signal |
+| HydraDB does | Stores it as written | Extracts the underlying preference or trait |
+| Speed | Faster, deterministic | Slower, involves extraction |
+| `custom_instructions` | Ignored | Guides extraction |
+| Use for | Structured facts, notes to retrieve exactly | Dialogue, behavior logs, feedback |
+
+### The same input, both ways
+
+Send a behavior log with `infer: true`:
+
+```json
+{
+  "text": "User switched to dark mode on first session. Toggled back to light once, then switched back to dark within 4 minutes. Has not changed theme since.",
+  "infer": true,
+  "custom_instructions": "Focus on display and theme preferences."
+}
+```
+
+Query `"what UI settings does the user prefer?"` and you get back the derived
+preference - *prefers dark mode* - not the log.
+
+Send that same text with `infer: false` and you get the event log back, verbatim.
+That is the right choice only when the log itself is what you want to retrieve.
+
+Now the reverse. A fact you already extracted:
+
+```json
+{
+  "text": "User's plan tier is Pro.",
+  "infer": false
+}
+```
+
+Setting `infer: true` here is the common mistake. HydraDB may re-derive and
+rephrase a fact that was already correct, and you lose your original wording for
+no benefit.
+
+<Warning>
+  `custom_instructions` only takes effect when `infer: true`. Setting it alongside
+  `infer: false` is silently ignored - a frequent source of "why is my instruction
+  doing nothing?"
+</Warning>
+
+**Rule of thumb:** if you wrote code to extract the preference before calling
+HydraDB, delete that code and set `infer: true`. If the fact arrived already
+structured from your database, use `infer: false`.
+
+---
+
+## Decision 4: How do I query what I stored?
+
+There is one endpoint - [`POST /query`](/api-reference/v2/endpoint/query) - and the
+`type` parameter selects the store.
+
+| `type` | Reads from | Use when |
+| --- | --- | --- |
+| `"knowledge"` | Knowledge store | The answer lives in shared docs |
+| `"memory"` | Memories store | You need only this user's context |
+| `"all"` | Both, merged and re-ranked | You want a personalized answer grounded in shared docs |
+
+`type: "all"` is the one most production apps want. It runs both stores in
+parallel and returns a single merged result set - so a support agent can answer
+from the refund policy *and* know this customer is on Pro, in one call. You do not
+need to make two requests and merge them yourself.
+
+<Note>
+  The `type` you query must match the `type` you ingested with. This is the other
+  half of the Decision 1 trap: content stored as a Memory never appears under
+  `type: "knowledge"`, no matter how the query is worded.
+</Note>
+
+---
+
+## Putting it together
+
+A support agent needs the company refund policy, the product FAQ, and per-customer
+history. Applying the four decisions:
+
+* Refund policy and FAQ - every agent needs them → **Knowledge**
+* Help-center articles synced from Notion, kept current → **Connector**
+* "Prefers email over phone", captured from a chat transcript → **Memory**,
+  `infer: true`
+* "Plan tier is Pro", read from your billing database → **Memory**, `infer: false`
+* Answering a live ticket → **`type: "all"`**
+
+That is one database, both stores, one query at runtime.
+
+---
+
+## Common mistakes this page prevents
+
+| Mistake | Symptom | Fix |
+| --- | --- | --- |
+| Shared docs stored as Memories | Missing from `type: "knowledge"` results, no error | [Decision 1](#decision-1-knowledge-or-memories) |
+| Choosing by file format instead of audience | Conversations misfiled as Memories | [Decision 1](#decision-1-knowledge-or-memories) |
+| Cron job re-ingesting the same app data | Duplicate content, stale windows | [Decision 2](#decision-2-where-does-the-data-come-from) |
+| Extracting preferences yourself, then `infer: true` | Duplicated work, rephrased facts | [Decision 3](#decision-3-should-hydradb-infer-the-memory) |
+| `custom_instructions` with `infer: false` | Instructions silently ignored | [Decision 3](#decision-3-should-hydradb-infer-the-memory) |
+| Querying `type: "knowledge"` for user context | Personalization missing from answers | [Decision 4](#decision-4-how-do-i-query-what-i-stored) |
+| Two calls to merge both stores | Extra latency, worse ranking | Use `type: "all"` |
+
+---
+
+## Where to go next
+
+| You landed on… | Read next |
+| --- | --- |
+| Knowledge | [Knowledge](/essentials/v2/knowledge) |
+| Memories | [Memories](/essentials/v2/memories) |
+| App sources | [App Sources](/essentials/v2/app-sources) |
+| Connectors | [Connectors](/essentials/v2/connectors) |
+| Ready to write code | [Quickstart](/get-started/v2/quickstart) |
+| Tuning retrieval | [Query](/essentials/v2/query) |
+| Scoping per user | [Multi-tenant](/essentials/v2/multi-tenant) |
