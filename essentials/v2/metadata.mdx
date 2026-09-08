@@ -63,16 +63,96 @@ That means a valid filter with no matching sources returns an empty result set; 
 | --- | --- |
 | Multiple keys | AND logic. Every provided key/value must match. |
 | Database + additional metadata | AND logic across both layers. |
-| Values | Exact equality for scalar values. |
-| Lists | **ANY, not ALL.** A list matches a source that has **any one** of the listed values (OR/IN). For example, `tags: ["alpha", "beta"]` matches a source tagged `"alpha"` and a source tagged `"beta"`. There is no ALL/AND operator inside a single key. Lists are supported on `VARCHAR` fields only  -  a list passed for a declared field of any other type is rejected with `400 VALIDATION_ERROR`. |
-| Range / contains / fuzzy | Not supported in user `metadata_filters`. Put fuzzy concepts in `query`, use semantic metadata fields, or post-process client-side. |
-| OR | Within one key, pass a list of values. Across different keys, run multiple queries and union client-side. |
+| Operators | Each `metadata` (top-level key) takes `{"equals": value}`, `{"contains": value}`, or `{"contains_any": [values]}`. Not available inside `additional_metadata`  -  use the bare forms there. `contains` and `contains_any` need a `VARCHAR` field; `equals` works on any type. See [Filter operators](#filter-operators). |
+| Values | `equals` is exact equality against the **whole** stored value. |
+| Lists | **ANY, not ALL.** A list matches a source holding **any one** of the listed values (OR/IN), so `tags: ["alpha", "beta"]` matches a source tagged `"alpha"` and a source tagged `"beta"`. Write it as `{"contains_any": [...]}` in `metadata` (top-level key), or as a bare list in `additional_metadata`. Adding values widens the result set; there is no ALL/AND operator inside a single key. Lists are supported on `VARCHAR` fields only  -  a list passed for a declared field of another type is rejected with `400 VALIDATION_ERROR`. |
+| Range / fuzzy | Not supported in user `metadata_filters`. Put fuzzy concepts in `query`, use semantic metadata fields, or post-process client-side. |
+| OR | Within one key, use `contains_any`. Across different keys, run multiple queries and union client-side. |
 | Graph context | Respects metadata filters; graph paths from excluded sources are removed. |
 | Size | Each list holds at most **500** values, and the whole `metadata_filters` object is capped at **64 KiB**. See [Filter size limits](#filter-size-limits). |
 
 <Warning>
   `metadata_filters` are hard constraints, not semantic hints. A filter like `{ "mood": "happy" }` requires an exact stored value; it does not expand to related values like "joyful" or "cheerful". To search metadata text semantically, declare a `VARCHAR` field with `enable_dense_embedding` and include the concept in the main `query`.
 </Warning>
+
+### Filter operators
+
+Each `metadata` (top-level) key in `metadata_filters` takes an operator object naming the comparison you want.
+
+| Operator | Value | Matches |
+| --- | --- | --- |
+| `equals` | a single value | sources whose field is **exactly** that value |
+| `contains` | a single value | sources whose field **holds** that value, at any position in a multi-value field |
+| `contains_any` | an array | sources holding **any one** of the listed values (OR/IN) |
+
+```json
+{
+  "metadata_filters": {
+    "department": { "equals": "legal" },
+    "attendee_emails": { "contains": "b@company.com" },
+    "tags": { "contains_any": ["alpha", "beta"] }
+  }
+}
+```
+
+Given four sources with these `emails` values:
+
+| Source | `emails` |
+| --- | --- |
+| A | `a@company.com` |
+| B | `a@company.com,b@company.com` |
+| C | `c@company.com` |
+| D | `x@company.com,a@company.com,z@company.com` |
+
+| Filter | Returns |
+| --- | --- |
+| `{"equals": "a@company.com"}` | A |
+| `{"contains": "a@company.com"}` | A, B, D |
+| `{"contains_any": ["a@company.com", "c@company.com"]}` | A, B, C, D |
+
+`contains` is position-independent: it matches whether the value is the only one, the first, or in the middle.
+
+Operators apply to `metadata` (top-level keys) only. Inside `additional_metadata`, use a bare scalar for an exact match or a bare array to match any listed value.
+
+<Warning>
+  An operator used inside `additional_metadata` is **not** rejected. It is read as an exact-match filter against a stored object, so on a normal field it matches nothing and the request returns `200` with an empty result rather than an error.
+</Warning>
+
+A known operator given the wrong operand type, or several operators in one object, is rejected with `400 VALIDATION_ERROR` rather than silently returning no results. A **misspelled** operator is not: `{"contian": "x"}` is indistinguishable from a filter for a stored object with that key, so it is left alone and matches nothing.
+
+<Note>
+  The bare forms still work and are unchanged, but are **deprecated** in favour of the operators, because the comparison they perform is inferred from the JSON shape rather than stated. A bare scalar behaves as `equals`, a bare array as `contains_any`, and a bare single-element array as `contains`  -  so `{"emails": "a@x"}` and `{"emails": ["a@x"]}` differ by one character and return different results.
+</Note>
+
+### Storing multiple values in one field
+
+A declared schema field holds a single value. To store several values in one field, declare it as `VARCHAR` and join the values with commas:
+
+```json
+{
+  "metadata": {
+    "attendee_emails": "a@company.com,b@company.com"
+  }
+}
+```
+
+Then filter for one member with `contains`:
+
+```json
+{
+  "metadata_filters": {
+    "attendee_emails": { "contains": "b@company.com" }
+  }
+}
+```
+
+Points to know:
+
+- `data_type: "array"` is **not** accepted on a declared field. Declaring one is rejected with `400`.
+- Sending an array **value** for a declared `VARCHAR` field is also rejected: `metadata field "attendee_emails" must be of type string, got array`. Join the values yourself.
+- The comma is the separator, so a value that itself contains a comma will not match as expected. Use a field per value, or a different value format, if your values can contain commas.
+- Size the field for the whole joined string. `max_length` defaults to `1024` and its maximum is `65535`, and it **cannot be raised after the field is created**, so declare it large enough up front.
+- `equals` compares the entire joined string, so it is rarely what you want on a multi-value field. Use `contains`.
 
 ---
 
@@ -164,7 +244,7 @@ await client.databases.create({
 | Field | Type / values | Purpose |
 | --- | --- | --- |
 | `name` | string | Metadata key. Must start with a letter or `_`, contain only letters/numbers/underscores, and not use reserved system names such as `source_id`, `chunk_id`, or `metadata`. |
-| `data_type` | `VARCHAR`, `BOOL`, `INT8`, `INT16`, `INT32`, `INT64`, `FLOAT`, `DOUBLE`, `JSON`, `ARRAY` or friendly aliases `string`, `boolean`, `integer`, `float`, `object`, `array` | Defaults to `VARCHAR`. |
+| `data_type` | `VARCHAR`, `BOOL`, `INT8`, `INT16`, `INT32`, `INT64`, `FLOAT`, `DOUBLE`, `JSON` or friendly aliases `string`, `boolean`, `integer`, `float`, `object` | Defaults to `VARCHAR`. `ARRAY` is **not** supported and is rejected with `400`; for multi-value fields see [Storing multiple values in one field](#storing-multiple-values-in-one-field). |
 | `max_length` | integer | Max length for `VARCHAR`. Default `1024`, maximum `65535`. This sizes one declared schema field, and is **not** the limit on how much metadata you can send per request  -  for that see [Size limits](#size-limits). |
 | `enable_match` | boolean | Creates the intended fast exact-match/filtering path for this field. Use this for top-level `metadata_filters` keys. |
 | `enable_dense_embedding` | boolean | Adds a dense semantic-search lane for a `VARCHAR` metadata field. |
