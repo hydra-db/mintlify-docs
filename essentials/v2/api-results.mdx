@@ -19,6 +19,7 @@ The retrieval payload has the same core shape regardless of `type` or `query_by`
 {
   "chunks": [
     {
+      "id": "doc-001",
       "chunk_uuid": "doc-001_chunk_0",
       "source_title": "my_document.pdf",
       "chunk_content": "Text content of the retrieved chunk...",
@@ -27,6 +28,13 @@ The retrieval payload has the same core shape regardless of `type` or `query_by`
       "additional_metadata": {
         "author": "Support Team"
       }
+    }
+  ],
+  "sources": [
+    {
+      "id": "doc-001",
+      "title": "my_document.pdf",
+      "url": "https://docs.example.com/my-document"
     }
   ],
   "graph_context": {
@@ -73,14 +81,15 @@ The retrieval payload has the same core shape regardless of `type` or `query_by`
 }
 ```
 
-Four things matter for prompt construction:
+Five things matter for prompt construction:
 
 - **`chunks`** - the primary retrieval output. Ranked by relevance; preserve the order HydraDB returns.
+- **`sources`** - deduplicated source metadata for the returned chunks. For citations, treat `chunk_uuid` as an opaque evidence identifier and join `chunks[].id` to `sources[].id` for the source title and URL.
 - **`graph_context.query_paths`** - entity traversal paths derived from your query. Useful for relational reasoning. See [Context Graphs](/essentials/v2/context-graphs).
 - **`graph_context.chunk_relations`** + **`chunk_id_to_group_ids`** - per-chunk graph relations grouped by `group_id`, so you can attach the right triplets to each chunk.
-- **`additional_context`** - a map keyed by `chunk_uuid`. When a chunk includes `extra_context_ids`, use those IDs to look up related chunks here.
+- **`additional_context`** - a map keyed by related chunk ID. When a primary chunk includes `extra_context_ids`, use those IDs to look up related chunks here and treat the matching map key as that related chunk's evidence ID.
 
-The raw object has too much noise for an LLM - IDs, timestamps, metadata. Section 2 shows how to convert it into a clean string.
+For an ordinary prompt, the raw object has too much noise for an LLM. Section 2 shows how to convert it into a clean string. If your model returns citations, retain the original response separately and validate each generated evidence ID against it before rendering. See [Validate Citations in RAG Answers](/cookbooks/v2/validated-citations) for a complete pattern.
 
 ---
 
@@ -467,7 +476,7 @@ If memory query fails or times out, fall back to the knowledge-only prompt.
 - **Preserve server order.** Don't re-sort chunks client-side.
 - **Start small on chunks.** `max_results: 10` is a reasonable default. Drop to 5 if you hit token limits, raise to 20 if you rerank downstream.
 - **Use graph context selectively.** It improves relational queries and bloats simple lookups. See [Context Graphs](/essentials/v2/context-graphs).
-- **Always give the model a grounding instruction.** A system prompt like "answer only from the provided context" prevents the model from inventing answers when retrieval is thin.
+- **Give the model a grounding instruction, then validate citations.** A system prompt like "answer only from the provided context" reduces unsupported answers, but it is not an enforcement boundary. Validate generated evidence IDs before rendering user-facing citations.
 - **Format consistently.** Whatever section delimiters you choose (`=== CONTEXT ===`, `Chunk N`, `Source:`), keep them stable across calls so the model learns the structure.
 - **`type: "all"` is the simplest path when you need both knowledge and memories.** One call, one result set, one `build_string` call.
 
@@ -481,7 +490,8 @@ If memory query fails or times out, fall back to the knowledge-only prompt.
 | Not including `collection` (formerly `sub_tenant_id`) when querying memories | Queries the default collection instead of the user's | Always pass the same `collection` used at ingestion. |
 | Including too many chunks | Token overflow or answer quality drops | Start at `max_results: 10`; reduce if needed. |
 | Re-sorting chunks client-side | Overrides HydraDB's ranking | Preserve the server-returned order. |
-| Missing a grounding instruction | The model invents answers when retrieval is thin | System prompt: answer only from the provided context. |
+| Missing grounding and validation | Unsupported answers and invented citation IDs can reach users | Add a context-only grounding prompt, then validate claim evidence IDs against the associated response. |
+| Treating a grounding prompt as citation validation | The model can still invent an ID, omit evidence, or return source metadata you did not retrieve | Require claim-level `chunk_uuid` values and validate them against the associated query response. |
 | Setting `graph_context: false` and expecting graph fields | Graph context will be omitted | `graph_context` is on by default; only set it to `false` when you explicitly don't want graph data. |
 | Using `query_forceful_relations` with `mode: "fast"` | Flag is silently ignored | `query_forceful_relations` only takes effect when `mode: "thinking"`. |
 | Looking up `chunk_relations` without `chunk_id_to_group_ids` | The right relations don't attach to the right chunk | Use `chunk_id_to_group_ids[chunk_uuid]` to find the `group_id`s, then filter `chunk_relations` by them. |
@@ -490,6 +500,7 @@ If memory query fails or times out, fall back to the knowledge-only prompt.
 
 ## Related
 
+- [Validate Citations in RAG Answers](/cookbooks/v2/validated-citations) - enforce same-response evidence membership before rendering citations
 - [Query](/essentials/v2/query) - request parameters and response shape
 - [Memories](/essentials/v2/memories) - what `POST /query` with `type: "memory"` queries
 - [Knowledge](/essentials/v2/knowledge) - what `POST /query` with `type: "knowledge"` queries
