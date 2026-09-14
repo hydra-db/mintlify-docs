@@ -1,0 +1,240 @@
+---
+title: "Bring Your Own Chunks"
+description: "Supply your own pre-split chunks for a source and skip HydraDB's chunking."
+---
+
+## 1. What it is
+
+Bring Your Own Chunks (BYOC) lets you attach a `chunks_payload` - your own pre-split chunks - to a **source** (a document, an `app_knowledge` source, or a memory) on [`POST /context/ingest`](/api-reference/v2/endpoint/ingest-context). For that source, HydraDB **uses your chunks instead of running its own chunker**.
+
+Your chunks flow through the rest of the pipeline unchanged: each is embedded and indexed, so the source stays fully vector-searchable, and graph extraction still runs on your chunks (unless you also [bring your own graph](/essentials/v2/bring-your-own-graph)). You supply chunk **content** only - HydraDB still owns enrichment such as inferred context, so any `inferred_content` you send is ignored.
+
+---
+
+## 2. When to use it
+
+Use BYOC when you already have the exact chunk boundaries you want indexed:
+
+- You run your own splitter (semantic, layout-aware, or domain-specific) and want those exact chunks searchable, not HydraDB's re-split.
+- You need deterministic, reproducible chunks rather than ones produced by our chunker.
+- You want faster ingestion - a BYOC source skips the chunking stage entirely.
+- You want stable `chunk_id`s you can reference elsewhere - for example to map [your own graph relations](/essentials/v2/bring-your-own-graph) to specific chunks (see [Combining with BYOG](#5-combining-with-bring-your-own-graph)).
+
+If you do not have your own chunks, do nothing - HydraDB chunks the source for you (the default).
+
+---
+
+## 3. The `chunks_payload` shape
+
+`chunks_payload` is a JSON string: a **map keyed by source id** - a document's `document_metadata` `id`, an `app_knowledge` item's `id`, or a memory's `id` - where each value is that source's chunk set (an object with a `chunks` array). Attach chunks to several sources in one request by adding more keys.
+
+```json
+{
+  "billing-policy-doc": {
+    "chunks": [
+      { "chunk_id": "billing-0", "content": "Invoices are issued on the first of each month." },
+      { "chunk_id": "billing-1", "content": "Late payments incur a 2% monthly fee." }
+    ]
+  }
+}
+```
+
+- **Top-level key** - the id of the source these chunks belong to. A key matching no source in the request is rejected with `400`.
+- **`chunks`** - a non-empty list of chunks, in the order you want them indexed.
+- **`chunks[].chunk_id`** (required) - your own id for the chunk. It must be unique within the source and is the handle you reference from a graph relation's `chunk_ids` (see below). It is stored as supplied.
+- **`chunks[].content`** (required) - the chunk text. Whitespace-only content is rejected.
+- **`chunks[].source_id`** - optional; defaults to the source's id when omitted.
+- **`chunks[].node_type`** - optional label carried through to the vector record (for example `attachment`).
+
+<Note>
+You supply chunk **content** only. HydraDB still runs its own enrichment (such as inferred context) over your chunks, so any `inferred_content` field you send is ignored and regenerated.
+</Note>
+
+---
+
+## 4. How it behaves
+
+- **Replace mode.** A BYOC source is chunked from your `chunks_payload`; HydraDB's chunker is skipped for it. Every chunk is still embedded and indexed, so the source stays fully vector-searchable.
+- **Enrichment still runs.** Inference and graph extraction run over your chunks exactly as they would over ones HydraDB produced (unless you also bring your own graph).
+- **Durable across re-ingest.** Your chunks are persisted server-side, so they outlive a single upload. Re-ingesting the same source **without** a `chunks_payload` - a connector re-sync, or iterating on other metadata - re-applies your stored chunks: HydraDB does **not** fall back to its chunker. To change the chunks, re-ingest **with** a new `chunks_payload`; it replaces the stored copy.
+
+---
+
+## 5. Combining with Bring Your Own Graph
+
+BYOC composes with [Bring Your Own Graph](/essentials/v2/bring-your-own-graph). Supply both `chunks_payload` and `graph_payload` for a source and you control both its chunks and its graph. On top of that, each graph relation may name the chunks it is evidenced by, using **your own** `chunk_id`s:
+
+```json
+{
+  "billing-policy-doc": {
+    "entities": {
+      "alice":   { "name": "Alice Carter",  "type": "PERSON", "namespace": "employees" },
+      "billing": { "name": "Billing Policy", "type": "POLICY", "namespace": "policies" }
+    },
+    "relations": [
+      {
+        "source": "alice",
+        "target": "billing",
+        "predicate": "OWNS",
+        "context": "Alice Carter owns the billing policy.",
+        "chunk_ids": ["billing-0", "billing-1"]
+      }
+    ]
+  }
+}
+```
+
+- A relation whose `chunk_ids` is set is linked to **exactly those chunks** - HydraDB skips the relevance search it would otherwise run to find them.
+- Every id in `chunk_ids` must be a `chunk_id` declared in the same source's `chunks_payload`. A relation that maps `chunk_ids` **requires** a `chunks_payload` for that source (HydraDB's own chunk ids are not knowable to you). A dangling id is rejected with `400`.
+- Relations that omit `chunk_ids` are linked the normal way (HydraDB finds their best-matching chunks).
+
+With chunks, a graph, and a `chunk_ids` mapping on every relation, HydraDB skips its entire generation pipeline for the source except the chunk embeddings.
+
+---
+
+## 6. Limits
+
+`chunks_payload` is validated up front; oversized or malformed payloads are rejected with `400`.
+
+| Limit | Value |
+| --- | --- |
+| Chunks per source | ≤ 50,000 |
+| `content` length per chunk | ≤ 100,000 chars |
+| Total `content` per source | ≤ 32 MiB |
+| `chunk_id` length | ≤ 512 chars |
+| `chunk_id` uniqueness | unique within a source |
+| `chunk_ids` per relation (with BYOG) | ≤ 100 |
+
+---
+
+## 7. Memories
+
+Memories accept a `chunks_payload` too - send `type=memory`, give each memory an `id`, and key the chunks by that `id`. The chunk shape is identical; each chunk is embedded and the memory's enrichment runs over your chunks.
+
+```bash cURL
+curl -X POST 'https://api.hydradb.com/context/ingest' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -F "type=memory" \
+  -F "database=acme_corp" \
+  -F 'memories=[{ "id": "mem-oncall-1", "text": "Dana Kim owns the incident playbook." }]' \
+  -F 'chunks_payload={
+    "mem-oncall-1": {
+      "chunks": [
+        { "chunk_id": "mem-oncall-1-0", "content": "Dana Kim owns the incident playbook." }
+      ]
+    }
+  }'
+```
+
+A memory must carry an explicit `id` to receive chunks (an id-less memory gets a server-generated id and cannot be targeted). The `memories` form field stays plural even though `type` is the singular `memory`.
+
+---
+
+## 8. Example: multiple sources in one request
+
+`chunks_payload` is a map, so one request can carry chunks for several sources at once - here **two documents**, each keyed by its own id.
+
+<CodeGroup>
+
+```bash cURL
+curl -X POST 'https://api.hydradb.com/context/ingest' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -F "type=knowledge" \
+  -F "database=acme_corp" \
+  -F "documents=@/path/to/billing-policy.pdf" \
+  -F "documents=@/path/to/deploy-runbook.pdf" \
+  -F 'document_metadata=[{ "id": "billing-policy-doc" }, { "id": "deploy-runbook-doc" }]' \
+  -F 'chunks_payload={
+    "billing-policy-doc": {
+      "chunks": [
+        { "chunk_id": "billing-0", "content": "Invoices are issued on the first of each month." },
+        { "chunk_id": "billing-1", "content": "Late payments incur a 2% monthly fee." }
+      ]
+    },
+    "deploy-runbook-doc": {
+      "chunks": [
+        { "chunk_id": "runbook-0", "content": "Roll back with make deploy REV=previous." }
+      ]
+    }
+  }'
+```
+
+```python Python SDK
+import json
+
+chunks = {
+    "billing-policy-doc": {
+        "chunks": [
+            {"chunk_id": "billing-0", "content": "Invoices are issued on the first of each month."},
+            {"chunk_id": "billing-1", "content": "Late payments incur a 2% monthly fee."},
+        ],
+    },
+    "deploy-runbook-doc": {
+        "chunks": [
+            {"chunk_id": "runbook-0", "content": "Roll back with make deploy REV=previous."},
+        ],
+    },
+}
+
+with open("/path/to/billing-policy.pdf", "rb") as f1, open("/path/to/deploy-runbook.pdf", "rb") as f2:
+    client.context.ingest(
+        type="knowledge",
+        database="acme_corp",
+        documents=[
+            ("billing-policy.pdf", f1, "application/pdf"),
+            ("deploy-runbook.pdf", f2, "application/pdf"),
+        ],
+        document_metadata=json.dumps([{"id": "billing-policy-doc"}, {"id": "deploy-runbook-doc"}]),
+        chunks_payload=json.dumps(chunks),
+    )
+```
+
+```typescript TypeScript SDK
+const chunks = {
+  "billing-policy-doc": {
+    chunks: [
+      { chunk_id: "billing-0", content: "Invoices are issued on the first of each month." },
+      { chunk_id: "billing-1", content: "Late payments incur a 2% monthly fee." },
+    ],
+  },
+  "deploy-runbook-doc": {
+    chunks: [
+      { chunk_id: "runbook-0", content: "Roll back with make deploy REV=previous." },
+    ],
+  },
+};
+
+await client.context.ingest({
+  type: "knowledge",
+  database: "acme_corp",
+  documents: [
+    { path: "/path/to/billing-policy.pdf", filename: "billing-policy.pdf", contentType: "application/pdf" },
+    { path: "/path/to/deploy-runbook.pdf", filename: "deploy-runbook.pdf", contentType: "application/pdf" },
+  ],
+  documentMetadata: JSON.stringify([{ id: "billing-policy-doc" }, { id: "deploy-runbook-doc" }]),
+  chunksPayload: JSON.stringify(chunks),
+});
+```
+
+</CodeGroup>
+
+Poll [Ingestion Status](/api-reference/v2/endpoint/source-status) until each source is ready, then query as usual - your chunks are what search returns.
+
+---
+
+## 9. Limitations
+
+- **Replace, not augment.** A BYOC source is indexed from your chunks only; HydraDB does not add its own chunks alongside them.
+- **Bulk, one-shot.** You supply the whole chunk set with the source. Per-chunk add/update/delete is not yet available.
+- **Content only.** You cannot supply enrichment fields such as `inferred_content`; HydraDB regenerates them.
+
+---
+
+## Related
+
+- [Bring Your Own Graph](/essentials/v2/bring-your-own-graph) - supply your own entities and relations, and map relations to your chunks with `chunk_ids`
+- [Knowledge](/essentials/v2/knowledge) - documents, and forceful relations between sources
+- [Ingest Context](/api-reference/v2/endpoint/ingest-context) - the `chunks_payload` form field reference
+- [Query](/essentials/v2/query) - how chunks and graph context are retrieved together
