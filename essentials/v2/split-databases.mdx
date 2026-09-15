@@ -1,0 +1,230 @@
+---
+title: "Split databases and legacy fields"
+description: "How databases created as type split work, the knowledge, memory and all selector, and every older field name with its current replacement."
+---
+
+Every other page in these docs describes a **unified** database: you ingest `items` and query without a corpus selector. This page covers the older model, for integrations that still use it:
+
+- databases created with `type: "split"`, including every database created before unified became the default
+- the older field names HydraDB still accepts on any database
+
+Nothing on this page is going away. Existing databases keep working unchanged and are not migrated.
+
+---
+
+## 1. Database types
+
+| Type | How you get one | What it holds |
+| --- | --- | --- |
+| `unified` | `POST /databases` without `type` (the default) | One corpus. Ingest `items`; query without `type`. |
+| `split` | `POST /databases` with `"type": "split"`, or any database created before unified became the default | Two corpora, knowledge and memory, selected with `type` on every context and query call. |
+
+```bash
+curl -X POST 'https://api.hydradb.com/databases' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -H "Content-Type: application/json" \
+  -d '{"database": "legacy-app", "type": "split"}'
+```
+
+To find out which type a database is:
+
+- `GET /databases` returns `details: [{ "database": "acme", "type": "unified" }, ...]`.
+- `GET /databases/status?database=acme` returns `type` alongside the readiness flags.
+
+The type is fixed when the database is created. There is no conversion: to move a split database to unified, create a new database, re-ingest your content as items, and point your client at it.
+
+---
+
+## 2. `type` on a split database
+
+On a split database, context and query calls take `type` to say which corpus they mean:
+
+| `type` | Meaning |
+| --- | --- |
+| absent | `knowledge` |
+| `knowledge` | the knowledge corpus |
+| `memory` | the memory corpus |
+| `all` | both corpora, where the endpoint can answer for both (see below) |
+| `unified` | `400`, there is no single corpus to name |
+
+On a unified database, `knowledge` and `memory` are a `400`, and absent, `all` and `unified` all mean the one corpus.
+
+### What `all` reaches
+
+| Endpoint | `type: "all"` on a split database |
+| --- | --- |
+| `POST /query` | both corpora, searched separately and merged into one ranked list |
+| `POST /context/list` | both corpora in one listing, under one cursor |
+| `DELETE /context` | both corpora: the knowledge lane runs, then the memory lane |
+| `GET /context/relations` | the knowledge corpus only |
+| `GET /context/{id}/subgraph` | the knowledge corpus only |
+| `GET /context/chunks` | the knowledge corpus only |
+| `POST /context/ingest` | `400`: a write has to name the one corpus it lands in |
+
+Relations, subgraph and chunks each page a cursor over one graph, and two cursors cannot be merged, so `all` reads knowledge there. Every response carries `meta.source_type`, which reports the corpus that answered, not the `type` you sent.
+
+<Warning>
+`DELETE /context` with `type: "all"` deletes from **both** corpora. The two lanes run against two stores with no transaction between them: if the knowledge lane succeeds and the memory lane then fails, the knowledge deletions have already happened. To delete from one corpus only, send `knowledge` or `memory`.
+</Warning>
+
+An ingest that carries `items` on a split database writes to its **memory** corpus, because items are memory-shaped. Absent and `type: "memory"` both land there; `type: "knowledge"` together with `items` is a `400`.
+
+---
+
+## 3. Split ingest fields
+
+A split database also accepts the ingest shapes that predate items. Each has its own page, kept live but out of the navigation:
+
+| Field | What it ingests | Page |
+| --- | --- | --- |
+| `documents` + `document_metadata` | Files (PDF, DOCX, Markdown, CSV and more), with per-file metadata | [Knowledge](/essentials/v2/knowledge) |
+| `app_knowledge` | Structured app sources (Slack threads, tickets, pages) | [App sources](/essentials/v2/app-sources) |
+| `memories` | Memory items: `text` or `user_assistant_pairs`, with `infer`, `expiry_time` and `relations` | [Memories](/essentials/v2/memories) |
+| `graph_payload` | A graph you built yourself | [Bring your own graph](/essentials/v2/bring-your-own-graph) |
+
+A unified database rejects `documents`, `app_knowledge` and `memories` with a `400` naming `items`. It takes text only, so extract text from files and send it as an item.
+
+### Mapping split fields to items
+
+| Split field | Item field |
+| --- | --- |
+| `memories[]`, `app_knowledge[]`, `documents` | `items[]` |
+| `id` | `context_id` |
+| `text` (memory), `content.text` (app knowledge) | `text` |
+| `user_assistant_pairs` | `conversation`, as `[{ role, content, name }]` |
+| `metadata` | `attributes` |
+| `additional_metadata` | `custom_attributes` |
+| `observation_date` | `happened_at` |
+| `infer` | `enrich` |
+
+An item reads only the names in the right-hand column. A left-hand name sent on an item is dropped without an error.
+
+---
+
+## 4. Legacy query and response fields
+
+### `metadata_filters`
+
+`metadata_filters` is the older filter language. It still works on every database; new integrations should use [`attributes`](/essentials/v2/attributes), which supports `$eq`, `$in`, `$gt`, `$and`, `$or` and the rest.
+
+Each declared (top-level) field in `metadata_filters` takes one operator object:
+
+| Operator | Value | Matches |
+| --- | --- | --- |
+| `equals` | a single value | the field is **exactly** that value |
+| `contains` | a single value | the field **holds** that value, at any position in a comma-joined field |
+| `contains_any` | an array | the field holds **any one** of the values |
+
+```json
+{
+  "metadata_filters": {
+    "department": { "equals": "legal" },
+    "attendee_emails": { "contains": "b@company.com" },
+    "tags": { "contains_any": ["alpha", "beta"] }
+  }
+}
+```
+
+- Multiple keys are ANDed. Lists are ANY, never ALL.
+- Operators apply to declared fields only. Inside `additional_metadata`, use a bare scalar for an exact match or a bare array to match any listed value. An operator object there is read as an exact match against a stored object and matches nothing.
+- The bare forms (a scalar for `equals`, an array for `contains_any`) still work but are deprecated.
+- Each list holds at most 500 values, and the whole object is capped at 64 KiB.
+
+**Storing several values in one field.** A declared field holds one value. To store several, declare it `VARCHAR`, join the values with commas (`"a@company.com,b@company.com"`), and filter with `contains`. A value that itself contains a comma will not match as expected, and `max_length` cannot be raised after the field is created.
+
+### `graph_context`
+
+| Legacy response field | Current field |
+| --- | --- |
+| `graph_context.query_paths` | `graph.paths[]` |
+| `graph_context.chunk_relations` | `graph.paths[]` |
+| `graph_context.chunk_id_to_group_ids` | `graph.paths[].chunk_ids` |
+
+`graph_context` is still returned. `graph.paths[]` is the same result as one ordered list: paths reached from the query first, then paths expanded from retrieved chunks, each carrying the chunk ids it is evidence for.
+
+### Forceful relations
+
+| Legacy field | Current field |
+| --- | --- |
+| `additional_context` (response) | `forceful_relations.declared` |
+
+`relations` on `memories`, `documents` and `app_knowledge`, and `query_forceful_relations` on query, are split-era fields for relations you declare yourself. See [Memories](/essentials/v2/memories#connect-related-memories-with-forceful-relations). Items have no field for declared relations yet.
+
+### `is_memory`
+
+On a unified database every chunk carries `is_memory`, and it is filterable in `attributes`. On a split database it is not filterable, because rows written before the column existed do not have it.
+
+---
+
+## 5. Renamed scope fields
+
+`database` and `collection` are the current names for what were `tenant_id` and `sub_tenant_id`. The old names are accepted on every route, in the query string, JSON body and multipart form, and will keep working.
+
+| Legacy | Current |
+| --- | --- |
+| `tenant_id` | `database` |
+| `sub_tenant_id` | `collection` |
+| `sub_tenant_ids` (on `/query`) | `collections` |
+| `/tenants/...` routes | `/databases/...` routes |
+| `tenant_metadata` | `database_metadata` |
+| `tenant_metadata_schema` | `database_metadata_schema` |
+
+### Deprecation signals
+
+A request that uses a legacy route or field still succeeds, with the same status code, and gets:
+
+- a `Deprecation: true` response header, plus a `Warning` header with the migration message
+- `meta.deprecation` in the response envelope: a list of notices, each with `deprecated`, `message` and `deprecated_since`, and for field-level notices `deprecated_field` and `preferred_field`
+
+```json
+{
+  "success": true,
+  "data": { "...": "..." },
+  "meta": {
+    "deprecation": [
+      {
+        "deprecated": true,
+        "message": "The /tenants routes are deprecated. Migrate to the /databases routes.",
+        "deprecated_since": "2.0.1"
+      }
+    ]
+  }
+}
+```
+
+Once a request uses only current names, both signals disappear.
+
+### Sending both names
+
+- Same value in both (for example `database` and `tenant_id` both `"acme"`): accepted.
+- Different values: `400`, since both name the same thing. The same rule applies to `collection` and `sub_tenant_id`, and to `collections` and `sub_tenant_ids`.
+
+<Warning>
+In the **indexing webhook payload**, `tenant_id` and `database` do not carry the same value: `database` is the name you ingested into, `tenant_id` is an internal identifier for it. See [Webhooks](/essentials/v2/webhooks#payload).
+</Warning>
+
+---
+
+## 6. Names that differ between items and responses
+
+Responses still use the original field names, so a few things are spelled differently on the way in and on the way out:
+
+| On an item | In a response |
+| --- | --- |
+| `attributes` | `metadata` |
+| `custom_attributes` | `additional_metadata` |
+| `context_id` | `id` |
+
+- `PATCH /context/{id}/metadata` takes `database_metadata` for attributes and `additional_metadata` for custom attributes.
+- `contexts`, `content` and `messages` are accepted on ingest as aliases of `items`, `text` and `conversation`.
+- On a unified database, `GET /databases/stats` reports the database's rows in `knowledge_collection.row_count`, and `memory_collection` repeats the same number.
+
+---
+
+## 7. Errors when the two models mix
+
+| Code | Status | When | Fix |
+| --- | --- | --- | --- |
+| `CORPUS_TYPE_UNSUPPORTED` | `400` | A `type` or split ingest field the database does not accept: `knowledge` or `memory` on a unified database, `unified` on a split one, `documents`, `app_knowledge` or `memories` on a unified database, or `all` on ingest | Omit `type` on a unified database and send `items`; on a split database send `knowledge` or `memory` |
+| `CONTEXT_CATEGORY_UNSUPPORTED` | `400` | A `context_category` other than `auto` on a split database | Drop `context_category`, or send `auto` |

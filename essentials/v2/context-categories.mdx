@@ -1,0 +1,222 @@
+---
+title: "Context categories"
+description: "Label each item as a user preference, business knowledge or a decision trace, or let HydraDB decide."
+---
+
+A **context category** says what kind of context an item is. You set it per item with `context_category` on [`POST /context/ingest`](/essentials/v2/ingest). Every category lives in the same database and is searched by the same [query](/essentials/v2/query); the category describes the item, it does not decide where it is stored.
+
+| Category | What it holds | Typical source | Usually stored in |
+| --- | --- | --- | --- |
+| `user_preference` | What a person likes, chose or asked for | Conversations, product events | That person's collection |
+| `business_knowledge` | Documentation, policy, product and domain facts | Docs, wikis, connector syncs | A shared collection |
+| `decision_trace` | What an agent or a team decided, and why | Agent runs, ADRs, postmortems, approvals | A shared or per-team collection |
+| `auto` | The default: HydraDB decides | Anything | Wherever you send it |
+
+---
+
+## 1. What a category is
+
+A database holds three kinds of context:
+
+- **User preferences:** what each person wants.
+- **Business knowledge:** what your company knows.
+- **Decision traces:** what your agents and teams decided, and why.
+
+Labelling an item tells HydraDB which of these it is, so enrichment extracts the right things from it. A conversation labelled `user_preference` is read for preferences; a postmortem labelled `decision_trace` is read for the decision, its outcome and the evidence behind it.
+
+A category you set is never relabelled. The value is validated strictly: a misspelling is a `400`, never an item filed under nothing.
+
+---
+
+## 2. `user_preference`
+
+Likes, dislikes, choices and requests a person has made. They usually arrive as conversations or product events, and they belong in that person's own collection, so they personalize answers for that person only.
+
+<CodeGroup>
+```python Python SDK
+import json
+
+client.context.ingest(
+    database="acme",
+    collection="user_alex",
+    items=json.dumps([{
+        "context_id": "chat-alex-001",
+        "conversation": [
+            {"role": "user", "content": "Keep answers short, I read on my phone.", "name": "alex"},
+            {"role": "assistant", "content": "Got it, short answers."},
+        ],
+        "context_category": "user_preference",
+        "happened_at": "2026-09-01",
+    }]),
+)
+```
+```typescript TypeScript SDK
+await client.context.ingest({
+  database: "acme",
+  collection: "user_alex",
+  items: JSON.stringify([{
+    context_id: "chat-alex-001",
+    conversation: [
+      { role: "user", content: "Keep answers short, I read on my phone.", name: "alex" },
+      { role: "assistant", content: "Got it, short answers." },
+    ],
+    context_category: "user_preference",
+    happened_at: "2026-09-01",
+  }]),
+});
+```
+```bash cURL
+curl -X POST 'https://api.hydradb.com/context/ingest' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "database": "acme",
+    "collection": "user_alex",
+    "items": [{
+      "context_id": "chat-alex-001",
+      "conversation": [
+        { "role": "user", "content": "Keep answers short, I read on my phone.", "name": "alex" },
+        { "role": "assistant", "content": "Got it, short answers." }
+      ],
+      "context_category": "user_preference",
+      "happened_at": "2026-09-01"
+    }]
+  }'
+```
+</CodeGroup>
+
+Recall it by querying that person's collection:
+
+```json
+{
+  "database": "acme",
+  "collection": "user_alex",
+  "query": "How does Alex like answers formatted?"
+}
+```
+
+---
+
+## 3. `business_knowledge`
+
+Facts that are true for everyone in the database: documentation, policies, product details, domain knowledge. Content synced by [connectors](/essentials/v2/connectors) is usually this kind. Keep it in a shared collection, and use [attributes](/essentials/v2/attributes) for the fields you filter on.
+
+```json
+{
+  "database": "acme",
+  "collection": "company",
+  "items": [{
+    "context_id": "refund-policy",
+    "title": "Refund policy",
+    "text": "Refunds are processed within 5 business days. Enterprise customers can request an expedited refund.",
+    "context_category": "business_knowledge",
+    "attributes": { "department": "support" }
+  }]
+}
+```
+
+---
+
+## 4. `decision_trace`
+
+The record of an agent or a team reasoning to an outcome: an agent run, an architecture decision record, a postmortem, an approval. Set `happened_at` to when the decision was made, and `user_name` to the agent or person who made it.
+
+```json
+{
+  "database": "acme",
+  "collection": "platform",
+  "items": [{
+    "context_id": "adr-012",
+    "title": "ADR 012: ledger datastore",
+    "text": "We chose Postgres over DynamoDB for the ledger because every write needs transactional reads across accounts, and the month-end batch touches every account at once.",
+    "context_category": "decision_trace",
+    "happened_at": "2026-07-14",
+    "user_name": "platform-team"
+  }]
+}
+```
+
+### How a decision appears in query results
+
+A decision trace becomes a node in the [context graph](/essentials/v2/context-graphs) of type `DECISION_TRACE`. The node is named by the decision, connected to the agent or team that made it, and carries the evidence behind it. The outcome rides on the relation. When a query reaches the decision, it comes back as a path in `graph.paths[]`:
+
+```json
+{
+  "graph": {
+    "paths": [
+      {
+        "triplets": [
+          {
+            "source": { "name": "platform-team", "type": "AGENT" },
+            "relation": { "predicate": "decided", "context": "Postgres chosen for the ledger" },
+            "target": { "name": "Choose the ledger datastore", "type": "DECISION_TRACE" }
+          }
+        ],
+        "relevancy_score": 0.87,
+        "chunk_ids": ["adr-012_chunk_0"]
+      }
+    ]
+  }
+}
+```
+
+The fields stored for a decision are `activity` (what was decided), `outcome`, `evidence`, `decided_at` and `agent`.
+
+---
+
+## 5. `auto`
+
+Leave `context_category` out, or send `auto`, and HydraDB classifies the item itself. That is the right choice when you do not know ahead of time what an item holds, for example a mixed export or a long chat log.
+
+Pin a category when you do know. A pinned category is never relabelled, and it tells enrichment exactly what to look for.
+
+---
+
+## 6. Changing a category
+
+Re-ingest the item with the same `context_id` and the new `context_category`. Ingest replaces the previous version, so the item is re-enriched under its new category.
+
+---
+
+## 7. Patterns
+
+### Mixed categories in one request
+
+One request can carry any mix of categories:
+
+```json
+{
+  "database": "acme",
+  "collection": "company",
+  "items": [
+    { "text": "We chose Postgres over DynamoDB for the ledger.", "context_category": "decision_trace" },
+    { "text": "Refunds are processed within 5 business days.", "context_category": "business_knowledge" },
+    { "text": "Weekly sync notes, 2026-09-08" }
+  ]
+}
+```
+
+The last item has no category, so HydraDB decides.
+
+### Preferences per person, knowledge shared
+
+Put each person's preferences in their own collection and shared knowledge in one collection, then query both at once with weighted `collections`:
+
+```json
+{
+  "database": "acme",
+  "collections": { "user_alex": 2, "company": 1 },
+  "query": "How should I explain our refund policy to Alex?"
+}
+```
+
+The weights rank Alex's own context above the shared context without excluding either. See [Databases and collections](/essentials/v2/databases-and-collections).
+
+---
+
+## Related
+
+- [Ingest context](/essentials/v2/ingest)
+- [Context graphs](/essentials/v2/context-graphs)
+- [Query](/essentials/v2/query)

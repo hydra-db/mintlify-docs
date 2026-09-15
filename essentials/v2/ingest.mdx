@@ -1,0 +1,355 @@
+---
+title: "Ingest context"
+description: "Send text and conversations to HydraDB as items in one call, label what kind of context each one is, and confirm it is searchable."
+---
+
+import LegacyLine from "/snippets/legacy-line.mdx";
+
+Everything you put into HydraDB is an **item**: a piece of text, or a conversation. You send items to one endpoint, [`POST /context/ingest`](/api-reference/v2/endpoint/ingest-context), and HydraDB chunks them, embeds them, extracts entities and relations into the [context graph](/essentials/v2/context-graphs), and makes them searchable through [`POST /query`](/essentials/v2/query).
+
+<LegacyLine />
+
+---
+
+## 1. One call for text and conversations
+
+A single request can mix text items and conversation items, in any collection of a database.
+
+<CodeGroup>
+```python Python SDK
+import json
+
+ingest = client.context.ingest(
+    database="acme",
+    collection="company",
+    items=json.dumps([
+        {
+            "context_id": "refund-policy",
+            "title": "Refund policy",
+            "text": "Refunds are processed within 5 business days.",
+            "context_category": "business_knowledge",
+            "attributes": {"department": "support"},
+            "custom_attributes": {"owner": "sam@acme.com"},
+        },
+        {
+            "context_id": "chat-alex-001",
+            "conversation": [
+                {"role": "user", "content": "Keep answers short, I read on my phone.", "name": "alex"},
+                {"role": "assistant", "content": "Got it, short answers."},
+            ],
+            "context_category": "user_preference",
+            "happened_at": "2026-09-01",
+        },
+    ]),
+)
+
+print([r.id for r in ingest.data.results])
+```
+```typescript TypeScript SDK
+const ingest = await client.context.ingest({
+  database: "acme",
+  collection: "company",
+  items: JSON.stringify([
+    {
+      context_id: "refund-policy",
+      title: "Refund policy",
+      text: "Refunds are processed within 5 business days.",
+      context_category: "business_knowledge",
+      attributes: { department: "support" },
+      custom_attributes: { owner: "sam@acme.com" },
+    },
+    {
+      context_id: "chat-alex-001",
+      conversation: [
+        { role: "user", content: "Keep answers short, I read on my phone.", name: "alex" },
+        { role: "assistant", content: "Got it, short answers." },
+      ],
+      context_category: "user_preference",
+      happened_at: "2026-09-01",
+    },
+  ]),
+});
+
+console.log(ingest.data.results.map((r) => r.id));
+```
+```bash cURL
+curl -X POST 'https://api.hydradb.com/context/ingest' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "database": "acme",
+    "collection": "company",
+    "items": [
+      {
+        "context_id": "refund-policy",
+        "title": "Refund policy",
+        "text": "Refunds are processed within 5 business days.",
+        "context_category": "business_knowledge",
+        "attributes": { "department": "support" },
+        "custom_attributes": { "owner": "sam@acme.com" }
+      },
+      {
+        "context_id": "chat-alex-001",
+        "conversation": [
+          { "role": "user", "content": "Keep answers short, I read on my phone.", "name": "alex" },
+          { "role": "assistant", "content": "Got it, short answers." }
+        ],
+        "context_category": "user_preference",
+        "happened_at": "2026-09-01"
+      }
+    ]
+  }'
+```
+</CodeGroup>
+
+The request body is JSON. The SDKs send the same array as the `items` form field, which is why `items` is a JSON string there. Keys inside each item stay `snake_case` in every language.
+
+The response is `202 Accepted`:
+
+```json
+{
+  "success": true,
+  "data": {
+    "results": [
+      { "id": "refund-policy", "status": "queued" },
+      { "id": "chat-alex-001", "status": "queued" }
+    ],
+    "success_count": 2,
+    "failed_count": 0
+  }
+}
+```
+
+A `202` means the items were accepted and queued, not that they are searchable yet. See [Verify processing](#11-verify-processing).
+
+---
+
+## 2. Item fields
+
+| Field | Notes |
+| --- | --- |
+| `context_id` | Your id for the item. Generated from `title` when omitted, so two items with the same text, no title and no id collide. Must not contain commas. |
+| `title` | Stored as the item's title. Searchable with `titles` on [query](/essentials/v2/query). |
+| `text` | Plain text. Send exactly one of `text` or `conversation`. |
+| `conversation` | A list of `{ role, content, name }` turns. See [Conversation items](#4-conversation-items). |
+| `context_category` | `auto` (default), `user_preference`, `business_knowledge` or `decision_trace`. Validated strictly, so a typo is a `400`. See [Context categories](/essentials/v2/context-categories). |
+| `attributes` | Filterable fields declared in the database's `database_metadata_schema`. See [Attributes](/essentials/v2/attributes). |
+| `custom_attributes` | Free-form fields returned with results. Not filterable with `attributes`. |
+| `happened_at` | A date, `YYYY-MM-DD`. When the item is about, as opposed to when you sent it. A timestamp is a `400`. |
+| `enrich` | Default `true`. Extract entities, relations and preferences into the graph. |
+| `custom_instructions` | Guidance for enrichment on this item. |
+| `is_markdown` | Chunk the text on its markdown structure instead of as flat prose. |
+| `user_name` | The speaker for a text item. On a conversation, the per-turn `name` wins. |
+| `acl` | Principals allowed to retrieve the item. Omit for unrestricted, `[]` for nobody. A malformed principal is a `400`. |
+
+A key an item does not recognise is dropped without an error, so check spelling against this table.
+
+---
+
+## 3. Text items
+
+A text item is a document, a note, a policy, an agent log line: anything you already have as a string.
+
+```json
+{
+  "context_id": "runbook-deploy",
+  "title": "Deploy runbook",
+  "text": "# Deploying\n\n1. Merge to main.\n2. Wait for the image build.\n3. Promote in ArgoCD.",
+  "is_markdown": true,
+  "user_name": "platform-team"
+}
+```
+
+- Set `title` so the item has a readable name in results and so `titles` filters can find it.
+- Set `is_markdown: true` for markdown, so headings and lists shape the chunks.
+- Set `user_name` when the text has an author the graph should attribute facts to.
+
+### Turning files into items
+
+`POST /context/ingest` takes text, not files. Extract the text in your application (a PDF parser, a DOCX reader, your CMS export) and send it as `text`, one item per document. For sources that live in tools like Slack, Notion or Google Drive, use a [connector](/essentials/v2/connectors) instead.
+
+---
+
+## 4. Conversation items
+
+```json
+"conversation": [
+  { "role": "system", "content": "You are a support agent for Acme." },
+  { "role": "user", "content": "Our invoices are late again.", "name": "sam" },
+  { "role": "user", "content": "Third time this quarter." },
+  { "role": "assistant", "content": "I have escalated this to Payments." }
+]
+```
+
+This is the message list you already build for OpenAI or Anthropic, so you can usually pass it straight through.
+
+- Roles are `user`, `assistant` and `system`. An unknown role is a `400`.
+- **`system` turns are context only.** They shape enrichment but are never stored as facts. A conversation of only `system` turns is a `400`.
+- **Consecutive turns with the same role are accepted** and joined.
+- **`name` is optional per turn.** Set it when several people speak in one conversation, so preferences are attributed to the right person.
+- An empty list, or a turn with empty `content`, is a `400`.
+
+---
+
+## 5. Enrichment
+
+With `enrich: true` (the default), HydraDB reads each item and extracts entities, the relations between them, and preferences, and writes them into the context graph. That is what lets a query about "Alex" reach a conversation where Alex never used the word the query used.
+
+Turn it off with `enrich: false` when the item is already exactly what you want stored and you only need it searchable, for example a raw transcript you keep for reference.
+
+Use `custom_instructions` to steer extraction for one item:
+
+```json
+{
+  "text": "Q3 planning notes ...",
+  "custom_instructions": "Extract owners and due dates for every action item. Ignore small talk."
+}
+```
+
+---
+
+## 6. Context categories
+
+Each item can say what kind of context it is:
+
+| Category | For |
+| --- | --- |
+| `user_preference` | What a person likes, chose or asked for |
+| `business_knowledge` | Documentation, policy, product and domain facts |
+| `decision_trace` | What an agent or a team decided, and why |
+
+Leave `context_category` out, or send `auto`, and HydraDB decides. See [Context categories](/essentials/v2/context-categories).
+
+---
+
+## 7. Attributes and custom attributes
+
+```json
+{
+  "text": "Refunds are processed within 5 business days.",
+  "attributes": { "department": "support", "region": "us" },
+  "custom_attributes": { "owner": "sam@acme.com", "reviewed": "2026-08-01" }
+}
+```
+
+`attributes` are the fields you declared in the database's `database_metadata_schema`, and you can filter on them at query time. `custom_attributes` are free-form: they come back with results but cannot be filtered. See [Attributes](/essentials/v2/attributes).
+
+---
+
+## 8. Time
+
+`happened_at` is when the item is about: the meeting date, the decision date, the day a preference was stated. HydraDB records when it received the item separately. Set `happened_at` whenever it differs from ingest time, so recency and temporal reasoning at query time use the right date.
+
+---
+
+## 9. Restricting an item
+
+```json
+{
+  "context_id": "pricing-q3",
+  "text": "The Q3 pricing plan raises the Scale tier.",
+  "acl": ["grace@acme.com", "group:slack:C0123"]
+}
+```
+
+Omit `acl` and the item is unrestricted. Send `[]` and nobody can retrieve it. A malformed principal rejects the whole request with `400`, so an item is never stored unprotected by accident. See [Access control](/essentials/v2/access-control).
+
+---
+
+## 10. IDs and replacement
+
+- `context_id` is yours. Reuse it to replace an item.
+- `upsert` defaults to `true`, and it **replaces**: re-ingesting a `context_id` deletes everything derived from the previous version (its chunks and its graph contribution) before writing the new one. It does not merge.
+- When you omit `context_id`, the id is generated from `title`. Give repeated text either a `context_id` or a distinct `title`, or the second item replaces the first.
+- `context_id` must not contain commas.
+
+---
+
+## 11. Verify processing
+
+Ingestion is asynchronous. Poll [`GET /context/status`](/api-reference/v2/endpoint/source-status) with the ids from the ingest response until each item reaches `completed` or `errored`.
+
+<CodeGroup>
+```python Python SDK
+import time
+
+ids = ["refund-policy", "chat-alex-001"]
+terminal = {"completed", "errored"}
+
+while True:
+    status = client.context.status(database="acme", collection="company", ids=ids)
+    if all(s.indexing_status in terminal for s in status.data.statuses):
+        break
+    time.sleep(5)
+```
+```typescript TypeScript SDK
+const ids = ["refund-policy", "chat-alex-001"];
+const terminal = new Set(["completed", "errored"]);
+
+while (true) {
+  const status = await client.context.status({ database: "acme", collection: "company", ids });
+  if (status.data.statuses.every((s) => terminal.has(s.indexingStatus))) break;
+  await new Promise((r) => setTimeout(r, 5_000));
+}
+```
+```bash cURL
+while true; do
+  statuses=$(curl -s -G 'https://api.hydradb.com/context/status' \
+    -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+    -H "API-Version: 2" \
+    --data-urlencode "database=acme" \
+    --data-urlencode "collection=company" \
+    --data-urlencode "ids=refund-policy" \
+    --data-urlencode "ids=chat-alex-001" \
+    | jq -r '.data.statuses[].indexing_status')
+  if ! echo "$statuses" | grep -qv '^\(completed\|errored\)$'; then break; fi
+  sleep 5
+done
+```
+</CodeGroup>
+
+Status moves through `queued`, `processing`, `graph_creation` and `completed`, or ends in `errored`.
+
+<Info>
+**`graph_creation` is already searchable.** Wait for `completed` only when you need full graph traversal in the results.
+</Info>
+
+To be notified instead of polling, register a [webhook](/essentials/v2/webhooks).
+
+---
+
+## 12. Other ways context arrives
+
+[Connectors](/essentials/v2/connectors) sync Slack, Notion, Google Drive, GitHub and other tools into a database on a schedule. Synced context lands in the same database as your items and is queried together with them.
+
+---
+
+## 13. Common mistakes
+
+<AccordionGroup>
+<Accordion title="Sending text and conversation on one item">
+An item carries exactly one of `text` or `conversation`. Sending both, or neither, is a `400`. Split them into two items.
+</Accordion>
+<Accordion title="A misspelled context_category">
+`context_category` is validated strictly. `"business-knowledge"` is a `400`, not a silent fallback to `auto`. Use `user_preference`, `business_knowledge`, `decision_trace` or `auto`.
+</Accordion>
+<Accordion title="An unknown role in a conversation">
+Only `user`, `assistant` and `system` are accepted. Map roles like `tool` or `human` before sending.
+</Accordion>
+<Accordion title="Filtering on a custom attribute">
+`custom_attributes` are returned with results but cannot be filtered. Filtering on one is a `400`. Declare the field in `database_metadata_schema` and send it in `attributes` instead.
+</Accordion>
+<Accordion title="Querying right after a 202">
+A `202` means queued. Poll status until `graph_creation` or `completed` before expecting the item in results.
+</Accordion>
+</AccordionGroup>
+
+---
+
+## Related
+
+- [Context categories](/essentials/v2/context-categories)
+- [Query](/essentials/v2/query)
+- [Attributes](/essentials/v2/attributes)
+- [Ingest context API reference](/api-reference/v2/endpoint/ingest-context)
