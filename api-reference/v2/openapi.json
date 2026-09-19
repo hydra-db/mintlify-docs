@@ -15,6 +15,14 @@
             "description": "ACLFingerprint is the stable identity of the ACL last APPLIED to this\nresource's already-indexed documents (PRO-1684). The sync compares the\nfreshly-resolved provider ACL against it: equal means nothing to do,\ndifferent means fan the new ACL out to existing documents. Empty means\nnothing has been applied yet (first capture-enabled sync).",
             "type": "string"
           },
+          "acl_warning": {
+            "description": "ACLWarning explains, in the provider's own words, why this resource's\npermissions could not be captured. Capture fails OPEN, so the resource\nis readable by everyone while this is set; without surfacing it, that\nwidening would be invisible to the person who turned RBAC on. Cleared\nautomatically by the next successful capture.",
+            "type": "string"
+          },
+          "acl_warning_at": {
+            "description": "ACLWarningAt is when this warning last CHANGED (RFC3339). An unchanged\nwarning is not rewritten each cycle, so it reads as \"open since\".",
+            "type": "string"
+          },
           "additional_metadata": {
             "additionalProperties": {},
             "description": "AdditionalMetadata is merged into the additional_metadata (document\nmetadata) layer of every object synced from this resource. User-supplied\nkeys are shallow-merged as the base; provider-generated fields are\napplied on top and always win on conflict.",
@@ -28,6 +36,10 @@
             "description": "BackfillChunkIntervalSeconds is the pacing interval persisted at configure\ntime so the scheduler can thread it into each chunk's workflow input.",
             "example": 86400,
             "type": "integer"
+          },
+          "backfill_floor": {
+            "description": "BackfillFloor is the fixed oldest boundary the historical crawl is working\ntowards, stamped once at configure time as now-lookback_days.\n\nIt exists because the floor used to be recomputed per chunk from the\nworkflow's own clock, which made it a *moving* target: every hour the\ncrawl was delayed, the boundary advanced an hour with it. A connector\npaused mid-backfill (PRO-1762) makes that trivially reachable — pause for\nlonger than the crawl has left and it resumes, finds backfill_oldest\nalready at or past the recomputed floor, declares itself complete and\nclears the marker. The remaining history is never fetched and nothing\nreports it missing. Anchoring the boundary is what makes \"backfill 30\ndays\" mean 30 days from when it was asked for, however long the crawl\ntakes.\n\nEmpty on rows configured before this field existed; the workflow falls\nback to the old now-relative computation for those, so their behaviour is\nunchanged rather than silently altered by a deploy.",
+            "type": "string"
           },
           "backfill_next_chunk_at": {
             "description": "BackfillNextChunkAt is the RFC3339 time the next chunk becomes due. The\nbackfill workflow processes one chunk then sets this to now+interval and\nexits; the connector scheduler starts the next chunk once it passes.",
@@ -80,6 +92,18 @@
               "priority": 7
             },
             "type": "object"
+          },
+          "page_acl_warning": {
+            "description": "PageACLWarning is the same signal for SOURCE-level failures inside this\nresource: individual pages whose own restrictions could not be resolved\nand were therefore opened (Confluence, PRO-1684).\n\nA SEPARATE field from ACLWarning on purpose. The two are written by\ndifferent steps at different points in a sync, and ACLWarning is CLEARED\nwhenever resource capture succeeds. Sharing one field would let a healthy\nspace wipe a live page warning every cycle, leaving a window in which the\ndashboard reports no problems while pages are still open — a false\nall-clear on an access-control surface, which is worse than no surface.",
+            "type": "string"
+          },
+          "page_acl_warning_at": {
+            "description": "PageACLWarningAt is when PageACLWarning last CHANGED (RFC3339).",
+            "type": "string"
+          },
+          "page_acl_warning_run": {
+            "description": "PageACLWarningRun is the drain run that last observed a page failing open\nhere. It is what makes the warning self-clearing: the drain settles each\nresource at the END of a cycle, and a stored run that is not the current\none means that whole cycle passed with nothing failing, so the warning is\nwithdrawn. Durable on purpose — the alternative was remembering it in the\nworker, which a restart loses and which has no moment that means \"all\npages have now been judged\".",
+            "type": "string"
           },
           "provider_cursor": {
             "description": "Bookmark of the last synced position. Non-empty value confirms the first sync has run.",
@@ -221,51 +245,55 @@
         ]
       },
       "feedback.SubmitRequest": {
-        "anyOf": [
+        "allOf": [
           {
-            "properties": {
-              "feedback": {
-                "minLength": 1,
-                "pattern": "\\S"
-              }
-            },
-            "required": [
-              "feedback"
-            ]
-          },
-          {
-            "properties": {
-              "ground_truth": {
-                "anyOf": [
-                  {
-                    "properties": {
-                      "answer": {
-                        "minLength": 1,
-                        "pattern": "\\S"
+            "anyOf": [
+              {
+                "patternProperties": {
+                  "^feedback$": {
+                    "minLength": 1,
+                    "pattern": "\\S"
+                  }
+                },
+                "required": [
+                  "feedback"
+                ]
+              },
+              {
+                "patternProperties": {
+                  "^ground_truth$": {
+                    "anyOf": [
+                      {
+                        "properties": {
+                          "answer": {
+                            "minLength": 1,
+                            "pattern": "\\S"
+                          }
+                        },
+                        "required": [
+                          "answer"
+                        ]
+                      },
+                      {
+                        "properties": {
+                          "source_ids": {
+                            "contains": {
+                              "minLength": 1,
+                              "pattern": "\\S"
+                            }
+                          }
+                        },
+                        "required": [
+                          "source_ids"
+                        ]
                       }
-                    },
-                    "required": [
-                      "answer"
-                    ]
-                  },
-                  {
-                    "properties": {
-                      "source_ids": {
-                        "contains": {
-                          "minLength": 1,
-                          "pattern": "\\S"
-                        }
-                      }
-                    },
-                    "required": [
-                      "source_ids"
                     ]
                   }
+                },
+                "required": [
+                  "ground_truth"
                 ]
               }
-            },
-            "required": [
-              "ground_truth"
             ]
           }
         ],
@@ -465,6 +493,16 @@
           }
         },
         "type": "object"
+      },
+      "github_com_hydradb_hydradb-application_internal_platform_storagelayout.Layout": {
+        "description": "StorageLayout is the physical storage layout the database is created with,\nfrom the request's `type` field. \"split\" is the two-collection layout every\ndatabase uses, and the default. Fixed at creation and IMMUTABLE thereafter:\nthe layout decides how every entity id is hashed, so a database that changed\nits mind would orphan everything already stored.",
+        "enum": [
+          "split"
+        ],
+        "type": "string",
+        "x-enum-varnames": [
+          "LayoutSplit"
+        ]
       },
       "github_com_hydradb_hydradb-application_internal_service.MetadataEditResult": {
         "properties": {
@@ -1068,40 +1106,6 @@
           },
           "truncated": {
             "description": "Truncated is set on auxiliary triplets whose fan-out hit a per-node cap,\nso a caller can tell \"this source has no more comments\" from \"we stopped\ncounting\". Omitted (false) on entity relations, which are bounded by the\nrequest's own limit/cursor instead.",
-            "example": true,
-            "type": "boolean"
-          }
-        },
-        "type": "object"
-      },
-      "handler.Envelope-tenants_SubTenantDeleteResponse": {
-        "properties": {
-          "data": {
-            "$ref": "#/components/schemas/tenants.SubTenantDeleteResponse",
-            "example": {
-              "collection": "engineering",
-              "database": "acme_corp",
-              "message": "Collection deregistered. Background cleanup is in progress.",
-              "status": "deletion_scheduled"
-            }
-          },
-          "error": {
-            "$ref": "#/components/schemas/handler.apiError",
-            "description": "Error message, empty string on success.",
-            "example": {
-              "code": "DATABASE_NOT_FOUND",
-              "message": "Database not found"
-            }
-          },
-          "meta": {
-            "$ref": "#/components/schemas/handler.responseMeta",
-            "example": {
-              "latency_ms": 12.3,
-              "request_id": "9d13aef4-02f4-4e73-8c62-4c2601d04f9d"
-            }
-          },
-          "success": {
-            "description": "Whether the request succeeded.",
             "example": true,
             "type": "boolean"
           }
@@ -1779,12 +1783,86 @@
         },
         "type": "object"
       },
+      "handler.Envelope-search_EntityProfileView": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/search.EntityProfileView",
+            "example": {
+              "entity_id": "entity_1a2b",
+              "entries": [
+                {
+                  "confidence": 0.92
+                }
+              ],
+              "name": "general",
+              "pending_importance": 1,
+              "version": 1
+            }
+          },
+          "error": {
+            "$ref": "#/components/schemas/handler.apiError",
+            "description": "Error message, empty string on success.",
+            "example": {
+              "code": "DATABASE_NOT_FOUND",
+              "message": "Database not found"
+            }
+          },
+          "meta": {
+            "$ref": "#/components/schemas/handler.responseMeta",
+            "example": {
+              "collection": "team_docs",
+              "database": "acme_corp",
+              "latency_ms": 12.3,
+              "request_id": "9d13aef4-02f4-4e73-8c62-4c2601d04f9d",
+              "source_type": "file",
+              "sub_tenant_id": "sub_tenant_4567",
+              "tenant_id": "tenant_1234"
+            }
+          },
+          "success": {
+            "description": "Whether the request succeeded.",
+            "example": true,
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
       "handler.Envelope-search_V2RetrievalResult": {
         "properties": {
           "data": {
             "$ref": "#/components/schemas/search.V2RetrievalResult",
             "example": {
               "additional_context": "The user is a senior engineer onboarding to the platform.",
+              "app_search_fusion": {
+                "stats": {
+                  "app_chunks": 1,
+                  "app_has_exact_ids": true,
+                  "app_lane_empty_text": true,
+                  "consensus": 1,
+                  "exact_candidates": 1,
+                  "exact_promoted": 1,
+                  "limit": 1,
+                  "normal_chunks": 1,
+                  "normal_displaced": 1,
+                  "tail_added": 1,
+                  "tail_candidates": 1
+                },
+                "stats_by_pass": [
+                  {
+                    "app_chunks": 1,
+                    "app_has_exact_ids": true,
+                    "app_lane_empty_text": true,
+                    "consensus": 1,
+                    "exact_candidates": 1,
+                    "exact_promoted": 1,
+                    "limit": 1,
+                    "normal_chunks": 1,
+                    "normal_displaced": 1,
+                    "tail_added": 1,
+                    "tail_candidates": 1
+                  }
+                ]
+              },
               "chunks": [
                 {
                   "additional_metadata": {
@@ -1812,6 +1890,109 @@
                   "sub_tenant_id": "sub_tenant_4567"
                 }
               ],
+              "code_search": {
+                "duration_ms": 0.5,
+                "repos": [
+                  {
+                    "duration_ms": 0.5,
+                    "error": "",
+                    "status": "completed",
+                    "truncated": true,
+                    "unsigned": true
+                  }
+                ],
+                "status": "completed"
+              },
+              "forceful_relations": {
+                "declared": [
+                  {
+                    "chunk": {
+                      "additional_metadata": {
+                        "author": "ada",
+                        "doc_version": 3
+                      },
+                      "chunk_content": "HydraDB supports hybrid retrieval across knowledge and memories.",
+                      "chunk_uuid": "a1b2c3d4-e5f6-7890-1234-567890abcdef",
+                      "collection": "team_docs",
+                      "extra_context_ids": [
+                        "HydraEmbeddings123_2",
+                        "HydraEmbeddings123_3"
+                      ],
+                      "id": "HydraDoc1234",
+                      "layout": "text",
+                      "metadata": {
+                        "department": "finance",
+                        "priority": 7
+                      },
+                      "relevancy_score": 0.87,
+                      "source_last_updated_time": "2026-07-02T12:30:00Z",
+                      "source_title": "Project Phoenix Overview",
+                      "source_type": "file",
+                      "source_upload_time": "2026-07-02T10:00:00Z",
+                      "sub_tenant_id": "sub_tenant_4567"
+                    }
+                  }
+                ],
+                "inferred": [
+                  {
+                    "chunk": {
+                      "additional_metadata": {
+                        "author": "ada",
+                        "doc_version": 3
+                      },
+                      "chunk_content": "HydraDB supports hybrid retrieval across knowledge and memories.",
+                      "chunk_uuid": "a1b2c3d4-e5f6-7890-1234-567890abcdef",
+                      "collection": "team_docs",
+                      "extra_context_ids": [
+                        "HydraEmbeddings123_2",
+                        "HydraEmbeddings123_3"
+                      ],
+                      "id": "HydraDoc1234",
+                      "layout": "text",
+                      "metadata": {
+                        "department": "finance",
+                        "priority": 7
+                      },
+                      "relevancy_score": 0.87,
+                      "source_last_updated_time": "2026-07-02T12:30:00Z",
+                      "source_title": "Project Phoenix Overview",
+                      "source_type": "file",
+                      "source_upload_time": "2026-07-02T10:00:00Z",
+                      "sub_tenant_id": "sub_tenant_4567"
+                    }
+                  }
+                ]
+              },
+              "graph": {
+                "paths": [
+                  {
+                    "chunk_ids": [
+                      "HydraEmbeddings123_0",
+                      "HydraEmbeddings123_1"
+                    ],
+                    "combined_context": "Acme Corp deploys HydraDB in production for context retrieval.",
+                    "relevancy_score": 0.87,
+                    "triplets": [
+                      {
+                        "relation": {
+                          "confidence": 0.92,
+                          "predicate": "works_at"
+                        },
+                        "source": {
+                          "entity_id": "entity_1a2b",
+                          "name": "Ada",
+                          "type": "person"
+                        },
+                        "target": {
+                          "entity_id": "entity_3c4d",
+                          "name": "Acme Corp",
+                          "type": "organization"
+                        }
+                      }
+                    ]
+                  }
+                ]
+              },
               "graph_context": {
                 "chunk_id_to_group_ids": {
                   "HydraEmbeddings123_0": [
@@ -1876,6 +2057,24 @@
                     ]
                   }
                 ]
+              },
+              "profile_context": {
+                "entity_id": "entity_1a2b",
+                "entries": [
+                  {
+                    "confidence": 0.92
+                  }
+                ],
+                "name": "general",
+                "version": 1
+              },
+              "profile_filter": {
+                "applied": true,
+                "degraded": true,
+                "entity_id": "entity_1a2b",
+                "found": true,
+                "selected_entries": 1,
+                "version": 1
               },
               "source_facts": [
                 {
@@ -2052,6 +2251,48 @@
               },
               "message": "Success",
               "org_id": "org_1a2b3c",
+              "tenant_id": "tenant_1234",
+              "type": "split"
+            }
+          },
+          "error": {
+            "$ref": "#/components/schemas/handler.apiError",
+            "description": "Error message, empty string on success.",
+            "example": {
+              "code": "DATABASE_NOT_FOUND",
+              "message": "Database not found"
+            }
+          },
+          "meta": {
+            "$ref": "#/components/schemas/handler.responseMeta",
+            "example": {
+              "collection": "team_docs",
+              "database": "acme_corp",
+              "latency_ms": 12.3,
+              "request_id": "9d13aef4-02f4-4e73-8c62-4c2601d04f9d",
+              "source_type": "file",
+              "sub_tenant_id": "sub_tenant_4567",
+              "tenant_id": "tenant_1234"
+            }
+          },
+          "success": {
+            "description": "Whether the request succeeded.",
+            "example": true,
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "handler.Envelope-tenants_SubTenantDeleteResponse": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/tenants.SubTenantDeleteResponse",
+            "example": {
+              "collection": "team_docs",
+              "database": "acme_corp",
+              "message": "Success",
+              "status": "completed",
+              "sub_tenant_id": "sub_tenant_4567",
               "tenant_id": "tenant_1234"
             }
           },
@@ -2214,6 +2455,12 @@
                 "acme_corp",
                 "research_kb"
               ],
+              "details": [
+                {
+                  "database": "acme_corp",
+                  "type": "split"
+                }
+              ],
               "failed_databases": [
                 {
                   "database": "acme_corp",
@@ -2280,6 +2527,46 @@
                 }
               ],
               "tenant_id": "acme_corp"
+            }
+          },
+          "error": {
+            "$ref": "#/components/schemas/handler.apiError",
+            "description": "Error message, empty string on success.",
+            "example": {
+              "code": "DATABASE_NOT_FOUND",
+              "message": "Database not found"
+            }
+          },
+          "meta": {
+            "$ref": "#/components/schemas/handler.responseMeta",
+            "example": {
+              "collection": "team_docs",
+              "database": "acme_corp",
+              "latency_ms": 12.3,
+              "request_id": "9d13aef4-02f4-4e73-8c62-4c2601d04f9d",
+              "source_type": "file",
+              "sub_tenant_id": "sub_tenant_4567",
+              "tenant_id": "tenant_1234"
+            }
+          },
+          "success": {
+            "description": "Whether the request succeeded.",
+            "example": true,
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "handler.Envelope-tenants_TenantRenameResponse": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/tenants.TenantRenameResponse",
+            "example": {
+              "connector_reassignment": "complete",
+              "database": "acme_corp",
+              "message": "Success",
+              "status": "completed",
+              "tenant_id": "tenant_1234"
             }
           },
           "error": {
@@ -2896,6 +3183,14 @@
             "example": 86400,
             "type": "integer"
           },
+          "full_visibility_roles": {
+            "description": "FullVisibilityRoles names the HubSpot roles whose members can see every\nrecord (PRO-2036). Resolved to ids against the portal at configure time\nand stored on the account-wide resource row. A pointer so an omitted\nfield keeps the current setting while an explicit [] clears it.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "uniqueItems": false
+          },
           "lookback_days": {
             "description": "How far back the first sync fetches historical data. Only applies to the initial sync — subsequent syncs are incremental from the last cursor.",
             "example": 30,
@@ -3071,6 +3366,18 @@
           "next_sync_at": {
             "description": "RFC3339 timestamp when the next scheduled sync will run.",
             "example": "2026-07-02T18:00:00Z",
+            "type": "string"
+          },
+          "paused": {
+            "description": "Paused marks a connector its owner deliberately stopped (PRO-1762). It\nparks next_sync_at as SyncBlocked does, but stays a separate field:\nblocking clears itself once the cause is fixed, whereas only an explicit\nresume lifts a pause. Resources keep their committed provider_cursor, so\nresuming continues from where each stream stopped.",
+            "example": true,
+            "type": "boolean"
+          },
+          "paused_at": {
+            "type": "string"
+          },
+          "paused_next_sync_at": {
+            "description": "PausedNextSyncAt preserves the schedule the pause displaced. Resume makes\nthe connector due immediately, so this is read back only to recover from\na pause applied by mistake.",
             "type": "string"
           },
           "provider": {
@@ -3323,6 +3630,18 @@
             "example": "2026-07-02T18:00:00Z",
             "type": "string"
           },
+          "paused": {
+            "description": "Paused marks a connector its owner deliberately stopped (PRO-1762). It\nparks next_sync_at as SyncBlocked does, but stays a separate field:\nblocking clears itself once the cause is fixed, whereas only an explicit\nresume lifts a pause. Resources keep their committed provider_cursor, so\nresuming continues from where each stream stopped.",
+            "example": true,
+            "type": "boolean"
+          },
+          "paused_at": {
+            "type": "string"
+          },
+          "paused_next_sync_at": {
+            "description": "PausedNextSyncAt preserves the schedule the pause displaced. Resume makes\nthe connector due immediately, so this is read back only to recover from\na pause applied by mistake.",
+            "type": "string"
+          },
           "provider": {
             "description": "External provider being synced (e.g. `slack`, `github`, `linear`, `notion`, `gmail`).",
             "example": "slack",
@@ -3403,8 +3722,39 @@
         },
         "type": "object"
       },
+      "handler.connectorLimitView": {
+        "description": "ConnectorLimit is present when the org has used its plan's connector\nallowance (Free: 3) and the caps mode enforces it: creating another\nconnector is refused with 402. Connectors already past the allowance\nkeep syncing; the limit applies to creating one. Absent otherwise, and\nsent with the health rollups only.",
+        "properties": {
+          "count": {
+            "description": "Total number of items returned.",
+            "example": 12,
+            "type": "integer"
+          },
+          "limit": {
+            "example": 1,
+            "type": "integer"
+          },
+          "message": {
+            "description": "Human-readable result message.",
+            "example": "Success",
+            "type": "string"
+          },
+          "plan": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
       "handler.connectorListResponse": {
         "properties": {
+          "connector_limit": {
+            "$ref": "#/components/schemas/handler.connectorLimitView",
+            "example": {
+              "count": 12,
+              "limit": 1,
+              "message": "Success"
+            }
+          },
           "connectors": {
             "example": [
               {
@@ -3420,6 +3770,7 @@
                 "name": "general",
                 "needs_reauth": true,
                 "next_sync_at": "2026-07-02T18:00:00Z",
+                "paused": true,
                 "provider": "slack",
                 "provider_account_scope": "T12345ACME",
                 "resources_pending_first_sync": 1,
@@ -3442,14 +3793,45 @@
             "additionalProperties": {
               "type": "string"
             },
-            "description": "Health maps connector_id to its rollup (healthy | degraded | failed |\nchecking), present only when the caller asks for `?include=health`.\nA connector missing from the map has an unknown rollup — its resources\ncould not be read — which clients must not render as a failure.",
+            "description": "Health maps connector_id to its rollup (healthy | degraded | failed |\nchecking | capped), present only when the caller asks for\n`?include=health`. A connector missing from the map has an unknown\nrollup — its resources could not be read — which clients must not\nrender as a failure. `capped` is not a rollup of the connector: it is\noverlaid on a healthy, degraded or checking one when the org is at a\nplan cap, and PlanCap says which.",
             "type": "object"
+          },
+          "plan_cap": {
+            "$ref": "#/components/schemas/handler.planCapView",
+            "example": {
+              "message": "Success"
+            }
+          }
+        },
+        "type": "object"
+      },
+      "handler.connectorPauseResponse": {
+        "properties": {
+          "connector_id": {
+            "description": "Connector this resource belongs to.",
+            "example": "conn_abc123",
+            "type": "string"
+          },
+          "paused": {
+            "example": true,
+            "type": "boolean"
+          },
+          "paused_at": {
+            "type": "string"
           }
         },
         "type": "object"
       },
       "handler.connectorResourceStatus": {
         "properties": {
+          "acl_warning": {
+            "description": "ACLWarning explains why permission capture could not read this\nresource. Capture fails OPEN, so while this is set the resource is\nreadable by EVERY caller regardless of the ACL they send. Deliberately\nnot folded into Status: the resource is syncing fine and its content is\ncurrent, so calling it failed would be wrong and would train people to\nignore a red badge. It is a separate signal because it needs a separate\nreaction (grant the missing permission, or set an access rule).",
+            "type": "string"
+          },
+          "acl_warning_at": {
+            "description": "ACLWarningAt is when this warning was last CHANGED (RFC3339), not when\nthe failure was last observed. An unchanged warning is deliberately not\nrewritten every cycle, so treat this as \"open since\", not \"checked at\".",
+            "type": "string"
+          },
           "action": {
             "description": "Action is what the user must do, when there is something they can do.",
             "type": "string"
@@ -3475,6 +3857,14 @@
           "message": {
             "description": "Message is the provider's own words when Status is failed.",
             "example": "Success",
+            "type": "string"
+          },
+          "page_acl_warning": {
+            "description": "PageACLWarning reports that individual PAGES inside this resource could\nnot have their own restrictions resolved and were opened to every caller.\nDistinct from ACLWarning above, which is about the resource itself: a\nresource can capture perfectly while pages inside it fail, and a healthy\nresource capture clears ACLWarning, so sharing one field would blank this\nevery cycle and report all-clear while pages are still open.",
+            "type": "string"
+          },
+          "page_acl_warning_at": {
+            "description": "PageACLWarningAt is when PageACLWarning last CHANGED (RFC3339).",
             "type": "string"
           },
           "resource_id": {
@@ -3548,7 +3938,7 @@
         "type": "object"
       },
       "handler.connectorStatusError": {
-        "description": "Error is the connector-level failure, set when Status is failed. Absent\nwhen the trouble is confined to individual resources — those carry their\nown messages below.",
+        "description": "Error is the connector-level failure: a rejected credential, a blocked\nconnector, or a latest sync cycle that failed as a whole. Absent when the\ntrouble is confined to individual resources — those carry their own\nmessages below.",
         "properties": {
           "action": {
             "description": "Action is what the user must do, when there is something they can do.",
@@ -3605,6 +3995,12 @@
             "example": "2026-07-02T18:00:00Z",
             "type": "string"
           },
+          "plan_cap": {
+            "$ref": "#/components/schemas/handler.planCapView",
+            "example": {
+              "message": "Success"
+            }
+          },
           "provider": {
             "description": "External provider being synced (e.g. `slack`, `github`, `linear`, `notion`, `gmail`).",
             "example": "slack",
@@ -3631,7 +4027,7 @@
             "uniqueItems": false
           },
           "status": {
-            "description": "Status is the rollup: healthy | degraded | failed | checking. It is the\nworst of the credential state and every resource state.",
+            "description": "Status is the rollup: healthy | degraded | failed | checking, or capped\nwhen the org is at an enforced plan cap and the rollup was healthy,\ndegraded or checking (PlanCap then says which cap). It is the worst of\nthe credential state and every resource state.",
             "example": "completed",
             "type": "string"
           },
@@ -3926,6 +4322,64 @@
         },
         "type": "object"
       },
+      "handler.instructionsResponse": {
+        "properties": {
+          "collections": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Collections maps collection name to that collection's own instructions.",
+            "example": [
+              "team_docs",
+              "engineering"
+            ],
+            "type": "object"
+          },
+          "custom_instructions": {
+            "description": "CustomInstructions applies to every document ingested into the database.",
+            "type": "string"
+          },
+          "database": {
+            "description": "Owning database. Formerly `tenant_id`; the `tenant_id` alias is still accepted (deprecated).",
+            "example": "acme_corp",
+            "type": "string"
+          },
+          "tenant_id": {
+            "deprecated": true,
+            "description": "TenantID mirrors Database as a deprecated alias, matching every other v2\ntenant response.",
+            "example": "acme_corp",
+            "type": "string",
+            "x-deprecated": "true"
+          }
+        },
+        "type": "object"
+      },
+      "handler.instructionsUpdateReq": {
+        "properties": {
+          "collections": {
+            "additionalProperties": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "description": "Collections merges per-collection instructions into the stored set: a\ncollection present with a value is set, a collection present with \"\" or\nnull is cleared, and a collection absent from the map is left untouched.\nMerge rather than replace so two people editing different collections\ncannot silently delete each other's work.",
+            "example": {
+              "engineering": null,
+              "team_docs": "Summarise decisions and who owns them."
+            },
+            "type": "object"
+          },
+          "custom_instructions": {
+            "description": "CustomInstructions sets the database-wide instructions. Send \"\" to clear.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "handler.metadataSchemaUpdateResponse": {
         "properties": {
           "added_fields": {
@@ -3950,6 +4404,23 @@
             "example": "acme_corp",
             "type": "string",
             "x-deprecated": "true"
+          }
+        },
+        "type": "object"
+      },
+      "handler.planCapView": {
+        "description": "PlanCap is present when the org is at a plan cap the caps mode\nenforces; every sync is skipped until the month resets or the plan\nchanges.",
+        "properties": {
+          "message": {
+            "description": "Human-readable result message.",
+            "example": "Success",
+            "type": "string"
+          },
+          "meter": {
+            "type": "string"
+          },
+          "plan": {
+            "type": "string"
           }
         },
         "type": "object"
@@ -4256,6 +4727,126 @@
         },
         "type": "object"
       },
+      "handler.vaultCredentialEntry": {
+        "properties": {
+          "collection": {
+            "description": "Collection scope. Defaults to the default collection when omitted. Formerly `sub_tenant_id`; the `sub_tenant_id` alias is still accepted (deprecated).",
+            "example": "team_docs",
+            "type": "string"
+          },
+          "connector_id": {
+            "description": "Connector this resource belongs to.",
+            "example": "conn_abc123",
+            "type": "string"
+          },
+          "credential_id": {
+            "type": "string"
+          },
+          "database": {
+            "description": "Owning database. Formerly `tenant_id`; the `tenant_id` alias is still accepted (deprecated).",
+            "example": "acme_corp",
+            "type": "string"
+          },
+          "fields": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "uniqueItems": false
+          },
+          "label": {
+            "type": "string"
+          },
+          "provider": {
+            "description": "External provider being synced (e.g. `slack`, `github`, `linear`, `notion`, `gmail`).",
+            "example": "slack",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "handler.vaultCredentialListResponse": {
+        "properties": {
+          "count": {
+            "description": "Total number of items returned.",
+            "example": 12,
+            "type": "integer"
+          },
+          "credentials": {
+            "description": "Provider-specific credentials (typically `{\"api_token\": \"...\"}` or `{\"access_token\": \"...\"}`).",
+            "example": {
+              "api_token": "xoxb-..."
+            },
+            "items": {
+              "$ref": "#/components/schemas/handler.vaultCredentialEntry"
+            },
+            "type": "array",
+            "uniqueItems": false
+          },
+          "unavailable_count": {
+            "example": 1,
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "handler.vaultCredentialRevealReq": {
+        "properties": {
+          "field": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "field"
+        ],
+        "type": "object"
+      },
+      "handler.vaultCredentialRevealResponse": {
+        "properties": {
+          "credential_id": {
+            "type": "string"
+          },
+          "field": {
+            "type": "string"
+          },
+          "provider": {
+            "description": "External provider being synced (e.g. `slack`, `github`, `linear`, `notion`, `gmail`).",
+            "example": "slack",
+            "type": "string"
+          },
+          "value": {}
+        },
+        "type": "object"
+      },
+      "handler.vaultCredentialUpdateReq": {
+        "properties": {
+          "credentials": {
+            "additionalProperties": {},
+            "description": "Provider-specific credentials (typically `{\"api_token\": \"...\"}` or `{\"access_token\": \"...\"}`).",
+            "example": {
+              "api_token": "xoxb-..."
+            },
+            "type": "object"
+          }
+        },
+        "required": [
+          "credentials"
+        ],
+        "type": "object"
+      },
+      "handler.vaultCredentialUpdateResponse": {
+        "properties": {
+          "credential_id": {
+            "type": "string"
+          },
+          "updated": {
+            "description": "Whether the source metadata was updated.",
+            "example": true,
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
       "ingestion.SourceStatus": {
         "description": "Status is the item's initial lifecycle state. Both modes share this\nvocabulary — memory mode reuses the same values.",
         "enum": [
@@ -4537,10 +5128,11 @@
             "x-deprecated": "true"
           },
           "type": {
-            "description": "Bucket to list: `knowledge` (default) or `memory`.",
+            "description": "Type names the corpus: knowledge (default) or memory.",
             "enum": [
               "knowledge",
-              "memory"
+              "memory",
+              "all"
             ],
             "example": "knowledge",
             "type": "string"
@@ -4898,6 +5490,324 @@
         ],
         "type": "object"
       },
+      "memories.ConversationTurn": {
+        "properties": {
+          "content": {
+            "description": "Extracted text content of the source document.",
+            "example": "# Q4 Report\n\nRevenue grew 23% quarter over quarter.",
+            "type": "string"
+          },
+          "name": {
+            "description": "Human-readable label for this resource.",
+            "example": "general",
+            "type": "string"
+          },
+          "role": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "memories.IngestItem": {
+        "properties": {
+          "acl": {
+            "description": "ACL is the item's access-control list (PRO-1684), the same contract as\nan app_knowledge item's `acl` on a split database: bare emails,\nuser_email:/group:/domain: principals, or the __public__/__private__\nsentinels. Omitted (nil) leaves the context unrestricted; an explicitly\nempty list stores __private__. Normalised here, all-or-nothing, so a\nmalformed principal is a 400 on the request rather than a silently\nmis-scoped context. Enforced by every read that takes `acl`.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "uniqueItems": false
+          },
+          "attributes": {
+            "additionalProperties": {},
+            "type": "object"
+          },
+          "content": {
+            "description": "Extracted text content of the source document.",
+            "example": "# Q4 Report\n\nRevenue grew 23% quarter over quarter.",
+            "type": "string"
+          },
+          "context_category": {
+            "description": "ContextCategory files this context under one of the three buckets\n(PRO-1618). Omitted or \"auto\" leaves it to HydraDB; naming a bucket pins\nit and inference will not overwrite it. See\ndomain/ingestion/context_category.go.",
+            "enum": [
+              "auto",
+              "user_preference",
+              "business_knowledge",
+              "decision_trace"
+            ],
+            "type": "string"
+          },
+          "context_id": {
+            "type": "string"
+          },
+          "conversation": {
+            "description": "Conversation is the canonical name; `messages` is accepted as an alias.\nBoth are the shape a developer already builds for OpenAI or Anthropic.",
+            "example": [
+              {
+                "content": "# Q4 Report\n\nRevenue grew 23% quarter over quarter.",
+                "name": "general"
+              }
+            ],
+            "items": {
+              "$ref": "#/components/schemas/memories.ConversationTurn"
+            },
+            "type": "array",
+            "uniqueItems": false
+          },
+          "custom_attributes": {
+            "additionalProperties": {},
+            "type": "object"
+          },
+          "custom_instructions": {
+            "type": "string"
+          },
+          "enrich": {
+            "example": true,
+            "type": "boolean"
+          },
+          "happened_at": {
+            "type": "string"
+          },
+          "is_markdown": {
+            "description": "IsMarkdown tells the pipeline the text is markdown, so it is chunked on\nstructure rather than as flat prose. The memories[] path has always\ncarried it; without it here a markdown sync has nowhere to say so.",
+            "example": true,
+            "type": "boolean"
+          },
+          "messages": {
+            "example": [
+              {
+                "content": "# Q4 Report\n\nRevenue grew 23% quarter over quarter.",
+                "name": "general"
+              }
+            ],
+            "items": {
+              "$ref": "#/components/schemas/memories.ConversationTurn"
+            },
+            "type": "array",
+            "uniqueItems": false
+          },
+          "text": {
+            "description": "Text is the canonical name; `content` is accepted as an alias.",
+            "type": "string"
+          },
+          "title": {
+            "description": "Title names the context. It becomes the context's document title, and it\nis what distinguishes two items whose text is identical: the document id\nis generated from the title, so without one they collide.",
+            "example": "Project Phoenix Overview",
+            "type": "string"
+          },
+          "user_name": {
+            "description": "UserName is the speaker identity for a TEXT item. A conversation names\nits speaker per turn instead, and that stays authoritative: this field\nonly fills in when the turns supplied none. Empty ends up as \"User\",\nmatching the split path, so the pipeline is never handed a blank.",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "memories.UnifiedIngestRequest": {
+        "properties": {
+          "collection": {
+            "description": "Collection scope. Defaults to the default collection when omitted. Formerly `sub_tenant_id`; the `sub_tenant_id` alias is still accepted (deprecated).",
+            "example": "team_docs",
+            "type": "string"
+          },
+          "contexts": {
+            "example": [
+              {
+                "content": "# Q4 Report\n\nRevenue grew 23% quarter over quarter.",
+                "conversation": [
+                  {
+                    "content": "# Q4 Report\n\nRevenue grew 23% quarter over quarter.",
+                    "name": "general"
+                  }
+                ],
+                "enrich": true,
+                "is_markdown": true,
+                "messages": [
+                  {
+                    "content": "# Q4 Report\n\nRevenue grew 23% quarter over quarter.",
+                    "name": "general"
+                  }
+                ],
+                "title": "Project Phoenix Overview"
+              }
+            ],
+            "items": {
+              "$ref": "#/components/schemas/memories.IngestItem"
+            },
+            "type": "array",
+            "uniqueItems": false
+          },
+          "database": {
+            "description": "Owning database. Formerly `tenant_id`; the `tenant_id` alias is still accepted (deprecated).",
+            "example": "acme_corp",
+            "type": "string"
+          },
+          "items": {
+            "description": "Items is the canonical name from the design spec. `contexts` is accepted\nas an alias because the field was drafted under that name.",
+            "example": [
+              {
+                "content": "# Q4 Report\n\nRevenue grew 23% quarter over quarter.",
+                "conversation": [
+                  {
+                    "content": "# Q4 Report\n\nRevenue grew 23% quarter over quarter.",
+                    "name": "general"
+                  }
+                ],
+                "enrich": true,
+                "is_markdown": true,
+                "messages": [
+                  {
+                    "content": "# Q4 Report\n\nRevenue grew 23% quarter over quarter.",
+                    "name": "general"
+                  }
+                ],
+                "title": "Project Phoenix Overview"
+              }
+            ],
+            "items": {
+              "$ref": "#/components/schemas/memories.IngestItem"
+            },
+            "type": "array",
+            "uniqueItems": false
+          },
+          "upsert": {
+            "example": "true",
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "search.AliasExpansionNote": {
+        "properties": {
+          "alias": {
+            "type": "string"
+          },
+          "canonical": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "search.AppSearchFusionDiagnostics": {
+        "description": "AppSearchFusion is the diagnostic block of the query_apps fusion\n(PRO-1882): per-chunk lane attribution and counts. Present only when\nquery_apps was on, the request was not ACL-scoped, and attributed chunks\nsurvived final filtering. Identifier maps cover only returned chunks.",
+        "properties": {
+          "app_recipes": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "AppRecipes maps the chunk_uuid of each final chunk the app lane returned to\nthe recipe that produced it (exact_id, recall, dated, bm25, broad, ...),\nincluding chunks the normal lane also had, so a consensus can be\nattributed to a recipe.",
+            "type": "object"
+          },
+          "chunk_origins": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "ChunkOrigins maps every returned chunk_uuid to where the fusion placed it\nfrom: \"normal\" (normal lane only), \"both\" (both lanes, normal position\nkept), \"exact_id\" (promoted from the app lane's exact-identifier\nrecipe), \"app_tail\" (appended from the app lane).",
+            "type": "object"
+          },
+          "stats": {
+            "$ref": "#/components/schemas/search.AppSearchFusionStats",
+            "description": "Counts for the first or only fusion pass before postprocessing, not final response counts or totals across alias alternatives. The entire diagnostic block is omitted for ACL-scoped requests.",
+            "example": {
+              "app_chunks": 1,
+              "app_has_exact_ids": true,
+              "app_lane_empty_text": true,
+              "consensus": 1,
+              "exact_candidates": 1,
+              "exact_promoted": 1,
+              "limit": 1,
+              "normal_chunks": 1,
+              "normal_displaced": 1,
+              "tail_added": 1,
+              "tail_candidates": 1
+            }
+          },
+          "stats_by_pass": {
+            "description": "StatsByPass preserves each independent fusion's accounting when results\ncombine multiple passes, in merge order (original before alternate when\nboth have diagnostics). Counts overlap; they are not unique totals.",
+            "example": [
+              {
+                "app_chunks": 1,
+                "app_has_exact_ids": true,
+                "app_lane_empty_text": true,
+                "consensus": 1,
+                "exact_candidates": 1,
+                "exact_promoted": 1,
+                "limit": 1,
+                "normal_chunks": 1,
+                "normal_displaced": 1,
+                "tail_added": 1,
+                "tail_candidates": 1
+              }
+            ],
+            "items": {
+              "$ref": "#/components/schemas/search.AppSearchFusionStats"
+            },
+            "type": "array",
+            "uniqueItems": false
+          }
+        },
+        "type": "object"
+      },
+      "search.AppSearchFusionStats": {
+        "description": "Stats describes the first (or only) fusion pass before postprocessing,\nnot final counts or a sum across alias alternatives/fan-out branches.",
+        "properties": {
+          "app_chunks": {
+            "description": "AppChunks is what the app lane returned.",
+            "example": 1,
+            "type": "integer"
+          },
+          "app_has_exact_ids": {
+            "description": "AppHasExactIDs mirrors the app plan's exact-identifier marker.",
+            "example": true,
+            "type": "boolean"
+          },
+          "app_lane_empty_text": {
+            "description": "AppLaneEmptyText is true when the app lane returned no chunks (sources\nor side context only).",
+            "example": true,
+            "type": "boolean"
+          },
+          "consensus": {
+            "description": "Consensus counts app chunks the normal lane already had; they keep the\nnormal lane's position.",
+            "example": 1,
+            "type": "integer"
+          },
+          "exact_candidates": {
+            "description": "ExactCandidates counts app chunks the exact-identifier recipe found;\nExactPromoted is how many of them were placed above the normal lane.",
+            "example": 1,
+            "type": "integer"
+          },
+          "exact_promoted": {
+            "description": "Exact-identifier chunks placed above the normal lane.",
+            "example": 1,
+            "type": "integer"
+          },
+          "limit": {
+            "description": "Limit is the final chunk limit the fusion applied.",
+            "example": 1,
+            "type": "integer"
+          },
+          "normal_chunks": {
+            "description": "NormalChunks is what the normal lane returned.",
+            "example": 1,
+            "type": "integer"
+          },
+          "normal_displaced": {
+            "description": "NormalDisplaced counts normal-lane chunks the promoted block and the\ntail pushed past the limit.",
+            "example": 1,
+            "type": "integer"
+          },
+          "tail_added": {
+            "description": "App-only chunks appended within the tail budget.",
+            "example": 1,
+            "type": "integer"
+          },
+          "tail_candidates": {
+            "description": "TailCandidates counts app-only chunks eligible for the tail; TailAdded\nis how many were appended within the tail budget.",
+            "example": 1,
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
       "search.ChunkInspectResult": {
         "properties": {
           "chunks": {
@@ -4959,7 +5869,263 @@
         },
         "type": "object"
       },
+      "search.CodeSearchRepoResult": {
+        "properties": {
+          "answer": {
+            "type": "string"
+          },
+          "duration_ms": {
+            "example": 0.5,
+            "type": "number"
+          },
+          "error": {
+            "description": "Error message, empty string on success.",
+            "example": "",
+            "type": "string"
+          },
+          "repo": {
+            "type": "string"
+          },
+          "status": {
+            "description": "Current lifecycle or processing state.",
+            "example": "completed",
+            "type": "string"
+          },
+          "truncated": {
+            "example": true,
+            "type": "boolean"
+          },
+          "unsigned": {
+            "example": true,
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "search.CodeSearchResult": {
+        "description": "CodeSearch is the repository code-search branch's answer, when routed.",
+        "properties": {
+          "decided_by": {
+            "description": "DecidedBy names the signal that routed the query: \"request\" (caller\nforced it), \"planner\" (is_code_query) or \"stage2\" (embedding router).",
+            "type": "string"
+          },
+          "duration_ms": {
+            "description": "DurationMS is the wall time the branch took.",
+            "example": 0.5,
+            "type": "number"
+          },
+          "reason": {
+            "description": "Reason explains a non-ok status in one sentence.",
+            "type": "string"
+          },
+          "repos": {
+            "description": "Repos lists each repository searched with its own status and answer.",
+            "example": [
+              {
+                "duration_ms": 0.5,
+                "error": "",
+                "status": "completed",
+                "truncated": true,
+                "unsigned": true
+              }
+            ],
+            "items": {
+              "$ref": "#/components/schemas/search.CodeSearchRepoResult"
+            },
+            "type": "array",
+            "uniqueItems": false
+          },
+          "status": {
+            "description": "Status is \"ok\" when at least one repository answered, \"not_found\" when\nnone had an archive, \"error\"/\"timeout\" when the branch failed, or\n\"skipped\" with a Reason when it was not attempted (no repositories\nconnected, caller opted out).",
+            "example": "completed",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "search.EntityProfileView": {
+        "properties": {
+          "compiled_at": {
+            "type": "string"
+          },
+          "entity_id": {
+            "description": "Unique identifier for this entity in the graph.",
+            "example": "entity_1a2b",
+            "type": "string"
+          },
+          "entity_type": {
+            "type": "string"
+          },
+          "entries": {
+            "example": [
+              {
+                "confidence": 0.92
+              }
+            ],
+            "items": {
+              "$ref": "#/components/schemas/search.ProfileEntry"
+            },
+            "type": "array",
+            "uniqueItems": false
+          },
+          "headline": {
+            "type": "string"
+          },
+          "name": {
+            "description": "Human-readable label for this resource.",
+            "example": "general",
+            "type": "string"
+          },
+          "pending_importance": {
+            "example": 1,
+            "type": "integer"
+          },
+          "perspective": {
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "summary": {
+            "type": "string"
+          },
+          "summary_cites": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "uniqueItems": false
+          },
+          "unknown": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "uniqueItems": false
+          },
+          "version": {
+            "example": 1,
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "search.ForcefulRelationEntry": {
+        "properties": {
+          "chunk": {
+            "$ref": "#/components/schemas/search.V2Chunk",
+            "example": {
+              "additional_metadata": {
+                "author": "ada",
+                "doc_version": 3
+              },
+              "chunk_content": "HydraDB supports hybrid retrieval across knowledge and memories.",
+              "chunk_uuid": "a1b2c3d4-e5f6-7890-1234-567890abcdef",
+              "collection": "team_docs",
+              "extra_context_ids": [
+                "HydraEmbeddings123_2",
+                "HydraEmbeddings123_3"
+              ],
+              "id": "HydraDoc1234",
+              "layout": "text",
+              "metadata": {
+                "department": "finance",
+                "priority": 7
+              },
+              "relevancy_score": 0.87,
+              "source_last_updated_time": "2026-07-02T12:30:00Z",
+              "source_title": "Project Phoenix Overview",
+              "source_type": "file",
+              "source_upload_time": "2026-07-02T10:00:00Z",
+              "sub_tenant_id": "sub_tenant_4567"
+            }
+          },
+          "via": {
+            "$ref": "#/components/schemas/search.RelationVia"
+          }
+        },
+        "type": "object"
+      },
+      "search.ForcefulRelationsBucket": {
+        "description": "ForcefulRelations is the caller-declared relation bucket, carrying the\nfrom-\u003eto edge that additional_context discards when it flattens these\ninto a chunk-uuid map. Always present, so a caller can read it\nunconditionally.",
+        "properties": {
+          "declared": {
+            "example": [
+              {
+                "chunk": {
+                  "additional_metadata": {
+                    "author": "ada",
+                    "doc_version": 3
+                  },
+                  "chunk_content": "HydraDB supports hybrid retrieval across knowledge and memories.",
+                  "chunk_uuid": "a1b2c3d4-e5f6-7890-1234-567890abcdef",
+                  "collection": "team_docs",
+                  "extra_context_ids": [
+                    "HydraEmbeddings123_2",
+                    "HydraEmbeddings123_3"
+                  ],
+                  "id": "HydraDoc1234",
+                  "layout": "text",
+                  "metadata": {
+                    "department": "finance",
+                    "priority": 7
+                  },
+                  "relevancy_score": 0.87,
+                  "source_last_updated_time": "2026-07-02T12:30:00Z",
+                  "source_title": "Project Phoenix Overview",
+                  "source_type": "file",
+                  "source_upload_time": "2026-07-02T10:00:00Z",
+                  "sub_tenant_id": "sub_tenant_4567"
+                }
+              }
+            ],
+            "items": {
+              "$ref": "#/components/schemas/search.ForcefulRelationEntry"
+            },
+            "type": "array",
+            "uniqueItems": false
+          },
+          "inferred": {
+            "example": [
+              {
+                "chunk": {
+                  "additional_metadata": {
+                    "author": "ada",
+                    "doc_version": 3
+                  },
+                  "chunk_content": "HydraDB supports hybrid retrieval across knowledge and memories.",
+                  "chunk_uuid": "a1b2c3d4-e5f6-7890-1234-567890abcdef",
+                  "collection": "team_docs",
+                  "extra_context_ids": [
+                    "HydraEmbeddings123_2",
+                    "HydraEmbeddings123_3"
+                  ],
+                  "id": "HydraDoc1234",
+                  "layout": "text",
+                  "metadata": {
+                    "department": "finance",
+                    "priority": 7
+                  },
+                  "relevancy_score": 0.87,
+                  "source_last_updated_time": "2026-07-02T12:30:00Z",
+                  "source_title": "Project Phoenix Overview",
+                  "source_type": "file",
+                  "source_upload_time": "2026-07-02T10:00:00Z",
+                  "sub_tenant_id": "sub_tenant_4567"
+                }
+              }
+            ],
+            "items": {
+              "$ref": "#/components/schemas/search.ForcefulRelationEntry"
+            },
+            "type": "array",
+            "uniqueItems": false
+          }
+        },
+        "type": "object"
+      },
       "search.GraphContext": {
+        "deprecated": true,
         "description": "GraphContext is omitted entirely when graph_context is disabled on the\nrequest (pointer + omitempty), so the response carries no graph slice\ninstead of an empty-but-present object.",
         "properties": {
           "chunk_id_to_group_ids": {
@@ -5052,11 +6218,105 @@
             "uniqueItems": false
           }
         },
+        "type": "object",
+        "x-deprecated": "true"
+      },
+      "search.GraphPath": {
+        "properties": {
+          "chunk_ids": {
+            "example": [
+              "HydraEmbeddings123_0",
+              "HydraEmbeddings123_1"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "uniqueItems": false
+          },
+          "combined_context": {
+            "description": "Merged text from all chunk passages in this relation path.",
+            "example": "Acme Corp deploys HydraDB in production for context retrieval.",
+            "type": "string"
+          },
+          "relevancy_score": {
+            "description": "Relevance score for this item against the query.",
+            "example": 0.87,
+            "type": "number"
+          },
+          "triplets": {
+            "description": "Knowledge-graph triplets that make up this relation path.",
+            "example": [
+              {
+                "relation": {
+                  "confidence": 0.92,
+                  "predicate": "works_at"
+                },
+                "source": {
+                  "entity_id": "entity_1a2b",
+                  "name": "Ada",
+                  "type": "person"
+                },
+                "target": {
+                  "entity_id": "entity_3c4d",
+                  "name": "Acme Corp",
+                  "type": "organization"
+                }
+              }
+            ],
+            "items": {
+              "$ref": "#/components/schemas/search.PathTriplet"
+            },
+            "type": "array",
+            "uniqueItems": false
+          }
+        },
+        "type": "object"
+      },
+      "search.GraphPlane": {
+        "description": "Graph is the consolidated graph plane: query_paths and\nchunk_relations consolidated into one ordered paths[] list, with each\npath carrying the chunk ids it supports so the caller no longer joins\nagainst chunk_id_to_group_ids. Populated whenever graph_context is on;\ngraph_context stays populated beside it.",
+        "properties": {
+          "paths": {
+            "example": [
+              {
+                "chunk_ids": [
+                  "HydraEmbeddings123_0",
+                  "HydraEmbeddings123_1"
+                ],
+                "combined_context": "Acme Corp deploys HydraDB in production for context retrieval.",
+                "relevancy_score": 0.87,
+                "triplets": [
+                  {
+                    "relation": {
+                      "confidence": 0.92,
+                      "predicate": "works_at"
+                    },
+                    "source": {
+                      "entity_id": "entity_1a2b",
+                      "name": "Ada",
+                      "type": "person"
+                    },
+                    "target": {
+                      "entity_id": "entity_3c4d",
+                      "name": "Acme Corp",
+                      "type": "organization"
+                    }
+                  }
+                ]
+              }
+            ],
+            "items": {
+              "$ref": "#/components/schemas/search.GraphPath"
+            },
+            "type": "array",
+            "uniqueItems": false
+          }
+        },
         "type": "object"
       },
       "search.MetadataFilters": {
         "additionalProperties": {},
-        "description": "Filters results by source metadata. Top-level keys target tenant metadata (for example department, priority, active, or tags). Nested additional_metadata keys target document metadata. Separate keys are ANDed. A scalar value is an exact match; an array means match ANY one of the listed values (OR) - there is no ALL/AND operator within a single key. Arrays are supported on VARCHAR fields only: an array passed for a declared field of any other type is rejected with 400 VALIDATION_ERROR. Size limits: each list may hold at most 500 values, and the whole metadata_filters object is capped at 64 KiB measured on its compact JSON encoding in UTF-8 bytes (keys and punctuation count). Exceeding either returns 400 naming the offending key or the actual byte count.",
+        "description": "DEPRECATED: use `attributes`, which is an operator language pushed into the vector search rather than bare equality applied after it. `metadata_filters` keeps working, and is still the only way to filter on per-context custom_attributes, which `attributes` does not cover yet. Filters results by context metadata. Top-level keys target tenant metadata (for example department, priority, active, or tags). Nested additional_metadata keys target document metadata. Separate keys are ANDed. Each top-level key accepts an operator object naming the comparison: {\"contains\": value} matches sources whose field holds that value (multi-value fields are stored comma-joined, so this matches one member); {\"contains_any\": [values]} matches sources holding ANY one of the listed values; {\"equals\": value} matches sources whose field is exactly that value. The bare forms remain supported and unchanged but are deprecated in favour of the operators, because the comparison they perform is inferred from the JSON shape rather than stated: a bare scalar behaves as equals, a bare array as contains_any, and a bare single-element array as contains. Operators apply to top-level keys only; inside additional_metadata use the bare scalar or array forms. An operator used inside additional_metadata is NOT rejected - it is read as an exact-match filter against a stored object, so on a normal field it matches nothing and the request returns 200 with an empty result rather than an error. A known operator given the wrong operand type, or several operators in one object, is rejected with 400 VALIDATION_ERROR rather than silently matching nothing. A MISSPELLED operator is not: {\"contian\": \"x\"} is indistinguishable from a filter for a stored object with that key, so it is left alone and matches nothing. An object whose keys are not operator names is likewise treated as an exact-match filter against a stored object, unchanged. RESERVED NAMES: contains, contains_any and equals are reserved as the keys of a top-level filter object, so an object built only from them is read as an operator and is no longer available for exact object matching -- {\"f\": {\"contains\": \"x\"}} is read as the operator, and an object whose keys are ALL operator names is rejected with 400. A caller matching such an object in a JSON-typed field must rename the nested key or the field. Mixing an operator name with any other key ({\"contains\": \"a\", \"other\": 1}) is unaffected and still exact-matches. There is no ALL/AND operator within a single key. contains, contains_any and arrays are supported on VARCHAR fields only: any of them passed for a declared field of another type is rejected with 400 VALIDATION_ERROR. equals works on every declared type, so {\"priority\": {\"equals\": 7}} is valid on an INT64 field. Size limits: each list may hold at most 500 values, and the whole metadata_filters object is capped at 64 KiB measured on its compact JSON encoding in UTF-8 bytes AFTER operator objects are reduced to their values, so {\"contains\": \"x\"} is measured as [\"x\"] and the operator keyword itself costs nothing. The cap bounds the cost of the resulting vector-store expression, which the operator spelling does not change. Field names and punctuation count. Exceeding either returns 400 naming the offending key or the actual byte count.",
         "example": {
           "active": true,
           "additional_metadata": {
@@ -5118,6 +6378,116 @@
         },
         "type": "object"
       },
+      "search.ProfileContext": {
+        "description": "ProfileContext/ProfileFilter surface the entity-profile block when the\nrequest named a profile_subject (PRO-1797); omitted otherwise.",
+        "properties": {
+          "entity_id": {
+            "description": "Unique identifier for this entity in the graph.",
+            "example": "entity_1a2b",
+            "type": "string"
+          },
+          "entries": {
+            "example": [
+              {
+                "confidence": 0.92
+              }
+            ],
+            "items": {
+              "$ref": "#/components/schemas/search.ProfileEntry"
+            },
+            "type": "array",
+            "uniqueItems": false
+          },
+          "headline": {
+            "type": "string"
+          },
+          "name": {
+            "description": "Human-readable label for this resource.",
+            "example": "general",
+            "type": "string"
+          },
+          "perspective": {
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "summary": {
+            "type": "string"
+          },
+          "version": {
+            "example": 1,
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "search.ProfileEntry": {
+        "properties": {
+          "confidence": {
+            "description": "Confidence score, from 0 to 1.",
+            "example": 0.92,
+            "type": "number"
+          },
+          "facet": {
+            "type": "string"
+          },
+          "since": {
+            "type": "string"
+          },
+          "slot": {
+            "type": "string"
+          },
+          "state": {
+            "description": "stated | observed | inferred | record",
+            "type": "string"
+          },
+          "statement_keys": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "uniqueItems": false
+          },
+          "text": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "search.ProfileFilterInfo": {
+        "properties": {
+          "applied": {
+            "example": true,
+            "type": "boolean"
+          },
+          "degraded": {
+            "example": true,
+            "type": "boolean"
+          },
+          "entity_id": {
+            "description": "Unique identifier for this entity in the graph.",
+            "example": "entity_1a2b",
+            "type": "string"
+          },
+          "found": {
+            "example": true,
+            "type": "boolean"
+          },
+          "selected_entries": {
+            "example": 1,
+            "type": "integer"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "version": {
+            "example": 1,
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
       "search.QueryBy": {
         "enum": [
           "hybrid",
@@ -5146,6 +6516,16 @@
           },
           "alpha": {
             "description": "Weighting balance between dense and sparse retrieval in hybrid mode. `\"auto\"` lets HydraDB choose; a number from 0 (full BM25) to 1 (full dense) sets it explicitly."
+          },
+          "attributes": {
+            "additionalProperties": {},
+            "description": "Attributes is the go-forward metadata filter: a MongoDB-like operator query\n($eq/$ne/$gt/$gte/$lt/$lte/$in/$nin/$and/$or/$not/$exists) over the\ndatabase attributes, translated to a safe Milvus scalar pre-filter by\nBuildAttributesFilterExpr (PRO-1618). It composes (AND) with the\ndeprecated metadata_filters while both exist. Field names are allowlisted\nand values escaped, so it is injection-safe.\n\nIt is applied everywhere metadata_filters is, and nowhere else: the\nchunks a query returns, the additional context and forceful-relation\nchunks (the fail-closed post-filter net in the service), and the graph\npaths, which the graph lane prunes by resolving every source a path\ncites and dropping the paths that touch one failing the predicate\n(disallowedGraphSources). Product decision 2026-09-04: `attributes`\nbehaves like `metadata_filters` on every part of the response.",
+            "type": "object"
+          },
+          "code_search": {
+            "description": "CodeSearch forces the repository code-search branch on (true) or off\n(false) for this query, overriding the classifier. Nil = let the\nclassifier decide. Only meaningful where the branch is enabled.",
+            "example": true,
+            "type": "boolean"
           },
           "collection": {
             "description": "Collection scope. Defaults to the default collection when omitted. Formerly `sub_tenant_id`; the `sub_tenant_id` alias is still accepted (deprecated).",
@@ -5226,7 +6606,9 @@
             "type": "integer"
           },
           "metadata_filters": {
-            "$ref": "#/components/schemas/search.MetadataFilters"
+            "$ref": "#/components/schemas/search.MetadataFilters",
+            "deprecated": true,
+            "x-deprecated": true
           },
           "mode": {
             "$ref": "#/components/schemas/search.RecallMode",
@@ -5241,13 +6623,24 @@
             "$ref": "#/components/schemas/search.Operator",
             "example": "and"
           },
+          "profile_entity_type": {
+            "description": "ProfileEntityType/ProfileNamespace refine the subject's graph identity;\ndefaults (\"PERSON\"/\"users\") cover the common case of a person subject.",
+            "type": "string"
+          },
+          "profile_namespace": {
+            "type": "string"
+          },
+          "profile_subject": {
+            "description": "ProfileSubject names the entity whose compiled profile should ride the\nresponse as profile_context/profile_filter (PRO-1797). Payload-only:\nchunk ranking is never altered. Omitted = no profile block. Dark until\nthe repo-level ENTITY_PROFILE_CONTEXT_ENABLED flag is on.",
+            "type": "string"
+          },
           "query": {
             "description": "Natural-language search query.",
             "example": "Which mode does the user prefer?",
             "type": "string"
           },
           "query_apps": {
-            "description": "Whether to include app-aware knowledge retrieval. Applies to knowledge hybrid queries.",
+            "description": "Whether to include app-aware knowledge retrieval. Applies to knowledge hybrid queries. Defaults to true when omitted; pass false to search files only.",
             "example": true,
             "type": "boolean"
           },
@@ -5262,7 +6655,7 @@
             "type": "boolean"
           },
           "recency_bias": {
-            "description": "Recency boost applied to ranking. 0 disables it; higher values favour more recent sources.",
+            "description": "Recency boost applied to ranking (0.0-1.0). Omit it to get the always-on default baseline of 0.40 (a bounded \u003c=40% swing on normalized relevance — it reorders within a relevance gap of up to 0.40 but never buries a more strongly relevant result); send 0 to disable recency entirely; higher values favour more recent sources more strongly.",
             "example": 0.2,
             "type": "number"
           },
@@ -5334,9 +6727,17 @@
             "type": "string",
             "x-deprecated": "true"
           },
+          "titles": {
+            "description": "Optional exact document-title filter. Values are matched case-insensitively and ORed, resolved to source IDs, then the normal query pipeline runs within that source scope. When ids is also supplied, the two filters are intersected.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "uniqueItems": false
+          },
           "type": {
             "$ref": "#/components/schemas/search.SourceType",
-            "description": "Corpus to query: knowledge, memory, or all."
+            "description": "Corpus to query: knowledge (the default), memory, or all (both, merged)."
           }
         },
         "type": "object"
@@ -5353,6 +6754,17 @@
           "RecallModeThinking",
           "RecallModeAuto"
         ]
+      },
+      "search.RelationVia": {
+        "properties": {
+          "from": {
+            "type": "string"
+          },
+          "to": {
+            "type": "string"
+          }
+        },
+        "type": "object"
       },
       "search.ScoredPathResponse": {
         "properties": {
@@ -5866,9 +7278,53 @@
             "additionalProperties": {
               "$ref": "#/components/schemas/search.V2Chunk"
             },
-            "description": "Map of chunk ID to chunk content for sources declared as related by the author (query_forceful_relations).",
+            "deprecated": true,
+            "description": "deprecated: use forceful_relations",
             "example": "The user is a senior engineer onboarding to the platform.",
-            "type": "object"
+            "type": "object",
+            "x-deprecated": "true"
+          },
+          "alias_expansions": {
+            "description": "AliasExpansions is the alias layer's honesty stamp (V0): which nickname\nwas expanded to which canonical name for this answer.",
+            "items": {
+              "$ref": "#/components/schemas/search.AliasExpansionNote"
+            },
+            "type": "array",
+            "uniqueItems": false
+          },
+          "app_search_fusion": {
+            "$ref": "#/components/schemas/search.AppSearchFusionDiagnostics",
+            "description": "App-search fusion diagnostics for unscoped requests: final returned chunk attribution and pre-postprocessing fusion counts. Omitted for ACL-scoped requests and when no attributed chunks remain.",
+            "example": {
+              "stats": {
+                "app_chunks": 1,
+                "app_has_exact_ids": true,
+                "app_lane_empty_text": true,
+                "consensus": 1,
+                "exact_candidates": 1,
+                "exact_promoted": 1,
+                "limit": 1,
+                "normal_chunks": 1,
+                "normal_displaced": 1,
+                "tail_added": 1,
+                "tail_candidates": 1
+              },
+              "stats_by_pass": [
+                {
+                  "app_chunks": 1,
+                  "app_has_exact_ids": true,
+                  "app_lane_empty_text": true,
+                  "consensus": 1,
+                  "exact_candidates": 1,
+                  "exact_promoted": 1,
+                  "limit": 1,
+                  "normal_chunks": 1,
+                  "normal_displaced": 1,
+                  "tail_added": 1,
+                  "tail_candidates": 1
+                }
+              ]
+            }
           },
           "chunks": {
             "description": "Retrieved and ranked chunks from the knowledge store or memories.",
@@ -5904,6 +7360,118 @@
             },
             "type": "array",
             "uniqueItems": false
+          },
+          "code_search": {
+            "$ref": "#/components/schemas/search.CodeSearchResult",
+            "example": {
+              "duration_ms": 0.5,
+              "repos": [
+                {
+                  "duration_ms": 0.5,
+                  "error": "",
+                  "status": "completed",
+                  "truncated": true,
+                  "unsigned": true
+                }
+              ],
+              "status": "completed"
+            }
+          },
+          "forceful_relations": {
+            "$ref": "#/components/schemas/search.ForcefulRelationsBucket",
+            "example": {
+              "declared": [
+                {
+                  "chunk": {
+                    "additional_metadata": {
+                      "author": "ada",
+                      "doc_version": 3
+                    },
+                    "chunk_content": "HydraDB supports hybrid retrieval across knowledge and memories.",
+                    "chunk_uuid": "a1b2c3d4-e5f6-7890-1234-567890abcdef",
+                    "collection": "team_docs",
+                    "extra_context_ids": [
+                      "HydraEmbeddings123_2",
+                      "HydraEmbeddings123_3"
+                    ],
+                    "id": "HydraDoc1234",
+                    "layout": "text",
+                    "metadata": {
+                      "department": "finance",
+                      "priority": 7
+                    },
+                    "relevancy_score": 0.87,
+                    "source_last_updated_time": "2026-07-02T12:30:00Z",
+                    "source_title": "Project Phoenix Overview",
+                    "source_type": "file",
+                    "source_upload_time": "2026-07-02T10:00:00Z",
+                    "sub_tenant_id": "sub_tenant_4567"
+                  }
+                }
+              ],
+              "inferred": [
+                {
+                  "chunk": {
+                    "additional_metadata": {
+                      "author": "ada",
+                      "doc_version": 3
+                    },
+                    "chunk_content": "HydraDB supports hybrid retrieval across knowledge and memories.",
+                    "chunk_uuid": "a1b2c3d4-e5f6-7890-1234-567890abcdef",
+                    "collection": "team_docs",
+                    "extra_context_ids": [
+                      "HydraEmbeddings123_2",
+                      "HydraEmbeddings123_3"
+                    ],
+                    "id": "HydraDoc1234",
+                    "layout": "text",
+                    "metadata": {
+                      "department": "finance",
+                      "priority": 7
+                    },
+                    "relevancy_score": 0.87,
+                    "source_last_updated_time": "2026-07-02T12:30:00Z",
+                    "source_title": "Project Phoenix Overview",
+                    "source_type": "file",
+                    "source_upload_time": "2026-07-02T10:00:00Z",
+                    "sub_tenant_id": "sub_tenant_4567"
+                  }
+                }
+              ]
+            }
+          },
+          "graph": {
+            "$ref": "#/components/schemas/search.GraphPlane",
+            "example": {
+              "paths": [
+                {
+                  "chunk_ids": [
+                    "HydraEmbeddings123_0",
+                    "HydraEmbeddings123_1"
+                  ],
+                  "combined_context": "Acme Corp deploys HydraDB in production for context retrieval.",
+                  "relevancy_score": 0.87,
+                  "triplets": [
+                    {
+                      "relation": {
+                        "confidence": 0.92,
+                        "predicate": "works_at"
+                      },
+                      "source": {
+                        "entity_id": "entity_1a2b",
+                        "name": "Ada",
+                        "type": "person"
+                      },
+                      "target": {
+                        "entity_id": "entity_3c4d",
+                        "name": "Acme Corp",
+                        "type": "organization"
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
           },
           "graph_context": {
             "$ref": "#/components/schemas/search.GraphContext",
@@ -5971,6 +7539,30 @@
                   ]
                 }
               ]
+            }
+          },
+          "profile_context": {
+            "$ref": "#/components/schemas/search.ProfileContext",
+            "example": {
+              "entity_id": "entity_1a2b",
+              "entries": [
+                {
+                  "confidence": 0.92
+                }
+              ],
+              "name": "general",
+              "version": 1
+            }
+          },
+          "profile_filter": {
+            "$ref": "#/components/schemas/search.ProfileFilterInfo",
+            "example": {
+              "applied": true,
+              "degraded": true,
+              "entity_id": "entity_1a2b",
+              "found": true,
+              "selected_entries": 1,
+              "version": 1
             }
           },
           "source_facts": {
@@ -6274,10 +7866,11 @@
             "x-deprecated": "true"
           },
           "type": {
-            "description": "Bucket to delete from: `knowledge` (default) or `memory`.",
+            "description": "Type names the corpus: knowledge (default) or memory.",
             "enum": [
               "knowledge",
-              "memory"
+              "memory",
+              "all"
             ],
             "example": "knowledge",
             "type": "string"
@@ -6325,6 +7918,24 @@
           "name": {
             "description": "Field name. Immutable after database creation.",
             "example": "category",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "tenants.DatabaseDetail": {
+        "properties": {
+          "database": {
+            "description": "Owning database. Formerly `tenant_id`; the `tenant_id` alias is still accepted (deprecated).",
+            "example": "acme_corp",
+            "type": "string"
+          },
+          "type": {
+            "description": "Type is the storage layout the database was created with: \"split\" (a\nknowledge and a memory corpus, selected by `type` on every call).\nAbsent where the deployment does not expose the layout.",
+            "enum": [
+              "split"
+            ],
+            "example": "split",
             "type": "string"
           }
         },
@@ -6385,6 +7996,14 @@
             "example": "tenant_1234",
             "type": "string",
             "x-deprecated": "true"
+          },
+          "type": {
+            "description": "Type is the storage layout the database was created with; absent while the\ndatabase is deleting or unknown.",
+            "enum": [
+              "split"
+            ],
+            "example": "split",
+            "type": "string"
           }
         },
         "type": "object"
@@ -6417,6 +8036,7 @@
         "type": "object"
       },
       "tenants.MilvusDataType": {
+        "description": "Declared type of a database metadata schema field. ARRAY appears in this enum because schemas persisted before it was rejected still read back and rebuild, but it CANNOT be declared on a new or evolved field: both the create and the update-metadata-schema endpoints answer 400 for it. For a field holding several values, declare VARCHAR and store the values comma-joined, then filter one member with the contains operator.",
         "enum": [
           "BOOL",
           "INT8",
@@ -6442,6 +8062,43 @@
           "DataTypeJSON",
           "DataTypeArray"
         ]
+      },
+      "tenants.SubTenantDeleteResponse": {
+        "properties": {
+          "collection": {
+            "description": "Collection scope. Defaults to the default collection when omitted. Formerly `sub_tenant_id`; the `sub_tenant_id` alias is still accepted (deprecated).",
+            "example": "team_docs",
+            "type": "string"
+          },
+          "database": {
+            "description": "Owning database. Formerly `tenant_id`; the `tenant_id` alias is still accepted (deprecated).",
+            "example": "acme_corp",
+            "type": "string"
+          },
+          "message": {
+            "description": "Human-readable result message.",
+            "example": "Success",
+            "type": "string"
+          },
+          "status": {
+            "description": "Current lifecycle or processing state.",
+            "example": "completed",
+            "type": "string"
+          },
+          "sub_tenant_id": {
+            "deprecated": true,
+            "example": "sub_tenant_4567",
+            "type": "string",
+            "x-deprecated": "true"
+          },
+          "tenant_id": {
+            "deprecated": true,
+            "example": "tenant_1234",
+            "type": "string",
+            "x-deprecated": "true"
+          }
+        },
+        "type": "object"
       },
       "tenants.SubTenantIdsResponse": {
         "properties": {
@@ -6556,43 +8213,9 @@
             "type": "array",
             "uniqueItems": false,
             "x-deprecated": "true"
-          }
-        },
-        "type": "object"
-      },
-      "tenants.SubTenantDeleteResponse": {
-        "properties": {
-          "collection": {
-            "description": "Collection that was deleted. Formerly `sub_tenant_id`.",
-            "example": "engineering",
-            "type": "string"
           },
-          "database": {
-            "description": "Owning database. Formerly `tenant_id`.",
-            "example": "acme_corp",
-            "type": "string"
-          },
-          "message": {
-            "description": "Human-readable result message.",
-            "example": "Collection deregistered. Background cleanup is in progress.",
-            "type": "string"
-          },
-          "status": {
-            "description": "Current lifecycle or processing state.",
-            "example": "deletion_scheduled",
-            "type": "string"
-          },
-          "sub_tenant_id": {
-            "deprecated": true,
-            "example": "engineering",
-            "type": "string",
-            "x-deprecated": "true"
-          },
-          "tenant_id": {
-            "deprecated": true,
-            "example": "acme_corp",
-            "type": "string",
-            "x-deprecated": "true"
+          "type": {
+            "$ref": "#/components/schemas/github_com_hydradb_hydradb-application_internal_platform_storagelayout.Layout"
           }
         },
         "type": "object"
@@ -6633,6 +8256,20 @@
             ],
             "items": {
               "type": "string"
+            },
+            "type": "array",
+            "uniqueItems": false
+          },
+          "details": {
+            "description": "Details carries one entry per live database with its storage layout.",
+            "example": [
+              {
+                "database": "acme_corp",
+                "type": "split"
+              }
+            ],
+            "items": {
+              "$ref": "#/components/schemas/tenants.DatabaseDetail"
             },
             "type": "array",
             "uniqueItems": false
@@ -6743,6 +8380,57 @@
             },
             "type": "array",
             "uniqueItems": false
+          }
+        },
+        "type": "object"
+      },
+      "tenants.TenantRenameRequest": {
+        "properties": {
+          "new_name": {
+            "description": "NewName is the database's new caller-facing name. Same rules as a\ncreate-time name (ValidateTenantName).\n\nbinding:\"required\" is read by swag, so the published schema lists the\nfield as required and generated SDKs make it a mandatory argument; it is\ninert at runtime, because the handler decodes through ParseRenameRequest,\nwhich rejects a missing or blank new_name itself.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "new_name"
+        ],
+        "type": "object"
+      },
+      "tenants.TenantRenameResponse": {
+        "properties": {
+          "connector_reassignment": {
+            "description": "ConnectorReassignment reports how the rename's connector sweep ended:\n\"complete\" (every connector already targets the new name), \"queued\" (a\ndurable background reconciliation owns the remainder and retries until\ndrained), or \"failed\" (neither — contact support; the failure is also\nalerted on server-side). The rename itself has succeeded in all three\nstates.",
+            "example": "complete",
+            "type": "string"
+          },
+          "database": {
+            "description": "Owning database. Formerly `tenant_id`; the `tenant_id` alias is still accepted (deprecated).",
+            "example": "acme_corp",
+            "type": "string"
+          },
+          "message": {
+            "description": "Human-readable result message.",
+            "example": "Success",
+            "type": "string"
+          },
+          "old_database": {
+            "type": "string"
+          },
+          "old_tenant_id": {
+            "deprecated": true,
+            "type": "string",
+            "x-deprecated": "true"
+          },
+          "status": {
+            "description": "Current lifecycle or processing state.",
+            "example": "completed",
+            "type": "string"
+          },
+          "tenant_id": {
+            "deprecated": true,
+            "example": "tenant_1234",
+            "type": "string",
+            "x-deprecated": "true"
           }
         },
         "type": "object"
@@ -7816,6 +9504,16 @@
               }
             },
             "description": "Bad Gateway"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handler.ErrorResponse"
+                }
+              }
+            },
+            "description": "Service Unavailable"
           }
         },
         "security": [
@@ -7829,6 +9527,76 @@
         ],
         "x-fern-sdk-group-name": "connectors",
         "x-fern-sdk-method-name": "discover"
+      }
+    },
+    "/connectors/{id}/pause": {
+      "post": {
+        "description": "Stop scheduling syncs and backfills for a connector until it is resumed. A sync already running is allowed to finish. Cursors are preserved, so resuming continues from where each resource left off.",
+        "parameters": [
+          {
+            "description": "Connector ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "example": "HydraDoc1234",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handler.connectorPauseResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handler.ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handler.ErrorResponse"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handler.ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Pause a connector",
+        "tags": [
+          "connectors"
+        ],
+        "x-fern-sdk-group-name": "connectors",
+        "x-fern-sdk-method-name": "pause"
       }
     },
     "/connectors/{id}/resources": {
@@ -8138,9 +9906,79 @@
         "x-fern-sdk-method-name": "update_resource_acl"
       }
     },
+    "/connectors/{id}/resume": {
+      "post": {
+        "description": "Return a paused connector to the schedule and make it due immediately. Each resource continues from its committed cursor, so data created during the pause is collected on the next cycle rather than skipped.",
+        "parameters": [
+          {
+            "description": "Connector ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "example": "HydraDoc1234",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handler.connectorPauseResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handler.ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handler.ErrorResponse"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handler.ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Resume a paused connector",
+        "tags": [
+          "connectors"
+        ],
+        "x-fern-sdk-group-name": "connectors",
+        "x-fern-sdk-method-name": "resume"
+      }
+    },
     "/connectors/{id}/status": {
       "get": {
-        "description": "Report whether a connector is working, in one call: a rollup status (healthy, degraded, failed, checking) plus per-resource detail. `degraded` means the connector is syncing but at least one configured resource is failing — the state that is otherwise invisible, because a connector whose resources partly fail still reports an idle sync status and no error.",
+        "description": "Report whether a connector is working, in one call: a rollup status (healthy, degraded, failed, checking) plus per-resource detail. `degraded` means the connector is scheduled but not fully working: at least one configured resource is failing, or the latest sync cycle failed after the resources reported (in which case `error` carries the failure and `retryable` says whether waiting can fix it). `failed` means only the user can fix it: a rejected credential, a blocked connector, or a terminal cycle failure.",
         "parameters": [
           {
             "description": "Connector ID",
@@ -8442,13 +10280,14 @@
             "style": "form"
           },
           {
-            "description": "Corpus type: 'knowledge' or 'memory'",
+            "description": "Corpus type: 'knowledge' (default), 'memory', or 'all'. This read addresses one corpus, so 'all' answers from knowledge and meta.source_type reports which corpus answered.",
             "in": "query",
             "name": "type",
             "schema": {
               "enum": [
                 "knowledge",
-                "memory"
+                "memory",
+                "all"
               ],
               "type": "string"
             }
@@ -8512,16 +10351,18 @@
     },
     "/context/ingest": {
       "post": {
-        "description": "Ingest knowledge documents or memories for a tenant.",
+        "description": "Ingest content for a database. `items` is the preferred shape (text or a conversation per item); the deprecated `documents`, `app_knowledge` and `memories` fields are selected by `type`. The same `items` array may also be sent as an application/json body.",
         "requestBody": {
           "content": {
             "multipart/form-data": {
               "schema": {
                 "properties": {
                   "app_knowledge": {
-                    "description": "App-knowledge items as a JSON array (type=knowledge). Per item, `metadata` is capped at 16 KiB and `additional_metadata` at 1 KiB, measured on the compact JSON encoding of the whole map in UTF-8 bytes (keys and punctuation count). The deprecated `tenant_metadata` / `document_metadata` spellings are accepted here and held to the same caps. Over-cap returns 400 with the actual byte count. Each item may also carry `acl`, a list of principals (`user_email:\u003cemail\u003e`, a bare email, `group:\u003cprovider\u003e:\u003cid\u003e`, `domain:\u003cdomain\u003e`, or `__public__`) restricting who may retrieve it; omit it to leave the document unrestricted, and send an empty list to restrict it to nobody. A malformed principal rejects the whole request with 400.",
+                    "deprecated": true,
+                    "description": "App-knowledge items as a JSON array (type=knowledge). Per item, `metadata` is capped at 16 KiB and `additional_metadata` at 1 KiB, measured on the compact JSON encoding of the whole map in UTF-8 bytes (keys and punctuation count). The deprecated `tenant_metadata` / `document_metadata` spellings are accepted here and held to the same caps. Over-cap returns 400 with the actual byte count. Each item may also carry `acl`, a list of principals (`user_email:\u003cemail\u003e`, a bare email, `group:\u003cprovider\u003e:\u003cid\u003e`, `domain:\u003cdomain\u003e`, or `__public__`) restricting who may retrieve it; omit it to leave the document unrestricted, and send an empty list to restrict it to nobody. A malformed principal rejects the whole request with 400. Items may also carry `evidence_kind`/`evidence_subject` provenance labels (see document_metadata); an unknown kind returns 400.",
                     "title": "app_knowledge",
-                    "type": "string"
+                    "type": "string",
+                    "x-deprecated": "true"
                   },
                   "collection": {
                     "title": "collection",
@@ -8532,23 +10373,37 @@
                     "type": "string"
                   },
                   "document_metadata": {
-                    "description": "Per-document metadata as a JSON array (type=knowledge). Per item, `metadata` is capped at 16 KiB and `additional_metadata` at 1 KiB. Both caps are measured on the compact JSON encoding of the whole map in UTF-8 bytes, so keys, quotes, commas and braces count toward the budget. Over-cap returns 400 with the actual byte count.",
+                    "deprecated": true,
+                    "description": "Per-document metadata as a JSON array (type=knowledge). Per item, `metadata` is capped at 16 KiB and `additional_metadata` at 1 KiB. Both caps are measured on the compact JSON encoding of the whole map in UTF-8 bytes, so keys, quotes, commas and braces count toward the budget. Over-cap returns 400 with the actual byte count. Each item may also carry evidence labels (`evidence_kind`: one of assertion, record, said, done, third_party, inferred; `evidence_subject`: a stable handle for who the evidence is about, e.g. `user:kiran@acme.com`) declaring the content's provenance for entity understanding; an unknown kind returns 400.",
                     "title": "document_metadata",
-                    "type": "string"
+                    "type": "string",
+                    "x-deprecated": "true"
                   },
                   "documents": {
-                    "format": "binary",
+                    "deprecated": true,
+                    "items": {
+                      "format": "binary",
+                      "type": "string"
+                    },
                     "title": "documents",
-                    "type": "string"
+                    "type": "array",
+                    "x-deprecated": "true"
                   },
                   "graph_payload": {
                     "title": "graph_payload",
                     "type": "string"
                   },
-                  "memories": {
-                    "description": "Memory items as a JSON array (type=memory). Per item, `metadata` is capped at 16 KiB and `additional_metadata` at 1 KiB, measured on the compact JSON encoding of the whole map in UTF-8 bytes (keys and punctuation count). Over-cap returns 400 with the actual byte count.",
-                    "title": "memories",
+                  "items": {
+                    "description": "JSON-encoded array of ingest items -- text or a conversation per item. The same array may also be POSTed as an application/json body; that variant is not listed here so SDK generators emit this form, which carries every field.",
+                    "title": "items",
                     "type": "string"
+                  },
+                  "memories": {
+                    "deprecated": true,
+                    "description": "Memory items as a JSON array (type=memory). Per item, `metadata` is capped at 16 KiB and `additional_metadata` at 1 KiB, measured on the compact JSON encoding of the whole map in UTF-8 bytes (keys and punctuation count). Over-cap returns 400 with the actual byte count. Items may also carry `evidence_kind`/`evidence_subject` provenance labels (see document_metadata); an unknown kind returns 400.",
+                    "title": "memories",
+                    "type": "string",
+                    "x-deprecated": "true"
                   },
                   "sub_tenant_id": {
                     "deprecated": true,
@@ -8563,7 +10418,6 @@
                     "x-deprecated": "true"
                   },
                   "type": {
-                    "default": "knowledge",
                     "enum": [
                       "knowledge",
                       "memory"
@@ -8584,7 +10438,7 @@
               }
             }
           },
-          "description": "Content type: 'knowledge' or 'memory' | Database (canonical name for the tenant scope) | Collection (canonical name for the sub-tenant scope) | Deprecated alias for database | Deprecated alias for collection | Upsert existing content (true/false/1/0) | Knowledge files to ingest (repeatable; type=knowledge) | Per-document metadata as a JSON array (type=knowledge). Per item: metadata \u003c= 16 KiB, additional_metadata \u003c= 1 KiB. | App-knowledge items as a JSON array (type=knowledge). Per item: metadata \u003c= 16 KiB, additional_metadata \u003c= 1 KiB, optional acl principal list (PRO-1684). | Memory items as a JSON array (type=memory). Per item: metadata \u003c= 16 KiB, additional_metadata \u003c= 1 KiB. | Optional bring-your-own-graph payload as JSON",
+          "description": "Items[] body: the application/json alternative to this form. | Corpus to write to: 'knowledge' (default) or 'memory'. 'all' is refused here: an ingest must name the one corpus it writes to. | Items as a JSON array; each item carries `text` or `conversation` (role/content turns), optional `context_id`, `title`, `attributes`, `custom_attributes`, `happened_at`, `enrich`, `context_category` (auto|user_preference|business_knowledge|decision_trace), and `acl` (principal list, PRO-1684: same contract as an app_knowledge item; omit for unrestricted). Items land in the memory corpus. | Database (canonical name for the tenant scope) | Collection (canonical name for the sub-tenant scope) | Deprecated alias for database | Deprecated alias for collection | Upsert existing content (true/false/1/0) | Deprecated: knowledge files to ingest (repeatable; type=knowledge, split databases only) | Deprecated: per-document metadata as a JSON array (type=knowledge, split databases only). Per item: metadata \u003c= 16 KiB, additional_metadata \u003c= 1 KiB. | Deprecated: app-knowledge items as a JSON array (type=knowledge, split databases only). Per item: metadata \u003c= 16 KiB, additional_metadata \u003c= 1 KiB, optional acl principal list (PRO-1684). | Deprecated: memory items as a JSON array (type=memory, split databases only); use items. Per item: metadata \u003c= 16 KiB, additional_metadata \u003c= 1 KiB. | Optional bring-your-own-graph payload as JSON",
           "required": true
         },
         "responses": {
@@ -8626,7 +10480,7 @@
                 }
               }
             },
-            "description": "Body is not multipart/form-data (e.g. a JSON body)"
+            "description": "Body is neither multipart/form-data nor application/json"
           },
           "422": {
             "content": {
@@ -8785,7 +10639,7 @@
     },
     "/context/list": {
       "post": {
-        "description": "List knowledge sources or memories (id + metadata) for a tenant.",
+        "description": "List items (id + metadata) for a database: knowledge sources (default) or memories, selected by `type`.",
         "requestBody": {
           "content": {
             "application/json": {
@@ -8830,6 +10684,139 @@
         ],
         "x-fern-sdk-group-name": "context",
         "x-fern-sdk-method-name": "list"
+      }
+    },
+    "/context/profile": {
+      "get": {
+        "description": "Return the compiled profile of one entity in one collection: identity headline, a cited summary, and the current admitted entries (each pointing at the statements behind it). Profiles are maintained continuously by the ingestion pipeline's entity keeper; this endpoint reads the materialized view and never triggers recomputation.",
+        "parameters": [
+          {
+            "description": "Database (canonical name for the tenant scope)",
+            "in": "query",
+            "name": "database",
+            "required": true,
+            "schema": {
+              "example": "acme_corp",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Collection (canonical name for the sub-tenant scope)",
+            "in": "query",
+            "name": "collection",
+            "required": true,
+            "schema": {
+              "example": "team_docs",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Deprecated alias for database",
+            "in": "query",
+            "name": "tenant_id",
+            "schema": {
+              "deprecated": true,
+              "example": "tenant_1234",
+              "type": "string",
+              "x-deprecated": "true"
+            }
+          },
+          {
+            "description": "Deprecated alias for collection",
+            "in": "query",
+            "name": "sub_tenant_id",
+            "schema": {
+              "deprecated": true,
+              "example": "sub_tenant_4567",
+              "type": "string",
+              "x-deprecated": "true"
+            }
+          },
+          {
+            "description": "Entity whose profile to return (e.g. a person's name)",
+            "in": "query",
+            "name": "subject",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Corpus type: 'knowledge' or 'memory'",
+            "in": "query",
+            "name": "type",
+            "schema": {
+              "default": "memory",
+              "enum": [
+                "knowledge",
+                "memory"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "Graph entity type of the subject",
+            "in": "query",
+            "name": "entity_type",
+            "schema": {
+              "default": "PERSON",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Graph namespace of the subject",
+            "in": "query",
+            "name": "namespace",
+            "schema": {
+              "default": "users",
+              "example": "organization",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handler.Envelope-search_EntityProfileView"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handler.ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handler.ErrorResponse"
+                }
+              }
+            },
+            "description": "No profile compiled for this subject yet, or the feature is not enabled"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Get entity profile",
+        "tags": [
+          "context"
+        ],
+        "x-fern-sdk-group-name": "context",
+        "x-fern-sdk-method-name": "profile"
       }
     },
     "/context/relations": {
@@ -8887,13 +10874,14 @@
             }
           },
           {
-            "description": "Corpus type: 'knowledge' or 'memory'",
+            "description": "Corpus type: 'knowledge' (default), 'memory', or 'all'. This read addresses one corpus, so 'all' answers from knowledge and meta.source_type reports which corpus answered.",
             "in": "query",
             "name": "type",
             "schema": {
               "enum": [
                 "knowledge",
-                "memory"
+                "memory",
+                "all"
               ],
               "type": "string"
             }
@@ -9068,6 +11056,144 @@
         "x-fern-sdk-method-name": "status"
       }
     },
+    "/context/subgraph": {
+      "get": {
+        "description": "Query-string form of GET /context/{id}/subgraph: the same parameters, the same response, and the same rules. It exists for an id that contains '/', which cannot be spelled as one path segment; generated SDKs call this form for every id. Return the connected subgraph of one ingested item: every item reachable from it through item-level relations (explicit `relates_to` links, a shared thread, parent/child hierarchy, traversed breadth-first up to `depth` hops), the relations among those members, and the structural graph around them (entities, comments, attachments, actors). Chunk-level entity relations are not included; use Inspecting Context Relations for those. An unknown id returns an empty subgraph, not an error.",
+        "parameters": [
+          {
+            "description": "Item ID: the ingested item whose connected subgraph to return. This form takes any id, including one that contains '/'.",
+            "in": "query",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "example": "HydraDoc1234",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Database (canonical name for the tenant scope)",
+            "in": "query",
+            "name": "database",
+            "required": true,
+            "schema": {
+              "example": "acme_corp",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Collection (canonical name for the sub-tenant scope)",
+            "in": "query",
+            "name": "collection",
+            "schema": {
+              "example": "team_docs",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Deprecated alias for database",
+            "in": "query",
+            "name": "tenant_id",
+            "schema": {
+              "deprecated": true,
+              "example": "tenant_1234",
+              "type": "string",
+              "x-deprecated": "true"
+            }
+          },
+          {
+            "description": "Deprecated alias for collection",
+            "in": "query",
+            "name": "sub_tenant_id",
+            "schema": {
+              "deprecated": true,
+              "example": "sub_tenant_4567",
+              "type": "string",
+              "x-deprecated": "true"
+            }
+          },
+          {
+            "description": "Corpus type: 'knowledge' (default), 'memory', or 'all'. This read addresses one corpus, so 'all' answers from knowledge and meta.source_type reports which corpus answered.",
+            "in": "query",
+            "name": "type",
+            "schema": {
+              "enum": [
+                "knowledge",
+                "memory",
+                "all"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "Max traversal depth in hops",
+            "in": "query",
+            "name": "depth",
+            "schema": {
+              "default": 5,
+              "maximum": 10,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Max members returned; `is_truncated` reports when this clipped the traversal",
+            "in": "query",
+            "name": "max_sources",
+            "schema": {
+              "default": 200,
+              "maximum": 1000,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Principals to answer as (document ACLs): the subgraph contains only items they may see, filtered at every hop. Repeated (acl=a\u0026acl=b) or comma-separated. Omit for no ACL scoping.",
+            "in": "query",
+            "name": "acl",
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "style": "form"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handler.Envelope-graph_SourceSubgraphResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handler.ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Get connected subgraph",
+        "tags": [
+          "context"
+        ],
+        "x-fern-sdk-group-name": "context",
+        "x-fern-sdk-method-name": "subgraph"
+      }
+    },
     "/context/{id}/metadata": {
       "patch": {
         "description": "Merge/upsert database_metadata and additional_metadata for one source. collection is required.",
@@ -9204,14 +11330,14 @@
             }
           },
           {
-            "description": "Corpus type: 'knowledge' or 'memory'",
+            "description": "Corpus type: 'knowledge' (default), 'memory', or 'all'. This read addresses one corpus, so 'all' answers from knowledge and meta.source_type reports which corpus answered.",
             "in": "query",
             "name": "type",
             "schema": {
-              "default": "knowledge",
               "enum": [
                 "knowledge",
-                "memory"
+                "memory",
+                "all"
               ],
               "type": "string"
             }
@@ -9282,8 +11408,151 @@
         "tags": [
           "context"
         ],
-        "x-fern-sdk-group-name": "context",
-        "x-fern-sdk-method-name": "subgraph"
+        "x-fern-ignore": true
+      }
+    },
+    "/credential-vault": {
+      "get": {
+        "description": "List metadata and field names for credentials already used by connectors in the current workspace.",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handler.vaultCredentialListResponse"
+                }
+              }
+            },
+            "description": "OK"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "List connector credentials",
+        "tags": [
+          "connectors"
+        ]
+      }
+    },
+    "/credential-vault/{id}": {
+      "patch": {
+        "description": "Update fields on the credential currently used by a connector. Owner-only human action.",
+        "parameters": [
+          {
+            "description": "Connector ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "example": "HydraDoc1234",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/handler.vaultCredentialUpdateReq"
+              }
+            }
+          },
+          "description": "Credential fields",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handler.vaultCredentialUpdateResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handler.ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Update connector credentials",
+        "tags": [
+          "connectors"
+        ]
+      }
+    },
+    "/credential-vault/{id}/reveal": {
+      "post": {
+        "description": "Reveal one field from the credential currently used by a connector in the workspace. The response must never be cached.",
+        "parameters": [
+          {
+            "description": "Connector ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "example": "HydraDoc1234",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/handler.vaultCredentialRevealReq"
+              }
+            }
+          },
+          "description": "Credential field",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handler.vaultCredentialRevealResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handler.ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Reveal a connector credential value",
+        "tags": [
+          "connectors"
+        ]
       }
     },
     "/databases": {
@@ -9470,6 +11739,84 @@
       }
     },
     "/databases/collections": {
+      "delete": {
+        "description": "Permanently remove one collection and all of its data from a database. The database itself is left intact.",
+        "parameters": [
+          {
+            "description": "Database identifier",
+            "in": "query",
+            "name": "database",
+            "required": true,
+            "schema": {
+              "example": "acme_corp",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Collection identifier",
+            "in": "query",
+            "name": "collection",
+            "required": true,
+            "schema": {
+              "example": "team_docs",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handler.Envelope-tenants_SubTenantDeleteResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handler.ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handler.ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handler.ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Delete a collection",
+        "tags": [
+          "database-management"
+        ],
+        "x-fern-sdk-group-name": "databases",
+        "x-fern-sdk-method-name": "deleteCollection"
+      },
       "get": {
         "description": "List all collections for a given database",
         "parameters": [
@@ -9537,84 +11884,6 @@
         ],
         "x-fern-sdk-group-name": "databases",
         "x-fern-sdk-method-name": "collections"
-      },
-      "delete": {
-        "description": "Permanently remove one collection and all of its data from a database. The database itself is left intact and its other collections are untouched. `database` and `collection` are both required. The API still accepts the deprecated `tenant_id` and `sub_tenant_id` aliases in their place, but generated clients should send the canonical names.",
-        "parameters": [
-          {
-            "description": "Database identifier. The API also accepts the deprecated `tenant_id` alias in its place; this operation models only the canonical name, as every other operation in this spec does.",
-            "in": "query",
-            "name": "database",
-            "required": true,
-            "schema": {
-              "example": "acme_corp",
-              "type": "string"
-            }
-          },
-          {
-            "description": "Collection identifier. Unlike the read endpoints this does not default to the database's own collection, because a delete has no safe default. The API also accepts the deprecated `sub_tenant_id` alias in its place; this operation models only the canonical name.",
-            "in": "query",
-            "name": "collection",
-            "required": true,
-            "schema": {
-              "example": "engineering",
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/handler.Envelope-tenants_SubTenantDeleteResponse"
-                }
-              }
-            },
-            "description": "OK"
-          },
-          "400": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/handler.ErrorResponse"
-                }
-              }
-            },
-            "description": "Bad Request"
-          },
-          "404": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/handler.ErrorResponse"
-                }
-              }
-            },
-            "description": "Not Found"
-          },
-          "500": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/handler.ErrorResponse"
-                }
-              }
-            },
-            "description": "Internal Server Error"
-          }
-        },
-        "security": [
-          {
-            "BearerAuth": []
-          }
-        ],
-        "summary": "Delete a collection",
-        "tags": [
-          "database-management"
-        ],
-        "x-fern-sdk-group-name": "databases",
-        "x-fern-sdk-method-name": "deleteCollection"
       }
     },
     "/databases/stats": {
@@ -9755,6 +12024,246 @@
         ],
         "x-fern-sdk-group-name": "databases",
         "x-fern-sdk-method-name": "status"
+      }
+    },
+    "/databases/{database}": {
+      "patch": {
+        "description": "Rename a database in place. The internal identity (and therefore all indexed data, graphs and documents) is unchanged — only the caller-facing name moves, atomically. Connectors syncing into the database are repointed at the new name. The old name stops resolving immediately, so callers must switch to the new name in the same rollout.",
+        "parameters": [
+          {
+            "description": "Current database identifier",
+            "in": "path",
+            "name": "database",
+            "required": true,
+            "schema": {
+              "example": "acme_corp",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/tenants.TenantRenameRequest"
+              }
+            }
+          },
+          "description": "New database name",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handler.Envelope-tenants_TenantRenameResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handler.ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handler.ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handler.ErrorResponse"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handler.ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Rename a database",
+        "tags": [
+          "database-management"
+        ],
+        "x-fern-sdk-group-name": "databases",
+        "x-fern-sdk-method-name": "rename"
+      }
+    },
+    "/databases/{database}/instructions": {
+      "get": {
+        "description": "Read the custom ingestion instructions configured for a database and for its collections.",
+        "parameters": [
+          {
+            "description": "Database identifier",
+            "in": "path",
+            "name": "database",
+            "required": true,
+            "schema": {
+              "example": "acme_corp",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handler.instructionsResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handler.ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handler.ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handler.ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Get ingestion instructions",
+        "tags": [
+          "database-management"
+        ],
+        "x-fern-sdk-group-name": "databases",
+        "x-fern-sdk-method-name": "get_instructions"
+      },
+      "patch": {
+        "description": "Set or clear the custom ingestion instructions for a database and its collections. Database instructions apply to every document; a collection's instructions apply on top of them. Both stack with any connector- or resource-level instructions rather than replacing them. Applies from the next ingestion; already-indexed data is not reprocessed.",
+        "parameters": [
+          {
+            "description": "Database identifier",
+            "in": "path",
+            "name": "database",
+            "required": true,
+            "schema": {
+              "example": "acme_corp",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/handler.instructionsUpdateReq"
+              }
+            }
+          },
+          "description": "Instructions to set or clear",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handler.instructionsResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handler.ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handler.ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handler.ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Update ingestion instructions",
+        "tags": [
+          "database-management"
+        ],
+        "x-fern-sdk-group-name": "databases",
+        "x-fern-sdk-method-name": "update_instructions"
       }
     },
     "/databases/{database}/metadata-schema": {
@@ -9987,7 +12496,7 @@
     },
     "/query": {
       "post": {
-        "description": "Unified query endpoint that dispatches across type (knowledge/memory/all) and query_by (hybrid/text). Prefer sub_tenant_ids for sub-tenant scoping; legacy sub_tenant_id is deprecated for /query and cannot be sent together with sub_tenant_ids.",
+        "description": "Unified query endpoint that dispatches across type and query_by (hybrid/text). Optionally filter by one or more exact document titles with `titles`; these are resolved to source IDs before normal retrieval. Filter with `attributes` (an operator language, pushed into the vector search); `metadata_filters` is deprecated in favour of it and still works. `type` is knowledge (the default), memory, or all (both, merged). Prefer sub_tenant_ids for sub-tenant scoping; legacy sub_tenant_id is deprecated for /query and cannot be sent together with sub_tenant_ids.",
         "requestBody": {
           "content": {
             "application/json": {
