@@ -3,7 +3,7 @@ title: "Split databases and legacy fields"
 description: "How databases created as type split work, the knowledge, memory and all selector, and every older field name with its current replacement."
 ---
 
-Every other page in these docs describes a **unified** database: you ingest `items` and query without a corpus selector. This page covers the older model, for integrations that still use it:
+Every other page in these docs describes a **unified** database: you send `context` items and query without a corpus selector. This page covers the older model, for integrations that still use it:
 
 - databases created with `type: "split"`, including every database created before unified became the default
 - the older field names HydraDB still accepts on any database
@@ -16,7 +16,7 @@ Nothing on this page is going away. Existing databases keep working unchanged an
 
 | Type | How you get one | What it holds |
 | --- | --- | --- |
-| `unified` | `POST /databases` without `type` (the default) | One corpus. Ingest `items`; query without `type`. |
+| `unified` | `POST /databases` without `type` (the default) | One corpus. Send `context` items; query without `type`. |
 | `split` | `POST /databases` with `"type": "split"`, or any database created before unified became the default | Two corpora, knowledge and memory, selected with `type` on every context and query call. |
 
 ```bash
@@ -29,10 +29,10 @@ curl -X POST 'https://api.hydradb.com/databases' \
 
 To find out which type a database is:
 
-- `GET /databases` returns `details: [{ "database": "acme", "type": "unified" }, ...]`.
+- `GET /databases` returns `details: [{ "database": "acme", "type": "unified" }, ...]`. When `type` is absent, treat the database as split.
 - `GET /databases/status?database=acme` returns `type` alongside the readiness flags.
 
-The type is fixed when the database is created. There is no conversion: to move a split database to unified, create a new database, re-ingest your content as items, and point your client at it.
+The type is fixed when the database is created. There is no conversion: to move a split database to unified, create a new database, re-ingest your content as items, and point your client at it. A client detects the layout once per database and caches it; it never branches on a request flag.
 
 ---
 
@@ -68,7 +68,7 @@ Relations, subgraph and chunks read one corpus at a time, so `all` reads knowled
 `DELETE /context` with `type: "all"` deletes from **both** corpora. The two deletes are not atomic: if the knowledge delete succeeds and the memory delete then fails, the knowledge deletions have already happened. To delete from one corpus only, send `knowledge` or `memory`.
 </Warning>
 
-An ingest that carries `items` on a split database writes to its **memory** corpus, because items are memory-shaped. Absent and `type: "memory"` both land there; `type: "knowledge"` together with `items` is a `400`.
+An ingest that carries `context` items on a split database writes to its **memory** corpus, because items are memory-shaped. Absent and `type: "memory"` both land there; `type: "knowledge"` together with `context` is a `400`.
 
 ---
 
@@ -83,26 +83,35 @@ A split database also accepts the ingest shapes that predate items. Each has its
 | `memories` | Memory items: `text` or `user_assistant_pairs`, with `infer`, `expiry_time` and `relations` | [Memories](/essentials/v2/memories) |
 | `graph_payload` | A graph you built yourself | [Bring your own graph](/essentials/v2/bring-your-own-graph) |
 
-A unified database rejects `documents`, `app_knowledge` and `memories` with a `400` naming `items`. It takes text only, so extract text from files and send it as an item.
+A unified database rejects `type`, `documents`, `app_knowledge` and `memories` with a `400` naming `context`. It takes text only, so extract text from files and send it as an item. `graph_payload` works on both, keyed by `context_id` on a unified database.
 
 ### Mapping split fields to items
 
 | Split field | Item field |
 | --- | --- |
-| `memories[]`, `app_knowledge[]`, `documents` | `items[]` |
-| `id` | `context_id` |
+| `memories[]`, `app_knowledge[]`, `documents` | `context[]` |
+| `id` / `source_id` | `context_id` |
 | `text` (memory), `content.text` (app knowledge) | `text` |
-| `user_assistant_pairs` | `conversation`, as `[{ role, content, name }]` |
+| `user_assistant_pairs` | `conversation`, as `[{ role, content, name? }]` |
+| `infer` (default `false`) | `enrich` (default `true`) |
+| `custom_instructions` | `instructions`, on the item or on the request |
+| `observation_date` | `happened_at` |
 | `metadata` | `attributes` |
 | `additional_metadata` | `custom_attributes` |
-| `observation_date` | `happened_at` |
-| `infer` | `enrich` |
+| `upsert` (request only) | `upsert` on the item, with the request value as the default |
+| `relations` (knowledge only) | `forceful_relations`, on any item |
+| `acl` (app sources only) | `acl`, on any item |
+| `evidence_kind`, `evidence_subject`, `expiry_time`, `retain_source` | removed; a `400` on a unified database |
 
-An item reads only the names in the right-hand column. A left-hand name sent on an item is dropped without an error.
+A few split names are accepted as aliases on a unified database: `items` and `contexts` for `context`, `custom_instructions` for `instructions`, `relations` for `forceful_relations`, and `context_ids` or `source_ids` for the `ids` key inside it. Send the item-field names; any other unknown key on an item is dropped without an error. The full item reference is on [Ingest context](/essentials/v2/ingest#3-item-fields).
 
 ---
 
 ## 4. Legacy query and response fields
+
+### `type` and `query_forceful_relations` on the request
+
+On a unified database, do not send `type`. `follow_forceful_relations` is the current name of the flag that pulls declared relations into the response; `query_forceful_relations` is its deprecated alias and still works.
 
 ### `metadata_filters`
 
@@ -133,27 +142,28 @@ Each declared (top-level) field in `metadata_filters` takes one operator object:
 
 **Storing several values in one field.** A declared field holds one value. To store several, declare it `VARCHAR`, join the values with commas (`"a@company.com,b@company.com"`), and filter with `contains`. A value that itself contains a comma will not match as expected, and `max_length` cannot be raised after the field is created.
 
-### `graph_context`
+### The query response
 
-| Legacy response field | Current field |
+A split database returns the old response exactly as before. A unified database returns four keys: `chunks`, `graph`, `relations` and `llm_prompt`, described on [Query](/essentials/v2/query#3-response). Field by field:
+
+| Split response field | Unified response field |
 | --- | --- |
-| `graph_context.query_paths` | `graph.paths[]` |
-| `graph_context.chunk_relations` | `graph.paths[]` |
-| `graph_context.chunk_id_to_group_ids` | `graph.paths[].chunk_ids` |
+| `chunks[].chunk_uuid` | `chunks[].chunk_id` |
+| `chunks[].id` | `chunks[].context_id` |
+| `chunks[].chunk_content` (with enrichment concatenated in) | `chunks[].content` (verbatim) plus `chunks[].enrichment` (`{ text, kind }`, stored separately) |
+| `chunks[].relevancy_score` | `chunks[].score` |
+| `chunks[].source_title`, `source_type`, `source_upload_time`, `metadata`, `additional_metadata`, `collection`, ... | removed; call `GET /context/inspect` with the `context_id` |
+| `chunks[].extra_context_ids` | removed |
+| `sources[]` | removed; call `GET /context/inspect` |
+| `graph_context.query_paths[]` and `graph_context.chunk_relations[]` | `graph[]`, one flat list: query paths first, then chunk expansions, deduplicated |
+| `graph_context.chunk_id_to_group_ids` | removed; each `triplets[].relation.chunk_id` names its evidence chunk |
+| path `relevancy_score`, `group_id`, `source_chunk_ids`, `combined_context` | `path_summary` only |
+| triplet `source.type`, `source.namespace`, `relation.canonical_predicate`, `relation.raw_predicate`, `relation.confidence`, `relation.source_entity_id`, `relation.target_entity_id` | removed; an entity is `{ entity_id, name }`, a relation is `{ predicate, context, temporal_details?, relationship_id, chunk_id }` |
+| `additional_context` and `forceful_relations.declared` | `relations[]`, each `{ via: { from, to }, chunk }` |
+| `temporal_facts` | `chunks[].temporal[]` |
+| (none) | `llm_prompt`, a server-built string with `[1]`, `[R1]` and `[P1]` citation labels |
 
-`graph_context` is still returned. `graph.paths[]` is the same result as one ordered list: paths reached from the query first, then paths expanded from retrieved chunks, each carrying the chunk ids it is evidence for.
-
-### Forceful relations
-
-| Legacy field | Current field |
-| --- | --- |
-| `additional_context` (response) | `forceful_relations.declared` |
-
-`relations` on `memories`, `documents` and `app_knowledge`, and `query_forceful_relations` on query, are split-era fields for relations you declare yourself. See [Memories](/essentials/v2/memories#connect-related-memories-with-forceful-relations). Items have no field for declared relations yet.
-
-### `is_memory`
-
-On a unified database every chunk carries `is_memory`, and it is filterable in `attributes`. On a split database it is not filterable, because context ingested before the field existed does not have it.
+The SDK `build_string` / `buildString` helper formats the split response for a model. On a unified database it is not needed: inject `llm_prompt`. A parser tells the two shapes apart by their keys: `llm_prompt` and a `graph` array mean unified, `graph_context` or `chunk_content` mean split.
 
 ---
 
@@ -206,18 +216,18 @@ In the **indexing webhook payload**, `tenant_id` and `database` do not carry the
 
 ---
 
-## 6. Names that differ between items and responses
+## 6. Names that differ between items and other responses
 
-Responses still use the original field names, so a few things are spelled differently on the way in and on the way out:
+`POST /query` on a unified database returns `context_id` on every chunk and no attributes at all. The context management endpoints keep their existing response shapes, so a few things are spelled differently on the way in and on the way out there:
 
-| On an item | In a response |
+| On an item | On `POST /context/list`, `GET /context/inspect` and `PATCH /context/{id}/metadata` |
 | --- | --- |
-| `attributes` | `metadata` |
-| `custom_attributes` | `additional_metadata` |
 | `context_id` | `id` |
+| `attributes` | `metadata` (`database_metadata` on the PATCH body) |
+| `custom_attributes` | `additional_metadata` |
 
-- `PATCH /context/{id}/metadata` takes `database_metadata` for attributes and `additional_metadata` for custom attributes.
-- `contexts`, `content` and `messages` are accepted on ingest as aliases of `items`, `text` and `conversation`.
+- The ingest `202` also reports each item as `results[].source_id`; read it as the `context_id`.
+- `items` and `contexts` are accepted on ingest as aliases of `context`; `content` as an alias of `text`; `messages` as an alias of `conversation`.
 - On a unified database, `GET /databases/stats` reports the database's indexed chunk count in `knowledge_collection.row_count`, and `memory_collection` repeats the same number.
 
 ---
@@ -226,5 +236,5 @@ Responses still use the original field names, so a few things are spelled differ
 
 | Code | Status | When | Fix |
 | --- | --- | --- | --- |
-| `CORPUS_TYPE_UNSUPPORTED` | `400` | A `type` or split ingest field the database does not accept: `knowledge` or `memory` on a unified database, `unified` on a split one, `documents`, `app_knowledge` or `memories` on a unified database, or `all` on ingest | Omit `type` on a unified database and send `items`; on a split database send `knowledge` or `memory` |
+| `CORPUS_TYPE_UNSUPPORTED` | `400` | A `type` or split ingest field the database does not accept: `knowledge` or `memory` on a unified database, `unified` on a split one, `documents`, `app_knowledge` or `memories` on a unified database, or `all` on ingest | Omit `type` on a unified database and send `context`; on a split database send `knowledge` or `memory` |
 | `CONTEXT_CATEGORY_UNSUPPORTED` | `400` | A `context_category` other than `auto` on a split database | Drop `context_category`, or send `auto` |

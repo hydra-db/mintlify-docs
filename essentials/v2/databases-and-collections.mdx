@@ -73,15 +73,19 @@ Typical flow:
 - Workspace-specific data uses a workspace `collection`.
 - User-specific Memories use a user-level `collection`.
 
-### Shared Knowledge + user personalization
+### Shared context + user personalization
 
-For personalized answers grounded in shared Knowledge, use the `type` parameter on `POST /query`:
+For personalized answers grounded in shared context, put the shared context in a shared collection and each person's preferences in their own, then query both with weighted `collections` on `POST /query`:
 
-- `type: "knowledge"` retrieves shared Knowledge (Knowledge vector store, `vectorstore_status.knowledge`).
-- `type: "memory"` retrieves user-specific Memories (Memories vector store, `vectorstore_status.memories`).
-- `type: "all"` runs both in parallel and returns one merged, re-ranked result set  -  usually what you want for personalized answers.
+```json
+{
+  "database": "acme_corp",
+  "collections": { "user_john": 2, "company": 1 },
+  "query": "How should I explain our refund policy to this user?"
+}
+```
 
-When you need different formatting for shared vs personal context in the LLM prompt, call `POST /query` twice (once with `type: "knowledge"`, once with `type: "memory"`) and combine in your application.
+The weights rank the person's own context above the shared context without excluding either. There is no `type` on a unified database; the collections are the only scope you choose. The returned `llm_prompt` already merges both into one prompt-ready string.
 
 ---
 
@@ -107,17 +111,11 @@ Use the same scoping values on query that you used when writing the data. A quer
 
 If your application needs to combine data from multiple scopes, prefer one query call with `collections` unless you need separate response formatting or client-side treatment per scope.
 
-Use `collection` for partitioning data. Use `metadata_filters` for narrowing results within that scope.
+Use `collection` for partitioning data. Use `attributes` for narrowing results within that scope.
 
-### Memories and Knowledge
+### Personal and shared context
 
-Memories and Knowledge live in separate stores, both reached through `POST /query`:
-
-- `type: "memory"` retrieves **Memories** (user-scoped, personal).
-- `type: "knowledge"` retrieves **Knowledge** (shared documents and app sources).
-- `type: "all"` retrieves both in one call.
-
-For a personalized answer, the common pattern is one `POST /query` with `type: "all"` and the user's `collection`. HydraDB runs both stores in parallel and merges results. Use two separate calls only when you need to format the two streams differently in your LLM prompt.
+A person's preferences and the company's shared context live in the same database and are read by the same `POST /query`; collections are what keep them apart. Write each person's context under their own `collection` and shared context under a shared one, and name both in `collections` when you query. Use two separate calls only when you need to format the two streams differently in your LLM prompt; otherwise one call and its `llm_prompt` is the whole pattern.
 
 <Warning>
   <strong>Use the same <code>collection</code> on writes and reads for the same logical scope.</strong>
@@ -128,37 +126,37 @@ For a personalized answer, the common pattern is one `POST /query` with `type: "
 
 ## 5. Minimal working example
 
-The example below shows a common personalized-answer flow: write a user Memory with a single `collection`, then query Knowledge and Memories together with `collections`.
+The example below shows a common personalized-answer flow: write a person's preference under their own `collection`, then query it together with the shared collection using `collections`.
 
 <CodeGroup>
 
 ```bash cURL
-# 1. Write a per-user memory under the user's collection.
+# 1. Write a person's preference under their own collection.
 curl -X POST 'https://api.hydradb.com/context/ingest' \
-  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
-  -H "API-Version: 2" \
-  -F "type=memory" \
-  -F "database=acme_corp" \
-  -F "collection=user_123" \
-  -F "upsert=true" \
-  -F 'memories=[
-    {
-      "text": "Prefers dark mode and short answers.",
-      "infer": true,
-      "user_name": "John"
-    }
-  ]'
-
-# 2. Search Knowledge + Memories together with type: "all".
-curl -X POST 'https://api.hydradb.com/query' \
   -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
   -H "API-Version: 2" \
   -H "Content-Type: application/json" \
   -d '{
     "database": "acme_corp",
     "collection": "user_123",
+    "context": [
+      {
+        "text": "Prefers dark mode and short answers.",
+        "context_category": "user_preference",
+        "user_name": "John"
+      }
+    ]
+  }'
+
+# 2. Query the person's collection and the shared one together.
+curl -X POST 'https://api.hydradb.com/query' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "database": "acme_corp",
+    "collections": { "user_123": 2, "company": 1 },
     "query": "refund policy",
-    "type": "all",
     "query_by": "hybrid",
     "mode": "thinking"
   }'
@@ -171,27 +169,25 @@ const client = new HydraDBClient({
   token: process.env.HYDRA_DB_API_KEY,
 });
 
-// 1. Write a per-user memory under the user's collection.
+// 1. Write a person's preference under their own collection.
+//    The SDK sends the item list in the `items` form field.
 await client.context.ingest({
-  type: "memory",
   database: "acme_corp",
   collection: "user_123",
-  upsert: true,
-  memories: JSON.stringify([
+  items: JSON.stringify([
     {
       text: "Prefers dark mode and short answers.",
-      infer: true,
+      context_category: "user_preference",
       user_name: "John",
     },
   ]),
 });
 
-// 2. Search Knowledge + Memories together with type: "all".
+// 2. Query the person's collection and the shared one together.
 const result = await client.query({
   database: "acme_corp",
-  collection: "user_123",
+  collections: { user_123: 2, company: 1 },
   query: "refund policy",
-  type: "all",
   queryBy: "hybrid",
   mode: "thinking",
 });
@@ -204,27 +200,25 @@ from hydra_db import HydraDB
 
 client = HydraDB(token=os.environ["HYDRA_DB_API_KEY"])
 
-# 1. Write a per-user memory under the user's collection.
+# 1. Write a person's preference under their own collection.
+#    The SDK sends the item list in the `items` form field.
 client.context.ingest(
-    type="memory",
     database="acme_corp",
     collection="user_123",
-    upsert=True,
-    memories=json.dumps([
+    items=json.dumps([
         {
             "text": "Prefers dark mode and short answers.",
-            "infer": True,
+            "context_category": "user_preference",
             "user_name": "John",
         }
     ]),
 )
 
-# 2. Search Knowledge + Memories together with type: "all".
+# 2. Query the person's collection and the shared one together.
 result = client.query(
     database="acme_corp",
-    collection="user_123",
+    collections={"user_123": 2, "company": 1},
     query="refund policy",
-    type="all",
     query_by="hybrid",
     mode="thinking",
 )
@@ -251,8 +245,8 @@ A query call uses the scope you provide. If your application needs data from mul
 **Writing shared Knowledge under a user scope by accident.**
 If broadly shared Knowledge is written with a user-specific `collection`, it may not appear where other users expect it. Choose the write scope based on where the content should be queried later.
 
-**Using metadata filters as a substitute for collections.**
-Metadata filters narrow results inside a scope. They are not a replacement for choosing the right `database` and `collection`.
+**Using attribute filters as a substitute for collections.**
+Attribute filters narrow results inside a scope. They are not a replacement for choosing the right `database` and `collection`.
 
 **Using unstable identifiers.**
 Avoid display names, emails that may change, or user-provided labels as long-term scope identifiers. Prefer stable internal IDs such as `user_123`, `workspace_42`, or `org_acme`.

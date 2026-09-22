@@ -1,6 +1,6 @@
 ---
 title: "Context categories"
-description: "Label each item as a user preference, business knowledge or a decision trace, or let HydraDB decide."
+description: "Label each item as a user preference, business knowledge or a decision trace. The label is yours to set; nothing infers it."
 ---
 
 A **context category** says what kind of context an item is. You set it per item with `context_category` on [`POST /context/ingest`](/essentials/v2/ingest). Every category lives in the same database and is searched by the same [query](/essentials/v2/query); the category describes the item, it does not decide where it is stored.
@@ -10,7 +10,7 @@ A **context category** says what kind of context an item is. You set it per item
 | `user_preference` | What a person likes, chose or asked for | Conversations, product events | That person's collection |
 | `business_knowledge` | Documentation, policy, product and domain facts | Docs, wikis, connector syncs | A shared collection |
 | `decision_trace` | What an agent or a team decided, and why | Agent runs, ADRs, postmortems, approvals | A shared or per-team collection |
-| `auto` | The default: HydraDB decides | Anything | Wherever you send it |
+| `auto` | The default: no label | Anything | Wherever you send it |
 
 ---
 
@@ -24,7 +24,7 @@ A database holds three kinds of context:
 
 Labelling an item tells HydraDB which of these it is, so enrichment extracts the right things from it. A conversation labelled `user_preference` is read for preferences; a postmortem labelled `decision_trace` is read for the decision, its outcome and the evidence behind it.
 
-A category you set is never relabelled. The value is validated strictly: a misspelling is a `400`, never an item filed under nothing.
+The label is yours. HydraDB never infers a category and never relabels one you set. The value is validated strictly: a misspelling is a `400`, never an item filed under nothing. On query, the label comes back as `enrichment.kind` on the item's chunks.
 
 ---
 
@@ -33,6 +33,25 @@ A category you set is never relabelled. The value is validated strictly: a missp
 Likes, dislikes, choices and requests a person has made. They usually arrive as conversations or product events, and they belong in that person's own collection, so they personalize answers for that person only.
 
 <CodeGroup>
+```bash cURL
+curl -X POST 'https://api.hydradb.com/context/ingest' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "database": "acme",
+    "collection": "user_alex",
+    "context": [{
+      "context_id": "chat-alex-001",
+      "conversation": [
+        { "role": "user", "content": "Keep answers short, I read on my phone.", "name": "alex" },
+        { "role": "assistant", "content": "Got it, short answers." }
+      ],
+      "context_category": "user_preference",
+      "happened_at": "2026-09-01"
+    }]
+  }'
+```
 ```python Python SDK
 import json
 
@@ -65,26 +84,9 @@ await client.context.ingest({
   }]),
 });
 ```
-```bash cURL
-curl -X POST 'https://api.hydradb.com/context/ingest' \
-  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
-  -H "API-Version: 2" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "database": "acme",
-    "collection": "user_alex",
-    "items": [{
-      "context_id": "chat-alex-001",
-      "conversation": [
-        { "role": "user", "content": "Keep answers short, I read on my phone.", "name": "alex" },
-        { "role": "assistant", "content": "Got it, short answers." }
-      ],
-      "context_category": "user_preference",
-      "happened_at": "2026-09-01"
-    }]
-  }'
-```
 </CodeGroup>
+
+The SDKs send the array in the `items` form field; the JSON body calls the list `context`. See [Ingest context](/essentials/v2/ingest#1-one-call-for-text-and-conversations).
 
 Recall it by querying that person's collection:
 
@@ -93,6 +95,18 @@ Recall it by querying that person's collection:
   "database": "acme",
   "collection": "user_alex",
   "query": "How does Alex like answers formatted?"
+}
+```
+
+The matching chunk comes back with the preference enrichment extracted from the conversation:
+
+```json
+{
+  "chunk_id": "ck_9f2",
+  "context_id": "chat-alex-001",
+  "score": 0.91,
+  "content": "user: Keep answers short, I read on my phone.\nassistant: Got it, short answers.",
+  "enrichment": { "text": "Alex prefers short answers.", "kind": "user_preference" }
 }
 ```
 
@@ -106,7 +120,7 @@ Facts that are true for everyone in the database: documentation, policies, produ
 {
   "database": "acme",
   "collection": "company",
-  "items": [{
+  "context": [{
     "context_id": "refund-policy",
     "title": "Refund policy",
     "text": "Refunds are processed within 5 business days. Enterprise customers can request an expedited refund.",
@@ -120,13 +134,13 @@ Facts that are true for everyone in the database: documentation, policies, produ
 
 ## 4. `decision_trace`
 
-The record of an agent or a team reasoning to an outcome: an agent run, an architecture decision record, a postmortem, an approval. Set `happened_at` to when the decision was made, and `user_name` to the agent or person who made it.
+The record of an agent or a team reasoning to an outcome: an agent run, an architecture decision record, a postmortem, an approval. Send it as text with the label. Set `happened_at` to when the decision was made, and `user_name` to the agent or person who made it.
 
 ```json
 {
   "database": "acme",
   "collection": "platform",
-  "items": [{
+  "context": [{
     "context_id": "adr-012",
     "title": "ADR 012: ledger datastore",
     "text": "We chose Postgres over DynamoDB for the ledger because every write needs transactional reads across accounts, and the month-end batch touches every account at once.",
@@ -139,37 +153,38 @@ The record of an agent or a team reasoning to an outcome: an agent run, an archi
 
 ### How a decision appears in query results
 
-A decision trace becomes a node in the [context graph](/essentials/v2/context-graphs) of type `DECISION_TRACE`. The node is named by the decision, connected to the agent or team that made it, and carries the evidence behind it. The outcome rides on the relation. When a query reaches the decision, it comes back as a path in `graph.paths[]`:
+A decision trace becomes part of the [context graph](/essentials/v2/context-graphs), connected to the agent or team that made it and to what it decided. When a query reaches the decision, it comes back as a path in `graph[]`, and the decision's own chunk carries `enrichment.kind: "decision_trace"`:
 
 ```json
 {
-  "graph": {
-    "paths": [
-      {
-        "triplets": [
-          {
-            "source": { "name": "platform-team", "type": "AGENT" },
-            "relation": { "predicate": "decided", "context": "Postgres chosen for the ledger" },
-            "target": { "name": "Choose the ledger datastore", "type": "DECISION_TRACE" }
-          }
-        ],
-        "relevancy_score": 0.87,
-        "chunk_ids": ["adr-012_chunk_0"]
-      }
-    ]
-  }
+  "graph": [
+    {
+      "triplets": [
+        {
+          "source": { "entity_id": "ent_pt1", "name": "platform-team" },
+          "relation": {
+            "predicate": "decided",
+            "context": "Postgres chosen over DynamoDB for the ledger.",
+            "temporal_details": "2026-07-14",
+            "relationship_id": "rel_88",
+            "chunk_id": "ck_adr12"
+          },
+          "target": { "entity_id": "ent_ldg", "name": "ledger datastore" }
+        }
+      ],
+      "path_summary": "platform-team chose Postgres for the ledger datastore because writes need transactional reads across accounts."
+    }
+  ]
 }
 ```
-
-The fields stored for a decision are `activity` (what was decided), `outcome`, `evidence`, `decided_at` and `agent`.
 
 ---
 
 ## 5. `auto`
 
-Leave `context_category` out, or send `auto`, and HydraDB classifies the item itself. That is the right choice when you do not know ahead of time what an item holds, for example a mixed export or a long chat log.
+Leave `context_category` out, or send `auto`, and the item carries no label: it is stored and enriched as general context, and its chunks come back without `enrichment.kind`. HydraDB does not classify the item for you.
 
-Pin a category when you do know. A pinned category is never relabelled, and it tells enrichment exactly what to look for.
+Use it for context that is none of the three kinds, or when you genuinely do not know. Pin a category whenever you do: a pinned category is never relabelled, and it tells enrichment exactly what to look for.
 
 ---
 
@@ -189,7 +204,7 @@ One request can carry any mix of categories:
 {
   "database": "acme",
   "collection": "company",
-  "items": [
+  "context": [
     { "text": "We chose Postgres over DynamoDB for the ledger.", "context_category": "decision_trace" },
     { "text": "Refunds are processed within 5 business days.", "context_category": "business_knowledge" },
     { "text": "Weekly sync notes, 2026-09-08" }
@@ -197,7 +212,7 @@ One request can carry any mix of categories:
 }
 ```
 
-The last item has no category, so HydraDB decides.
+The last item has no category, so it is stored as general context.
 
 ### Preferences per person, knowledge shared
 

@@ -7,28 +7,21 @@ description: "Quick reference for context management endpoints, their lifecycle,
 
 | Task | Endpoint |
 | :-- | :-- |
-| Upload PDFs, DOCX, CSVs, and other documents HydraDB should parse | `/context/ingest` with `type=knowledge` and `documents` |
-| Upload Slack messages, Notion pages, Gmail threads, or webpages with pre-extracted text | `/context/ingest` with `type=knowledge` and `app_knowledge` |
-| Upload user preferences, conversation history, or inline notes | `/context/ingest` with `type=memory` and `memories` |
-| Poll indexing progress | `/context/status` |
-| Browse stored sources or memories | `/context/list` |
-| Inspect original source content | `/context/inspect` |
-| Delete sources or memories | `DELETE /context` |
-| Inspect graph relations | `/context/relations` |
+| Send text and conversations as context items | `POST /context/ingest` with `context[]` |
+| Poll indexing progress | `GET /context/status` |
+| Browse stored items | `POST /context/list` |
+| Inspect an item's title, attributes and original content | `GET /context/inspect` |
+| Delete items | `DELETE /context` |
+| Inspect graph relations | `GET /context/relations` |
+| Walk everything connected to one item | `GET /context/{id}/subgraph` |
+
+On a split database, `POST /context/ingest` also takes `documents` and `app_knowledge` under `type=knowledge`, and `memories` under `type=memory`. See [Split databases](#split-databases).
 
 ## Lifecycle
 
 ```mermaid
 flowchart LR
-    A([Choose content type]) --> B{Knowledge or memory?}
-
-    subgraph Ingestion [" "]
-      direction LR
-      SI([POST /context/ingest])
-    end
-
-    B -- Documents / app sources --> SI
-    B -- User memories --> SI
+    A([Text or conversation]) --> SI([POST /context/ingest])
 
     SI --> Q([queued])
     Q --> P([processing])
@@ -42,7 +35,6 @@ flowchart LR
 
     linkStyle default stroke:#64748b,stroke-width:2px,color:#f8fafc
     style A fill:#0f172a,stroke:#334155,stroke-width:2px,color:#f8fafc
-    style B fill:#1e293b,stroke:#334155,stroke-width:2px,color:#f8fafc
     style SI fill:#1e293b,stroke:#334155,stroke-width:2px,color:#f8fafc
     style Q fill:#1e293b,stroke:#334155,stroke-width:2px,color:#f8fafc
     style P fill:#1e293b,stroke:#334155,stroke-width:2px,color:#f8fafc
@@ -53,49 +45,59 @@ flowchart LR
     style E fill:#0f172a,stroke:#ef4444,stroke-width:2px,color:#f8fafc
 ```
 
-<Note>
-  **Why both** `type=knowledge `**and** `app_knowledge`**?** They have a theoretical differentiation.
+## Core concepts
 
-  - `type` picks the **bucket**: `knowledge` (shared documents) or `memory` (per-user context). It routes the ingest to the right store.
-  - Within `type=knowledge`, you pick the **payload shape**: `documents` (binary documents HydraDB will parse  -  PDFs, DOCX, CSV) or `app_knowledge` (a JSON array of already-extracted content from your app  -  Slack messages, Notion pages, web pages). You can send both in the same request.
-</Note>
+- **Items**: everything you ingest is a piece of context, a `text` or a `conversation`, with an optional `context_category` (`user_preference`, `business_knowledge`, `decision_trace`) that you set. One database holds all of them; collections partition them per user, team or project. See [Ingest context](/essentials/v2/ingest).
+- **IDs**: each item has a `context_id`, yours or generated. The ingest response reports it as `results[].source_id`. Use it for polling status, inspecting content, deleting, and inspecting relations.
+- **Attributes**: `attributes` are the declared, filterable fields from `database_metadata_schema`; `custom_attributes` are free-form and stored with the item. Filter queries with `attributes`. See [Attributes](/essentials/v2/attributes).
+- **Enrichment**: on by default (`enrich: true`). HydraDB extracts entities, relations and preferences from each item into the [context graph](/essentials/v2/context-graphs); the extracted text comes back on query as `enrichment`, separate from the item's own `content`.
+- **Declared relations**: any item can name the items it relates to with `forceful_relations`, so they surface together at query time in `relations[]`.
 
-## Core Ingestion Concepts
+## Declared relations and attributes
 
-- **Knowledge vs. Memories**: [Knowledge](/essentials/v2/knowledge) is shared, database-wide content (documents, app pages, Slack messages). [Memories](/essentials/v2/memories) are user-specific preferences and conversational traits scoped by `collection`. Both can be searched together via `type: "all"` on `POST /query`.
-- **IDs**: Unique identifiers returned by `/context/ingest`. You can assign custom IDs using `id` in metadata or `id` in `app_knowledge` items. Use them for polling status, inspecting content, and deleting context.
-- **Metadata Filtering**: You can scope queries using `metadata` (structured fields defined in your database schema) or `additional_metadata` (free-form per-document JSON). For detailed guidelines on structuring metadata, see the [Scoping using metadata](/essentials/v2/attributes) guide.
-- **Forceful Relations**: Relationships between sources can be declared at ingestion time to construct a robust knowledge graph. For more details on the graph layer, see the [Context Graphs](/essentials/v2/context-graphs) guide.
+Declared relations pre-wire item relationships at ingestion time so that related items surface together during retrieval, before the graph layer discovers connections on its own. Think of them as explicit "see also" links between your items.
 
-## Forceful relations and metadata
+Paired with declared attributes, you get deterministic control over how results are filtered and ranked.
 
-Forceful relations let you pre-wire document relationships at ingestion time so that relevant documents surface together during retrieval - even before the graph layer discovers connections organically. Think of them as explicit "see also" links between your documents.
-
-Paired with document-level metadata, you get deterministic control over how results are filtered and ranked.
-
-```python Python SDK
-result = client.context.ingest(
-    type="knowledge",
-    database="acme_corp",
-    documents=[("runbook.pdf", f, "application/pdf")],
-    document_metadata=json.dumps([{
-        "id": "runbook_deploy",
-        "metadata": {"department": "ops"},
-        "additional_metadata": {"owner": "platform-team"},
-        "relations": {"ids": ["monitoring_guide"]},
-    }]),
-)
+```json
+{
+  "database": "acme_corp",
+  "collection": "ops",
+  "context": [
+    {
+      "context_id": "runbook_deploy",
+      "title": "Deploy runbook",
+      "text": "1. Merge to main. 2. Wait for the image build. 3. Promote in ArgoCD.",
+      "attributes": { "department": "ops" },
+      "custom_attributes": { "owner": "platform-team" },
+      "forceful_relations": { "ids": ["monitoring_guide"] }
+    }
+  ]
+}
 ```
+
+## Split databases
+
+A database created with `type: "split"` keeps two corpora and the older ingest shapes:
+
+| Task | Endpoint |
+| :-- | :-- |
+| Upload PDFs, DOCX, CSVs, and other documents HydraDB should parse | `/context/ingest` with `type=knowledge` and `documents` |
+| Upload Slack messages, Notion pages, Gmail threads, or webpages with pre-extracted text | `/context/ingest` with `type=knowledge` and `app_knowledge` |
+| Upload user preferences, conversation history, or inline notes | `/context/ingest` with `type=memory` and `memories` |
+
+There, `type` picks the bucket (`knowledge` for shared documents, `memory` for per-user context) and routes the write to the right store; within `type=knowledge` you pick the payload shape (`documents` or `app_knowledge`, or both in one request). Both corpora can be searched together with `type: "all"` on `POST /query`. See [Knowledge](/essentials/v2/knowledge), [Memories](/essentials/v2/memories) and [Split databases and legacy fields](/essentials/v2/split-databases).
 
 ## Related sections
 
-- [Usage - Forceful Relations](/essentials/v2/knowledge) - linking sources at ingestion (see §7)
-- [Query](/api-reference/v2/endpoint/query-overview) - retrieve ingested content
+- [Ingest Context](/api-reference/v2/endpoint/ingest-context): the field reference
+- [Usage: Ingest context](/essentials/v2/ingest): every item field, conversations, enrichment, declared relations
+- [Query](/api-reference/v2/endpoint/query-overview): retrieve ingested content
 
 <Tip>
   Related Resources
 
-  - [Usage - Memories](/essentials/v2/memories) - memories vs knowledge, when to use which
+  - [Usage: Context categories](/essentials/v2/context-categories): preferences, knowledge and decisions
 
-  - [Usage - Metadata](/essentials/v2/attributes) - database-level vs document-level metadata
+  - [Usage: Attributes](/essentials/v2/attributes): declared versus free-form fields
 </Tip>

@@ -1,25 +1,220 @@
 ---
 title: "Ingest Context"
-description: "Ingestion endpoint for knowledge (documents, app sources) and user memories."
+description: "Send text and conversations to a database as context items. Split databases keep documents, app_knowledge and memories."
 openapi: "api-reference/v2/openapi.json POST /context/ingest"
 ---
 
 import { Field } from "/snippets/field.jsx";
+import LegacyLine from "/snippets/legacy-line.mdx";
 
-When context is of `type=knowledge`:
+`POST /context/ingest` takes a list of **context items**, each a `text` or a `conversation`, and queues them for chunking, embedding, enrichment and graph extraction. That is the only ingest shape a unified database accepts. The guide is [Ingest context](/essentials/v2/ingest); this page is the field reference.
 
-1. **Documents** - Use the `documents` field for binary uploads that HydraDB should parse: PDFs, Office and iWork files, spreadsheets, images and plain text. See [Supported file formats](#supported-file-formats) for the full list.
-2. **App Sources** - Use `app_knowledge` for pre-extracted JSON content (Slack threads, Notion pages, emails, tickets). Read more about [ingesting knowledge from your apps](/essentials/v2/app-sources).
-
-When context is of `type=memory`
-
-Use `memories` for per-user content, scoped with `collection`. Set `infer: true` to let HydraDB extract preferences from raw signals, or `infer: false` to store the text verbatim. Read more about [ingesting memories](/essentials/v2/memories).
+<LegacyLine />
 
 <Note>
 `database` and `collection` are the current field names (formerly `tenant_id` and `sub_tenant_id`). The old names remain accepted as deprecated aliases for full backward compatibility.
 </Note>
 
 <RequestExample>
+
+```python Python SDK
+import json
+
+# The SDK sends a multipart form; the item list goes in the `items` form field.
+result = client.context.ingest(
+    database="acme_corp",
+    collection="company",
+    upsert=True,
+    items=json.dumps([
+        {
+            "context_id": "refund-policy",
+            "title": "Refund policy",
+            "text": "Refunds are processed within 5 business days.",
+            "context_category": "business_knowledge",
+            "attributes": {"department": "support"},
+            "custom_attributes": {"owner": "sam@acme.com"},
+        },
+        {
+            "context_id": "chat-alex-001",
+            "conversation": [
+                {"role": "user", "content": "Keep answers short, I read on my phone.", "name": "alex"},
+                {"role": "assistant", "content": "Got it, short answers."},
+            ],
+            "context_category": "user_preference",
+            "happened_at": "2026-09-01",
+            "forceful_relations": {"ids": ["refund-policy"]},
+        },
+    ]),
+)
+
+print([r.source_id for r in result.data.results])
+```
+
+```typescript TypeScript SDK
+// The SDK sends a multipart form; the item list goes in the `items` form field.
+const result = await client.context.ingest({
+  database: "acme_corp",
+  collection: "company",
+  upsert: true,
+  items: JSON.stringify([
+    {
+      context_id: "refund-policy",
+      title: "Refund policy",
+      text: "Refunds are processed within 5 business days.",
+      context_category: "business_knowledge",
+      attributes: { department: "support" },
+      custom_attributes: { owner: "sam@acme.com" },
+    },
+    {
+      context_id: "chat-alex-001",
+      conversation: [
+        { role: "user", content: "Keep answers short, I read on my phone.", name: "alex" },
+        { role: "assistant", content: "Got it, short answers." },
+      ],
+      context_category: "user_preference",
+      happened_at: "2026-09-01",
+      forceful_relations: { ids: ["refund-policy"] },
+    },
+  ]),
+});
+
+console.log(result.data.results.map((r) => r.sourceId));
+```
+
+```bash cURL
+curl -X POST 'https://api.hydradb.com/context/ingest' \
+  -H "Authorization: Bearer <your_api_key>" \
+  -H "API-Version: 2" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "database": "acme_corp",
+    "collection": "company",
+    "enrich": true,
+    "upsert": true,
+    "context": [
+      {
+        "context_id": "refund-policy",
+        "title": "Refund policy",
+        "text": "Refunds are processed within 5 business days.",
+        "context_category": "business_knowledge",
+        "attributes": { "department": "support" },
+        "custom_attributes": { "owner": "sam@acme.com" }
+      },
+      {
+        "context_id": "chat-alex-001",
+        "conversation": [
+          { "role": "user", "content": "Keep answers short, I read on my phone.", "name": "alex" },
+          { "role": "assistant", "content": "Got it, short answers." }
+        ],
+        "context_category": "user_preference",
+        "happened_at": "2026-09-01",
+        "forceful_relations": { "ids": ["refund-policy"] }
+      }
+    ]
+  }'
+```
+
+</RequestExample>
+
+## Request body
+
+Send `application/json`. The SDKs send `multipart/form-data` instead: the same array goes in the `items` form field, with `database`, `collection`, `upsert`, `enrich`, `instructions` and `graph_payload` as form fields. Both entry points run the same validation.
+
+| Name | Description |
+| --- | --- |
+| <Field name="database" type="string" required /> | Target database. Formerly `tenant_id`; the `tenant_id` alias is still accepted (deprecated). |
+| <Field name="collection" type="string" /> | Collection inside the database. Formerly `sub_tenant_id`; the `sub_tenant_id` alias is still accepted (deprecated). (default=the default collection) |
+| <Field name="context" type="object[]" required /> | The items to ingest, at most 100. `items` and `contexts` are accepted as aliases; send `context`. In the multipart form the field is `items`, a JSON-encoded array. |
+| <Field name="enrich" type="boolean" /> | Request-level default for every item's `enrich`. (default=`true`) |
+| <Field name="upsert" type="boolean" /> | Request-level default for every item's `upsert`. (default=`true`) |
+| <Field name="instructions" type="string" /> | Request-level default for every item's `instructions`. (default=empty) |
+| <Field name="graph_payload" type="object" /> | Bring your own graph: a map of `context_id` to `{ entities, relations }` that replaces extraction for that item. Every key must match an item's `context_id` in the same request, otherwise `400`. See [Bring Your Own Graph](/essentials/v2/bring-your-own-graph). |
+
+### Item fields
+
+Each item is exactly one of `text` or `conversation`.
+
+| Name | Description |
+| --- | --- |
+| <Field name="context_id" type="string" /> | Your id for the item; the upsert key. Generated from `title` when omitted. Must not contain a comma (`,`), which is the id separator on `/context/status?ids=`. |
+| <Field name="title" type="string" /> | Readable name. Searchable with `titles` on `/query`. |
+| <Field name="text" type="string" /> | Plain text. Send exactly one of `text` or `conversation`. `content` is accepted as an alias. |
+| <Field name="conversation" type="object[]" /> | Turns of `{ role, content, name? }`; roles are `user`, `assistant` and `system`. `system` turns shape enrichment but are never stored as facts. `messages` is accepted as an alias. |
+| <Field name="enrich" type="boolean" /> | Extract entities, relations and preferences from this item into the graph; the output is stored separately and returned as `enrichment` on query. (default=the request's `enrich`, else `true`) |
+| <Field name="upsert" type="boolean" /> | Replace an existing item with the same `context_id`, deleting its chunks and graph contribution first. (default=the request's `upsert`, else `true`) |
+| <Field name="instructions" type="string" /> | Steer enrichment for this item. `custom_instructions` is accepted as an alias. (default=the request's `instructions`) |
+| <Field name="happened_at" type="string" /> | The date the item is about, `YYYY-MM-DD` only. A timestamp is a `400`. HydraDB records when it received the item separately. |
+| <Field name="attributes" type="object" /> | Declared, filterable fields; keys must be in `database_metadata_schema`. Filter with `attributes` on `/query`. |
+| <Field name="custom_attributes" type="object" /> | Free-form fields. Stored with the item; not filterable and not returned on query chunks. |
+| <Field name="context_category" type='"auto", "user_preference", "business_knowledge" or "decision_trace"' /> | What kind of context this is. You set it; nothing infers it, and a misspelling is a `400`. Returned as `enrichment.kind` (omitted for `auto`). (default=`"auto"`) |
+| <Field name="forceful_relations" type="object" /> | Relations you declare to other items: `{ "ids": ["<context_id>", ...], "properties": {} }`. Followed on `/query` with `follow_forceful_relations` and returned in `relations[]`. `relations` is accepted as an alias for the field; `context_ids` or `source_ids` for the `ids` key. |
+| <Field name="acl" type="string[]" /> | Principals allowed to retrieve the item: bare emails or `user_email:`, `group:`, `domain:` principals, or `__public__`. Omit for unrestricted; `[]` for nobody. A malformed principal rejects the whole request with `400`. |
+| <Field name="is_markdown" type="boolean" /> | Chunk `text` on its markdown structure instead of as flat prose. (default=`false`) |
+| <Field name="user_name" type="string" /> | The speaker for a text item. On a conversation each turn's `name` wins. (default=`"User"`) |
+
+### Limits
+
+- At most **100 items** per request, **1 MiB** of text per item, **8 MiB** of text per request.
+- A validation error names the item as `context[N]`.
+
+### Refused on a unified database
+
+`type`, `documents` (file uploads), `app_knowledge`, `memories`, `evidence_kind`, `evidence_subject`, `expiry_time` and `retain_source` return `400 CORPUS_TYPE_UNSUPPORTED`. Extract text from files and send it as an item; structured app sources arrive through [connectors](/essentials/v2/connectors). Any other key an item does not recognise is dropped without an error.
+
+## Response
+
+`202 Accepted`, with one result per item:
+
+```json
+{
+  "success": true,
+  "data": {
+    "success": true,
+    "message": "Success",
+    "results": [
+      { "source_id": "refund-policy", "title": "Refund policy", "status": "queued", "infer": true, "error": null, "error_code": null },
+      { "source_id": "chat-alex-001", "title": null, "status": "queued", "infer": true, "error": null, "error_code": null }
+    ],
+    "success_count": 2,
+    "failed_count": 0
+  },
+  "error": null,
+  "meta": { "request_id": "bcd03673-174d-4a73-83e6-73bfcdc16061", "api_version": "2.0.1" }
+}
+```
+
+| Field | Description |
+| --- | --- |
+| `results[].source_id` | The item's `context_id`, sent or generated. The result item keeps the name `source_id`; read it as the context id and pass it to [`GET /context/status`](/api-reference/v2/endpoint/source-status). |
+| `results[].title` | The item's `title`, or `null`. |
+| `results[].status` | `queued` or `failed`. A failed item does not stop the others. |
+| `results[].infer` | Mirrors the item's `enrich`. |
+| `results[].error`, `results[].error_code` | Why the item failed; `null` on success. |
+| `success_count`, `failed_count` | Totals across `results`. |
+
+<Note>
+**`202 Accepted` means queued, not indexed.** Ingestion is asynchronous. Poll [`GET /context/status`](/api-reference/v2/endpoint/source-status) with the returned ids until each item reaches `completed` or `errored` (`graph_creation` is already searchable), or register a webhook for `indexing.status_changed` events (see [Webhooks](/essentials/v2/webhooks)).
+</Note>
+
+<div className="api-before-related-resources" />
+
+<Tip>
+  **Related Resources**
+
+  - **Always check** [ingestion status](/api-reference/v2/endpoint/source-status) to ensure context is ready to be retrieved
+  - [Query](/api-reference/v2/endpoint/query) once context is ready
+  - **Inspect:** [List Documents](/api-reference/v2/endpoint/list-documents) helps you fetch titles and descriptions of ingested context
+  - **Inspect:** [Fetch Content](/api-reference/v2/endpoint/fetch-content) returns the title, attributes and content behind a `context_id`
+  - **Cleanup:** [Delete Context](/api-reference/v2/endpoint/delete-source)
+</Tip>
+
+## Split databases
+
+Everything below applies only to a database created with `type: "split"`. There, `type` picks the corpus and the payload is one of the older shapes: `documents` (files HydraDB parses) or `app_knowledge` (pre-extracted app sources) under `type=knowledge`, or `memories` under `type=memory`. Set `infer: true` on a memory to extract preferences from raw signals, or `infer: false` to store the text verbatim. Read more in [Knowledge](/essentials/v2/knowledge), [App sources](/essentials/v2/app-sources) and [Memories](/essentials/v2/memories); the mapping from each split field to its item field is on [Split databases and legacy fields](/essentials/v2/split-databases#3-split-ingest-fields).
+
+### Split request examples
+
+<CodeGroup>
 
 ```python Python SDK
 import json
@@ -216,9 +411,9 @@ curl -X POST 'https://api.hydradb.com/context/ingest' \
   ]'
 ```
 
-</RequestExample>
+</CodeGroup>
 
-## Upload in-memory text as a `.txt` file
+### Upload in-memory text as a `.txt` file
 
 If you already have text in memory, create a file-like object and upload it through `documents` as a `text/plain` `.txt` file.
 
@@ -307,7 +502,7 @@ response.raise_for_status()
 ```
 </CodeGroup>
 
-## Important form fields
+### Important form fields
 
 | Name | Description |
 | --- | --- |
@@ -328,7 +523,7 @@ response.raise_for_status()
 </Note>
 
 
-## Supported file formats
+### Supported file formats
 
 Anything in this table can be uploaded through `documents` and HydraDB will read it.
 
@@ -352,7 +547,7 @@ What HydraDB extracts differs by type, and it is worth knowing which one you are
 
 A scanned page with nothing readable on it, or a photo that happens to contain no text, will index as an empty document rather than fail.
 
-### Formats we cannot read
+#### Formats we cannot read
 
 These are rejected the moment you upload them, before anything is queued. You get the answer in the upload response rather than minutes later.
 
@@ -369,7 +564,7 @@ These are rejected the moment you upload them, before anything is queued. You ge
 `.heic` is the format iPhones use for photos by default, so it is the one people hit most often without realizing. On iOS you can change this under **Settings > Camera > Formats > Most Compatible**, which makes the camera save JPEGs instead. Or export the photo as JPEG or PDF before uploading.
 </Note>
 
-### How we decide the format
+#### How we decide the format
 
 The file extension is what counts. `report.pdf` is treated as a PDF because of the `.pdf`, not because of what is inside it.
 
@@ -379,11 +574,11 @@ If the filename has no extension at all, the `Content-Type` you send with that p
 Renaming a file does not convert it. A `.heic` photo renamed to `photo.pdf` passes this check, because the check reads the name, then fails later during parsing and comes back as `errored` on [`GET /context/status`](/api-reference/v2/endpoint/source-status). Upload files under their real extension.
 </Note>
 
-### Size limit
+#### Size limit
 
 Each file in `documents` can be up to **50 MB**. A larger file is rejected with `413` and a message naming the file, and no part of the request is processed. Split large documents, or upload them separately.
 
-## When a file is not supported
+### When a file is not supported
 
 A rejected file does not stop the rest of your upload. Each file is checked on its own, so a batch of ten with one bad file still indexes the other nine.
 
@@ -417,9 +612,9 @@ The request returns `202` as usual. The rejected file comes back with `status: "
 </Note>
 
 
-## Common use-cases and their configurations
+### Common use-cases and their configurations
 
-### Document metadata
+#### Document metadata
 
 Per-document metadata (`id`, `metadata`, `additional_metadata`, `relations`) can be passed alongside each uploaded document to control indexing, filtering, and display. The key list is closed  -  an item carrying any other key is rejected with a `400` naming it, rather than being silently dropped. See the field reference below.
 
@@ -794,22 +989,10 @@ Per-document metadata (`id`, `metadata`, `additional_metadata`, `relations`) can
   </Note>
 </Accordion>
 
-## Some important notes
+### Some important notes
 
 - **Async indexing.** `202 Accepted` means HydraDB queued the work, not that content is searchable. Poll [Ingestion Status](/api-reference/v2/endpoint/source-status) until `indexing_status` reaches `graph_creation` (searchable) or `completed` (graph-ready).
 - **Multipart, not JSON.** This endpoint uses `multipart/form-data`. Stringify all JSON arrays (`metadata`, `app_knowledge`, `memories`) before placing them in the form field.
 - **Declare hot schema fields upfront.** Put frequently filtered fields in `metadata`, define them in `database_metadata_schema` with `enable_match: true`, and use `additional_metadata` for free-form display/bookkeeping fields. Define filterable fields when creating the database via [Create Database](/api-reference/v2/endpoint/create-tenant). Additive schema updates exist, but data already ingested is not re-indexed for newly added dense/sparse metadata fields.
 - **Memory vs knowledge.** Use `type: "memory"` for memory ingestion, listing, and deletion. Use `type: "all"` on `POST /query` when results should combine both. The multipart field name for memories is always `memories`.
 - **Collection defaulting.** Omitting `collection` writes to the default collection. List available collections with [List Collections](/api-reference/v2/endpoint/list-sub-tenants).
-
-<div className="api-before-related-resources" />
-
-<Tip>
-  **Related Resources**
-
-  - **Always check** [ingestion status](/api-reference/v2/endpoint/source-status) to ensure context is ready to be retrieved
-  - [Query](/api-reference/v2/endpoint/query) once context is ready
-  - **Inspect:** [List Documents](/api-reference/v2/endpoint/list-documents) helps you fetch titles and descriptions of ingested context
-  - **Inspect:** [Fetch Content](/api-reference/v2/endpoint/fetch-content) helps you fetch full context of a document, memory, knowledge item
-  - **Cleanup:** [Delete Context](/api-reference/v2/endpoint/delete-source)
-</Tip>

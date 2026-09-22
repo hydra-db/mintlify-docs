@@ -1,319 +1,42 @@
 ---
 title: "How to Use API Results"
-description: "Turn a query response into an LLM prompt."
+description: "Inject llm_prompt into your model call, read the four response keys when you need structure, and map citations back to context."
 ---
 
-`POST /query` returns structured JSON. Before you can pass it to an LLM, you need to convert the retrieval payload into a plain string. This page shows how.
+import LegacyLine from "/snippets/legacy-line.mdx";
 
-The same pattern works regardless of whether you set `type: "knowledge"`, `type: "memory"`, or `type: "all"` - the response shape is identical.
+[`POST /query`](/essentials/v2/query) on a unified database returns four keys: `chunks`, `graph`, `relations` and `llm_prompt`. The last one is the whole context block, already formatted for a model. This page shows how to use it, and what to read when you need structure instead of a string.
 
----
-
-## 1. What the response looks like
-
-The SDKs return the full response envelope from `POST /query`; the retrieval payload is on its `data` field (e.g. `result.data`). Raw HTTP responses use the same envelope, with the payload under `data`. The `build_string` / `buildString` helper accepts either the full envelope or just the `data` payload, so you can pass the SDK return value to it directly.
-
-The retrieval payload has the same core shape regardless of `type` or `query_by`:
-
-```json
-{
-  "chunks": [
-    {
-      "chunk_uuid": "doc-001_chunk_0",
-      "source_title": "my_document.pdf",
-      "chunk_content": "Text content of the retrieved chunk...",
-      "relevancy_score": 1.09,
-      "extra_context_ids": ["ctx-id-1"],
-      "additional_metadata": {
-        "author": "Support Team"
-      }
-    }
-  ],
-  "graph_context": {
-    "query_paths": [
-      {
-        "triplets": [
-          {
-            "source": { "name": "EntityA" },
-            "target": { "name": "EntityB" },
-            "relation": {
-              "canonical_predicate": "DEPENDS_ON",
-              "context": "reason text",
-              "temporal_details": "2024-01"
-            }
-          }
-        ]
-      }
-    ],
-    "chunk_id_to_group_ids": {
-      "doc-001_chunk_0": ["group-1"]
-    },
-    "chunk_relations": [
-      {
-        "group_id": "group-1",
-        "triplets": [
-          {
-            "source": { "name": "EntityA" },
-            "target": { "name": "EntityB" },
-            "relation": {
-              "canonical_predicate": "DEPENDS_ON",
-              "context": "reason text"
-            }
-          }
-        ]
-      }
-    ]
-  },
-  "additional_context": {
-    "ctx-id-1": {
-      "source_title": "related_doc.pdf",
-      "chunk_content": "Extra related content..."
-    }
-  }
-}
-```
-
-Four things matter for prompt construction:
-
-- **`chunks`** - the primary retrieval output. Ranked by relevance; preserve the order HydraDB returns.
-- **`graph_context.query_paths`** - entity traversal paths derived from your query. Useful for relational reasoning. See [Context Graphs](/essentials/v2/context-graphs).
-- **`graph_context.chunk_relations`** + **`chunk_id_to_group_ids`** - per-chunk graph relations grouped by `group_id`, so you can attach the right triplets to each chunk.
-- **`additional_context`** - a map keyed by `chunk_uuid`. When a chunk includes `extra_context_ids`, use those IDs to look up related chunks here.
-
-The raw object has too much noise for an LLM - IDs, timestamps, metadata. Section 2 shows how to convert it into a clean string.
+<LegacyLine />
 
 ---
 
-## 2. Transforming the response into LLM context
+## 1. Inject `llm_prompt`
 
-Use `build_string` / `buildString` from the SDK. It takes any `POST /query` result and returns a formatted plain string.
+The server builds `llm_prompt` from the chunks, the related context and the graph paths, with a citation label on every entry. Pass it to your model as is:
 
 <CodeGroup>
 ```python Python SDK
 from hydra_db import HydraDB
-from hydra_db.helpers import build_string
-
-client = HydraDB(token="YOUR_API_KEY")
-
-result = client.query(
-    database="your-database",
-    collection="your-collection",
-    query="How does authentication work?",
-    type="knowledge",
-    query_by="hybrid",
-    max_results=5,
-    mode="fast",
-    graph_context=True,
-)
-
-context = build_string(result)
-```
-```typescript TypeScript SDK
-import { HydraDBClient } from "@hydradb/sdk";
-import { buildString } from "@hydradb/sdk/helpers";
-
-const client = new HydraDBClient({ token: process.env.HYDRA_DB_API_KEY });
-
-const result = await client.query({
-  database: "your-database",
-  collection: "your-collection",
-  query: "How does authentication work?",
-  type: "knowledge",
-  queryBy: "hybrid",
-  maxResults: 5,
-  mode: "fast",
-  graphContext: true,
-});
-
-const context = buildString(result);
-```
-```python Python SDK (Async)
-import asyncio
-
-from hydra_db import AsyncHydraDB
-from hydra_db.helpers import build_string
-
-client = AsyncHydraDB(token="YOUR_API_KEY")
-
-
-async def main():
-    result = await client.query(
-        database="your-database",
-        collection="your-collection",
-        query="How does authentication work?",
-        type="knowledge",
-        query_by="hybrid",
-        max_results=5,
-        mode="fast",
-        graph_context=True,
-    )
-
-    context = build_string(result)
-    return context
-
-
-asyncio.run(main())
-```
-</CodeGroup>
-
----
-
-## 3. Feeding the context into your LLM
-
-<CodeGroup>
-```python Python SDK
-from hydra_db import HydraDB
-from hydra_db.helpers import build_string
 from openai import OpenAI
 
 hydra = HydraDB(token="YOUR_HYDRA_DB_API_KEY")
 openai_client = OpenAI(api_key="YOUR_OPENAI_API_KEY")
 
-question = "How does authentication work?"
+question = "How should I explain our refund policy to Alex?"
 
 result = hydra.query(
-    database="your-database",
+    database="acme",
+    collections={"user_alex": 2, "company": 1},
     query=question,
-    type="knowledge",
-    query_by="hybrid",
-    mode="fast",
-    graph_context=True,
-)
-
-context = build_string(result)
-
-completion = openai_client.chat.completions.create(
-    model="gpt-4o",
-    messages=[
-        {
-            "role": "system",
-            "content": "You are a helpful assistant. Answer the user's question using only the context provided. If the answer is not in the context, say you don't know.",
-        },
-        {
-            "role": "user",
-            "content": f"Context:\n{context}\n\nQuestion: {question}",
-        },
-    ],
-)
-
-print(completion.choices[0].message.content)
-```
-```typescript TypeScript SDK
-import { HydraDBClient } from "@hydradb/sdk";
-import { buildString } from "@hydradb/sdk/helpers";
-import OpenAI from "openai";
-
-const hydra = new HydraDBClient({ token: process.env.HYDRA_DB_API_KEY });
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
-const question = "How does authentication work?";
-
-const result = await hydra.query({
-  database: "your-database",
-  query: question,
-  type: "knowledge",
-  queryBy: "hybrid",
-  mode: "fast",
-  graphContext: true,
-});
-
-const context = buildString(result);
-
-const completion = await openai.chat.completions.create({
-  model: "gpt-4o",
-  messages: [
-    {
-      role: "system",
-      content: "You are a helpful assistant. Answer the user's question using only the context provided. If the answer is not in the context, say you don't know.",
-    },
-    {
-      role: "user",
-      content: `Context:\n${context}\n\nQuestion: ${question}`,
-    },
-  ],
-});
-
-console.log(completion.choices[0].message.content);
-```
-```python Python SDK (Async)
-import asyncio
-
-from hydra_db import AsyncHydraDB
-from hydra_db.helpers import build_string
-from openai import AsyncOpenAI
-
-hydra = AsyncHydraDB(token="YOUR_HYDRA_DB_API_KEY")
-openai_client = AsyncOpenAI(api_key="YOUR_OPENAI_API_KEY")
-
-question = "How does authentication work?"
-
-
-async def main():
-    result = await hydra.query(
-        database="your-database",
-        query=question,
-        type="knowledge",
-        query_by="hybrid",
-        mode="fast",
-        graph_context=True,
-    )
-
-    context = build_string(result)
-
-    completion = await openai_client.chat.completions.create(
-        model="gpt-4o",
-        messages=[
-            {
-                "role": "system",
-                "content": "You are a helpful assistant. Answer the user's question using only the context provided. If the answer is not in the context, say you don't know.",
-            },
-            {
-                "role": "user",
-                "content": f"Context:\n{context}\n\nQuestion: {question}",
-            },
-        ],
-    )
-
-    print(completion.choices[0].message.content)
-
-
-asyncio.run(main())
-```
-</CodeGroup>
-
----
-
-## 4. Combining Knowledge and Memories
-
-The simplest path is one `POST /query` with `type: "all"` - HydraDB queries both stores in parallel and returns one merged, ranked result set.
-
-<CodeGroup>
-```python Python SDK
-from hydra_db import HydraDB
-from hydra_db.helpers import build_string
-from openai import OpenAI
-
-hydra = HydraDB(token="YOUR_HYDRA_DB_API_KEY")
-openai_client = OpenAI(api_key="YOUR_OPENAI_API_KEY")
-
-question = "What is our refund policy?"
-
-result = hydra.query(
-    database="acme_corp",
-    collection="user_123",
-    query=question,
-    type="all",
-    query_by="hybrid",
     mode="thinking",
 )
 
-context = build_string(result)
-
 completion = openai_client.chat.completions.create(
     model="gpt-4o",
     messages=[
-        {"role": "system", "content": "Answer using only the context provided."},
-        {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {question}"},
+        {"role": "system", "content": "Answer using only the context below. Cite the bracketed labels you rely on. If the answer is not in the context, say so.\n\n" + result.data.llm_prompt},
+        {"role": "user", "content": question},
     ],
 )
 
@@ -321,392 +44,200 @@ print(completion.choices[0].message.content)
 ```
 ```typescript TypeScript SDK
 import { HydraDBClient } from "@hydradb/sdk";
-import { buildString } from "@hydradb/sdk/helpers";
 import OpenAI from "openai";
 
 const hydra = new HydraDBClient({ token: process.env.HYDRA_DB_API_KEY });
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-const question = "What is our refund policy?";
+const question = "How should I explain our refund policy to Alex?";
 
 const result = await hydra.query({
-  database: "acme_corp",
-  collection: "user_123",
+  database: "acme",
+  collections: { user_alex: 2, company: 1 },
   query: question,
-  type: "all",
-  queryBy: "hybrid",
   mode: "thinking",
 });
-
-const context = buildString(result);
 
 const completion = await openai.chat.completions.create({
   model: "gpt-4o",
   messages: [
-    { role: "system", content: "Answer using only the context provided." },
-    { role: "user", content: `Context:\n${context}\n\nQuestion: ${question}` },
+    { role: "system", content: "Answer using only the context below. Cite the bracketed labels you rely on. If the answer is not in the context, say so.\n\n" + result.data.llmPrompt },
+    { role: "user", content: question },
   ],
 });
 
 console.log(completion.choices[0].message.content);
 ```
-```python Python SDK (Async)
-import asyncio
-
-from hydra_db import AsyncHydraDB
-from hydra_db.helpers import build_string
-from openai import AsyncOpenAI
-
-hydra = AsyncHydraDB(token="YOUR_HYDRA_DB_API_KEY")
-openai_client = AsyncOpenAI(api_key="YOUR_OPENAI_API_KEY")
-
-question = "What is our refund policy?"
-
-
-async def main():
-    result = await hydra.query(
-        database="acme_corp",
-        collection="user_123",
-        query=question,
-        type="all",
-        query_by="hybrid",
-        mode="thinking",
-    )
-
-    context = build_string(result)
-
-    completion = await openai_client.chat.completions.create(
-        model="gpt-4o",
-        messages=[
-            {"role": "system", "content": "Answer using only the context provided."},
-            {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {question}"},
-        ],
-    )
-
-    print(completion.choices[0].message.content)
-
-
-asyncio.run(main())
+```bash cURL
+curl -s -X POST 'https://api.hydradb.com/query' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "database": "acme",
+    "collections": { "user_alex": 2, "company": 1 },
+    "query": "How should I explain our refund policy to Alex?",
+    "mode": "thinking"
+  }' | jq -r '.data.llm_prompt'
 ```
 </CodeGroup>
 
-If you need to format knowledge and memories in separate labeled sections, call `POST /query` twice in parallel:
+There is no client-side string building on a unified database. Do not concatenate `chunks[].content` yourself; the prompt already contains it, in ranked order, with labels the model can cite.
+
+---
+
+## 2. What is in the prompt
+
+```text
+=== CONTEXT ===
+Cite anything you use from this context with its bracketed label, e.g. [1].
+
+[1] context_id: chat-alex-001
+user: Keep answers short, I read on my phone.
+assistant: Got it, short answers.
+
+[2] context_id: refund-policy
+Refunds are processed within 5 business days.
+
+=== RELATED CONTEXT ===
+[R1] context_id: refund-policy-enterprise
+Enterprise customers can request an expedited refund.
+
+=== GRAPH ===
+[P1] Alex prefers short answers.
+    Alex -> prefers -> short answers [1]
+```
+
+| Section | Built from | Labels |
+| --- | --- | --- |
+| `=== CONTEXT ===` | `chunks[]`, in ranked order | `[1]`, `[2]`, ... Each entry names its `context_id`. |
+| `=== RELATED CONTEXT ===` | `relations[]`, the items the hits declared with `forceful_relations` at ingest | `[R1]`, `[R2]`, ... |
+| `=== GRAPH ===` | `graph[]`, one line per path with its `path_summary`, then each step | `[P1]`, `[P2]`, ... A step cites the chunk label it is evidence for. |
+
+A section is omitted when its array is empty. Ask the model to cite the labels and you get answers you can trace: a `[2]` in the reply is `context_id: refund-policy`, which you can open with [`GET /context/inspect`](/api-reference/v2/endpoint/fetch-content).
+
+---
+
+## 3. When you need structure
+
+Render a UI, rerank, or apply your own rules from the three structured keys. The full field reference is on [Query](/essentials/v2/query#3-response).
+
+| Read | For |
+| --- | --- |
+| `chunks[].content` | The matched text, verbatim. |
+| `chunks[].enrichment.text` | What enrichment extracted from that chunk (a preference, a fact), with `enrichment.kind` as the item's `context_category`. |
+| `chunks[].score` | Relevance, for your own thresholds. |
+| `graph[].path_summary` | One sentence per graph path; `graph[].triplets` for the steps. |
+| `relations[]` | Declared related chunks, each with the `via` link that brought it in. |
 
 <CodeGroup>
 ```python Python SDK
-import asyncio
-from hydra_db import AsyncHydraDB
-from hydra_db.helpers import build_string
+for chunk in result.data.chunks:
+    print(chunk.score, chunk.context_id, chunk.content)
+    if chunk.enrichment:
+        print("  enrichment:", chunk.enrichment.text)
 
-hydra = AsyncHydraDB(token="YOUR_HYDRA_DB_API_KEY")
+for path in result.data.graph:
+    print("path:", path.path_summary)
 
-async def main():
-    knowledge_result, memory_result = await asyncio.gather(
-        hydra.query(
-            database="acme_corp",
-            query="refund policy",
-            type="knowledge",
-            query_by="hybrid",
-            mode="thinking",
-        ),
-        hydra.query(
-            database="acme_corp",
-            collection="user_123",
-            query="answer style preferences",
-            type="memory",
-            query_by="hybrid",
-        ),
-    )
-
-    prompt = (
-        f"User preferences:\n{build_string(memory_result)}\n\n"
-        f"Relevant docs:\n{build_string(knowledge_result)}\n\n"
-        f"Question: {question}"
-    )
-    return prompt
-
-
-asyncio.run(main())
+for rel in result.data.relations:
+    print("related:", rel.via.to, ":", rel.chunk.content)
 ```
 ```typescript TypeScript SDK
-import { HydraDBClient } from "@hydradb/sdk";
-import { buildString } from "@hydradb/sdk/helpers";
+for (const chunk of result.data.chunks) {
+  console.log(chunk.score, chunk.contextId, chunk.content);
+  if (chunk.enrichment) console.log("  enrichment:", chunk.enrichment.text);
+}
 
-const hydra = new HydraDBClient({ token: process.env.HYDRA_DB_API_KEY });
+for (const path of result.data.graph) console.log("path:", path.pathSummary);
 
-const [knowledgeResult, memoryResult] = await Promise.all([
-  hydra.query({
-    database: "acme_corp",
-    query: "refund policy",
-    type: "knowledge",
-    queryBy: "hybrid",
-    mode: "thinking",
-  }),
-  hydra.query({
-    database: "acme_corp",
-    collection: "user_123",
-    query: "answer style preferences",
-    type: "memory",
-    queryBy: "hybrid",
-  }),
-]);
-
-const prompt =
-  `User preferences:\n${buildString(memoryResult)}\n\n` +
-  `Relevant docs:\n${buildString(knowledgeResult)}\n\n` +
-  `Question: ${question}`;
+for (const rel of result.data.relations) {
+  console.log("related via", rel.via.from, "->", rel.via.to, ":", rel.chunk.content);
+}
 ```
 </CodeGroup>
 
-If memory query fails or times out, fall back to the knowledge-only prompt.
+---
+
+## 4. Showing source details
+
+A chunk carries only `chunk_id`, `context_id`, `score`, `content`, `enrichment` and `temporal`. It has no title, url, collection, timestamps or attributes. To show any of that, call [`GET /context/inspect`](/api-reference/v2/endpoint/fetch-content) with the chunk's `context_id`:
+
+```bash
+curl -G 'https://api.hydradb.com/context/inspect' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  --data-urlencode "database=acme" \
+  --data-urlencode "id=refund-policy"
+```
+
+Fetch it lazily, when a citation is opened, rather than for every chunk on every query.
 
 ---
 
 ## 5. Practical guidance
 
-- **Preserve server order.** Don't re-sort chunks client-side.
-- **Start small on chunks.** `max_results: 10` is a reasonable default. Drop to 5 if you hit token limits, raise to 20 if you rerank downstream.
-- **Use graph context selectively.** It improves relational queries and bloats simple lookups. See [Context Graphs](/essentials/v2/context-graphs).
-- **Always give the model a grounding instruction.** A system prompt like "answer only from the provided context" prevents the model from inventing answers when retrieval is thin.
-- **Format consistently.** Whatever section delimiters you choose (`=== CONTEXT ===`, `Chunk N`, `Source:`), keep them stable across calls so the model learns the structure.
-- **`type: "all"` is the simplest path when you need both knowledge and memories.** One call, one result set, one `build_string` call.
+- **Use `llm_prompt` for the model, the arrays for your code.** Both describe the same result.
+- **Give the model a grounding instruction.** "Answer only from the provided context" prevents invented answers when retrieval is thin. Ask it to cite labels.
+- **Preserve server order.** `chunks[]` is ranked; do not re-sort it client-side.
+- **Start small on chunks.** `max_results: 10` is a reasonable default. Drop to `5` if you hit token limits, raise to `20` if you rerank downstream.
+- **Keep graph context on for relational questions.** It adds size to `llm_prompt`; set `graph_context: false` for simple lookups.
 
 ---
 
 ## 6. Common mistakes
 
 | Mistake | What goes wrong | Fix |
-|---|---|---|
-| Passing the raw result object to the LLM | Wastes tokens on IDs and metadata | Use `build_string` / `buildString`. |
-| Not including `collection` (formerly `sub_tenant_id`) when querying memories | Queries the default collection instead of the user's | Always pass the same `collection` used at ingestion. |
-| Including too many chunks | Token overflow or answer quality drops | Start at `max_results: 10`; reduce if needed. |
-| Re-sorting chunks client-side | Overrides HydraDB's ranking | Preserve the server-returned order. |
+| --- | --- | --- |
+| Building your own context string | Duplicates what the server already did, without the labels | Inject `llm_prompt`. |
+| Passing the raw `data` object to the model | Wastes tokens on ids and scores | Inject `llm_prompt`. |
+| Expecting a title or url on a chunk | Chunks carry no source details | Call `GET /context/inspect` with `context_id`. |
+| Concatenating `content` and `enrichment.text` | Enrichment is stored separately on purpose | Use `content` for what was said, `enrichment.text` for what was extracted. |
+| Re-sorting chunks client-side | Overrides HydraDB's ranking | Preserve the returned order. |
 | Missing a grounding instruction | The model invents answers when retrieval is thin | System prompt: answer only from the provided context. |
-| Setting `graph_context: false` and expecting graph fields | Graph context will be omitted | `graph_context` is on by default; only set it to `false` when you explicitly don't want graph data. |
-| Using `query_forceful_relations` with `mode: "fast"` | Flag is silently ignored | `query_forceful_relations` only takes effect when `mode: "thinking"`. |
-| Looking up `chunk_relations` without `chunk_id_to_group_ids` | The right relations don't attach to the right chunk | Use `chunk_id_to_group_ids[chunk_uuid]` to find the `group_id`s, then filter `chunk_relations` by them. |
+| Reading `graph_context` or `chunk_content` | Those are split-database fields | On a unified database read `graph[]` and `chunks[].content`. |
+
+---
+
+## 7. Split databases
+
+A database created with `type: "split"` returns the old response (`chunks[].chunk_content`, `sources[]`, `graph_context`, `additional_context`) and has no `llm_prompt`. There, build the context string with the SDK's `build_string` / `buildString` helper, which accepts the full envelope or just `data`:
+
+<CodeGroup>
+```python Python SDK
+from hydra_db.helpers import build_string
+
+result = client.query(
+    database="legacy-app",
+    collection="user_123",
+    query="What is our refund policy?",
+    type="all",
+    mode="thinking",
+)
+
+context = build_string(result)
+```
+```typescript TypeScript SDK
+import { buildString } from "@hydradb/sdk/helpers";
+
+const result = await client.query({
+  database: "legacy-app",
+  collection: "user_123",
+  query: "What is our refund policy?",
+  type: "all",
+  mode: "thinking",
+});
+
+const context = buildString(result);
+```
+</CodeGroup>
+
+Detect which shape you are holding by its keys: `llm_prompt` and a `graph` array mean unified; `graph_context` or `chunk_content` mean split. See [Split databases and legacy fields](/essentials/v2/split-databases#4-legacy-query-and-response-fields) for the field-by-field mapping.
 
 ---
 
 ## Related
 
-- [Query](/essentials/v2/query) - request parameters and response shape
-- [Memories](/essentials/v2/memories) - what `POST /query` with `type: "memory"` queries
-- [Knowledge](/essentials/v2/knowledge) - what `POST /query` with `type: "knowledge"` queries
-- [Context Graphs](/essentials/v2/context-graphs) - what `graph_context` fields contain
-
----
-
-<Accordion title="Full flow without SDK">
-
-If you are not using the SDK, use the helper below to call `POST /query`, format the response, and pass the result to your LLM.
-
-<CodeGroup>
-```python Python
-from __future__ import annotations
-from typing import Any
-
-import httpx
-
-
-def _format_path_chain(path: Any) -> str:
-    triplets = path.get("triplets") or []
-    parts = []
-    for t in triplets:
-        src  = t.get("source", {}).get("name", "")
-        tgt  = t.get("target", {}).get("name", "")
-        rel  = t.get("relation", {})
-        pred = rel.get("canonical_predicate", "")
-        line = f"[{src}] -> {pred} -> [{tgt}]"
-        ctx  = rel.get("context")
-        if ctx:
-            line += f": {ctx}"
-        temporal = rel.get("temporal_details")
-        if temporal:
-            line += f" [Time: {temporal}]"
-        parts.append(line)
-    return "\n  ↳ ".join(parts)
-
-
-def build_context_string(result: dict) -> str:
-    lines: list[str] = []
-    gc = result.get("graph_context") or {}
-
-    query_paths = gc.get("query_paths") or []
-    if query_paths:
-        lines.append("=== ENTITY PATHS ===")
-        for path in query_paths:
-            lines.append(_format_path_chain(path))
-        lines.append("")
-
-    chunks = result.get("chunks") or []
-    additional_context = result.get("additional_context") or {}
-    chunk_id_to_group_ids = gc.get("chunk_id_to_group_ids") or {}
-    chunk_relations = gc.get("chunk_relations") or []
-
-    if chunks:
-        lines.append("=== CONTEXT ===")
-        for i, chunk in enumerate(chunks):
-            lines.append(f"Chunk {i + 1}")
-            source = chunk.get("source_title", "")
-            if source:
-                lines.append(f"Source: {source}")
-            lines.append(chunk.get("chunk_content", ""))
-
-            chunk_uuid = chunk.get("chunk_uuid", "")
-            if chunk_uuid and chunk_id_to_group_ids and chunk_relations:
-                group_ids = chunk_id_to_group_ids.get(chunk_uuid, [])
-                relevant = [r for r in chunk_relations if r.get("group_id") in group_ids]
-                if relevant:
-                    lines.append("Graph Relations:")
-                    for rel in relevant:
-                        for triplet in rel.get("triplets") or []:
-                            src  = triplet.get("source", {}).get("name", "")
-                            tgt  = triplet.get("target", {}).get("name", "")
-                            pred = triplet.get("relation", {}).get("canonical_predicate", "")
-                            ctx  = triplet.get("relation", {}).get("context", "")
-                            line = f"  [{src}] -> {pred} -> [{tgt}]: {ctx}"
-                            temporal = triplet.get("relation", {}).get("temporal_details")
-                            if temporal:
-                                line += f" [Time: {temporal}]"
-                            lines.append(line)
-
-            extra_ids = chunk.get("extra_context_ids") or []
-            if extra_ids and additional_context:
-                extras = [additional_context[eid] for eid in extra_ids if eid in additional_context]
-                if extras:
-                    lines.append("Extra Context:")
-                    for extra in extras:
-                        lines.append(f"  Related Context ({extra.get('source_title', '')}): {extra.get('chunk_content', '')}")
-
-            lines.append("---")
-            lines.append("")
-
-    return "\n".join(lines)
-
-
-# Call the API and format the result
-response = httpx.post(
-    "https://api.hydradb.com/query",
-    headers={
-        "Authorization": "Bearer YOUR_HYDRA_DB_API_KEY",
-        "API-Version": "2",
-    },
-    json={
-        "database": "your-database",
-        "query": "How does authentication work?",
-        "type": "knowledge",
-        "query_by": "hybrid",
-        "mode": "fast",
-        "graph_context": True,
-    },
-)
-
-response.raise_for_status()
-envelope = response.json()
-if not envelope.get("success"):
-    error = envelope.get("error") or {}
-    raise RuntimeError(error.get("message", "HydraDB search failed"))
-
-context = build_context_string(envelope["data"])
-
-# Pass context to your LLM
-print(context)
-```
-```typescript TypeScript
-function formatPathChain(path: any): string {
-  return (path.triplets || [])
-    .map((t: any) => {
-      let str = `[${t.source?.name}] -> ${t.relation?.canonical_predicate} -> [${t.target?.name}]`;
-      if (t.relation?.context) str += `: ${t.relation.context}`;
-      if (t.relation?.temporal_details) str += ` [Time: ${t.relation.temporal_details}]`;
-      return str;
-    })
-    .join("\n  ↳ ");
-}
-
-function buildContextString(result: any): string {
-  const lines: string[] = [];
-  const gc = result.graph_context;
-
-  if (gc?.query_paths?.length) {
-    lines.push("=== ENTITY PATHS ===");
-    for (const path of gc.query_paths) lines.push(formatPathChain(path));
-    lines.push("");
-  }
-
-  if (result.chunks?.length) {
-    lines.push("=== CONTEXT ===");
-    for (let i = 0; i < result.chunks.length; i++) {
-      const chunk = result.chunks[i];
-      lines.push(`Chunk ${i + 1}`);
-      lines.push(`Source: ${chunk.source_title}`);
-      lines.push(chunk.chunk_content);
-
-      if (gc?.chunk_id_to_group_ids && gc.chunk_relations) {
-        const groupIds = gc.chunk_id_to_group_ids[chunk.chunk_uuid] || [];
-        const relations = gc.chunk_relations.filter(
-          (r: any) => r.group_id && groupIds.includes(r.group_id)
-        );
-        if (relations.length) {
-          lines.push("Graph Relations:");
-          for (const rel of relations) {
-            for (const t of rel.triplets) {
-              let line = `  [${t.source.name}] -> ${t.relation.canonical_predicate} -> [${t.target.name}]: ${t.relation.context}`;
-              if (t.relation.temporal_details) line += ` [Time: ${t.relation.temporal_details}]`;
-              lines.push(line);
-            }
-          }
-        }
-      }
-
-      if (chunk.extra_context_ids?.length && result.additional_context) {
-        const extras = chunk.extra_context_ids
-          .map((id: string) => result.additional_context[id])
-          .filter(Boolean);
-        if (extras.length) {
-          lines.push("Extra Context:");
-          for (const extra of extras) {
-            lines.push(`  Related Context (${extra.source_title}): ${extra.chunk_content}`);
-          }
-        }
-      }
-
-      lines.push("---");
-      lines.push("");
-    }
-  }
-  return lines.join("\n");
-}
-
-// Call the API and format the result
-const res = await fetch("https://api.hydradb.com/query", {
-  method: "POST",
-  headers: {
-    "Content-Type": "application/json",
-    Authorization: "Bearer YOUR_HYDRA_DB_API_KEY",
-    "API-Version": "2",
-  },
-  body: JSON.stringify({
-    database: "your-database",
-    query: "How does authentication work?",
-    type: "knowledge",
-    query_by: "hybrid",
-    mode: "fast",
-    graph_context: true,
-  }),
-});
-
-const envelope = await res.json();
-if (!res.ok || !envelope.success) {
-  throw new Error(envelope.error?.message ?? "HydraDB search failed");
-}
-
-const context = buildContextString(envelope.data);
-
-// Pass context to your LLM
-console.log(context);
-```
-</CodeGroup>
-
-</Accordion>
+- [Query](/essentials/v2/query): request parameters and the four response keys
+- [Context graphs](/essentials/v2/context-graphs): what `graph[]` contains
+- [Ingest context](/essentials/v2/ingest): `context_category`, `enrich` and `forceful_relations` decide what comes back here
