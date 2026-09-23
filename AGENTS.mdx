@@ -208,7 +208,7 @@ Recommended patterns:
 An item is one piece of context, and carries exactly one of:
 
 - `text`: a document, a note, a policy, an agent log line; anything you already have as a string. To ingest a file, extract its text first.
-- `conversation`: a list of `{ role, content, name? }` turns, the same message list you already send to OpenAI or Anthropic.
+- `conversation`: a list of `{ role, content }` turns, the same message list you already send to OpenAI or Anthropic.
 
 Every item can also carry a `context_id` (your id; reuse it to replace the item), a `title`, declared `attributes` and free-form `custom_attributes`, a `happened_at` date, `forceful_relations` to other items, an `acl`, and per-item `enrich` / `upsert` / `instructions`. See [Item fields](#item-fields).
 
@@ -259,7 +259,7 @@ At ingest, any item (text or conversation) can declare which other items it is l
 {
   "context_id": "refund-policy",
   "text": "Refunds are processed within 5 business days.",
-  "forceful_relations": { "ids": ["refund-faq", "refund-escalations"], "properties": {} }
+  "forceful_relations": { "context_ids": ["refund-faq", "refund-escalations"], "properties": {} }
 }
 ```
 
@@ -268,7 +268,7 @@ At query time, in `thinking` mode and with `follow_forceful_relations: true` (th
 Rules:
 
 - Forceful relations are followed only in `thinking` mode (including when `mode: "auto"` routes a query to thinking).
-- `ids` are `context_id`s.
+- `context_ids` are `context_id`s.
 - They are linked by the author, not ranked for the query, so do not read their `score` as relevance.
 
 ---
@@ -361,8 +361,9 @@ client.context.ingest(
     collection="user_alex",
     context=json.dumps([{
         "context_id": "chat-alex-001",
+        "user_name": "alex",
         "conversation": [
-            {"role": "user", "content": "Keep answers short, I read on my phone.", "name": "alex"},
+            {"role": "user", "content": "Keep answers short, I read on my phone."},
             {"role": "assistant", "content": "Got it, short answers."},
         ],
         "happened_at": "2026-09-01",
@@ -436,8 +437,9 @@ await client.context.ingest({
   collection: "user_alex",
   context: JSON.stringify([{
     context_id: "chat-alex-001",
+    user_name: "alex",
     conversation: [
-      { role: "user", content: "Keep answers short, I read on my phone.", name: "alex" },
+      { role: "user", content: "Keep answers short, I read on my phone." },
       { role: "assistant", content: "Got it, short answers." },
     ],
     happened_at: "2026-09-01",
@@ -627,12 +629,13 @@ One endpoint takes every item, text or conversation, into any collection of a da
       "text": "Refunds are processed within 5 business days.",
       "attributes": { "department": "support" },
       "custom_attributes": { "owner": "sam@acme.com" },
-      "forceful_relations": { "ids": ["refund-faq"], "properties": {} }
+      "forceful_relations": { "context_ids": ["refund-faq"], "properties": {} }
     },
     {
       "context_id": "chat-alex-001",
+      "user_name": "alex",
       "conversation": [
-        { "role": "user", "content": "Keep answers short, I read on my phone.", "name": "alex" },
+        { "role": "user", "content": "Keep answers short, I read on my phone." },
         { "role": "assistant", "content": "Got it, short answers." }
       ],
       "happened_at": "2026-09-01",
@@ -664,28 +667,27 @@ Each item carries exactly one of `text` or `conversation`.
 | Field | Notes |
 |---|---|
 | `context_id` | Your id for the item. Generated from `title` when omitted, so two untitled items without ids and with the same text collide. Must not contain commas. |
-| `title` | Optional readable name, printed in `llm_prompt` and matchable with `titles` on `/query`. |
+| `title` | Optional readable name, printed in `llm_prompt` and matchable with `titles` on `/query`. At most 1,024 bytes. |
 | `text` | Plain text or markdown. |
-| `conversation` | A list of `{ role, content, name? }` turns. |
+| `conversation` | A list of `{ role, content }` turns. |
 | `enrich` | Extract entities, relations and preferences from this item. Default: the request's `enrich`, else `true`. Set `false` to store the item only as searchable text. |
 | `upsert` | Replace an existing item with the same `context_id`. Default: the request's `upsert`, else `true`. |
-| `instructions` | Steer enrichment for this item. Default: the request's `instructions`. |
+| `instructions` | Steer enrichment for this item. At most 4,000 characters. Default: the request's `instructions`. |
 | `happened_at` | The date the item is about, `YYYY-MM-DD` only; a timestamp is a `400`. HydraDB records when it received the item separately. |
 | `attributes` | Declared, filterable fields from the database's `database_metadata_schema`. |
 | `custom_attributes` | Free-form fields. Not filterable. |
-| `forceful_relations` | `{ "ids": [...], "properties": {} }`: the `context_id`s this item is linked to. |
+| `forceful_relations` | `{ "context_ids": [...], "properties": {} }`: the `context_id`s this item is linked to. `properties` is an optional flat map of string, number or boolean values (at most 1 KiB) stored on each edge; `id`, `created_at`, `relation_type`, `tenant_id` and `sub_tenant_id` are reserved keys. |
 | `acl` | Principals allowed to retrieve the item: `user_email:a@x.com` (or a bare email), `group:<provider>:<id>`, `domain:acme.com`, `__public__`. Omit for unrestricted, `[]` for nobody. A malformed principal rejects the whole request with `400`. |
-| `is_markdown` | Chunk `text` on its markdown structure instead of as flat prose. |
-| `user_name` | The speaker for a text item. On a conversation, the per-turn `name` wins. |
+| `user_name` | The speaker for the item: the author of a text item, or the person in a conversation's `user` turns. Default `"User"`. |
 
-A key an item does not recognise is dropped without an error, so check spelling against this table.
+An unknown key is a `400` naming the key and listing the accepted ones, whether it is on the request, on an item, on a conversation turn or inside `forceful_relations`.
 
 ### Conversations
 
 - Roles are `user`, `assistant` and `system`. Any other role is a `400`; map roles such as `tool` or `human` before sending.
-- `system` turns shape enrichment but are never stored as facts. A conversation of only `system` turns is a `400`.
+- `system` turns are never stored as facts. When neither the item nor the request sets `instructions`, they become the item's instructions, held to the same 4,000-character limit; otherwise they are dropped. A conversation of only `system` turns is a `400`.
 - Consecutive turns with the same role are accepted and joined.
-- Set `name` per turn when several people speak, so preferences are attributed to the right person.
+- The speaker is the item's `user_name`. A turn carries only `role` and `content`; any other key on a turn is a `400`.
 - An empty list, or a turn with empty `content`, is a `400`.
 
 ### IDs and replacement
@@ -723,13 +725,14 @@ Every key in `graph_payload` must equal the `context_id` of an item in the same 
 ### Limits and validation
 
 - At most **100 items** per request, **1 MiB** of text per item, **8 MiB** of text per request. Split larger batches.
+- `title` at most **1,024 bytes**; `instructions` at most **4,000 characters**, on the request and on each item.
 - `attributes` are capped at **16 KiB** and `custom_attributes` at **1 KiB** per item, measured on the compact JSON encoding in UTF-8 bytes (keys and punctuation count).
 - A validation error names the item it refers to as `context[N]`.
 - Ingest takes text only. To ingest a PDF, DOCX or CMS export, extract its text in your application and send it as `text`, one item per document. For tools such as Slack, Notion or Google Drive, use a [connector](/essentials/v2/connectors): synced content lands in the same database and is queried together with your items.
 
 ### SDKs: the `context` form field
 
-The SDKs send a multipart form rather than a JSON body. The item array goes in the `context` form field as a JSON string, next to `database`, `collection`, `upsert` and `graph_payload`; the server runs the same validation on both entry points. Set `enrich` and `instructions` on each item. Python: `client.context.ingest(database=..., collection=..., context=json.dumps([...]))`. TypeScript: `await client.context.ingest({ database, collection, context: JSON.stringify([...]) })`. Keys inside each item stay snake_case in both. Full examples are in [Minimal end-to-end flow](#4-minimal-end-to-end-flow). SDK releases generated from the current API spec take `context`; older releases take `items`, which the API still accepts as a deprecated alias.
+The SDKs send a multipart form rather than a JSON body. The item array goes in the `context` form field as a JSON string, next to `database`, `collection`, `upsert`, `enrich`, `instructions` and `graph_payload`; the server runs the same validation on both entry points. On the form, `upsert` and `enrich` are `"true"`, `"false"`, `"1"` or `"0"`, and any other value is a `400`. Python: `client.context.ingest(database=..., collection=..., context=json.dumps([...]))`. TypeScript: `await client.context.ingest({ database, collection, context: JSON.stringify([...]) })`. Keys inside each item stay snake_case in both. Full examples are in [Minimal end-to-end flow](#4-minimal-end-to-end-flow).
 
 ### Response
 
