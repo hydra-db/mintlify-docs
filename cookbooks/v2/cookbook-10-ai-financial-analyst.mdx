@@ -82,7 +82,7 @@ One database for the whole financial corpus. Collections isolate by company, fun
 
 ```python
 # setup.py
-import os
+import os, time
 from hydra_db import HydraDB
 
 API_KEY   = os.environ["HYDRA_DB_API_KEY"]
@@ -103,6 +103,11 @@ result = client.databases.create(
 )
 print(result)
 # Output: {'status': 'accepted', 'database': 'financial-analyst', ...}
+
+# Database creation is asynchronous - poll until ready before ingesting
+while not client.databases.status(database=TENANT_ID).data.infra.ready_for_ingestion:
+    time.sleep(4)
+print(f"✓ Database '{TENANT_ID}' ready.")
 
 # Collection conventions used throughout this guide:
 #   "earnings-{TICKER}"        - earnings calls + SEC filings for one company
@@ -135,17 +140,18 @@ MAX_TEXT_BYTES = 900 * 1024   # stay under the 1 MiB per-item text limit
 
 def extract_pdf_text(file_path: str) -> list[str]:
     """Extract text from a PDF and split into <=1 MiB parts."""
-    reader = PdfReader(file_path)
-    text   = "\n".join(page.extract_text() or "" for page in reader.pages)
+    reader  = PdfReader(file_path)
+    encoded = "\n".join(page.extract_text() or "" for page in reader.pages).encode("utf-8")
 
-    parts, current = [], ""
-    for paragraph in text.split("\n\n"):
-        if len((current + paragraph).encode("utf-8")) > MAX_TEXT_BYTES:
-            parts.append(current)
-            current = ""
-        current += paragraph + "\n\n"
-    if current:
-        parts.append(current)
+    parts, start = [], 0
+    while start < len(encoded):
+        end = start + MAX_TEXT_BYTES
+        # prefer a blank-line boundary; hard-cut if none exists in range
+        boundary = encoded.rfind(b"\n\n", start, end)
+        if boundary <= start:
+            boundary = min(end, len(encoded))
+        parts.append(encoded[start:boundary].decode("utf-8", "ignore"))
+        start = boundary
     return parts
 
 
