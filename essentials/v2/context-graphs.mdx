@@ -1,23 +1,27 @@
 ---
 title: "Context Graphs"
-description: "How HydraDB models relationships between chunks using triplets to improve query quality."
+description: "How HydraDB models relationships between the entities in your context as triplets, and returns them as paths on every query."
 ---
+
+import LegacyLine from "/snippets/legacy-line.mdx";
 
 ## 1. What it is
 
-A context graph is a structured map of relationships between stored pieces of context in your database.
+A context graph is a structured map of the entities in your database and the relationships between them, built from everything you ingest.
 
-It represents those relationships as **triplets**: `source → relation → target`. Each triplet is a directional connection between two pieces of context, with `source`, `relation`, and `target` returned as structured objects - not plain strings.
+It represents those relationships as **triplets**: `source`, `relation`, `target`. Each triplet is a directional connection between two entities, returned as structured objects, not plain strings. A query returns the triplets that connect what you asked about to what is relevant, grouped into **paths**.
 
 Context graphs augment retrieval. They do not replace it.
+
+<LegacyLine />
 
 ---
 
 ## 2. What it does
 
-When `graph_context: true` is set on a query call (the default), HydraDB returns relationship data alongside the retrieved chunks - showing how those chunks connect to each other and to your query. Set `graph_context: false` to drop the graph slice when you only need ranked chunks.
+With `graph_context: true` on a query (the default), HydraDB returns `graph[]` alongside the retrieved chunks: the paths through the graph that connect the query to the results and the results to each other. Set `graph_context: false` when you only need ranked chunks; `graph` is then `[]`.
 
-This helps your LLM reason about questions that require connecting information across multiple chunks or sources. Similarity query returns relevant content; the context graph surfaces how that content fits together.
+This helps your LLM reason about questions that require connecting information across several items. Similarity retrieval returns relevant content; the context graph surfaces how that content fits together.
 
 ---
 
@@ -25,8 +29,8 @@ This helps your LLM reason about questions that require connecting information a
 
 Use context graphs when:
 
-- Answers require synthesising information across multiple chunks.
-- Relational context matters for correctness - cause and effect, ownership, sequence, dependency.
+- Answers require synthesising information across several chunks.
+- Relational context matters for correctness: cause and effect, ownership, sequence, dependency.
 - You need multi-hop reasoning ("What team owns the service that failed?", "What depends on this API?").
 
 Skip them for direct factual lookups. Graph traversal adds response size and can add latency, so reserve it for queries where relational structure materially improves the answer.
@@ -37,33 +41,33 @@ Skip them for direct factual lookups. Graph traversal adds response size and can
 
 Context graphs are hybrid: relationships are extracted at ingestion time and traversed at query time.
 
-**At ingestion**, HydraDB extracts relationships from your data and stores them in the graph. Sources can also declare explicit relationships to other sources via a `relations` payload at ingestion. Or skip extraction for a document and supply the entities and relations yourself with [Bring Your Own Graph](/essentials/v2/bring-your-own-graph).
+**At ingestion**, with `enrich: true` (the default), HydraDB extracts entities and relations from each item and stores them in the graph. An item can also declare its own links to other items with [`forceful_relations`](/essentials/v2/ingest#11-declared-relations), or skip extraction and supply its entities and relations with [`graph_payload`](/essentials/v2/ingest#12-bring-your-own-graph).
 
-**At query**, when `graph_context: true` is set (the default):
+**At query**, with `graph_context: true`:
 
 1. HydraDB runs hybrid retrieval to find relevant chunks.
-2. It traverses the graph to discover relevant relationships between retrieved context.
-3. It returns multi-hop paths from the query (`query_paths`), relationship paths between retrieved chunks (`chunk_relations`), and a chunk-to-path-group mapping (`chunk_id_to_group_ids`).
+2. It traverses the graph from the query and from the retrieved chunks.
+3. It returns the paths it found in `graph[]`: paths grown from the query first (`origin: "query_path"`), then paths expanded from the returned chunks (`origin: "chunk_relation"`), deduplicated.
 
-When no relevant relationships are found, graph fields may be empty.
+When no relevant relationships are found, `graph` is `[]`. That is not an error; it is the absence of structure for that query.
 
 ---
 
 ## 5. Key concepts
 
-**Triplets.** The unit of the graph. Each triplet is `source → relation → target`, where `source` and `target` are entity objects and `relation` describes the connection between them.
+**Triplets.** The unit of the graph. `source` and `target` are entities, `{ entity_id, name }`. `relation` describes the connection: `predicate`, the sentence it was extracted from (`context`), when it holds (`temporal_details`, absent when unknown), its `relationship_id`, and the `chunk_id` of the chunk that is evidence for it.
 
-Example: `billing_policy → governs → failed_payment_handling`
+Example: `Alex`, `prefers`, `short answers`, from chunk `ck_9f2`.
 
-**`query_paths`.** Multi-hop chains of triplets connecting the query to retrieved chunks. Each path carries a relevancy score and the chunk IDs whose traversal produced it.
+**Paths.** A chain of triplets plus a `path_summary`, one sentence that states what the chain means (never empty: when the server wrote no summary, it narrates the hops), and an `origin`: `query_path` when it was grown from the entities in the query, `chunk_relation` when it is the neighbourhood of a returned chunk. `graph[]` is one flat, ordered list of paths.
 
-**`chunk_relations`.** Paths describing how returned chunks relate to one another. Same shape as `query_paths`; the difference is the anchor - query-driven vs chunk-to-chunk.
+**Evidence.** `relation.chunk_id` names the chunk every step of a path was extracted from. Group hops by it against `chunks[].chunk_id` to show a chunk's relations under that chunk: a `chunk_relation` path is only returned when one of its hops came from a returned chunk (or a `forceful_relations` chunk), and hangs under that chunk; a `query_path` hop may also sit under the chunk it came from. See [Attaching graph paths to chunks](/essentials/v2/query#attaching-graph-paths-to-chunks).
 
-**`chunk_id_to_group_ids`.** Maps each chunk ID to the path-group identifiers (e.g. `p_0`, `p_1`) it belongs to. Use it to group retrieved chunks by which graph path produced them.
+**Forceful relations.** Links between items rather than between entities, which you declare at ingest with `forceful_relations`. They come back in `forceful_relations[]`, not in `graph[]`.
 
-**Connected subgraph.** The graph also holds relations between *items* rather than between entities: a Slack reply and the message it answers, a page and the pages it links to, a comment and its ticket. Given one item's id, [Connected Subgraph](/api-reference/v2/endpoint/subgraph) walks those links breadth-first and returns everything reachable (the rest of the thread, the hierarchy above and below, the items it references) with the relations among them. Reach for it when one query result is not enough and you need what surrounds it; it is also what the dashboard's **Subgraph** button opens.
+**Connected subgraph.** The graph also holds relations between items themselves: a Slack reply and the message it answers, a page and the pages it links to, a comment and its ticket. Given one item's id, [Connected Subgraph](/api-reference/v2/endpoint/subgraph) walks those links breadth-first and returns everything reachable with the relations among them. Reach for it when one query result is not enough and you need what surrounds it; it is also what the dashboard's **Subgraph** button opens.
 
-For full field schemas, see the [Query API Reference](/api-reference/v2/endpoint/query-overview).
+For the full field reference, see [Query](/essentials/v2/query#graph).
 
 ---
 
@@ -77,10 +81,8 @@ curl -X POST 'https://api.hydradb.com/query' \
   -H "API-Version: 2" \
   -H "Content-Type: application/json" \
   -d '{
-    "database": "acme_corp",
+    "database": "acme",
     "query": "How does the billing system handle failed payments?",
-    "type": "knowledge",
-    "query_by": "hybrid",
     "mode": "thinking",
     "graph_context": true
   }'
@@ -88,112 +90,125 @@ curl -X POST 'https://api.hydradb.com/query' \
 
 ```typescript TypeScript SDK
 const result = await client.query({
-  database: "acme_corp",
+  database: "acme",
   query: "How does the billing system handle failed payments?",
-  type: "knowledge",
-  queryBy: "hybrid",
   mode: "thinking",
   graphContext: true,
 });
 
-if (result.data?.graphContext) {
-  for (const path of result.data.graphContext.queryPaths) {
-    for (const t of path.triplets) {
-      console.log(
-        `${t.source.name} - ${t.relation.canonicalPredicate} → ${t.target.name}`,
-      );
-    }
+for (const path of result.data.graph) {
+  console.log(path.pathSummary);
+  for (const t of path.triplets) {
+    console.log(`  ${t.source.name} -> ${t.relation.predicate} -> ${t.target.name} [${t.relation.chunkId}]`);
   }
 }
 ```
 
 ```python Python SDK
 result = client.query(
-    database="acme_corp",
+    database="acme",
     query="How does the billing system handle failed payments?",
-    type="knowledge",
-    query_by="hybrid",
     mode="thinking",
     graph_context=True,
 )
 
-if result.data.graph_context:
-    for path in result.data.graph_context.query_paths:
-        for t in path.triplets:
-            print(
-                t.source.name,
-                " - ",
-                t.relation.canonical_predicate,
-                "→",
-                t.target.name,
-            )
+for path in result.data.graph:
+    print(path.path_summary)
+    for t in path.triplets:
+        print(f"  {t.source.name} -> {t.relation.predicate} -> {t.target.name} [{t.relation.chunk_id}]")
 ```
 
 </CodeGroup>
 
-A response with graph context looks like:
+The `graph` key of the response looks like:
 
 ```json
 {
-  "chunks": [ /* ranked chunks */ ],
-  "graph_context": {
-    "query_paths": [
-      {
-        "triplets": [
-          {
-            "source": { "name": "billing_policy", "type": "POLICY" },
-            "relation": { "canonical_predicate": "governs" },
-            "target": { "name": "failed_payment_handling", "type": "PROCESS" }
-          }
-        ],
-        "relevancy_score": 0.84,
-        "group_id": "p_0",
-        "source_chunk_ids": ["chunk_abc", "chunk_def"]
-      }
-    ],
-    "chunk_relations": [],
-    "chunk_id_to_group_ids": { "chunk_abc": ["p_0"] }
-  }
+  "graph": [
+    {
+      "origin": "query_path",
+      "triplets": [
+        {
+          "source": { "entity_id": "ent_b10", "name": "billing policy" },
+          "relation": {
+            "predicate": "governs",
+            "context": "The billing policy governs how failed payments are retried.",
+            "relationship_id": "rel_41",
+            "chunk_id": "ck_2aa"
+          },
+          "target": { "entity_id": "ent_f77", "name": "failed payment handling" }
+        },
+        {
+          "source": { "entity_id": "ent_f77", "name": "failed payment handling" },
+          "relation": {
+            "predicate": "triggers",
+            "context": "A failed payment triggers a customer notification.",
+            "temporal_details": "after the third retry",
+            "relationship_id": "rel_42",
+            "chunk_id": "ck_2ab"
+          },
+          "target": { "entity_id": "ent_n03", "name": "notification service" }
+        }
+      ],
+      "path_summary": "The billing policy governs failed payment handling, which notifies the customer after the third retry."
+    }
+  ]
 }
 ```
-
-When no relevant relationships are found, graph fields may be empty.
 
 ---
 
 ## 7. Using graph context in your prompt
 
-To include graph relationships in your LLM prompt, use the `buildContextString` / `build_context_string` helper from [How to Use API Results](/essentials/v2/api-results). It handles `query_paths`, `chunk_relations`, and `chunk_id_to_group_ids` automatically.
+You do not format the graph yourself. The `llm_prompt` returned by the same query already contains a `## Related facts` section with one line per path in `graph[]`: its label (`[P1]`, `[P2]`, ... in `graph[]` order, so an agent can cite a fact by it), its chain of hops, `query path` or `chunk relation` for its `origin` with the path's relevance after reranking when it has one, and the numbers of the results its hops were extracted from. The `path_summary` is indented on the line under it, unless it only narrates the hops the chain already shows. From the [example response on Query](/essentials/v2/query#1-one-call):
 
-The helper formats triplets as:
+```markdown
+## Related facts
 
+- [P1] **Refund Processing** -managed by→ **Finance Department** (query path, relevance 0.81) [1]
+  Refund processing is managed by the Finance Department.
+- [P2] **User** -prefers→ **short answers** (chunk relation, relevance 0.74) [2]
+  The user prefers short answers about refunds.
 ```
-[billing_policy] -> governs -> [failed_payment_handling]: policy covering retry logic
-  ↳ [failed_payment_handling] -> triggers -> [notification_service]: sends customer alert
-```
+
+How a chain reads:
+
+- Each hop is `**source** -predicate→ **target**`. The next hop continues the chain only from the entity the chain ended on, so the two-hop billing path in [section 6](#6-minimal-working-example) reads `**billing policy** -governs→ **failed payment handling** -triggers→ **notification service** (after the third retry)`.
+- A hop walked against its edge reads `←predicate-`: in `**A** -p→ **B** ←q- **C**`, the edge is `C -q→ B`.
+- A hop that shares no entity with the chain starts a new segment after `; `.
+- A hop's `temporal_details` follows it in parentheses, as `(after the third retry)` does in that path.
+- A citation `[1]` is a result the hop was extracted from (`[R1]` for a forceful relation). A hop whose chunk is not in the response carries none.
+
+Inject `llm_prompt` and the model can reason over the paths and cite them. See [How to Use API Results](/essentials/v2/api-results).
 
 ---
 
 ## 8. Common mistakes
 
-**Setting `graph_context: false` and then expecting the graph slice.** Graph context is on by default - only set the flag to `false` if you explicitly don't want graph data.
+**Setting `graph_context: false` and then expecting paths.** Graph context is on by default; only set the flag to `false` if you explicitly do not want graph data.
 
-**Assuming the graph replaces retrieval.** It doesn't. `chunks` is still the primary result; the graph enriches it with relationships. Use both.
+**Assuming the graph replaces retrieval.** It does not. `chunks` is still the primary result; the graph enriches it with relationships. Use both.
 
-**Forgetting to disable when you don't need it.** Graph context adds response size and a small traversal cost. If your code path only consumes `chunks`, set `graph_context: false` to drop it.
+**Forgetting to disable when you do not need it.** Graph context adds response size and a small traversal cost. If your code path only consumes `chunks`, set `graph_context: false`.
 
-**Treating triplets as flat strings.** `source`, `relation`, and `target` are objects with their own fields. Read them as structured data.
+**Treating triplets as flat strings.** `source`, `relation` and `target` are objects with their own fields. Read them as structured data.
 
-**Expecting relationships that don't exist.** If the retrieved chunks don't share entities or declared relations, the graph fields will be empty. That's not an error - it's the absence of structure for that query.
+**Looking for forceful relations in `graph[]`.** Items you linked with `forceful_relations` come back in `forceful_relations[]`, with the `via` link that brought them in.
+
+**Expecting relationships that do not exist.** If the retrieved chunks do not share entities or declared relations, `graph` is `[]`.
+
+---
+
+## 9. Split databases
+
+A database created with `type: "split"` returns the graph under `graph_context` as `query_paths`, `chunk_relations` and `chunk_id_to_group_ids`, with `canonical_predicate` and `relevancy_score` on each path. The mapping to `graph[]` is on [Split databases and legacy fields](/essentials/v2/split-databases#4-legacy-query-and-response-fields).
 
 ---
 
 ## Related
 
-- [Query](/essentials/v2/query) - how chunks and graph context are retrieved together
-- [Bring Your Own Graph](/essentials/v2/bring-your-own-graph) - supply your own entities and relations instead of auto-extraction
-- [Memories](/essentials/v2/memories) - user-scoped context for personalization
-- [Knowledge](/essentials/v2/knowledge) - document-level context for shared retrieval
-- [How to Use API Results](/essentials/v2/api-results) - formatting graph context for LLM prompts
-- [Full Query API Reference](/api-reference/v2/endpoint/query-overview) - full graph response schema
-- [Connected Subgraph](/api-reference/v2/endpoint/subgraph) - everything connected to one item, walked breadth-first
+- [Query](/essentials/v2/query): how chunks, paths and forceful relations are retrieved together
+- [Ingest context](/essentials/v2/ingest): `enrich`, `forceful_relations` and `graph_payload`
+- [Bring Your Own Graph](/essentials/v2/bring-your-own-graph): supply your own entities and relations instead of auto-extraction
+- [How to Use API Results](/essentials/v2/api-results): the `## Related facts` section of `llm_prompt`
+- [Connected Subgraph](/api-reference/v2/endpoint/subgraph): everything connected to one item, walked breadth-first
