@@ -1,10 +1,7 @@
 ---
-title: "AI Financial Analyst with Memory"
-description: "Upload earnings PDFs, internal metrics, and board memos into HydraDB. Ask trend questions across quarters, get temporally-aware answers, and surface the exact clause, figure, or narrative shift - not a generic summary."
-noindex: true
+title: "AI Financial Analyst"
+description: "Ingest earnings filings, internal metrics, and board memos into HydraDB. Ask trend questions across quarters, get temporally-aware answers, and surface the exact clause, figure, or narrative shift - not a generic summary."
 ---
-
-<Warning>This page is deprecated: it documents the knowledge and memory API, which unified databases replace. See [Ingest context](/essentials/v2/ingest) and [Query](/essentials/v2/query).</Warning>
 
 This guide walks you through building a production-grade **AI Financial Analyst** powered by HydraDB. The agent ingests structured and unstructured financial data - earnings call transcripts, PDF filings, internal metric exports, and board memos - and answers questions that require reasoning across time:
 
@@ -15,7 +12,7 @@ This guide walks you through building a production-grade **AI Financial Analyst*
 
 Standard RAG fails on these because **two earnings calls produce nearly identical embeddings** - they're the same format, the same vocabulary, the same topics. A vector search can't tell Q2 from Q4 without temporal structure. HydraDB's `recency_bias` parameter, timestamp-aware graph, and multi-stage retrieval pipeline solve this structurally.
 
-> **Note**: All API calls in this guide are real and ready to run. Base URL: `https://api.hydradb.com`. Get your API key at [app.hydradb.com](https://app.hydradb.com).
+> **Note**: All API calls in this guide are real and ready to run. Base URL: `https://api.hydradb.com`. Get your API key at [app.hydradb.com](https://app.hydradb.com). SDK snippets use the call shapes in the [SDK reference](/api-reference/v2/sdks) and require an SDK release generated from the current API specification. There is no file upload on a unified database: this cookbook extracts PDF text client-side with [pypdf](https://pypdf.readthedocs.io/) and ingests it as `text` items.
 
 ---
 
@@ -25,7 +22,7 @@ Standard RAG fails on these because **two earnings calls produce nearly identica
 **Required tools**:
 - HydraDB API key
 - Python 3.11 or 3.12 (`python --version`)
-- `pip install hydradb-sdk`
+- `pip install hydradb-sdk pypdf`
 
 ## What You'll Build
 
@@ -43,7 +40,7 @@ The structural problem is **temporal ambiguity**. A Q2 2023 earnings call and a 
 
 HydraDB fixes this through three architectural properties:
 
-1. **Timestamp-aware indexing** - every ingested document carries an ISO 8601 `timestamp` field that HydraDB indexes as a first-class attribute alongside the vector. `recency_bias` uses this to weight results by recency or spread results across time depending on what the query needs.
+1. **Timestamp-aware indexing** - every ingested item carries an ISO 8601 `happened_at` field that HydraDB indexes as a first-class temporal attribute alongside the vector. `recency_bias` uses this to weight results by recency or spread results across time depending on what the query needs.
 2. **Temporal Knowledge Graph** - entities (companies, executives, metrics, products) are stored as nodes. Each mention of a metric across different documents creates a time-ordered edge sequence on that entity - effectively a versioned history. Querying "revenue trend" traverses these edges in temporal order rather than returning a flat ranked list of chunks.
 3. **Multi-query expansion** - in `mode: "thinking"`, HydraDB expands the query into semantically diverse reformulations, then executes all of them in parallel. "How did guidance change between Q2 and Q4?" becomes "Q2 guidance outlook", "Q4 forward guidance revised", "guidance comparison quarterly" - each targeting a different point on the timeline.
 
@@ -52,7 +49,7 @@ HydraDB fixes this through three architectural properties:
 | Q2 vs Q4 trend question | Returns one call, ignores the other | Retrieves both, timestamps preserved |
 | "Current" vs "historical" | No distinction | `recency_bias` controls the balance |
 | Same metric across quarters | Chunks look identical, rank arbitrarily | Graph edges connect metric nodes across time |
-| CFO quote attribution | Quote appears; quarter is lost | Source metadata + timestamp surfaced in every chunk |
+| CFO quote attribution | Quote appears; quarter is lost | `context_id` + `happened_at` surfaced in every chunk |
 | Cross-source synthesis (PDF + metrics + memo) | Siloed - no linking across sources | Context graph links by entity across all sources |
 
 ---
@@ -61,9 +58,9 @@ HydraDB fixes this through three architectural properties:
 
 ```mermaid
 graph TD
-    A["Earnings PDFs\n(10-K, 10-Q, transcripts)"] -->|SDK upload| B["HydraDB\nIngestion Pipeline"]
-    C["Internal Metrics\n(CSV / JSON exports)"] -->|SDK upload| B
-    D["Board Memos\n(PDF / text)"] -->|SDK upload| B
+    A["Earnings PDFs\n(10-K, 10-Q, transcripts)"] -->|context items| B["HydraDB\nIngestion Pipeline"]
+    C["Internal Metrics\n(CSV / JSON exports)"] -->|context items| B
+    D["Board Memos\n(PDF / text)"] -->|context items| B
     B --> E["Temporal Knowledge Graph\n+ Vector Index"]
     F["Analyst Profile\n(/context/ingest)"] --> E
     E -->|"/query\nrecency_bias + graph_context"| G["Context Assembly"]
@@ -75,7 +72,7 @@ graph TD
 - One **database** for the entire financial data corpus. Collections namespace by company or analyst team.
 - **`recency_bias: 0.7`** for trend questions (surface recent but still gather historical). **`recency_bias: 0.3`** for historical comparison (spread evenly across time).
 - **`mode: "thinking"`** for all analytical queries - multi-query reranking is essential for financial reasoning.
-- **`graph_context: true`** on `/query` gives you `query_paths` - the entity relationship chains that show how a metric's value evolved across documents.
+- **`graph_context: true`** on `/query` gives you `data.graph` - entity relationship chains (`path_summary` + `triplets`) that show how a metric's value evolved across documents.
 
 ---
 
@@ -93,8 +90,17 @@ TENANT_ID = "financial-analyst"
 
 client = HydraDB(token=API_KEY)
 
-# Create database
-result = client.databases.create(database=TENANT_ID)
+# Create database - declare the attribute fields used for filters below
+result = client.databases.create(
+    database=TENANT_ID,
+    database_metadata_schema=[
+        {"name": "ticker",         "data_type": "VARCHAR"},
+        {"name": "doc_type",       "data_type": "VARCHAR"},
+        {"name": "fiscal_year",    "data_type": "INT64"},
+        {"name": "fiscal_quarter", "data_type": "INT64"},
+        {"name": "period_label",   "data_type": "VARCHAR"},
+    ],
+)
 print(result)
 # Output: {'status': 'accepted', 'database': 'financial-analyst', ...}
 
@@ -102,89 +108,103 @@ print(result)
 #   "earnings-{TICKER}"        - earnings calls + SEC filings for one company
 #   "internal-metrics"         - internal financial metrics exports
 #   "board-memos"              - board meeting memos
-#   "analyst-{user_id}"        - per-analyst preference memory
+#   "analyst-{user_id}"        - per-analyst preference context
 ```
 
-> **SDK required for all API calls.** Install: `pip install hydradb-sdk`. Import as `from hydra_db import HydraDB` (the import name differs from the package name).
+> **SDK snippets use the call shapes in the [SDK reference](/api-reference/v2/sdks).** They require an SDK release generated from the current API specification. Install: `pip install hydradb-sdk`. Import as `from hydra_db import HydraDB` (the import name differs from the package name).
 
 ---
 
-## Step 2 - Upload Financial Documents
+## Step 2 - Ingest Financial Documents
 
 ### 2.1 Earnings Call Transcripts & SEC Filings (PDF)
 
-Earnings PDFs are the primary context. Tag each with structured metadata - `ticker`, `period`, `doc_type`, `fiscal_year`, `fiscal_quarter` - so you can filter search to a specific company or exact fiscal period before semantic search even runs.
+Earnings PDFs are the primary context. There is no file upload on a unified database, so extract the text client-side with `pypdf` and ingest it as `text` items. Tag each with declared attributes - `ticker`, `doc_type`, `fiscal_year`, `fiscal_quarter`, `period_label` - so you can filter search to a specific company or exact fiscal period before semantic search even runs.
 
 ```python
 # ingest/earnings_pdfs.py
 import json, time, os
+from pypdf import PdfReader
 from hydra_db import HydraDB
 
 client    = HydraDB(token=os.environ["HYDRA_DB_API_KEY"])
 TENANT_ID = "financial-analyst"
+
+MAX_TEXT_BYTES = 900 * 1024   # stay under the 1 MiB per-item text limit
+
+
+def extract_pdf_text(file_path: str) -> list[str]:
+    """Extract text from a PDF and split into <=1 MiB parts."""
+    reader = PdfReader(file_path)
+    text   = "\n".join(page.extract_text() or "" for page in reader.pages)
+
+    parts, current = [], ""
+    for paragraph in text.split("\n\n"):
+        if len((current + paragraph).encode("utf-8")) > MAX_TEXT_BYTES:
+            parts.append(current)
+            current = ""
+        current += paragraph + "\n\n"
+    if current:
+        parts.append(current)
+    return parts
+
 
 def ingest_earnings_pdf(
     file_path: str,
     ticker: str,
     doc_type: str,        # "earnings_transcript" | "10K" | "10Q" | "8K" | "annual_report"
     fiscal_year: int,
-    fiscal_quarter: int,  # 1–4; use 0 for annual filings
+    fiscal_quarter: int,  # 1-4; use 0 for annual filings
     period_label: str,    # e.g. "Q2 2023" - human-readable label for UI
     period_end_date: str, # ISO 8601, e.g. "2023-06-30T00:00:00Z"
-) -> str:
+) -> list:
     """
-    Upload a single earnings PDF. Returns the id for verification.
-
-    IMPORTANT: database and collection must appear both as top-level
-    SDK params AND inside the app_knowledge JSON - AppKnowledgeModel validates both.
+    Extract an earnings PDF's text and ingest it as context items.
+    Returns the list of context_ids (one per text part) for verification.
     """
     collection = f"earnings-{ticker.lower()}"
+    base_id    = f"{ticker}-{doc_type}-{fiscal_year}-Q{fiscal_quarter}"
 
-    app_knowledge = json.dumps([{
-        "id":           f"{ticker}-{doc_type}-{fiscal_year}-Q{fiscal_quarter}",
-        "title":        f"{ticker} {period_label} {doc_type.replace('_', ' ').title()}",
-        "type":         "pdf",
-        "timestamp":    period_end_date,   # drives recency ranking - must be accurate
-        "database":    TENANT_ID,
-        "collection": collection,
-        "metadata": {
-            "ticker":          ticker,
-            "doc_type":        doc_type,
-            "fiscal_year":     fiscal_year,
-            "fiscal_quarter":  fiscal_quarter,
-            "period_label":    period_label,
-            "period_end_date": period_end_date,
-        }
-    }])
+    items = []
+    for i, part in enumerate(extract_pdf_text(file_path)):
+        items.append({
+            "context_id":  f"{base_id}-part{i+1}" if i else base_id,
+            "title":       f"{ticker} {period_label} {doc_type.replace('_', ' ').title()}",
+            "happened_at": period_end_date,   # drives recency ranking - must be accurate
+            "text":        part,
+            "attributes": {
+                "ticker":         ticker,
+                "doc_type":       doc_type,
+                "fiscal_year":    fiscal_year,
+                "fiscal_quarter": fiscal_quarter,
+                "period_label":   period_label,
+            },
+            "custom_attributes": {"source_file": os.path.basename(file_path)},
+        })
 
-    with open(file_path, "rb") as f:
-        # FIX: SDK expects a tuple of (filename, file_obj, mime_type), not a raw file handle.
+    ids = []
+    for i in range(0, len(items), 100):   # max 100 items per request
         result = client.context.ingest(
             database=TENANT_ID,
             collection=collection,
-            app_knowledge=app_knowledge,
-            documents=[(os.path.basename(file_path), f, "application/pdf")],
+            upsert=True,
+            context=json.dumps(items[i:i+100]),
         )
+        ids += [r.id for r in (result.data.results or [])]
 
-    id = result.data.results[0].id if result.data.results else str(result)
-    print(f"Uploaded {ticker} {period_label} {doc_type} → id: {id}")
-    return id
+    print(f"Uploaded {ticker} {period_label} {doc_type} → {len(ids)} item(s)")
+    return ids
 
 
 def ingest_earnings_batch(filings: list[dict]) -> list[str]:
     """
-    Upload a batch of earnings PDFs. Max 20 per batch, 1s between batches.
+    Ingest a batch of earnings PDFs.
     Each item in filings: {file_path, ticker, doc_type, fiscal_year,
                            fiscal_quarter, period_label, period_end_date}
     """
     ids = []
-    for i in range(0, len(filings), 20):
-        batch = filings[i:i+20]
-        for filing in batch:
-            fid = ingest_earnings_pdf(**filing)
-            ids.append(fid)
-        if i + 20 < len(filings):
-            time.sleep(1)   # rate limit between batches
+    for filing in filings:
+        ids += ingest_earnings_pdf(**filing)
     return ids
 
 
@@ -229,13 +249,13 @@ filings = [
 ]
 ids = ingest_earnings_batch(filings)
 # Output:
-# Uploaded ACME Q1 2023 earnings_transcript → id: 988293fa-e29
-# Uploaded ACME Q2 2023 earnings_transcript → id: 9d7951c8-160
-# Uploaded ACME Q3 2023 earnings_transcript → id: 2cf6ea6e-5fe
-# Uploaded ACME Q4 2023 earnings_transcript → id: edff67d5-237
+# Uploaded ACME Q1 2023 earnings_transcript → 1 item(s)
+# Uploaded ACME Q2 2023 earnings_transcript → 1 item(s)
+# Uploaded ACME Q3 2023 earnings_transcript → 1 item(s)
+# Uploaded ACME Q4 2023 earnings_transcript → 1 item(s)
 ```
 
-> **The `timestamp` field is load-bearing.** HydraDB uses `timestamp` to sort and weight results when `recency_bias` is set. If you leave it blank or use the upload date instead of the reporting period end date, every Q2 and Q4 call will look equally "recent" and temporal queries will fail. Always use the fiscal period end date.
+> **The `happened_at` field is load-bearing.** HydraDB uses `happened_at` to sort and weight results when `recency_bias` is set. If you leave it blank or use the upload date instead of the reporting period end date, every Q2 and Q4 call will look equally "recent" and temporal queries will fail. Always use the fiscal period end date.
 
 ### 2.2 Internal Metrics (CSV / JSON)
 
@@ -273,36 +293,37 @@ def ingest_metrics_series(metrics_by_period: list[dict]) -> list[str]:
         metrics: dict               {revenue_usd: ..., arr_usd: ..., churn_pct: ..., ...}
     }
 
-    Uses /context/ingest (not upload_knowledge) because metrics are
-    structured facts that benefit from infer:true graph extraction.
+    Uses /context/ingest with enrich:true so metrics become
+    structured facts that benefit from graph extraction.
     """
-    memory_ids = []
+    item_ids = []
 
     for item in metrics_by_period:
         text_chunk = format_metrics_as_text(item["metrics"], item["period_label"])
 
         result = client.context.ingest(
-            type='memory',
             database=TENANT_ID,
             collection="internal-metrics",
             upsert=True,
-            memories=json.dumps([{
-                "text":   text_chunk,
-                "infer":  True,   # extract entities + build graph connections
-                "metadata": {
+            context=json.dumps([{
+                "context_id":  f"{item['ticker']}-internal_metrics-{item['fiscal_year']}-Q{item['fiscal_quarter']}",
+                "title":       f"{item['ticker']} internal metrics {item['period_label']}",
+                "happened_at": item["period_end_date"],
+                "text":        text_chunk,
+                "enrich":      True,   # extract entities + build graph connections
+                "attributes": {
                     "ticker":         item["ticker"],
                     "doc_type":       "internal_metrics",
                     "period_label":   item["period_label"],
-                    "period_end_date":item["period_end_date"],
                     "fiscal_year":    item["fiscal_year"],
                     "fiscal_quarter": item["fiscal_quarter"],
-                }
+                },
             }]),
         )
-        memory_ids.append(result.data.results[0].id if result.data.results else "ok")
+        item_ids.append(result.data.results[0].id if result.data.results else "ok")
         print(f"Stored metrics: {item['period_label']} ({item['ticker']})")
 
-    return memory_ids
+    return item_ids
 
 
 # ── Example: 4-quarter internal metrics series ───────────────────────────
@@ -407,36 +428,42 @@ def ingest_board_memo(
     meeting_date: str,   # ISO 8601 - date of the board meeting
     period_label: str,   # e.g. "Q3 2023 Board Meeting"
     memo_type: str,      # "board_memo" | "investor_letter" | "management_commentary"
-) -> str:
+    fiscal_year: int = None,
+    fiscal_quarter: int = None,
+) -> list:
+    """Extract a board memo's text with pypdf and ingest it as context items."""
+    from ingest.earnings_pdfs import extract_pdf_text   # reuse the PDF extractor
     collection = "board-memos"
+    base_id    = f"{ticker}-{memo_type}-{meeting_date[:10]}"
 
-    app_knowledge = json.dumps([{
-        "id":           f"{ticker}-{memo_type}-{meeting_date[:10]}",
-        "title":        f"{ticker} {period_label} - {memo_type.replace('_', ' ').title()}",
-        "type":         "pdf",
-        "timestamp":    meeting_date,
-        "database":    TENANT_ID,
-        "collection": collection,
-        "metadata": {
-            "ticker":       ticker,
-            "doc_type":     memo_type,
-            "period_label": period_label,
-            "meeting_date": meeting_date,
-        }
-    }])
+    attrs = {
+        "ticker":       ticker,
+        "doc_type":     memo_type,
+        "period_label": period_label,
+    }
+    if fiscal_year:    attrs["fiscal_year"]    = fiscal_year
+    if fiscal_quarter: attrs["fiscal_quarter"] = fiscal_quarter
 
-    with open(file_path, "rb") as f:
-        # FIX: SDK expects a tuple of (filename, file_obj, mime_type), not a raw file handle.
-        result = client.context.ingest(
-            database=TENANT_ID,
-            collection=collection,
-            app_knowledge=app_knowledge,
-            documents=[(os.path.basename(file_path), f, "application/pdf")],
-        )
+    items = []
+    for i, part in enumerate(extract_pdf_text(file_path)):
+        items.append({
+            "context_id":  f"{base_id}-part{i+1}" if i else base_id,
+            "title":       f"{ticker} {period_label} - {memo_type.replace('_', ' ').title()}",
+            "happened_at": meeting_date,
+            "text":        part,
+            "attributes":  attrs,
+            "custom_attributes": {"source_file": os.path.basename(file_path)},
+        })
 
-    id = result.data.results[0].id if result.data.results else str(result)
-    print(f"Uploaded memo: {ticker} {period_label} → {id}")
-    return id
+    result = client.context.ingest(
+        database=TENANT_ID,
+        collection=collection,
+        upsert=True,
+        context=json.dumps(items),
+    )
+    ids = [r.id for r in (result.data.results or [])]
+    print(f"Uploaded memo: {ticker} {period_label} → {len(ids)} item(s)")
+    return ids
 ```
 
 ### 2.4 Verify Indexing Before Going Live
@@ -494,13 +521,13 @@ def verify_all_indexed(ids: list[str], poll_interval: int = 3, max_polls: int = 
 verify_all_indexed(ids)
 ```
 
-> **Batch limit reminder.** Maximum 20 sources per request. Wait 1 second between batches. Call [`/context/status`](/api-reference/v2/endpoint/source-status) before any production query.
+> **Batch limit reminder.** Maximum 100 context items per request. Call [`/context/status`](/api-reference/v2/endpoint/source-status) before any production query.
 
 ---
 
-## Step 3 - Store Analyst Memory
+## Step 3 - Store Analyst Profiles
 
-Per-analyst memory personalizes search based on the analyst's focus area, preferred companies, and communication style. A macro fund PM cares about different metrics than a sector-specialist equity analyst.
+Per-analyst context personalizes search based on the analyst's focus area, preferred companies, and communication style. A macro fund PM cares about different metrics than a sector-specialist equity analyst.
 
 ```python
 # memory/analysts.py
@@ -517,16 +544,17 @@ def store_analyst_profile(user_id: str, profile_text: str) -> dict:
 
     user_id:      their login/email slug - must be consistent across sessions
     profile_text: natural language - focus, companies covered, preferred depth, style
-    infer: true   - HydraDB extracts signals + builds graph connections automatically
+    enrich: true  - HydraDB extracts signals + builds graph connections automatically
     """
     result = client.context.ingest(
-        type='memory',
         database=TENANT_ID,
         collection=f"analyst-{user_id}",
         upsert=True,
-        memories=json.dumps([{
-            "text":  profile_text,
-            "infer": True,
+        context=json.dumps([{
+            "context_id": f"profile-{user_id}",
+            "title":      f"Analyst profile - {user_id}",
+            "text":       profile_text,
+            "enrich":     True,
         }]),
     )
     return result
@@ -565,7 +593,7 @@ store_analyst_profile(
 # Output: Stored analyst profile for 'priya'  =>  ok
 ```
 
-> **`infer: true` is the default and should stay on for analyst profiles.** HydraDB extracts signals like `user COVERS ticker:ACME`, `user PREFERS format:quantitative`, `user FOCUS unit_economics`, and builds graph connections automatically. These become structured priors that influence search ranking for every subsequent query from that analyst.
+> **`enrich: true` is the default and should stay on for analyst profiles.** HydraDB extracts signals like `user COVERS ticker:ACME`, `user PREFERS format:quantitative`, `user FOCUS unit_economics`, and builds graph connections automatically. These become structured priors that influence search ranking for every subsequent query from that analyst.
 
 ---
 
@@ -575,7 +603,7 @@ This is the core of the financial analyst use case. Four distinct query patterns
 
 ### 4.1 Point-in-Time: "What happened in Q2?"
 
-Use high `recency_bias` to surface the most relevant recent documents. For point-in-time questions, also use `metadata_filters` to scope to the exact quarter.
+Use high `recency_bias` to surface the most relevant recent documents. For point-in-time questions, also use `attributes` filters to scope to the exact quarter.
 
 ```python
 # query/point_in_time.py
@@ -594,25 +622,32 @@ def query_point_in_time(
 ) -> dict:
     """
     Retrieve context about a specific quarter.
-    metadata_filters narrows to exact period BEFORE semantic search runs.
+    attributes narrows to exact period BEFORE semantic search runs.
     recency_bias: 0.7 - prefer the targeted period but allow adjacent context.
     mode: "thinking" - multi-query reranking, personalised search.
     """
     return client.query(
         database=TENANT_ID,
-        collection=f"analyst-{user_id}",
         query=question,
         max_results=12,
         graph_context=True,
         mode="thinking",
         alpha=0.5,         # balanced keyword + semantic
         recency_bias=0.7,
-        metadata_filters={
+        attributes={
             "ticker":         ticker,
             "fiscal_year":    fiscal_year,
             "fiscal_quarter": fiscal_quarter,
         },
     )
+
+
+def period_of(chunk) -> str:
+    """Derive "Q2 2023" from a context_id ending in -{YYYY}-Q{N}."""
+    parts = (chunk.context_id or "").split("-")
+    q  = next((p for p in reversed(parts) if p.startswith("Q")), "?")
+    yr = next((p for p in reversed(parts) if p.isdigit() and len(p) == 4), "????")
+    return f"{q} {yr}"
 
 
 # Usage
@@ -624,8 +659,8 @@ result = query_point_in_time(
     fiscal_quarter=2,
 )
 for chunk in (result.data.chunks or [])[:3]:
-    print(f"[{chunk.relevancy_score or 0:.2f}] {chunk.source_title or ''}")
-    print((chunk.chunk_content or "")[:240])
+    print(f"[{chunk.score or 0:.2f}] {period_of(chunk)} ({chunk.context_id})")
+    print((chunk.content or "")[:240])
 # Output:
 # [0.75] Financial Metrics -- Q2 2023
 # revenue_usd: 9100000  arr_usd: 37200000  gross_margin_pct: 72.8
@@ -642,6 +677,7 @@ For trend questions, **remove the quarter filter** and lower `recency_bias` so H
 import os, uuid
 from openai import OpenAI
 from hydra_db import HydraDB
+from query.point_in_time import period_of
 
 TENANT_ID     = "financial-analyst"
 openai_client = OpenAI()
@@ -658,7 +694,7 @@ def query_trend(
     Answer trend questions that span multiple quarters.
 
     recency_bias: 0.3 - spread across the timeline, don't cluster recent results.
-    graph_context: True - returns query_paths showing how the metric evolved.
+    graph_context: True - returns data.graph showing how the metric evolved.
     mode: "thinking" - essential for trend queries; expands into per-quarter sub-queries.
     No fiscal_quarter filter - we want ALL quarters for this ticker.
     """
@@ -674,45 +710,44 @@ def query_trend(
         alpha=0.5,
         recency_bias=0.3,   # LOW - surface older documents too
         graph_context=True,  # get temporal entity paths
-        metadata_filters=filters,
+        attributes=filters,
     )
 
-    chunks      = search.data.chunks or []
-    graph_ctx   = search.data.graph_context
-    query_paths = graph_ctx.query_paths if graph_ctx else []
+    chunks = search.data.chunks or []
+    graph  = search.data.graph  or []
 
     if not chunks:
-        return "No relevant context found - verify documents are uploaded and indexed."
+        return "No relevant context found - verify documents are ingested and indexed."
 
-    # Sort chunks by timestamp so LLM sees them in chronological order
-    chunks_sorted = sorted(
-        chunks,
-        key=lambda c: c.source_upload_time or "",
-    )
+    # Sort chunks chronologically using the -{YYYY}-Q{N} tail of each context_id
+    def period_key(c) -> str:
+        parts = (c.context_id or "").split("-")
+        q  = next((p for p in reversed(parts) if p.startswith("Q")), "Q9")
+        yr = next((p for p in reversed(parts) if p.isdigit() and len(p) == 4), "9999")
+        return f"{yr}-{q}"
+
+    chunks_sorted = sorted(chunks, key=period_key)
 
     # Build context with explicit period labels and source attribution
     context_parts = []
     for c in chunks_sorted:
-        meta        = c.additional_metadata or {}
-        period      = meta.get("period_label", "unknown period")
-        doc_type    = meta.get("doc_type", "unknown source")
-        score       = c.relevancy_score or 0
         context_parts.append(
-            f"[{period} | {doc_type} | relevance:{score:.2f}]\n{c.chunk_content or ''}"
+            f"[{period_of(c)} | relevance:{(c.score or 0):.2f}]\n{c.content or ''}"
         )
 
     # Append graph paths - temporal entity relationships
-    for path in query_paths[:6]:
-        context_parts.append(f"[Graph path - temporal]: {str(path)}")
+    for entry in graph[:6]:
+        context_parts.append(f"[Graph path - temporal]: {entry.path_summary}")
 
     # Retrieve analyst profile for answer personalization
     analyst_prefs = client.query(
-        type="memory",
         database=TENANT_ID,
         collection=f"analyst-{user_id}",
         mode="thinking",
         query="focus area metrics preferences output format",
     )
+    profile_text = (analyst_prefs.data.chunks[0].content
+                    if analyst_prefs.data.chunks else "No profile stored.")
 
     context_text = "\n\n".join(context_parts)
 
@@ -734,7 +769,7 @@ def query_trend(
             {
                 "role": "user",
                 "content": (
-                    f"Analyst profile: {analyst_prefs}\n\n"
+                    f"Analyst profile: {profile_text}\n\n"
                     f"Question: {question}\n\n"
                     f"Context (chronological, from HydraDB):\n{context_text}"
                 )
@@ -798,16 +833,17 @@ def cross_source_reconciliation(
     Uses three separate search calls, one per collection, then merges context.
     """
 
-    def search(collection: str, doc_type_filter: str) -> list[dict]:
+    def search(collection: str, doc_type_filter: str) -> list:
         resp = client.query(
             database=TENANT_ID,
+            collection=collection,
             query=f"{ticker} {period_label} financial performance",
             max_results=8,
             mode="thinking",
             alpha=0.5,
             recency_bias=0.7,
             graph_context=True,
-            metadata_filters={
+            attributes={
                 "ticker":         ticker,
                 "fiscal_year":    fiscal_year,
                 "fiscal_quarter": fiscal_quarter,
@@ -824,7 +860,7 @@ def cross_source_reconciliation(
         if not chunks:
             return f"[{label}]: No data found for this period."
         return f"[{label}]:\n" + "\n---\n".join(
-            c.chunk_content or "" for c in chunks
+            c.content or "" for c in chunks
         )
 
     context_text = "\n\n".join([
@@ -905,6 +941,7 @@ Track how management's language around a specific topic (e.g. guidance, macro ri
 import os
 from openai import OpenAI
 from hydra_db import HydraDB
+from query.point_in_time import period_of
 
 TENANT_ID     = "financial-analyst"
 openai_client = OpenAI()
@@ -931,7 +968,7 @@ def track_narrative_shift(
         alpha=0.3,   # lean keyword for topic specificity
         recency_bias=0.2,   # very even - want full timeline
         graph_context=False, # narrative question; graph context less useful here
-        metadata_filters={
+        attributes={
             "ticker":   ticker,
             "doc_type": "earnings_transcript",
         },
@@ -939,14 +976,14 @@ def track_narrative_shift(
 
     chunks = sorted(
         search.data.chunks or [],
-        key=lambda c: (c.additional_metadata or {}).get("period_end_date", ""),
+        key=lambda c: c.context_id or "",   # ids end in -{YYYY}-Q{N}
     )
 
     if not chunks:
         return f"No earnings transcripts found for {ticker}. Verify ingestion."
 
     context_text = "\n\n".join(
-        f"[{c['additional_metadata'].get('period_label', '?')}]\n{c['chunk_content']}"
+        f"[{period_of(c)}]\n{c.content or ''}"
         for c in chunks
     )
 
@@ -1005,7 +1042,7 @@ print(arc)
 
 ## Step 5 - Analyst Search Interface
 
-For analyst chat interfaces, use `POST /query` to retrieve chunks, sources, and graph context. Generate the final answer in your application layer with your LLM provider so citations, formatting, and conversation memory stay under your control.
+For analyst chat interfaces, use `POST /query` to retrieve chunks, graph context, and the ready-made `llm_prompt`. Generate the final answer in your application layer with your LLM provider so citations, formatting, and conversation history stay under your control.
 
 ```python
 # query/financial_recall.py
@@ -1031,9 +1068,10 @@ def financial_recall(
     """
     Retrieve financial context for an analyst question.
 
-    Returns: {"chunks": [...], "sources": [...], "graph_context": {...}, "session_id": str}
+    Returns: {"data": <query response data>, "session_id": str}
 
-    Your app should pass chunks and graph_context to an LLM to generate the final answer.
+    Your app should pass data.llm_prompt (or data.chunks) to an LLM to generate
+    the final answer.
     """
     if user_id not in analyst_sessions:
         analyst_sessions[user_id] = str(uuid.uuid4())
@@ -1045,8 +1083,7 @@ def financial_recall(
     if fiscal_quarter: filters["fiscal_quarter"]  = fiscal_quarter
 
     payload: dict = {
-        "database":     TENANT_ID,
-        "collection": f"analyst-{user_id}",
+        "database":      TENANT_ID,
         "query":         question,
         "max_results":   15,
         "graph_context": True,
@@ -1055,17 +1092,20 @@ def financial_recall(
         "recency_bias":  recency_bias,
     }
     if filters:
-        payload["metadata_filters"] = filters
+        payload["attributes"] = filters
 
     result = client.query(**payload)
-    result["session_id"] = analyst_sessions[user_id]
-    return result
+    return {"data": result.data, "session_id": analyst_sessions[user_id]}
 
 
 def context_for_llm(result) -> str:
+    # data.llm_prompt is a ready-made markdown block with citation labels;
+    # fall back to raw chunk content if it is empty.
+    if result["data"].llm_prompt:
+        return result["data"].llm_prompt
     return "\n\n".join(
-        chunk.chunk_content or ""
-        for chunk in (result.data.chunks or [])
+        chunk.content or ""
+        for chunk in (result["data"].chunks or [])
     )
 
 
@@ -1090,7 +1130,7 @@ r2 = financial_recall(
     fiscal_year=2023,
     recency_bias=0.3,   # spread across all quarters
 )
-print(f"Chunks: {len(r2.data.chunks or [])}")
+print(f"Chunks: {len(r2['data'].chunks or [])}")
 
 # Cross-doc question - no source filter, let HydraDB find relevant sources
 r3 = financial_recall(
@@ -1120,7 +1160,7 @@ print(context_for_llm(r4)[:1000])
 
 ## Step 6 - Automated Quarterly Briefing Agent
 
-Run this agent after each earnings release. It assembles a full briefing - performance summary, trend table, guidance revision, and narrative shift - and saves it back to HydraDB as a memory for the analyst's next session.
+Run this agent after each earnings release. It assembles a full briefing - performance summary, trend table, guidance revision, and narrative shift - and saves it back to HydraDB for the analyst's next session.
 
 ```python
 # agents/briefing.py
@@ -1162,7 +1202,7 @@ def generate_quarterly_briefing(
       2. Search prior quarters for trend context
       3. Cross-source reconciliation
       4. Synthesize into a structured briefing
-      5. Store the briefing back into HydraDB as analyst memory
+      5. Store the briefing back into HydraDB as analyst context
     """
     run_id = str(uuid.uuid4())[:8]
     print(f"\n=== Briefing: {ticker} {period_label} [run:{run_id}] ===")
@@ -1177,7 +1217,7 @@ def generate_quarterly_briefing(
         alpha=0.5,
         recency_bias=0.8,
         graph_context=True,
-        metadata_filters={
+        attributes={
             "ticker":         ticker,
             "fiscal_year":    fiscal_year,
             "fiscal_quarter": fiscal_quarter,
@@ -1207,19 +1247,19 @@ def generate_quarterly_briefing(
     # ── 4. Synthesize briefing ────────────────────────────────────────────
     print("[4/4] Synthesizing briefing...")
     current_context = "\n\n".join(
-        f"[{c.get('additional_metadata', {}).get('period_label','?')} | "
-        f"{c.get('additional_metadata', {}).get('doc_type','?')}]\n{c['chunk_content']}"
+        f"[{c.context_id}]\n{c.content or ''}"
         for c in current_chunks
     )
 
     # Search analyst profile
     analyst_prefs = client.query(
-        type="memory",
         database=TENANT_ID,
         collection=f"analyst-{analyst_user_id}",
         mode="thinking",
         query="coverage focus metrics preferences format",
     )
+    profile_text = (analyst_prefs.data.chunks[0].content
+                    if analyst_prefs.data.chunks else "No profile stored.")
 
     resp = openai_client.chat.completions.create(
         model="gpt-4o",
@@ -1244,7 +1284,7 @@ def generate_quarterly_briefing(
             {
                 "role": "user",
                 "content": (
-                    f"Analyst profile: {analyst_prefs}\n\n"
+                    f"Analyst profile: {profile_text}\n\n"
                     f"Ticker: {ticker} | Period: {period_label}\n\n"
                     f"--- Current Quarter Data ---\n{current_context}\n\n"
                     f"--- Trend Analysis ---\n{trend_answer}\n\n"
@@ -1258,13 +1298,14 @@ def generate_quarterly_briefing(
 
     # ── 5. Store briefing back to HydraDB ────────────────────────────────
     store_resp = client.context.ingest(
-        type='memory',
         database=TENANT_ID,
         collection=f"analyst-{analyst_user_id}",
         upsert=True,
-        memories=json.dumps([{
-            "text":  f"QUARTERLY BRIEFING [{ticker}] [{period_label}] [run:{run_id}]:\n{briefing_text}",
-            "infer": False,   # store verbatim - this is the canonical output
+        context=json.dumps([{
+            "context_id": f"briefing-{ticker}-{fiscal_year}-Q{fiscal_quarter}-{run_id}",
+            "title":      f"Quarterly briefing {ticker} {period_label} [run:{run_id}]",
+            "text":       f"QUARTERLY BRIEFING [{ticker}] [{period_label}] [run:{run_id}]:\n{briefing_text}",
+            "enrich":     False,   # store verbatim - this is the canonical output
         }]),
     )
 
@@ -1387,44 +1428,36 @@ POST /databases
 { "database": "financial-analyst" }
 ```
 
-### Upload Financial Document (SDK required)
+### Ingest Financial Document Text
 
 ```http
 POST /context/ingest
-Content-Type: multipart/form-data
+Content-Type: application/json
 ```
 
-```jsonc
-// app_knowledge - JSON string of the array below
-[{
-  "id":           "ACME-earnings_transcript-2023-Q2",
-  "title":        "ACME Q2 2023 Earnings Transcript",
-  "type":         "pdf",
-  "timestamp":    "2023-06-30T00:00:00Z",
+```json
+{
   "database":    "financial-analyst",
-  "collection":"earnings-acme",
-  "metadata": {
-    "ticker":          "ACME",
-    "doc_type":        "earnings_transcript",
-    "fiscal_year":     2023,
-    "fiscal_quarter":  2,
-    "period_label":    "Q2 2023",
-    "period_end_date": "2023-06-30T00:00:00Z"
-  }
-}]
+  "collection": "earnings-acme",
+  "upsert":      true,
+  "context": [{
+    "context_id":  "ACME-earnings_transcript-2023-Q2",
+    "title":       "ACME Q2 2023 Earnings Transcript",
+    "happened_at": "2023-06-30T00:00:00Z",
+    "text":        "Text extracted client-side from ACME_Q2_2023_transcript.pdf with pypdf...",
+    "attributes": {
+      "ticker":         "ACME",
+      "doc_type":       "earnings_transcript",
+      "fiscal_year":    2023,
+      "fiscal_quarter": 2,
+      "period_label":   "Q2 2023"
+    },
+    "custom_attributes": {"source_file": "ACME_Q2_2023_transcript.pdf"}
+  }]
+}
 ```
 
-> Max 20 sources per request. Wait 1 second between batches.
-
-### Upload PDF via cURL
-
-```bash
-curl -X POST 'https://api.hydradb.com/context/ingest' \
-  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
-  -F "documents=@ACME_Q2_2023_transcript.pdf" \
-  -F "database=financial-analyst" \
-  -F "collection=earnings-acme"
-```
+> Max 100 items per request, 1 MiB of text per item. Split long transcripts into parts.
 
 ### Verify Indexing
 
@@ -1432,7 +1465,7 @@ curl -X POST 'https://api.hydradb.com/context/ingest' \
 GET /context/status?ids=ID&database=financial-analyst
 ```
 
-### Store Metrics / Analyst Memory
+### Store Metrics / Analyst Profile
 
 ```http
 POST /context/ingest
@@ -1440,13 +1473,23 @@ POST /context/ingest
 
 ```json
 {
-  "memories": [{
-    "text":  "Q2 2023 Metrics - ACME: revenue_usd: 9100000, arr_usd: 37200000, gross_margin_pct: 72.8, churn_rate_pct: 1.6, cac_usd: 4050",
-    "infer": true
-  }],
-  "database":     "financial-analyst",
+  "database":    "financial-analyst",
   "collection": "internal-metrics",
-  "upsert":        true
+  "upsert":      true,
+  "context": [{
+    "context_id":  "ACME-internal_metrics-2023-Q2",
+    "title":       "ACME internal metrics Q2 2023",
+    "happened_at": "2023-06-30T00:00:00Z",
+    "text":        "Q2 2023 Metrics - ACME: revenue_usd: 9100000, arr_usd: 37200000, gross_margin_pct: 72.8, churn_rate_pct: 1.6, cac_usd: 4050",
+    "enrich":      true,
+    "attributes": {
+      "ticker":         "ACME",
+      "doc_type":       "internal_metrics",
+      "fiscal_year":    2023,
+      "fiscal_quarter": 2,
+      "period_label":   "Q2 2023"
+    }
+  }]
 }
 ```
 
@@ -1459,14 +1502,13 @@ POST /query
 ```json
 {
   "database":     "financial-analyst",
-  "collection": "analyst-alice",
   "query":         "What did management say about gross margin in Q2 2023?",
   "max_results":   12,
   "graph_context": true,
   "mode":          "thinking",
   "alpha":         0.5,
   "recency_bias":  0.7,
-  "metadata_filters": {
+  "attributes": {
     "ticker":         "ACME",
     "fiscal_year":    2023,
     "fiscal_quarter": 2
@@ -1489,7 +1531,7 @@ POST /query
   "alpha":         0.5,
   "recency_bias":  0.3,
   "graph_context": true,
-  "metadata_filters": {
+  "attributes": {
     "ticker":      "ACME",
     "fiscal_year": 2023
   }
@@ -1511,7 +1553,7 @@ POST /query
   "alpha":        0.3,
   "recency_bias": 0.2,
   "graph_context": true,
-  "metadata_filters": {
+  "attributes": {
     "ticker":   "ACME",
     "doc_type": "earnings_transcript"
   }
@@ -1537,30 +1579,30 @@ POST /query
 
 ```json
 {
-  "chunks": [
-    {
-      "chunk_content":     "Gross margin for Q2 2023 came in at 72.8%, up 160 basis points...",
-      "source_title":      "ACME Q2 2023 Earnings Transcript",
-      "relevancy_score":   0.91,
-      "source_upload_time":"2023-06-30T00:00:00Z",
-      "additional_metadata": {
-        "ticker":         "ACME",
-        "doc_type":       "earnings_transcript",
-        "period_label":   "Q2 2023",
-        "fiscal_year":    2023,
-        "fiscal_quarter": 2
+  "data": {
+    "chunks": [
+      {
+        "chunk_id":   "c9f2a1...",
+        "context_id": "ACME-earnings_transcript-2023-Q2",
+        "score":      0.91,
+        "content":    "Gross margin for Q2 2023 came in at 72.8%, up 160 basis points..."
       }
-    }
-  ],
-  "graph_context": {
-    "query_paths": [
-      ["ACME.gross_margin", "INCREASED_BY", "Q2_2023", "CONTEXT: efficiency programs"],
-      ["ACME.gross_margin", "DECREASED_BY", "Q3_2023", "CONTEXT: sales mix headwinds"]
     ],
-    "chunk_relations": [
-      {"source": "ACME Q2 2023 transcript", "target": "ACME Q2 2023 board memo",
-       "relation": "corroborates", "confidence": 0.84}
-    ]
+    "graph": [
+      {
+        "origin": "ACME.gross_margin",
+        "triplets": [
+          {
+            "source":   {"entity_id": "...", "name": "ACME gross margin"},
+            "relation": {"predicate": "DECREASED_BY", "context": "sales mix headwinds", "relationship_id": "...", "chunk_id": "..."},
+            "target":   {"entity_id": "...", "name": "Q3 2023"}
+          }
+        ],
+        "path_summary": "ACME gross margin increased in Q2 2023 (efficiency programs), decreased in Q3 2023 (sales mix headwinds)."
+      }
+    ],
+    "forceful_relations": [],
+    "llm_prompt": "## Context\n\n[1] ACME Q2 2023 Earnings Transcript\nGross margin for Q2 2023 came in at 72.8%..."
   }
 }
 ```
@@ -1571,7 +1613,7 @@ POST /query
 
 | Query type | `recency_bias` | Reasoning |
 |---|---|---|
-| What happened in Q4? (point-in-time) | `0.8 – 0.9` | Target the specific most-recent relevant document |
+| What happened in Q4? (point-in-time) | `0.8 - 0.9` | Target the specific most-recent relevant document |
 | How did metric X trend in 2023? | `0.3` | Spread evenly across all 4 quarters |
 | How has tone on X shifted over the past 2 years? | `0.2` | Even wider spread, oldest documents matter |
 | Current guidance / most recent statement | `0.9` | Strongly prefer the latest document |
@@ -1602,13 +1644,12 @@ Tested across 3 company corpora (4 quarters of earnings transcripts + internal m
 
 | Pitfall | Symptom | Fix |
 |---|---|---|
-| Wrong `timestamp` on upload | Q1 and Q4 both surface for "most recent" queries | Use `period_end_date`, not upload date |
+| Wrong `happened_at` on ingest | Q1 and Q4 both surface for "most recent" queries | Set `happened_at` to the period end date, not the upload date |
 | Too high `recency_bias` for trend queries | Only Q4 results returned for "how did X trend?" | Use `recency_bias: 0.3` for trend questions |
-| Missing `fiscal_quarter` in metadata | "Q2" filter returns all quarters | Add `fiscal_quarter: 2` to `meta` on upload |
-| `file=f` instead of `documents=[f]` in SDK | `TypeError` on `context.ingest()` | SDK expects a **list**: `documents=[f]` not `file=f` |
-| Raw `requests` for PDF upload | 422 error on `/context/ingest` | Use the SDK: `pip install hydradb-sdk` |
+| Missing `fiscal_quarter` in attributes | "Q2" filter returns all quarters | Add `"fiscal_quarter": 2` to `attributes` on ingest |
+| Sending a PDF binary to `/context/ingest` | 400 error, nothing ingested | No file upload on a unified database: extract text with `pypdf` and send it as `text` items |
 | No `/context/status` polling | Queries return empty results silently | Always poll status before querying |
-| `infer: false` on analyst profiles | No personalization applied | Leave `infer: true` (the default) for profiles |
+| `enrich: false` on analyst profiles | No personalization applied | Leave `enrich: true` (the default) for profiles |
 | Empty `chunks` passed to LLM | Confident hallucinations about quarters | Add guard: `if not chunks: return "No data found"` |
 | Mismatched `collection` on read/write | Empty results despite successful ingestion | Read and write collections must match exactly |
 | Relative imports in `briefing.py` / `slack_bot.py` | `ModuleNotFoundError` when running as a script | Add `sys.path.insert(0, project_root)` at top of file |

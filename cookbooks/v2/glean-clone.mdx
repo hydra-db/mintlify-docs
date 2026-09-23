@@ -1,14 +1,11 @@
 ---
 title: "Build your own Glean with HydraDB"
 description: "Learn how to build a comprehensive workplace search and AI assistant platform using HydraDB APIs. This guide covers data ingestion, retrieval, and app-layer answer generation across multiple data sources."
-noindex: true
 ---
-
-<Warning>This page is deprecated: it documents the knowledge and memory API, which unified databases replace. See [Ingest context](/essentials/v2/ingest) and [Query](/essentials/v2/query).</Warning>
 
 This guide will walk you through building an extremely powerful workplace search and AI assistant platform that rivals Glean using HydraDB APIs. You'll learn how to create a unified retrieval experience across multiple data sources and generate answers in your application layer.
 
-> **Note**: All code in this guide uses the official HydraDB Python SDK. Base URL: `https://api.hydradb.com`. Get your API key at [app.hydradb.com](https://app.hydradb.com).
+> **Note**: All code in this guide uses the official HydraDB Python SDK. Base URL: `https://api.hydradb.com`. Get your API key at [app.hydradb.com](https://app.hydradb.com). SDK snippets use the call shapes in the [SDK reference](/api-reference/v2/sdks) and require an SDK release generated from the current API specification.
 
 ## Prerequisites
 
@@ -23,7 +20,7 @@ This guide will walk you through building an extremely powerful workplace search
 By the end of this cookbook, you'll be able to:
 - Ingest documents from multiple data sources (Slack, email, Google Drive, Jira) into a unified HydraDB knowledge base
 - Run natural language workplace search across all sources with a single [`/query`](/api-reference/v2/endpoint/query) call
-- Personalize search results per user by storing and retrieving AI memories
+- Personalize search results per user by storing and retrieving per-user context
 - Generate grounded AI answers from retrieved context using any LLM
 
 ## Overview
@@ -32,7 +29,7 @@ A Glean-like application typically includes these core features:
 
 - **Universal Search**: Search across multiple data sources (documents, emails, chats, etc.)
 - **Retrieval-Assisted Answers**: Generate intelligent answers from retrieved company knowledge
-- **AI Memories for User Preferences**: Remember and adapt to individual user preferences, search patterns, and behavioral patterns
+- **User Context for Preferences**: Remember and adapt to individual user preferences, search patterns, and behavioral patterns
 - **Data Ingestion**: Connect to various apps and services
 - **Knowledge Graph**: Build connections between information
 - **Security & Access Control**: Role-based permissions and data isolation
@@ -43,11 +40,11 @@ A Glean-like application typically includes these core features:
 graph TD
     A["Frontend UI<br/>• Search UI<br/>• Chat Interface<br/>• Results View"] 
     B["Backend API<br/>• Data Sync<br/>• Auth/ACL<br/>• App Connectors"]
-    C["HydraDB APIs<br/>• Retrieval Engine<br/>• Document Index<br/>• Memory Store"]
+    C["HydraDB APIs<br/>• Retrieval Engine<br/>• Context Index<br/>• Context Store"]
     
     D["Data Sources<br/>• Google apps<br/>• Slack<br/>• Notion<br/>• Jira"]
     E["App Connectors for Fetching Data<br/><br/>• Composio<br/>• Vanilla APIs<br/>• Webhooks<br/>• Scheduled Jobs"]
-    F["Retrieval Layer<br/>• HydraDB Memory<br/>• User Sessions<br/>• Metadata Store"]
+    F["Retrieval Layer<br/>• HydraDB Context<br/>• User Sessions<br/>• Metadata Store"]
     
     A <--> B
     B <--> C
@@ -171,36 +168,31 @@ class GmailConnector {
 
 ### 1.2 Data Normalization
 
-Create a unified data format for all sources:
+Create a unified data format for all sources. Each source document becomes a HydraDB `context` item:
 
-> **Important**: For optimal performance, limit each batch to a maximum of **20 app sources** per request. Send multiple batch requests with an interval of **1 second** between each request.
+> **Important**: For optimal performance, limit each batch to a maximum of **100 context items** per request. Send multiple batch requests with a short interval between each request.
 
 
 ```javascript
-// Unified data structure for HydraDB app upload
-const normalizedData = {
-  id: 'unique_id',
-  database: 'your_database',
-  collection: 'your_collection',
+// Unified context item for HydraDB ingest
+const normalizedItem = {
+  context_id: 'unique_id',          // stable id for idempotent re-ingest with upsert
   title: 'Document/Message Title',
-  type: 'slack_message', // Source category: gmail, slack_message, notion_page, document, etc.
-  timestamp: '2024-01-01T00:00:00Z', // ISO timestamp
-  content: {
-    text: 'Main content text',
-    html_base64: 'base64_encoded_html',
-    markdown: 'markdown_content'
+  text: 'Main content text',        // plain text extracted client-side
+  happened_at: '2024-01-01T00:00:00Z', // ISO timestamp
+  attributes: {                      // declared in the database metadata schema
+    source_type: 'slack',            // gmail, slack, notion, drive, etc.
+    author: 'user@company.com'
   },
-  url: 'https://app.com/item/123', // Optional: source URL
-  description: 'Optional description of the source', // Optional
-  metadata: {}, // Optional database-level metadata
-  additional_metadata: {
-    author: 'user@company.com',
-    id: 'original_id',
-    tags: ['project-a', 'urgent', 'meeting-notes'],
-    permissions: ['user1@company.com', 'user2@company.com']
-  }
+  custom_attributes: {               // free-form, non-filterable detail
+    url: 'https://app.com/item/123',
+    tags: 'project-a,urgent,meeting-notes'
+  },
+  acl: ['user1@company.com', 'user2@company.com'] // Optional: per-item access control
 };
 ```
+
+> **`attributes` must be declared.** Declare `source_type` and `author` (and any other filter keys) in `database_metadata_schema` when you create the database, as in [Attributes](/essentials/v2/attributes). Filter keys that are not declared cannot be used in query-time `attributes` filters.
 
 
 ### 1.3 Batch Upload to HydraDB
@@ -218,33 +210,28 @@ from hydra_db import HydraDB
 
 client = HydraDB(token=os.environ["HYDRA_DB_API_KEY"])
 
-# Upload a batch of knowledge sources
-def upload_batch(sources: list, database: str, collection: str = None):
-    app_knowledge = [
-        {**source, "database": database, "collection": collection or database}
-        for source in sources
-    ]
-
-    result = client.context.ingest(
+# Ingest a batch of context items (up to 100 per request)
+def upload_batch(items: list, database: str, collection: str):
+    return client.context.ingest(
         database=database,
-        app_knowledge=json.dumps(app_knowledge)
+        collection=collection,
+        upsert=True,
+        context=json.dumps(items),
     )
-    return result
 
-# Upload with verification — confirm each item is indexed before proceeding
-def upload_with_verification(sources: list, database: str, collection: str = None):
-    upload_result = upload_batch(sources, database, collection)
+# Ingest with verification - confirm each item is indexed before proceeding
+def upload_with_verification(items: list, database: str, collection: str):
+    upload_result = upload_batch(items, database, collection)
 
     if upload_result.data.results:
         for item in upload_result.data.results:
-            id = item.id
             status = client.context.status(
                 database=database,
-                ids=[id]
+                ids=[item.id]
             )
-            items = status.data.statuses or []
-            if items and items[0].indexing_status == "errored":
-                raise Exception(f"Processing failed for source {id}")
+            statuses = status.data.statuses or []
+            if statuses and statuses[0].indexing_status == "errored":
+                raise Exception(f"Processing failed for source {item.id}")
 
     return upload_result
 ```
@@ -253,28 +240,22 @@ import { HydraDBClient } from "@hydradb/sdk";
 
 const client = new HydraDBClient({ token: process.env.HYDRA_DB_API_KEY! });
 
-// Upload a batch of knowledge sources
-const uploadBatch = async (sources: any[], database: string, collection?: string) => {
-  const appKnowledge = sources.map(source => ({
-    ...source,
+// Ingest a batch of context items (up to 100 per request)
+const uploadBatch = async (items: any[], database: string, collection: string) => {
+  return await client.context.ingest({
     database: database,
-    collection: collection || database
-  }));
-
-  const result = await client.context.ingest({
-    database: database,
-    appKnowledge: JSON.stringify(appKnowledge)
+    collection: collection,
+    upsert: true,
+    context: JSON.stringify(items)
   });
-
-  return result;
 };
 
-// Upload with verification — confirm each item is indexed before proceeding
-const uploadWithVerification = async (sources: any[], database: string, collection?: string) => {
-  const uploadResult = await uploadBatch(sources, database, collection);
+// Ingest with verification - confirm each item is indexed before proceeding
+const uploadWithVerification = async (items: any[], database: string, collection: string) => {
+  const uploadResult = await uploadBatch(items, database, collection);
 
-  const items = uploadResult.data?.results ?? [];
-  for (const item of items) {
+  const results = uploadResult.data?.results ?? [];
+  for (const item of results) {
     const id = item.id;
     const status = await client.context.status({
       database: database,
@@ -298,7 +279,7 @@ const uploadWithVerification = async (sources: any[], database: string, collecti
 
 Create a search interface that queries across all data sources:
 
-> **Note**: HydraDB supports filtering by `source_title` and `source_type` using the `metadata` parameter. Use these for targeted searches across specific data sources.
+> **Note**: HydraDB supports filtering by declared attributes such as `source_type` using the `attributes` parameter. Attribute keys must be declared in the database's `database_metadata_schema` - see [Attributes](/essentials/v2/attributes).
 
 
 <CodeGroup>
@@ -310,7 +291,7 @@ client = HydraDB(token=os.environ["HYDRA_DB_API_KEY"])
 
 def search(query: str, database: str, collection: str = None,
            max_results: int = 10, mode: str = "fast",
-           metadata: dict = None):
+           attributes: dict = None):
     return client.query(
         query=query,
         database=database,
@@ -319,16 +300,12 @@ def search(query: str, database: str, collection: str = None,
         mode=mode,
         alpha=0.5,        # Balance semantic vs keyword search (0.0 to 1.0)
         recency_bias=0.3, # Recency preference (0.0 to 1.0)
-        **({"metadata": metadata} if metadata else {}),
+        **({"attributes": attributes} if attributes else {}),
     )
 
 # Filter search by source type
 def query_by_source_type(query: str, database: str, source_type: str):
-    return search(query, database, metadata={"source_type": source_type})
-
-# Filter search by source title
-def query_by_source_title(query: str, database: str, source_title: str):
-    return search(query, database, metadata={"source_title": source_title})
+    return search(query, database, attributes={"source_type": source_type})
 ```
 ```typescript TypeScript SDK
 import { HydraDBClient } from "@hydradb/sdk";
@@ -339,7 +316,7 @@ interface SearchOptions {
   collection?: string;
   max_results?: number;
   mode?: string;
-  metadata?: Record<string, any>;
+  attributes?: Record<string, any>;
 }
 
 const search = async (query: string, database: string, options: SearchOptions = {}) => {
@@ -347,7 +324,7 @@ const search = async (query: string, database: string, options: SearchOptions = 
     collection,
     max_results = 10,
     mode = "fast",
-    metadata,
+    attributes,
   } = options;
 
   return await client.query({
@@ -358,17 +335,13 @@ const search = async (query: string, database: string, options: SearchOptions = 
     mode,
     alpha: 0.5,         // Balance semantic vs keyword search (0.0 to 1.0)
     recencyBias: 0.3,  // Recency preference (0.0 to 1.0)
-    ...(metadata && { metadata }),
+    ...(attributes && { attributes }),
   });
 };
 
 // Filter search by source type
 const searchBySourceType = (query: string, database: string, sourceType: string) =>
-  search(query, database, { metadata: { source_type: sourceType } });
-
-// Filter search by source title
-const searchBySourceTitle = (query: string, database: string, sourceTitle: string) =>
-  search(query, database, { metadata: { source_title: sourceTitle } });
+  search(query, database, { attributes: { source_type: sourceType } });
 ```
 </CodeGroup>
 
@@ -392,13 +365,11 @@ from hydra_db import HydraDB
 
 client = HydraDB(token=os.environ["HYDRA_DB_API_KEY"])
 
-# Search with optional source type / title metadata filters
-def search_with_filters(query: str, database: str, source_types: str = None, source_titles: str = None):
-    metadata = {}
-    if source_types:
-        metadata["source_type"] = source_types
-    if source_titles:
-        metadata["source_title"] = source_titles
+# Search with optional source type attribute filter
+def search_with_filters(query: str, database: str, source_type: str = None):
+    attributes = {}
+    if source_type:
+        attributes["source_type"] = source_type
 
     return client.query(
         query=query,
@@ -407,10 +378,10 @@ def search_with_filters(query: str, database: str, source_types: str = None, sou
         mode="fast",
         alpha=0.5,
         recency_bias=0.3,
-        **({"metadata": metadata} if metadata else {})
+        **({"attributes": attributes} if attributes else {})
     )
 
-# Guide retrieval with additional context — prepend context to the query string
+# Guide retrieval with additional context - prepend context to the query string
 def search_with_context(query: str, database: str, context: str):
     return client.query(
         query=f"{context}\n\n{query}" if context else query,
@@ -421,7 +392,7 @@ def search_with_context(query: str, database: str, context: str):
         recency_bias=0.3,
     )
 
-# Conversational search — fold prior conversation turns into the query
+# Conversational search - fold prior conversation turns into the query
 def conversational_search(query: str, database: str, conversation_history: list = None):
     history = conversation_history or []
     enriched_query = (
@@ -442,15 +413,14 @@ import { HydraDBClient } from "@hydradb/sdk";
 
 const client = new HydraDBClient({ token: process.env.HYDRA_DB_API_KEY! });
 
-// Search with optional source type / title metadata filters
+// Search with optional source type attribute filter
 const searchWithFilters = async (
   query: string,
   database: string,
-  filters: { sourceTypes?: string; sourceTitles?: string } = {}
+  filters: { sourceType?: string } = {}
 ) => {
-  const metadata: Record<string, any> = {};
-  if (filters.sourceTypes) metadata.source_type = filters.sourceTypes;
-  if (filters.sourceTitles) metadata.source_title = filters.sourceTitles;
+  const attributes: Record<string, any> = {};
+  if (filters.sourceType) attributes.source_type = filters.sourceType;
 
   return await client.query({
     query,
@@ -459,11 +429,11 @@ const searchWithFilters = async (
     mode: "fast",
     alpha: 0.5,
     recencyBias: 0.3,
-    ...(Object.keys(metadata).length > 0 && { metadata })
+    ...(Object.keys(attributes).length > 0 && { attributes })
   });
 };
 
-// Guide retrieval with additional context — prepend context to the query string
+// Guide retrieval with additional context - prepend context to the query string
 const searchWithContext = async (query: string, database: string, context: string) =>
   client.query({
     query: context ? `${context}\n\n${query}` : query,
@@ -474,7 +444,7 @@ const searchWithContext = async (query: string, database: string, context: strin
     recencyBias: 0.3,
   });
 
-// Conversational search — fold prior conversation turns into the query
+// Conversational search - fold prior conversation turns into the query
 const conversationalSearch = async (
   query: string,
   database: string,
@@ -494,20 +464,20 @@ const conversationalSearch = async (
 </CodeGroup>
 
 
-### 2.3 AI Memories and User Preferences
+### 2.3 User Context and Preferences
 
-One of the most powerful features of building a Glean-like application with HydraDB is leveraging **AI Memories** to create truly personalized experiences. HydraDB automatically manages AI memories using `collection` for user-level isolation. This allows your application to remember user preferences, past interactions, and behavioral patterns, making every search and interaction more relevant and efficient.
+One of the most powerful features of building a Glean-like application with HydraDB is leveraging **per-user context** to create truly personalized experiences. Store each user's profile and interaction signals in their own `collection` (`user-<id>`) for isolation, then query it before generating answers. This allows your application to remember user preferences, past interactions, and behavioral patterns, making every search and interaction more relevant and efficient.
 
-#### Understanding AI Memories
+#### Understanding User Context
 
-HydraDB's AI memories are dynamic, user-specific profiles that evolve over time. They capture not just what users say, but their intentions, preferences, and unique behaviors. HydraDB automatically manages these memories using `collection` for user-level isolation. This enables your Glean clone to:
+User context is a dynamic, user-specific profile that evolves over time. It captures not just what users say, but their intentions, preferences, and unique behaviors. Ingest profile updates with `enrich: true` so HydraDB extracts preference signals and links them into the context graph. This enables your Glean clone to:
 
 - **Remember User Preferences**: Format preferences, source preferences, search patterns
 - **Understand Intent**: Learn what types of information users typically seek
 - **Adapt Responses**: Tailor answers based on past interactions
 - **Anticipate Needs**: Suggest relevant information before users ask
 
-#### Implementing AI Memories in Your Search
+#### Implementing User Context in Your Search
 
 
 <CodeGroup>
@@ -518,7 +488,7 @@ from hydra_db import HydraDB
 
 client = HydraDB(token=os.environ["HYDRA_DB_API_KEY"])
 
-# In-memory profile store — replace with your own database in production
+# In-memory profile store - replace with your own database in production
 user_profiles: dict = {}
 
 def get_user_profile(user_id: str) -> dict:
@@ -554,7 +524,7 @@ def save_user_profile(user_id: str, profile: dict):
     print(f"Saving profile for user {user_id}:", profile)
 
 # Search with personalized query enrichment derived from the user's local profile
-def search_with_memory(query: str, database: str, user_id: str):
+def search_with_user_context(query: str, database: str, user_id: str):
     profile = get_user_profile(user_id)
     enriched_query = f"{build_personalized_instructions(profile, query)}\n\n{query}"
 
@@ -568,7 +538,7 @@ def search_with_memory(query: str, database: str, user_id: str):
         recency_bias=0.3,
     )
     if profile["preferred_source_types"]:
-        kwargs["metadata"] = {"source_type": profile["preferred_source_types"]}
+        kwargs["attributes"] = {"source_type": profile["preferred_source_types"]}
 
     search_results = client.query(**kwargs)
 
@@ -584,8 +554,9 @@ def search_with_memory(query: str, database: str, user_id: str):
         profile["frequent_queries"] = ([query] + profile["frequent_queries"])[:10]
 
     for chunk in (search_results.data.chunks or []):
-        if chunk.source_title and chunk.source_title not in profile["favorite_sources"]:
-            profile["favorite_sources"].append(chunk.source_title)
+        source = (chunk.context_id or "").split("-")[0]   # context_id is prefixed per source
+        if source and source not in profile["favorite_sources"]:
+            profile["favorite_sources"].append(source)
     profile["favorite_sources"] = profile["favorite_sources"][:5]
 
     profile["last_interaction"] = datetime.utcnow().isoformat()
@@ -598,7 +569,7 @@ import { HydraDBClient } from "@hydradb/sdk";
 
 const client = new HydraDBClient({ token: process.env.HYDRA_DB_API_KEY! });
 
-// In-memory profile store — replace with your own database in production
+// In-memory profile store - replace with your own database in production
 const userProfiles = new Map<string, any>();
 
 const getUserProfile = (userId: string) => {
@@ -634,7 +605,7 @@ const saveUserProfile = async (userId: string, profile: any) => {
 };
 
 // Search with personalized query enrichment derived from the user's local profile
-const searchWithMemory = async (query: string, database: string, userId: string) => {
+const searchWithUserContext = async (query: string, database: string, userId: string) => {
   const userProfile = getUserProfile(userId);
   const enrichedQuery = `${buildPersonalizedInstructions(userProfile, query)}\n\n${query}`;
 
@@ -647,7 +618,7 @@ const searchWithMemory = async (query: string, database: string, userId: string)
     alpha: 0.5,
     recencyBias: 0.3,
     ...(userProfile.preferredSourceTypes?.length > 0 && {
-      metadata: { source_type: userProfile.preferredSourceTypes }
+      attributes: { source_type: userProfile.preferredSourceTypes }
     })
   });
 
@@ -662,8 +633,9 @@ const searchWithMemory = async (query: string, database: string, userId: string)
 
   if (searchResults.data.chunks) {
     for (const chunk of searchResults.data.chunks) {
-      if (chunk.source && !userProfile.favoriteSources.includes(chunk.source)) {
-        userProfile.favoriteSources.push(chunk.source);
+      const source = (chunk.context_id ?? "").split("-")[0]; // context_id is prefixed per source
+      if (source && !userProfile.favoriteSources.includes(source)) {
+        userProfile.favoriteSources.push(source);
       }
     }
     userProfile.favoriteSources = userProfile.favoriteSources.slice(0, 5);
@@ -782,17 +754,18 @@ class PreferenceLearner {
 ```
 
 
-#### Memory-Enhanced Search Interface
+#### Personalized Search Interface
 
 
 ```javascript
-const MemoryEnhancedSearch = ({ userId }) => {
+// DATABASE, getUserProfile, saveUserProfile and searchWithUserContext are
+// defined in the snippets above. DATABASE is your database name.
+const PersonalizedSearchUI = ({ userId }) => {
   const [query, setQuery] = useState('');
   const [results, setResults] = useState(null);
   const [userPreferences, setUserPreferences] = useState(null);
   const [suggestions, setSuggestions] = useState([]);
 
-  const searchClient = new PersonalizedSearch(API_KEY, TENANT_ID);
   const preferenceLearner = new PreferenceLearner();
 
   useEffect(() => {
@@ -801,7 +774,7 @@ const MemoryEnhancedSearch = ({ userId }) => {
   }, [userId]);
 
   const loadUserPreferences = async () => {
-    const profile = await searchClient.getUserProfile(userId);
+    const profile = getUserProfile(userId);   // local profile helper from step 2.3
     setUserPreferences(profile);
     
     // Generate search suggestions based on user's history
@@ -843,14 +816,14 @@ const MemoryEnhancedSearch = ({ userId }) => {
     const startTime = Date.now();
     
     try {
-      const searchResults = await searchClient.searchWithMemory(query, userId);
+      const searchResults = await searchWithUserContext(query, DATABASE, userId);
       setResults(searchResults);
       
       // Learn from this interaction
       const interaction = {
         query,
         selectedResults: [], // Will be populated when user clicks results
-        responseFormat: searchResults.format || 'default',
+        responseFormat: 'default',
         searchFilters: {},
         timeSpent: Date.now() - startTime,
         followUpQueries: []
@@ -865,17 +838,18 @@ const MemoryEnhancedSearch = ({ userId }) => {
 
   const handleResultClick = async (result) => {
     // Update user preferences when they click on results
-    const profile = await searchClient.getUserProfile(userId);
-    
-    // Mark this source type as preferred
-    if (result.source && !profile.preferredSourceTypes.includes(result.source)) {
-      profile.preferredSourceTypes.push(result.source);
-      await searchClient.saveUserProfile(userId, profile);
+    const profile = getUserProfile(userId);
+
+    // Mark this source type as preferred (context_id is prefixed per source)
+    const source = (result.context_id ?? '').split('-')[0];
+    if (source && !profile.preferredSourceTypes.includes(source)) {
+      profile.preferredSourceTypes.push(source);
+      await saveUserProfile(userId, profile);
     }
   };
 
   return (
-    <div className="memory-enhanced-search">
+    <div className="personalized-search">
       <div className="search-header">
         <input
           type="text"
@@ -931,16 +905,16 @@ const MemoryEnhancedSearch = ({ userId }) => {
 ```
 
 
-#### Benefits of AI Memories in Your Glean Clone
+#### Benefits of User Context in Your Glean Clone
 
 1. **Personalized Search Results**: Users get results tailored to their preferences and past behavior
 2. **Faster Information Discovery**: The system learns what sources and formats users prefer
 3. **Improved User Experience**: Every interaction feels more personal and relevant
 4. **Reduced Cognitive Load**: Users don't need to repeat their preferences or search patterns
 5. **Adaptive Learning**: The system continuously improves based on user interactions
-6. **Automatic Management**: HydraDB handles memory updates automatically - no manual implementation required
+6. **Enrichment**: Ingest profile updates with `enrich: true` so HydraDB extracts preference signals and graph links automatically
 
-#### Best Practices for AI Memories
+#### Best Practices for User Context
 
 - **Respect Privacy**: Always give users control over their data and preferences
 - **Transparency**: Show users what preferences are being used and allow them to modify them
@@ -1022,7 +996,7 @@ const GleanSearchInterface = () => {
 
 ```javascript
 const SearchResults = ({ results }) => {
-  const { chunks, graphContext } = results.data ?? {};
+  const { chunks, graph } = results.data ?? {};
 
   return (
     <div className="search-results">
@@ -1035,10 +1009,12 @@ const SearchResults = ({ results }) => {
         </div>
       )}
 
-      {graphContext && graphContext.queryPaths && (
+      {graph && graph.length > 0 && (
         <div className="graph-context">
-          <h3>Related Knowledge Graph Paths</h3>
-          <pre>{JSON.stringify(graphContext.queryPaths, null, 2)}</pre>
+          <h3>Related Context Graph Paths</h3>
+          {graph.map((path, i) => (
+            <p key={i}>{path.path_summary}</p>
+          ))}
         </div>
       )}
     </div>
@@ -1049,16 +1025,16 @@ const ChunkCard = ({ chunk }) => {
   return (
     <div className="source-card">
       <div className="source-header">
-        <span className="source-type">{chunk.source}</span>
-        <span className="source-title">{chunk.source_title}</span>
-        <span className="source-date">{formatDate(chunk.timestamp)}</span>
+        <span className="source-type">{(chunk.context_id ?? '').split('-')[0]}</span>
+        <span className="source-title">{chunk.context_id}</span>
+        <span className="source-score">score {chunk.score?.toFixed(2)}</span>
       </div>
 
       <div className="source-chunk">
-        <p>{chunk.chunk_content}</p>
-        {chunk.bounding_box && (
-          <div className="chunk-highlight">
-            Position: {chunk.bounding_box.x}, {chunk.bounding_box.y}
+        <p>{chunk.content}</p>
+        {chunk.enrichment && (
+          <div className="chunk-enrichment">
+            {chunk.enrichment}
           </div>
         )}
       </div>
@@ -1075,9 +1051,8 @@ const ChunkCard = ({ chunk }) => {
 
 ```javascript
 class DataSyncManager {
-  constructor(connectors, cortexIngestion) {
+  constructor(connectors) {
     this.connectors = connectors;
-    this.cortexIngestion = cortexIngestion;
     this.syncIntervals = {
       slack: 5 * 60 * 1000, // 5 minutes
       gmail: 10 * 60 * 1000, // 10 minutes
@@ -1105,8 +1080,8 @@ class DataSyncManager {
           this.normalizeData(item, connectorName)
         );
         
-        // Use batch upload with verification
-        await this.cortexIngestion.uploadWithVerification(normalizedData);
+        // Use batched ingest with verification
+        await uploadWithVerification(normalizedData, DATABASE, connectorName);
         console.log(`Synced ${newData.length} items from ${connectorName}`);
       }
     } catch (error) {
@@ -1132,24 +1107,18 @@ class DataSyncManager {
 
   normalizeData(item, sourceType) {
     return {
-      id: `${sourceType}_${item.id}`,
+      context_id: `${sourceType}-${item.id}`,
       title: item.title || item.subject || item.text?.substring(0, 100),
-      source: sourceType,
-      timestamp: item.timestamp || item.created_at || new Date().toISOString(),
-      content: {
-        text: item.text || item.body || item.content,
-        html_base64: item.html ? btoa(item.html) : '',
-        markdown: item.markdown || ''
+      text: item.text || item.body || item.content,
+      happened_at: item.timestamp || item.created_at || new Date().toISOString(),
+      attributes: {
+        source_type: sourceType,
+        author: item.author || item.user || ''
       },
-      url: item.url,
-      description: item.description,
-      metadata: {},
-      additional_metadata: {
-        id: item.id,
-        author: item.author || item.user,
-        tags: item.tags || [],
-        created_at: item.created_at,
-        updated_at: item.updated_at
+      custom_attributes: {
+        url: item.url || '',
+        tags: (item.tags || []).join(','),
+        updated_at: item.updated_at || ''
       }
     };
   }
@@ -1176,25 +1145,23 @@ def slack_webhook():
 
     if event.get("type") == "message":
         from datetime import datetime
-        normalized_data = {
-            "id": f"slack_{event['ts']}",
-            "database": os.environ["TENANT_ID"],
-            "collection": os.environ["SUB_TENANT_ID"],
+        item = {
+            "context_id": f"slack-{event['channel']}-{event['ts']}",
             "title": f"Message in {event['channel']}",
-            "type": "slack_message",
-            "content": {"text": event["text"]},
-            "metadata": {},
-            "additional_metadata": {
-                "id": event["ts"],
-                "author": event["user"],
-                "created_at": datetime.utcfromtimestamp(float(event["ts"])).isoformat(),
+            "text": event["text"],
+            "happened_at": datetime.utcfromtimestamp(float(event["ts"])).isoformat(),
+            "user_name": event.get("user"),
+            "attributes": {
+                "source_type": "slack",
                 "channel": event["channel"]
             }
         }
 
         client.context.ingest(
             database=os.environ["TENANT_ID"],
-            app_knowledge=json.dumps([normalized_data])
+            collection="slack",
+            upsert=True,
+            context=json.dumps([item])
         )
 
     return "OK", 200
@@ -1209,25 +1176,23 @@ app.post("/webhooks/slack", async (req, res) => {
   const { event } = req.body;
 
   if (event.type === "message") {
-    const normalizedData = {
-      id: `slack_${event.ts}`,
-      database: process.env.TENANT_ID!,
-      collection: process.env.SUB_TENANT_ID!,
+    const item = {
+      context_id: `slack-${event.channel}-${event.ts}`,
       title: `Message in ${event.channel}`,
-      type: "slack_message",
-      content: { text: event.text },
-      metadata: {},
-      additional_metadata: {
-        id: event.ts,
-        author: event.user,
-        created_at: new Date(event.ts * 1000).toISOString(),
+      text: event.text,
+      happened_at: new Date(Number(event.ts) * 1000).toISOString(),
+      user_name: event.user,
+      attributes: {
+        source_type: "slack",
         channel: event.channel
       }
     };
 
     await client.context.ingest({
       database: process.env.TENANT_ID!,
-      appKnowledge: JSON.stringify([normalizedData])
+      collection: "slack",
+      upsert: true,
+      context: JSON.stringify([item])
     });
   }
 
@@ -1286,15 +1251,8 @@ class TenantManager {
 
     const searchOptions = {
       database,
-      collection,
-      metadata: {
-        database: database
-      }
+      collection
     };
-
-    if (collection) {
-      searchOptions.metadata.collection = collection;
-    }
 
     return await searchClient.search(query, searchOptions);
   }
@@ -1324,16 +1282,16 @@ class DataPrivacyManager {
       cutoff.setDate(cutoff.getDate() - retentionDays);
 
       // DELETE /context deletes by explicit id - there is no date filter - so
-      // list the memories first and delete only those older than the cutoff.
-      const expiredIds = await this.findExpiredMemories(database, cutoff);
+      // list the context items first and delete only those older than the cutoff.
+      const expiredIds = await this.findExpiredItems(database, cutoff);
       if (expiredIds.length > 0) {
         await this.deleteOldData(database, expiredIds);
       }
     }
   }
 
-  async findExpiredMemories(database, cutoff, collection = null) {
-    const body = { type: 'memory', database: database };
+  async findExpiredItems(database, cutoff, collection = null) {
+    const body = { database: database, include_fields: ['timestamp'] };
     if (collection) {
       body.collection = collection;
     }
@@ -1342,26 +1300,23 @@ class DataPrivacyManager {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${API_KEY}`,
+        'API-Version': '2',
         'Content-Type': 'application/json'
       },
       body: JSON.stringify(body)
     });
 
     const envelope = await response.json();
-    // A type: 'memory' listing returns data.user_memories, not data.sources, and
-    // each row's identifier is memory_id (knowledge listings use data.sources
-    // with id). Reading data.sources here would always yield an empty array.
-    const memories = envelope.data?.user_memories ?? [];
+    const items = envelope.data?.sources ?? [];
 
-    return memories
-      .filter((memory) => memory.timestamp && new Date(memory.timestamp) < cutoff)
-      .map((memory) => memory.memory_id);
+    return items
+      .filter((item) => item.timestamp && new Date(item.timestamp) < cutoff)
+      .map((item) => item.id);
   }
 
   async deleteOldData(database, ids, collection = null) {
-    // Use HydraDB's context deletion endpoint for memory deletion.
-    // Raw fetch to the REST API: the JSON body uses snake_case wire keys.
-    const body = { type: 'memory', database: database, ids: ids };
+    // DELETE /context takes {database, collection?, ids}.
+    const body = { database: database, ids: ids };
     if (collection) {
       body.collection = collection;
     }
@@ -1370,6 +1325,7 @@ class DataPrivacyManager {
       method: 'DELETE',
       headers: {
         'Authorization': `Bearer ${API_KEY}`,
+        'API-Version': '2',
         'Content-Type': 'application/json'
       },
       body: JSON.stringify(body)
@@ -1512,7 +1468,7 @@ class SearchAnalytics {
   async trackSearch(query, filters, results, responseTime) {
     this.metrics.searches++;
     
-    if (results && results.answer) {
+    if (results && results.data?.chunks?.length) {
       this.metrics.successfulSearches++;
     } else {
       this.metrics.failedSearches++;
@@ -1528,7 +1484,7 @@ class SearchAnalytics {
     // Track source type usage
     if (results && results.data?.chunks) {
       results.data.chunks.forEach(chunk => {
-        const sourceType = chunk.source;
+        const sourceType = (chunk.context_id ?? 'unknown').split('-')[0];
         this.metrics.sourceTypeUsage.set(
           sourceType,
           (this.metrics.sourceTypeUsage.get(sourceType) || 0) + 1
@@ -1566,8 +1522,8 @@ class SearchAnalytics {
 
 ### 1. Data Ingestion Best Practices
 
-- **Batch Processing**: Use HydraDB's batch upload endpoints for efficiency
-- **Batch Limits**: Limit to 20 app sources per request with 1-second intervals between batches
+- **Batch Processing**: Send up to 100 `context` items per `/context/ingest` request
+- **Batch Limits**: Keep each request under the 8 MiB body and 1 MiB per-item limits
 - **Incremental Sync**: Only sync new/changed data to minimize API calls
 - **Error Handling**: Implement retry logic with exponential backoff
 - **Processing Verification**: Always verify upload processing using `/context/status`
@@ -1577,7 +1533,7 @@ class SearchAnalytics {
 
 - **Query Preprocessing**: Clean and normalize user queries
 - **Result Ranking**: Use `alpha` and `recency_bias` for fine-tuning
-- **Metadata Filtering**: Use `source_title` and `source_type` for targeted searches
+- **Attribute Filtering**: Use declared `attributes` like `source_type` for targeted searches
 - **Thinking Mode**: Use `mode: "thinking"` for complex queries that benefit from multi-query retrieval with reranking
 - **Caching**: Cache frequent queries and results
 
@@ -1593,7 +1549,7 @@ class SearchAnalytics {
 - **Connection Pooling**: Reuse HTTP connections
 - **Async Processing**: Use async/await for non-blocking operations
 - **Memory Management**: Implement proper cleanup for large datasets
-- **Batch Optimization**: Respect 20-source batch limits and 1-second intervals
+- **Batch Optimization**: Respect the 100-item batch limit and keep a short interval between batches
 - **Processing Verification**: Verify uploads to ensure data is properly indexed
 - **Monitoring**: Track response times and error rates
 
@@ -1619,7 +1575,7 @@ class SearchAnalytics {
 
 Building a Glean-like application with HydraDB APIs provides you with a powerful, scalable foundation for workplace search and AI assistance. By following this guide and implementing the best practices outlined, you can create a comprehensive solution that rivals commercial offerings while maintaining full control over your data and user experience.
 
-The key to success is starting with a solid architecture, implementing proper data synchronization, and gradually adding advanced features like multi-step reasoning, conversation memory, and personalized responses. HydraDB's APIs provide the AI capabilities you need, while your application handles the data ingestion, user interface, and business logic.
+The key to success is starting with a solid architecture, implementing proper data synchronization, and gradually adding advanced features like multi-step reasoning, conversation context, and personalized responses. HydraDB's APIs provide the AI capabilities you need, while your application handles the data ingestion, user interface, and business logic.
 
 Remember to monitor performance, gather user feedback, and continuously iterate on your implementation to create the best possible user experience.
 
@@ -1627,10 +1583,11 @@ Remember to monitor performance, gather user feedback, and continuously iterate 
 
 | Date | Change |
 |------|--------|
+| 2026-06-04 | Rewritten for the unified context API: `app_knowledge`/`type`-based calls replaced with `context` items, `metadata` filters replaced with declared `attributes`, memory features recast as per-user context collections, and response reads updated to `content`/`context_id`/`score`/`graph` |
 | 2026-05-14 | Replaced raw `fetch()`-based `HydraDBDataIngestion` class with official SDK calls (`client.context.ingest`, `client.context.status`) |
 | 2026-05-14 | Replaced raw `fetch()`-based `GleanSearch` class with `client.query` SDK call |
 | 2026-05-14 | Replaced `AdvancedSearch` class with standalone SDK helper functions (`searchWithFilters`, `searchWithContext`, `conversationalSearch`) |
-| 2026-05-14 | Replaced `PersonalizedSearch` class with flat SDK-based `searchWithMemory` function |
+| 2026-05-14 | Replaced `PersonalizedSearch` class with a flat SDK-based personalized search function |
 | 2026-05-14 | Replaced webhook `cortexIngestion.uploadBatch()` call with `client.context.ingest()` SDK call |
 | 2026-05-14 | Added Python SDK equivalents in `<CodeGroup>` tabs for all replaced code blocks |
 | 2026-05-14 | Removed "Status: In progress" notice |

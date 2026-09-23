@@ -1,16 +1,13 @@
 ---
 title: "Internal IT Support Agent"
 description: "Ingest your entire workspace - Notion, Confluence, Slack - into HydraDB and build a conversational interface that understands relationships between documents. Answer 'why did we decide X?' using HydraDB's context graph. Every endpoint in this guide is real and copy-paste ready."
-noindex: true
 ---
-
-<Warning>This page is deprecated: it documents the knowledge and memory API, which unified databases replace. See [Ingest context](/essentials/v2/ingest) and [Query](/essentials/v2/query).</Warning>
 
 Notion's built-in AI keyword-searches. It returns the document you asked about and stops. It can't tell you **why** a decision was made, who influenced it, or whether it's been superseded by something newer.
 
-HydraDB is different. It doesn't just store vectors - it builds a **living context graph**. Every memory is parsed, enriched, and connected to other memories. When your agent calls `POST /query`, it doesn't just get semantically similar chunks. It gets the most useful context for that exact query - weighted by recency, relevance, relationships, and historical usage patterns.
+HydraDB is different. It doesn't just store vectors - it builds a **living context graph**. Every context item is parsed, enriched, and connected to other items. When your agent calls `POST /query`, it doesn't just get semantically similar chunks. It gets the most useful context for that exact query - weighted by recency, relevance, relationships, and historical usage patterns.
 
-> **All code in this cookbook is real.** Base URL is `https://api.hydradb.com`. Get your API key at [app.hydradb.com](https://app.hydradb.com).
+> **All code in this cookbook is real.** Base URL is `https://api.hydradb.com`. Get your API key at [app.hydradb.com](https://app.hydradb.com). SDK snippets use the call shapes in the [SDK reference](/api-reference/v2/sdks) and require an SDK release generated from the current API specification; the cURL and `requests` examples work today.
 
 ---
 
@@ -27,7 +24,7 @@ HydraDB is different. It doesn't just store vectors - it builds a **living conte
 | Source | Install | Environment |
 | --- | --- | --- |
 | Notion | `pip install notion-client` | `NOTION_TOKEN` |
-| Confluence | `pip install requests` | `CONFLUENCE_URL`, `CONFLUENCE_USER`, `CONFLUENCE_TOKEN` |
+| Confluence | `pip install atlassian-python-api beautifulsoup4` | `CONFLUENCE_URL`, `CONFLUENCE_USER`, `CONFLUENCE_TOKEN` |
 | Slack | `pip install slack_sdk slack_bolt` | `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN` |
 
 ## What You'll Build
@@ -35,7 +32,7 @@ HydraDB is different. It doesn't just store vectors - it builds a **living conte
 By the end of this cookbook, you'll be able to:
 - Ingest Notion pages, Confluence docs, and Slack threads into a unified HydraDB workspace
 - Answer "why did we decide X?" by retrieving decision context across linked documents
-- Batch-upload documents with verified indexing before any search query
+- Batch-upload context items with verified indexing before any search query
 - Build a conversational interface grounded in your team's actual knowledge
 
 ---
@@ -45,8 +42,8 @@ By the end of this cookbook, you'll be able to:
 Before writing code, understand the three primitives you'll use throughout this cookbook:
 
 - **Database** - your workspace. All data is isolated per database. Think of it as your "company" in HydraDB. Create one per application.
-- **Memory** - any unit of context: a Notion page, a Confluence doc, a Slack thread, a user preference. HydraDB automatically chunks, embeds, and connects memories into a context graph.
-- **Search** - the retrieval call your agent makes before acting. HydraDB's search runs a multi-stage pipeline: metadata filtering → graph traversal → semantic retrieval → personalized ranking.
+- **Context item** - any unit of context: a Notion page, a Confluence doc, a Slack thread, a user preference. HydraDB automatically chunks, embeds, and connects items into a context graph.
+- **Search** - the retrieval call your agent makes before acting. HydraDB's search is a hybrid pipeline: text and semantic retrieval, attribute filtering, graph context and reranking.
 
 **LongMemEvals search accuracy: 90%**
 
@@ -75,8 +72,14 @@ Every HydraDB workspace starts with a database. Create one for your knowledge ba
 ```bash
 curl -X POST 'https://api.hydradb.com/databases' \
   -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "API-Version: 2" \
   -H "Content-Type: application/json" \
-  -d '{"database": "notion-ai-workspace"}'
+  -d '{
+    "database": "notion-ai-workspace",
+    "database_metadata_schema": [
+      { "name": "source_type", "data_type": "VARCHAR" }
+    ]
+  }'
 ```
 
 ### Python
@@ -90,8 +93,14 @@ DATABASE_ID = "notion-ai-workspace"
 
 client = HydraDB(token=API_KEY)
 
-# Create database - idempotent, safe to re-run
-resp = client.databases.create(database=DATABASE_ID)
+# Create database - idempotent, safe to re-run.
+# `source_type` is declared here so queries can filter on it later.
+resp = client.databases.create(
+    database=DATABASE_ID,
+    database_metadata_schema=[
+        {"name": "source_type", "data_type": "VARCHAR"},
+    ],
+)
 print("Database:", resp)
 ```
 
@@ -99,15 +108,15 @@ print("Database:", resp)
 
 ---
 
-## Step 02 - Upload Knowledge Memories
+## Step 02 - Upload Context Items
 
 HydraDB automatically parses, chunks, embeds, and connects your content into a context graph. You don't manage embeddings or vector indexes. You just upload.
 
 ### Notion Connector
 
-Fetch pages from Notion, format them into HydraDB's app source structure, and batch upload. HydraDB builds the context graph automatically - no edge creation needed.
+Fetch pages from Notion, format them as context items, and batch upload. HydraDB builds the context graph automatically - no edge creation needed.
 
-> **Batch limit:** Max **20 sources per request**. Wait **1 second between batches** to respect rate limits.
+> **Batch limit:** Max **100 items per request**.
 
 ```python
 import json, time
@@ -127,14 +136,12 @@ def extract_text(page_id: str) -> str:
     return "\n\n".join(lines)
 
 
-def upload_batch(sources: list, collection: str = None) -> list:
-    """Upload up to 20 sources. Returns list of IDs."""
-    if collection:
-        for s in sources:
-            s["collection"] = collection
+def upload_batch(items: list, collection: str = None) -> list:
+    """Upload up to 100 context items. Returns list of IDs."""
     result = client.context.ingest(
         database=DATABASE_ID,
-        app_knowledge=json.dumps(sources),
+        collection=collection,
+        context=json.dumps(items),
     )
     return [r.id for r in (result.data.results or []) if r.id]
 
@@ -153,22 +160,21 @@ def ingest_notion_database(database_id: str, collection: str = None) -> list:
         author     = page["created_by"]["id"]
 
         batch.append({
-            "id":        page["id"],
-            "title":     title,
-            "type":      "notion_page",                    # required
-            "timestamp": page["last_edited_time"],         # required ISO
-            "content":   {"text": text},
-            "url":       f"https://notion.so/{page['id'].replace('-','')}",
-            "metadata": {
+            "context_id": f"notion-{page['id']}",
+            "title":      title,
+            "text":       text,
+            "happened_at": page["last_edited_time"][:10],
+            "attributes": {"source_type": "notion_page"},
+            "custom_attributes": {
                 "author": author,
+                "url":    f"https://notion.so/{page['id'].replace('-','')}",
                 "tags":   ["notion", "knowledge"],
             },
         })
 
-        if len(batch) == 20:
+        if len(batch) == 100:
             all_ids += upload_batch(batch, collection)
             batch = []
-            time.sleep(1)  # required 1-second interval between batches
 
     if batch:
         all_ids += upload_batch(batch, collection)
@@ -177,7 +183,7 @@ def ingest_notion_database(database_id: str, collection: str = None) -> list:
 
 ### Confluence Connector
 
-Confluence pages follow the same upload format. Use `type: "confluence"` so HydraDB can distinguish sources during search and apply metadata filtering.
+Confluence pages follow the same upload format. Set `source_type` in `attributes` so queries can filter to Confluence content.
 
 ```python
 from atlassian import Confluence
@@ -202,21 +208,20 @@ def ingest_space(space_key: str, collection: str = None) -> list:
         text = BeautifulSoup(html, "html.parser").get_text("\n\n")
 
         batch.append({
-            "id":        page["id"],
-            "title":     page["title"],
-            "type":      "confluence",                    # required
-            "timestamp": page["version"]["when"],         # required ISO
-            "content":   {"text": text},
-            "metadata": {
+            "context_id": f"confluence-{page['id']}",
+            "title":      page["title"],
+            "text":       text,
+            "happened_at": page["version"]["when"][:10],
+            "attributes": {"source_type": "confluence"},
+            "custom_attributes": {
                 "author": page["history"]["createdBy"]["accountId"],
                 "tags":   ["confluence", space_key.lower()],
             },
         })
 
-        if len(batch) == 20:
+        if len(batch) == 100:
             all_ids += upload_batch(batch, collection)
             batch = []
-            time.sleep(1)
 
     if batch:
         all_ids += upload_batch(batch, collection)
@@ -236,7 +241,7 @@ def poll_until_indexed(id: str, timeout: int = 120, interval: int = 3):
     while time.time() < deadline:
         result = client.context.status(
             database=DATABASE_ID,
-            ids=id,
+            ids=[id],
         )
         items  = result.data.statuses or []
         status = items[0].indexing_status if items else None
@@ -254,65 +259,59 @@ def verify_all(ids: list):
 
 ---
 
-## Step 03 - Add User Memories
+## Step 03 - Add User Context
 
-Beyond documents, HydraDB stores **user memories** - preferences, habits, and patterns that personalize search per user. Set `infer: true` to let HydraDB extract implicit signals from text. Set `infer: false` to store facts verbatim.
+Beyond documents, HydraDB stores per-user context - preferences, habits, and patterns that personalize search per user. Set `enrich: true` (the default) to let HydraDB extract implicit signals from text; set it to `false` to store facts verbatim.
 
-**Endpoint:** `POST /context/ingest` - Add a user memory
+**Endpoint:** `POST /context/ingest` - Add user context
 
 ### Bash
 
 ```bash
 curl -X POST 'https://api.hydradb.com/context/ingest' \
   -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "API-Version: 2" \
   -H "Content-Type: application/json" \
   -d '{
-    "memories": [{
-      "text": "Alice prefers concise bullet-point answers and always wants source links",
-      "user_name": "alice",
-      "infer": true
-    }],
     "database": "notion-ai-workspace",
     "collection": "user-alice",
-    "upsert": true
+    "upsert": true,
+    "context": [{
+      "text": "Alice prefers concise bullet-point answers and always wants source links",
+      "user_name": "alice",
+      "enrich": true
+    }]
   }'
 ```
 
 ### Python
 
 ```python
-def add_user_memory(
+def add_user_context(
     user_name: str,
     preference: str,
     collection: str = None,
-    infer: bool = True,
+    enrich: bool = True,
 ) -> dict:
-    """
-    Store a user memory/preference in HydraDB.
-    Uses the SDK-spec body format with the memories[] array wrapper.
-    """
-    payload = {
-        "memories": [{
+    """Store a user preference in HydraDB as a context item."""
+    return client.context.ingest(
+        database=DATABASE_ID,
+        collection=collection,
+        upsert=True,
+        context=json.dumps([{
             "text":      preference,
             "user_name": user_name,
-            "infer":     infer,
-        }],
-        "database": DATABASE_ID,
-        "upsert":    True,
-    }
-    if collection:
-        payload["collection"] = collection
-
-    return client.context.ingest(
-    type='memory',**payload)
+            "enrich":    enrich,
+        }]),
+    )
 
 
 # Example usage
-add_user_memory(
+add_user_context(
     user_name="alice",
     preference="Alice prefers concise bullet-point answers and always wants source links",
     collection="user-alice",
-    infer=True,
+    enrich=True,
 )
 ```
 
@@ -322,7 +321,7 @@ After a few interactions, HydraDB builds a behavioral model per user. Alice's se
 
 ## Step 04 - Search Context
 
-This is the call your agent makes before answering any question. `POST /query` runs HydraDB's full multi-stage pipeline and returns ranked, contextually relevant chunks - including graph context showing relationships between entities.
+This is the call your agent makes before answering any question. `POST /query` runs HydraDB's retrieval pipeline and returns ranked chunks, graph paths, and a ready-made `llm_prompt`.
 
 **Endpoint:** `POST /query` - Retrieve agent context
 
@@ -331,16 +330,16 @@ def recall_context(
     query: str,
     collection: str     = None,
     max_results: int    = 10,
-    alpha: float        = 0.8,    # FIX: single definition, no duplicate
+    alpha: float        = 0.8,
     recency_bias: float = 0.3,
     graph_context: bool = True,
 ) -> dict:
     """
-    Full search - searches knowledge base (documents).
-    To also retrieve user memories, call /query separately.
-    collection: scope to a specific workspace or user namespace.
-    mode: "thinking" enables personalised ranking.
-    graph_context: true enables cross-document entity linking.
+    Full search over the workspace collection.
+    To search a workspace and a user's context in one call, pass
+    collections=["workspace", "user-alice"] instead of collection.
+    mode: "thinking" expands and reranks; "fast" is a single pass.
+    graph_context: true (the default) returns entity paths under data.graph.
     """
     payload = {
         "database":     DATABASE_ID,
@@ -348,7 +347,7 @@ def recall_context(
         "max_results":   max_results,
         "mode":          "thinking",
         "graph_context": graph_context,
-        "alpha":         alpha,       # FIX: single key only
+        "alpha":         alpha,
         "recency_bias":  recency_bias,
     }
     if collection:
@@ -356,8 +355,10 @@ def recall_context(
 
     return client.query(**payload)
     # Response shape:
-    # data["chunks"]        - ranked context chunks with relevancy_score
-    # data["graph_context"] - entity paths and chunk_relations
+    # data.chunks             - ranked chunks: content, score, context_id
+    # data.graph              - entity paths related to the hits
+    # data.forceful_relations - caller-declared relations pulled into the result
+    # data.llm_prompt         - prompt-ready markdown block with citations
 
 
 # Example
@@ -366,15 +367,15 @@ context = recall_context(
     collection="workspace",
 )
 for chunk in (context.data.chunks or []):
-    print(f"[{chunk.relevancy_score or 0:.2f}] {chunk.source_title or ''}")
-    print((chunk.chunk_content or "")[:200])
+    print(f"[{chunk.score or 0:.2f}] {chunk.context_id or ''}")
+    print((chunk.content or "")[:200])
 ```
 
 ---
 
 ## Step 05 - Search and Answer Generation
 
-For conversational, AI-generated answers, first retrieve context with `POST /query`. Then pass the returned `chunks` and `sources` into your application-layer LLM prompt. Key parameters: `alpha` (0-1, balance semantic vs keyword bm25), `recency_bias` (0-1, prefer newer content), and `graph_context`.
+For conversational, AI-generated answers, first retrieve context with `POST /query`. The response carries `llm_prompt`: a ready-made markdown block with citation labels you can pass to your application-layer LLM as-is. Key parameters: `alpha` (0-1, balance semantic vs keyword bm25), `recency_bias` (0-1, prefer newer content), and `graph_context`.
 
 **Endpoint:** `POST /query` - retrieved context for app-layer answer generation
 
@@ -389,7 +390,8 @@ def ask_workspace(
 ) -> dict:
     """
     Retrieve workspace context for a question.
-    Returns chunks, sources, and graph_context. Generate the final answer in your app layer.
+    Returns chunks, graph, forceful_relations and llm_prompt.
+    Generate the final answer in your app layer.
     """
     payload = {
         "database":     DATABASE_ID,
@@ -403,16 +405,14 @@ def ask_workspace(
     if collection:
         payload["collection"] = collection
     if source_filter:
-        payload["metadata_filters"] = {"source_type": source_filter}
+        payload["attributes"] = {"source_type": source_filter}
 
     return client.query(**payload)
 
 
 def build_context(result) -> str:
-    return "\n\n".join(
-        chunk.chunk_content or ""
-        for chunk in (result.data.chunks or [])
-    )
+    # llm_prompt is the rendered context block, citations included.
+    return result.data.llm_prompt or ""
 
 
 # Usage examples
@@ -466,12 +466,15 @@ def handle_mention(event, client):
     result     = ask_workspace(question)
 
     chunks = result.data.chunks or []
-    answer = "\n\n".join(c.chunk_content or "" for c in chunks[:3]) or "No results found."
-    sources = result.data.sources or []
+    answer = "\n\n".join(c.content or "" for c in chunks[:3]) or "No results found."
 
-    if sources:
-        links  = "\n".join(f"• {s.title or ''}" for s in sources[:3])
-        answer += f"\n\n*Sources:*\n{links}"
+    # Resolve titles for the cited items
+    ctx_ids = [c.context_id for c in chunks[:3] if c.context_id]
+    if ctx_ids:
+        listed = client.context.list(database=DATABASE_ID, ids=ctx_ids)
+        titles = [s.title for s in (listed.data.sources or []) if s.title]
+        if titles:
+            answer += "\n\n*Sources:*\n" + "\n".join(f"• {t}" for t in titles)
 
     client.chat_update(
         channel=event["channel"],
@@ -498,34 +501,47 @@ All endpoints used in this cookbook. Base URL: `https://api.hydradb.com`. Header
 { "database": "notion-ai-workspace" }
 ```
 
-### Upload app sources (Notion, Slack, Confluence…)
+### Upload context items (Notion, Slack, Confluence…)
 
-**POST** `/context/ingest` - Max 20/call, 1s between batches
+**POST** `/context/ingest` - Max 100 items per request
 
 ```json
-[{
-  "id":        "page-uuid",
-  "title":     "RFC-041 Database Migration",
-  "type":      "notion_page",                    // required
-  "timestamp": "2024-09-01T08:00:00Z",          // required ISO
-  "content":   { "text": "We chose Postgres because..." },
-  "url":       "https://notion.so/...",
-  "metadata": {
-    "author": "alice@company.com",
-    "tags":   ["rfc", "database"]
-  }
-}]
+{
+  "database": "notion-ai-workspace",
+  "collection": "workspace",
+  "context": [{
+    "context_id": "notion-page-uuid",
+    "title":      "RFC-041 Database Migration",
+    "text":       "We chose Postgres because...",
+    "happened_at": "2024-09-01",
+    "attributes": { "source_type": "notion_page" },
+    "custom_attributes": {
+      "author": "alice@company.com",
+      "url":    "https://notion.so/...",
+      "tags":   ["rfc", "database"]
+    }
+  }]
+}
 ```
 
-### Upload a single file (PDF / DOCX)
+### Ingest a file (PDF / DOCX)
 
-**POST** `/context/ingest` - Single file with database as form field
+There is no file upload on a unified database. Extract the text in your app (for PDFs, `pypdf`; for DOCX, `python-docx`) and send it as `text` items, chunked to stay under the 1 MiB per item limit:
 
-```bash
-curl -X POST 'https://api.hydradb.com/context/ingest' \
-  -H "Authorization: Bearer YOUR_API_KEY" \
-  -F "documents=@/path/to/document.pdf" \
-  -F "database=notion-ai-workspace"
+```python
+from pypdf import PdfReader
+
+text = "\n".join(page.extract_text() or "" for page in PdfReader("report.pdf").pages)
+
+client.context.ingest(
+    database=DATABASE_ID,
+    collection="workspace",
+    context=json.dumps([{
+        "context_id": "report-pdf",
+        "title":      "report.pdf",
+        "text":       text,
+    }]),
+)
 ```
 
 ### Verify processing
@@ -534,7 +550,7 @@ curl -X POST 'https://api.hydradb.com/context/ingest' \
 
 ### Full search
 
-**POST** `/query` - Searches knowledge base - returns chunks + graph_context
+**POST** `/query` - returns `chunks`, `graph`, `forceful_relations` and `llm_prompt`
 
 ```json
 {
@@ -551,7 +567,7 @@ curl -X POST 'https://api.hydradb.com/context/ingest' \
 
 ### Search for answer generation
 
-**POST** `/query` - retrieved context for app-layer answer generation
+**POST** `/query` - retrieved context for app-layer answer generation; use `data.llm_prompt` as the context block
 
 ```json
 {
@@ -562,43 +578,50 @@ curl -X POST 'https://api.hydradb.com/context/ingest' \
   "graph_context":    true,
   "alpha":            0.5,
   "recency_bias":     0.3,
-  "metadata_filters": { "source_type": "notion_page" }
+  "attributes":       { "source_type": "notion_page" }
 }
 ```
 
-### Add user memory
+### Add user context
 
-**POST** `/context/ingest` - memories[] array wrapper - consistent SDK format
+**POST** `/context/ingest` - a `context` item with `user_name` set on the item
 
 ```json
 {
-  "memories": [{
+  "database":     "notion-ai-workspace",
+  "collection": "user-alice",
+  "upsert":        true,
+  "context": [{
     "text":      "Alice prefers bullet-point responses",
     "user_name": "alice",
-    "infer":     true
-  }],
-  "database":     "notion-ai-workspace",
-  "collection": "user-alice",
-  "upsert":        true
+    "enrich":    true
+  }]
 }
 ```
 
-### Search user memories
+### Query a user's context
 
-**POST** `/query` - user_name key - consistent across all calls
+**POST** `/query` - scope to the user's collection, or fan out with `collections`
 
 ```json
 {
   "database":     "notion-ai-workspace",
-  "collection": "user-alice",
-  "user_name":     "alice",
+  "collections": ["workspace", "user-alice"],
   "query":         "How should I format answers for this user?"
 }
 ```
 
-### Delete memory
+### Delete context
 
-**DELETE** `/context` - Remove stale or incorrect memory data with `type: "memory"` and `request.ids`
+**DELETE** `/context` - remove stale or incorrect items by id
+
+```json
+{
+  "database":   "notion-ai-workspace",
+  "collection": "user-alice",
+  "ids":        ["pref-001"]
+}
+```
 
 ---
 
@@ -610,7 +633,7 @@ HydraDB leads LongMemEvals with 90% search accuracy. Compared to a naive RAG pip
 |-----------|-----------|---------|-------|
 | Factual lookup queries | 81% search | 90% search | +11% |
 | "Why did we…" decision queries | 34% search | 79% search | +132% |
-| Stale doc surface rate | 41% of results | 7% of results | −83% |
+| Stale doc surface rate | 41% of results | 7% of results | -83% |
 | P95 query latency | 220ms | under 200 ms | Sub-second |
 
 > **Benchmark methodology.** Figures are based on internal HydraDB testing. For the formal benchmark paper see [research.hydradb.com/hydradb.pdf](https://research.hydradb.com/hydradb.pdf). Results will vary by corpus size, content quality, and query distribution.
