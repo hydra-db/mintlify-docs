@@ -9,7 +9,7 @@ import { Field } from "/snippets/field.jsx";
 Use this endpoint to add new fields to a database's `database_metadata_schema`.
 
 <Warning>
-  This endpoint is additive only. It cannot delete fields, rename fields, or change the type/flags of existing fields.
+  This endpoint is additive only. It cannot delete fields, rename fields, or change the type or flags of existing fields, and a new field cannot enable dense or sparse embeddings.
 </Warning>
 
 <RequestExample>
@@ -27,10 +27,8 @@ curl -X PATCH 'https://api.hydradb.com/databases/acme_corp/metadata-schema' \
         "enable_match": true
       },
       {
-        "name": "summary_label",
-        "data_type": "VARCHAR",
-        "enable_dense_embedding": true,
-        "enable_sparse_embedding": true
+        "name": "priority",
+        "data_type": "INT64"
       }
     ]
   }'
@@ -49,12 +47,7 @@ response = requests.patch(
     json={
         "add_fields": [
             {"name": "region", "data_type": "VARCHAR", "enable_match": True},
-            {
-                "name": "summary_label",
-                "data_type": "VARCHAR",
-                "enable_dense_embedding": True,
-                "enable_sparse_embedding": True,
-            },
+            {"name": "priority", "data_type": "INT64"},
         ]
     },
 )
@@ -71,12 +64,7 @@ const response = await fetch("https://api.hydradb.com/databases/acme_corp/metada
   body: JSON.stringify({
     add_fields: [
       { name: "region", data_type: "VARCHAR", enable_match: true },
-      {
-        name: "summary_label",
-        data_type: "VARCHAR",
-        enable_dense_embedding: true,
-        enable_sparse_embedding: true,
-      },
+      { name: "priority", data_type: "INT64" },
     ],
   }),
 });
@@ -102,26 +90,26 @@ Each `add_fields[]` item uses the same field shape as `database_metadata_schema`
 
 | Field | Description |
 | --- | --- |
-| <Field name="name" type="string" required /> | New metadata key. Must start with a letter or `_`, contain only letters/numbers/underscores, and not be a reserved system name. |
+| <Field name="name" type="string" required /> | New metadata key. Must start with a letter, contain only letters, numbers and underscores, and not be a reserved system name. |
 | <Field name="data_type" type="string" /> | `VARCHAR`, `BOOL`, `INT8`, `INT16`, `INT32`, `INT64`, `FLOAT`, `DOUBLE`, `JSON`, or friendly aliases such as `string`, `integer`, `float`, `boolean`, `object`. Defaults to `VARCHAR`. `ARRAY` is not supported and is rejected with `400`; for multi-value fields declare `VARCHAR` and store the values comma-joined. |
 | <Field name="max_length" type="integer" /> | Max length for `VARCHAR`. Default `1024`; maximum `65535`. |
-| <Field name="enable_match" type="boolean" /> | Enables the intended exact-match metadata filtering path for this field. |
-| <Field name="enable_dense_embedding" type="boolean" /> | Adds dense semantic search for a `VARCHAR` metadata field. |
-| <Field name="enable_sparse_embedding" type="boolean" /> | Adds sparse/BM25 search for a `VARCHAR` metadata field. |
+| <Field name="enable_match" type="boolean" /> | Enables exact-match filtering on this field. (default=`false`) |
+| <Field name="enable_dense_embedding" type="boolean" /> | Not supported here: `true` on a new field returns `400`. Dense embeddings can only be declared at [database creation](/api-reference/v2/endpoint/create-tenant). |
+| <Field name="enable_sparse_embedding" type="boolean" /> | Not supported here: `true` on a new field returns `400`. Sparse (BM25) embeddings can only be declared at database creation. |
 | <Field name="filterable" type="boolean" /> | Backward-compatible shorthand for `enable_match: true`. Prefer `enable_match`. |
 
 ## Rules
 
 - Additions only.
-- Existing field names cannot be reused, case-insensitively.
+- Re-sending a field with exactly its existing definition is a no-op: the request succeeds and the field is left out of `added_fields`. Any other reuse of an existing name (compared case-insensitively) returns `409`.
 - Existing fields cannot be deleted or changed.
 - Total custom database metadata fields cannot exceed 32.
 - Reserved names such as `source_id`, `chunk_id`, `metadata`, and `document_metadata` are rejected.
-- Dense/sparse embedding flags are only valid on `VARCHAR` fields.
-- Filter indexes for `enable_match` fields are created before the merged schema is saved.
+- `enable_dense_embedding` and `enable_sparse_embedding` are rejected on new fields.
+- `ARRAY` fields are rejected.
 
 <Warning>
-  This endpoint saves the updated schema and its filter indexes. It does not yet re-index data already ingested for newly added dense/sparse metadata fields. Create the desired semantic metadata fields before ingesting, or migrate/re-ingest into a database with the final schema if those fields must participate in semantic/BM25 metadata search.
+  A field that needs semantic or BM25 search must be declared when the database is created. To add one to an existing database, create a new database with the final schema and re-ingest into it.
 </Warning>
 
 ## Response
@@ -131,7 +119,8 @@ Each `add_fields[]` item uses the same field shape as `database_metadata_schema`
 ```json Success
 {
   "database": "acme_corp",
-  "added_fields": ["region", "summary_label"]
+  "tenant_id": "acme_corp",
+  "added_fields": ["region", "priority"]
 }
 ```
 
@@ -140,8 +129,8 @@ Each `add_fields[]` item uses the same field shape as `database_metadata_schema`
   "success": false,
   "data": null,
   "error": {
-    "code": "CONFLICT",
-    "message": "field \"region\" already exists in the schema"
+    "code": "INTERNAL_ERROR",
+    "message": "Schema conflict: field \"region\" already exists in the schema with a different definition. Resubmitting a field with its existing definition is accepted as a no-op, but an existing field cannot be modified. See https://docs.hydradb.com/api-reference/v2/endpoint/patch-metadata-schema for usage details. Re-send the field with its existing definition to make this a no-op, or use a different field name."
   },
   "meta": {
     "request_id": "9d13aef4-02f4-4e73-8c62-4c2601d04f9d",
@@ -156,14 +145,14 @@ Each `add_fields[]` item uses the same field shape as `database_metadata_schema`
 
 | Status | When it happens |
 | --- | --- |
-| `400` | Invalid request body, empty `add_fields`, invalid field name/type, too many fields, embedding enabled on a non-`VARCHAR` field. |
+| `400` | Invalid request body, empty `add_fields`, invalid field name or type, `ARRAY` type, more than 32 fields in total, or `enable_dense_embedding` / `enable_sparse_embedding` on a new field. |
 | `404` | Database not found. |
-| `409` | Field already exists or the update conflicts with stored database mapping/schema state. |
+| `409` | A field with the same name exists with a different definition (or appears twice in `add_fields` with different definitions), or the database changed during the request. |
 | `500` | Backend persistence or index creation failed. |
 
 ## Related
 
 - [Create Database](/api-reference/v2/endpoint/create-tenant)
-- [Scoping using metadata](/essentials/v2/attributes)
+- [Attributes](/essentials/v2/attributes)
 - [Ingest Context](/api-reference/v2/endpoint/ingest-context)
 - [Query](/api-reference/v2/endpoint/query)

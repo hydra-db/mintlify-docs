@@ -5,7 +5,7 @@ description: "LLM-facing reference for building against the current HydraDB API 
 
 # HydraDB Agent Integration Guide
 
-This document is a self-contained reference for AI coding agents. It covers everything needed to understand, install, configure and integrate HydraDB into a project, from zero prior knowledge to production use.
+This document is a self-contained reference for AI coding agents integrating HydraDB into a project.
 
 HydraDB stores **context**: text and conversations that you send as items. It chunks, embeds and enriches every item, extracts entities and relations into a context graph, and answers questions over all of it through one query endpoint that returns ranked chunks, graph paths and a prompt-ready string.
 
@@ -42,6 +42,7 @@ Core raw HTTP responses (`/databases`, `/context/*`, `/query` and `/feedback`) a
   "error": null,
   "meta": {
     "request_id": "...",
+    "api_version": "2.0.1",
     "latency_ms": 12.3
   }
 }
@@ -177,7 +178,7 @@ except Exception:
 
 Send `answer`, `source_ids`, or both. Do **not** guess: only send ground truth you actually have. A fabricated answer key is worse than none, because it is scored as if it were true.
 
-Limit: 100 submissions per minute per organization, far above what reporting only the queries that fell short will ever reach. If you do hit `429`, honour `Retry-After` or simply skip that report. Never spin.
+Limit: 100 submissions per minute per organization, far above what reporting only the queries that fell short will ever reach. If you do hit `429`, honour `Retry-After` or skip that report. Never spin.
 
 ### Do not mix scopes accidentally
 
@@ -314,7 +315,7 @@ const client = new HydraDBClient({
 SDK naming:
 
 - Python methods and fields: snake_case, for example `client.databases.collections()`, `max_results`, `query_by`, `result.data.llm_prompt`, `status.indexing_status`.
-- TypeScript methods and fields: camelCase, for example `maxResults`, `queryBy`, `pageSize`, `result.data.llmPrompt`, `chunk.chunkId`, `chunk.contextId`, `chunk.enrichmentKind`, `path.pathSummary`, `result.data.forcefulRelations`, `status.indexingStatus`.
+- TypeScript methods and fields: camelCase, for example `maxResults`, `queryBy`, `pageSize`, `result.data.llmPrompt`, `chunk.chunkId`, `chunk.contextId`, `path.pathSummary`, `result.data.forcefulRelations`, `status.indexingStatus`.
 - Both SDKs return a `{ success, data, error, meta }` envelope; the payload is under `.data` (for example `response.data.infra`, `response.data.statuses`, `response.data.results`).
 - `client.context.ingest()` sends a multipart form: the item list goes in the `context` form field as a JSON string. Keys inside each item stay snake_case in every language (`context_id`, `happened_at`, `custom_attributes`), because that string is raw wire data.
 
@@ -585,7 +586,7 @@ Notes:
 
 - `database` is the only required field. `database_metadata_schema` is optional and declares the filterable `attributes` (see [Attributes guide](#10-attributes-guide)).
 - Database creation is asynchronous.
-- `database` is a stable, case-sensitive id of up to 25 characters, immutable after creation. Lowercase letters, numbers and underscores are the most portable.
+- `database` is an id of up to 255 characters: lowercase letters, digits, `-` and `_` only; anything else is a `400`. `PATCH /databases/{database}` renames it, and the old name stops resolving immediately.
 - Plan the schema up front. You can add fields later with `PATCH /databases/{database}/metadata-schema` (additive only: no deletes, no data-type or flag changes).
 - `POST /databases` may return `409 DATABASE_ALREADY_EXISTS` for a duplicate name and `403 FORBIDDEN` when the API key or plan cannot create more databases.
 
@@ -666,7 +667,7 @@ Each item carries exactly one of `text` or `conversation`.
 
 | Field | Notes |
 |---|---|
-| `context_id` | Your id for the item. Generated from `title` when omitted, so two untitled items without ids and with the same text collide. Must not contain commas. |
+| `context_id` | Your id for the item. When omitted it is generated from the item's text and `title`, so two items without ids that have the same text and the same (or no) title collide. Must not contain commas. |
 | `title` | Optional readable name, printed in `llm_prompt` and matchable with `titles` on `/query`. At most 1,024 bytes. |
 | `text` | Plain text or markdown. |
 | `conversation` | A list of `{ role, content }` turns. |
@@ -811,11 +812,11 @@ Payload shape (`id` is the item's `context_id`):
   "database": "<database>",
   "collection": "<collection>",
   "status": "completed",
-  "timestamp": "<ISO-8601 timestamp>",
-  "error_code": null,
-  "error_message": null
+  "timestamp": "<ISO-8601 timestamp>"
 }
 ```
+
+An `errored` event can also carry `error_code` and `error_message`; each key is present only when it has a value.
 
 Headers:
 
@@ -861,17 +862,17 @@ Rules:
 | `collection` | string | Search one collection; the default collection when neither this nor `collections` is sent. |
 | `collections` | `string[]` or `{ [collection]: weight }` | Search several. A list weights them equally; an object ranks one above another (weights rank, they do not exclude). Maximum 100. |
 | `query` | string | Required. The question or search terms. |
-| `max_results` | integer | Default `10`, maximum `50`. Caps the merged result across collections. |
+| `max_results` | integer | Default `10`, maximum `250`. Caps the merged result across collections. |
 | `mode` | `auto`, `fast`, `thinking` | `auto` (default) routes each query. `thinking` expands the query, reranks, traverses the graph further and follows forceful relations; `fast` is one pass. |
 | `query_by` | `hybrid`, `text` | `hybrid` (default) blends semantic and BM25; `text` is BM25 only. |
 | `operator` | `or`, `and`, `phrase` | BM25 term matching; only for `query_by: "text"`. Default `or`. |
-| `alpha` | `0.0` to `1.0`, or `"auto"` | Semantic versus keyword blend for `hybrid`. `1.0` is fully semantic, `0.0` fully BM25. Default `0.8`. |
-| `recency_bias` | `0.0` to `1.0` | Boost newer content. `0` disables it. |
+| `alpha` | `0.0` to `1.0`, or `"auto"` | Semantic versus keyword blend for `hybrid`. `1.0` is fully semantic, `0.0` fully BM25. Default `0.8`; `"auto"` also resolves to `0.8`. |
+| `recency_bias` | `0.0` to `1.0` | Boost newer content. Default `0.4`; `0` disables it. |
 | `ids` | `string[]` | Restrict retrieval to these `context_id`s. |
 | `titles` | `string[]` | Restrict retrieval to items with one of these exact titles (case-insensitive). |
 | `attributes` | object | Filter on declared attributes with operators. See [Filtering with attributes](#filtering-with-attributes). |
 | `acl` | `string[]` | Query on behalf of an identity: only items it may retrieve are returned. Omitted, empty or `["*"]` disables filtering. |
-| `query_apps` | boolean | App-aware lane for connector content (exact ids, actors, threads), on top of normal retrieval. |
+| `query_apps` | boolean | Default `true`: also search connector content by its app identity (exact ids, actors, threads), on top of normal retrieval. |
 | `graph_context` | boolean | Default `true`: include `graph[]`. |
 | `follow_forceful_relations` | boolean | Default `true`: pull declared forceful relations into `forceful_relations[]` (`thinking` mode only). |
 | `temporal_reasoning` | boolean | Default `true`. Resolve time-based questions (current, as of, ranges); matched facts come back in `chunks[].temporal`. Never changes which chunks are returned. |
@@ -883,13 +884,13 @@ Rules:
 | Goal | Request shape |
 |---|---|
 | Fast RAG | `mode: "fast"`, `graph_context: false`, `max_results: 5` to `10` |
-| Highest-quality RAG | `mode: "thinking"`, `alpha: "auto"` (graph on by default) |
+| Highest-quality RAG | `mode: "thinking"` (graph on by default) |
 | Personalized grounded answer | `collections: { "user_alex": 2, "company": 1 }`, `mode: "thinking"` |
 | One person's context only | `collection: "user_alex"` |
 | Exact keyword or phrase | `query_by: "text"`, `operator: "phrase"` |
 | Error codes, SKUs, product names | `query_by: "hybrid"`, `alpha: 0.3` to `0.5` |
-| Recent operational updates | `recency_bias: 0.2` to `0.4`, plus an `attributes` filter on status or doc type |
-| Connector content (Slack, Jira, Gmail) | `query_apps: true`, `mode: "thinking"` |
+| Recent operational updates | `recency_bias` above the default `0.4`, plus an `attributes` filter on status or doc type |
+| Connector content (Slack, Jira, Gmail) | `mode: "thinking"` (`query_apps` is on by default) |
 | Follow linked items | `mode: "thinking"` (`follow_forceful_relations` is on by default) |
 | A known item or document | `ids: [...]` or `titles: [...]` |
 
@@ -966,7 +967,7 @@ Attribute-filtered search, on behalf of one user:
             "target": { "entity_id": "ent_finance", "name": "Finance Department" }
           }
         ],
-        "path_summary": "Refund processing is managed by the Finance Department."
+        "path_summary": "Refund Processing managed by Finance Department."
       },
       {
         "origin": "chunk_relation",
@@ -1007,7 +1008,7 @@ Attribute-filtered search, on behalf of one user:
 
 Chunks carry nothing about their source: no title, url, collection or attributes. `llm_prompt` prints the title, collection, last-updated date and url for the model. To read an item's stored content yourself, call `GET /context/inspect` with the chunk's `context_id`; to read its title and attributes, call `POST /context/list` with `ids: [context_id]`.
 
-`graph[]`: paths through the context graph, query paths first, then paths expanded from the returned chunks. The list is deduplicated across both lanes (a path both found is reported once, as a `query_path`) and is not capped. `[]` when `graph_context` is `false` or nothing connects.
+`graph[]`: paths through the context graph, query paths first, then paths expanded from the returned chunks. The list is deduplicated across both origins (a path found both ways is reported once, as a `query_path`) and is not capped. `[]` when `graph_context` is `false` or nothing connects.
 
 | Field | Meaning |
 |---|---|
@@ -1016,7 +1017,7 @@ Chunks carry nothing about their source: no title, url, collection or attributes
 | `triplets[].relation.predicate` | The relation, for example `managed by`. |
 | `triplets[].relation.context` | The sentence the relation was extracted from. |
 | `triplets[].relation.temporal_details` | When the relation holds, for example `since June`. Omitted when empty. |
-| `triplets[].relation.timestamp` | Epoch seconds (a float) for the edge. Omitted when the edge has none. |
+| `triplets[].relation.timestamp` | When the relation was introduced: the date of the source it was extracted from, in epoch seconds (may be fractional). Omitted when the edge has none. |
 | `triplets[].relation.relationship_id` | The relation's id. |
 | `triplets[].relation.chunk_id` | The chunk the relation was extracted from. |
 | `path_summary` | One sentence summarizing the path. Never empty. |
@@ -1107,10 +1108,13 @@ FAQ: refunds to a card take 5 to 7 business days to appear.
 
 ## Related facts
 
-- [P1] **Refund Processing** -managed by→ **Finance Department** (relevance 0.81) [1]
-  Refund processing is managed by the Finance Department.
+- [P1] **Refund Processing** -managed by→ **Finance Department** [1]
 - [P2] **User** -prefers→ **short answers** (relevance 0.74) [2]
   The user prefers short answers about refunds.
+
+## Temporal facts
+
+- **Refund policy** *effective_from* → **June 2026** (from 2026-06-01, precision: month, status: ongoing; evidence: "from June") [1]
 
 ## Sources
 
@@ -1208,7 +1212,7 @@ Declared at `POST /databases` (or added later with `PATCH /databases/{database}/
 
 | Field | Purpose |
 |---|---|
-| `name` | Attribute key. Starts with a letter or `_`; letters, numbers and underscores only; not a reserved system name such as `chunk_id`. |
+| `name` | Attribute key. Starts with a letter; letters, numbers and underscores only; not a reserved system name such as `chunk_id`. |
 | `data_type` | `VARCHAR`, `BOOL`, `INT8`, `INT16`, `INT32`, `INT64`, `FLOAT`, `DOUBLE`, `JSON`, or the aliases `string`, `boolean`, `integer`, `float`, `object`. Default `VARCHAR`. Arrays are not supported. |
 | `enable_match` | Fast exact-match path for a field you filter on often. |
 | `enable_dense_embedding` | Semantic search over a `VARCHAR` field. |
@@ -1293,7 +1297,7 @@ Parameters:
 - `database`, `collection`
 - `ids`: only these `context_id`s (filters and paging still apply)
 - `page` (1-indexed, default `1`), `page_size` (`1` to `100`, default `50`)
-- `filters`: exact-match constraints, ANDed. `source_fields` matches built-in fields such as `title`, `url`, `timestamp` and, for connector content, `app_provider`, `app_kind`, `app_external_id`, `app_parent_id`. The list filter keeps its own wire names for the two attribute maps: `filters.metadata` matches declared `attributes` and `filters.additional_metadata` matches `custom_attributes`.
+- `filters`: exact-match constraints, ANDed (`source_fields.title` matches a case-insensitive prefix). `source_fields` matches built-in fields such as `title`, `url`, `timestamp` and, for connector content, `app_provider`, `app_kind`, `app_external_id`, `app_parent_id`. The list filter keeps its own wire names for the two attribute maps: `filters.metadata` matches declared `attributes` and `filters.additional_metadata` matches `custom_attributes`.
 - `include_fields`: projection, for example `["title", "timestamp"]`. `content` and `url` are not projectable (a `400`); read an item's content with `GET /context/inspect`.
 - `acl`: list as an identity; only items it may see are returned.
 
@@ -1403,7 +1407,7 @@ Response `data`: `results[]` (per id: `id`, `deleted`, `error`), `deleted_count`
 
 ### Ingest validation (`400`)
 
-The whole request is rejected, and the message names the item as `context[N]`, when an item has both `text` and `conversation` (or neither), a conversation breaks the rules in [Conversations](#conversations), `happened_at` is malformed, an `acl` principal is malformed, a `graph_payload` key matches no item, or a size limit in [Limits and validation](#limits-and-validation) is exceeded.
+The whole request is rejected, and the message names the item as `context[N]`, when an item has both `text` and `conversation` (or neither), a conversation breaks the rules in [Conversations](#conversations), `happened_at` is malformed, an `acl` principal is malformed, or a size limit in [Limits and validation](#limits-and-validation) is exceeded. A `graph_payload` key that matches no item is also a `400`, and the message names the key.
 
 Retry only `429`, `500`, `502` and `503`; use bounded exponential backoff with jitter.
 
