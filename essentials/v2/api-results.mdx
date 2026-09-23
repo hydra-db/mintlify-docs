@@ -5,7 +5,7 @@ description: "Inject llm_prompt into your model call, read the four response key
 
 import LegacyLine from "/snippets/legacy-line.mdx";
 
-[`POST /query`](/essentials/v2/query) on a unified database returns four keys: `chunks`, `graph`, `relations` and `llm_prompt`. The last one is the whole context block, already formatted for a model. This page shows how to use it, and what to read when you need structure instead of a string.
+[`POST /query`](/essentials/v2/query) on a unified database returns four keys: `chunks`, `graph`, `forceful_relations` and `llm_prompt`. The last one is the whole context block, already formatted for a model. This page shows how to use it, and what to read when you need structure instead of a string.
 
 <LegacyLine />
 
@@ -13,7 +13,7 @@ import LegacyLine from "/snippets/legacy-line.mdx";
 
 ## 1. Inject `llm_prompt`
 
-The server builds `llm_prompt` from the chunks, the related context and the graph paths, with a citation label on every entry. Pass it to your model as is:
+The server builds `llm_prompt` from the chunks, the forceful relations and the graph paths, with a citation label on every entry. Pass it to your model as is:
 
 <CodeGroup>
 ```python Python SDK
@@ -88,33 +88,45 @@ There is no client-side string building on a unified database. Do not concatenat
 
 ## 2. What is in the prompt
 
+For the [example response on Query](/essentials/v2/query#1-one-call), `llm_prompt` is:
+
 ```text
 === CONTEXT ===
 Cite anything you use from this context with its bracketed label, e.g. [1].
 
-[1] context_id: chat-alex-001
-user: Keep answers short, I read on my phone.
-assistant: Got it, short answers.
+[1] context_id: refund-policy
+Refunds are processed within 30 days of purchase by the Finance Department.
+Enrichment: Refund window is 30 days; Finance owns refund processing.
+Dated: Refund policy effective from 2026-06-01. Start: 2026-06-01
 
-[2] context_id: refund-policy
-Refunds are processed within 5 business days.
+[2] context_id: chat-2026-07-29
+user: Keep refund answers short please
+assistant: Got it.
+Enrichment: User prefers short answers about refunds.
 
-=== RELATED CONTEXT ===
-[R1] context_id: refund-policy-enterprise
-Enterprise customers can request an expedited refund.
+=== FORCEFUL RELATIONS ===
+Linked to a result by the author at ingest time (forceful_relations), not by relevance to this query.
+
+[R1] context_id: refund-faq, linked from: refund-policy
+FAQ: refunds to a card take 5 to 7 business days to appear.
 
 === GRAPH ===
-[P1] Alex prefers short answers.
-    Alex -> prefers -> short answers [1]
+Facts extracted from this context. A label after a fact is the context it came from.
+
+[P1] Refund processing is managed by the Finance Department.
+    Refund Processing -> managed by -> Finance Department [1]
+
+[P2] The user prefers short answers about refunds.
+    User -> prefers -> short answers [2]
 ```
 
 | Section | Built from | Labels |
 | --- | --- | --- |
-| `=== CONTEXT ===` | `chunks[]`, in ranked order | `[1]`, `[2]`, ... Each entry names its `context_id`. |
-| `=== RELATED CONTEXT ===` | `relations[]`, the items the hits declared with `forceful_relations` at ingest | `[R1]`, `[R2]`, ... |
-| `=== GRAPH ===` | `graph[]`, one line per path with its `path_summary`, then each step | `[P1]`, `[P2]`, ... A step cites the chunk label it is evidence for. |
+| `=== CONTEXT ===` | `chunks[]`, in ranked order, each with its `enrichment.text` and any `temporal` facts | `[1]`, `[2]`, ... Each entry names its `context_id`. |
+| `=== FORCEFUL RELATIONS ===` | `forceful_relations[]`, the items the hits declared with `forceful_relations` at ingest | `[R1]`, `[R2]`, ... Each entry names its `context_id` and, after `linked from:`, the context whose declaration pulled it in. |
+| `=== GRAPH ===` | `graph[]`, one line per path with its `path_summary`, then each step | `[P1]`, `[P2]`, ... A step cites the label of the chunk it was extracted from, when that chunk is in the response. |
 
-A section is omitted when its array is empty. Ask the model to cite the labels and you get answers you can trace: a `[2]` in the reply is `context_id: refund-policy`, which you can open with [`GET /context/inspect`](/api-reference/v2/endpoint/fetch-content).
+A section is omitted when its array is empty. Ask the model to cite the labels and you get answers you can trace: a `[1]` in the reply is `context_id: refund-policy`, which you can open with [`GET /context/inspect`](/api-reference/v2/endpoint/fetch-content).
 
 ---
 
@@ -127,8 +139,8 @@ Render a UI, rerank, or apply your own rules from the three structured keys. The
 | `chunks[].content` | The matched text, verbatim. |
 | `chunks[].enrichment.text` | What enrichment extracted from that chunk (a preference, a fact), with `enrichment.kind` as the item's `context_category`. |
 | `chunks[].score` | Relevance, for your own thresholds. |
-| `graph[].path_summary` | One sentence per graph path; `graph[].triplets` for the steps. |
-| `relations[]` | Declared related chunks, each with the `via` link that brought it in. |
+| `graph[].path_summary` | One sentence per graph path; `graph[].triplets` for the steps and `graph[].origin` for the lane that found it. To show a path under its chunk, see [Attaching graph paths to chunks](/essentials/v2/query#attaching-graph-paths-to-chunks). |
+| `forceful_relations[]` | Chunks linked at ingest with `forceful_relations`, each with the `via` link that brought it in. |
 
 <CodeGroup>
 ```python Python SDK
@@ -140,8 +152,8 @@ for chunk in result.data.chunks:
 for path in result.data.graph:
     print("path:", path.path_summary)
 
-for rel in result.data.relations:
-    print("related:", rel.via.to, ":", rel.chunk.content)
+for rel in result.data.forceful_relations:
+    print("linked:", rel.via.to, ":", rel.chunk.content)
 ```
 ```typescript TypeScript SDK
 for (const chunk of result.data.chunks) {
@@ -151,7 +163,7 @@ for (const chunk of result.data.chunks) {
 
 for (const path of result.data.graph) console.log("path:", path.pathSummary);
 
-for (const rel of result.data.relations) {
+for (const rel of result.data.forcefulRelations) {
   console.log("related via", rel.via.from, "->", rel.via.to, ":", rel.chunk.content);
 }
 ```
