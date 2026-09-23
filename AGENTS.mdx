@@ -1,21 +1,22 @@
 ---
 title: "HydraDB Agent Integration Guide"
-description: "LLM-facing reference for building against the current HydraDB docs, API, SDKs, and cookbooks."
+description: "LLM-facing reference for building against the current HydraDB API and SDKs."
 ---
 
 # HydraDB Agent Integration Guide
 
-This document is a self-contained reference designed for AI coding agents. It covers everything needed to understand, install, configure, and integrate HydraDB into any project -- from zero prior knowledge to production-ready usage.
+This document is a self-contained reference for AI coding agents. It covers everything needed to understand, install, configure and integrate HydraDB into a project, from zero prior knowledge to production use.
+
+HydraDB stores **context**: text and conversations that you send as items. It chunks, embeds and enriches every item, extracts entities and relations into a context graph, and answers questions over all of it through one query endpoint that returns ranked chunks, graph paths and a prompt-ready string.
 
 ### TL;DR: Critical endpoints
 
-1. **`POST /databases`** (`client.databases.create()`): Provision an isolated database workspace.
-2. **`GET /databases/status`** (`client.databases.status()`): Poll until `infra.ready_for_ingestion` is true.
-3. **`POST /context/ingest`** (`client.context.ingest()`): Ingest documents, app records, or memories under `type="knowledge"` or `type="memory"`.
-4. **`GET /context/status`** (`client.context.status()`): Poll status using `ids` until `indexing_status` is `completed` or `graph_creation`.
-5. **`POST /query`** (`client.query()`): Retrieve context via `type: "knowledge"`, `"memory"`, or `"all"`.
+1. **`POST /databases`** (`client.databases.create()`): Create an isolated database. A name is all it needs.
+2. **`GET /databases/status`** (`client.databases.status()`): Poll until `data.infra.ready_for_ingestion` is `true`.
+3. **`POST /context/ingest`** (`client.context.ingest()`): Send a `context` list of items. Each item is either a `text` or a `conversation`.
+4. **`GET /context/status`** (`client.context.status()`): Poll with `ids` until `indexing_status` is `graph_creation` or `completed` (searchable), or `errored`.
+5. **`POST /query`** (`client.query()`): Ask a question. The response `data` has exactly four keys: `chunks`, `graph`, `forceful_relations` and `llm_prompt`. Inject `llm_prompt` into your model call verbatim.
 6. **`POST /feedback`** (`client.feedback.submit()`): Tell us when a query did not give you what you needed, and once the task is done, how the context held up. See [Sending feedback](#sending-feedback).
-
 
 ---
 
@@ -32,7 +33,7 @@ This document is a self-contained reference designed for AI coding agents. It co
 
 ### Response envelope
 
-Core raw HTTP responses (`/databases`, `/context/*`, and `/query`) are wrapped:
+Core raw HTTP responses (`/databases`, `/context/*`, `/query` and `/feedback`) are wrapped:
 
 ```json
 {
@@ -47,73 +48,64 @@ Core raw HTTP responses (`/databases`, `/context/*`, and `/query`) are wrapped:
 ```
 
 - Parse core raw HTTP payloads from `data`.
-- The SDKs return the full envelope object; read the payload from its `data` field (e.g. `response.data`). On failure they raise a typed exception rather than returning an envelope with `error` set.
+- The SDKs return the full envelope object; read the payload from its `data` field (for example `response.data`). On failure they raise a typed exception rather than returning an envelope with `error` set.
 - Log `meta.request_id` for failed requests.
-- `meta` may also carry an optional `deprecation` list (with a `Deprecation: true` response header) when a request uses a legacy `/tenants` route or a deprecated field (`tenant_id`/`sub_tenant_id`, or `sub_tenant_ids` on `/query`). Every entry has `deprecated`, `message`, and `deprecated_since`. `deprecated_field` and `preferred_field` are **optional**: the `sub_tenant_ids` notice on `/query` carries them, the `tenant_id`/`sub_tenant_id` notice does not. Read `message` for the migration, and do not key logic off the two optional fields. It is a non-breaking nudge. The status code is unchanged. Prefer the `/databases` routes and `database`/`collection`/`collections` fields to avoid it. Treat `meta` as an open object: ignore keys you do not recognize.
+- `meta` may also carry an optional `deprecation` list (with a `Deprecation: true` response header) when a request uses a deprecated name: `tenant_id` / `sub_tenant_id`, or `sub_tenant_ids` on `/query`. Every entry has `deprecated`, `message` and `deprecated_since`; `deprecated_field` and `preferred_field` are optional. Read `message` for the migration and do not key logic off the optional fields. It is a non-breaking nudge and the status code is unchanged. Use `database`, `collection` and `collections` to avoid it. Treat `meta` as an open object: ignore keys you do not recognize.
 - Exception: webhook management endpoints (`/webhooks/indexing*`) return their documented response object directly, without the `{ success, data, error, meta }` envelope.
 
 ### Core endpoints
 
-| Task | Use this endpoint / SDK method |
+| Task | Endpoint · SDK method |
 |---|---|
 | Create database | `POST /databases` · `client.databases.create()` |
 | Check database readiness | `GET /databases/status` · `client.databases.status()` |
 | List databases | `GET /databases` · `client.databases.list()` |
-| List collections | `GET /databases/collections` · TS `client.databases.collections()` / Python `client.databases.collections()` |
+| List collections | `GET /databases/collections` · `client.databases.collections()` |
 | Database stats | `GET /databases/stats` · `client.databases.stats()` |
-| Ingest documents, app sources, memories | `POST /context/ingest` · `client.context.ingest()` |
+| Ingest text and conversations | `POST /context/ingest` · `client.context.ingest()` |
 | Check indexing | `GET /context/status` · `client.context.status()` |
-| Search knowledge/memories/both | `POST /query` · `client.query()` |
+| Search | `POST /query` · `client.query()` |
 | Report back on query results | `POST /feedback` · `client.feedback.submit()` |
-| List sources/memories | `POST /context/list` · `client.context.list()` |
-| Inspect source content | `GET /context/inspect` · `client.context.inspect()` |
-| Delete sources/memories | `DELETE /context` · `client.context.delete()` |
+| List items | `POST /context/list` · `client.context.list()` |
+| Read an item's stored content | `GET /context/inspect` · `client.context.inspect()` |
+| Delete items | `DELETE /context` · `client.context.delete()` |
 | Inspect graph relations | `GET /context/relations` · `client.context.relations()` |
+| Walk an item's connected items | `GET /context/{id}/subgraph` · `client.context.subgraph()` |
+| Edit an indexed item's attributes | `PATCH /context/{id}/metadata` · Python `client.context.update_source_metadata()` / TS `client.context.updateSourceMetadata()` |
 | Indexing webhooks | `/webhooks/indexing*` |
 
 ### Async lifecycle
 
 Two operations are asynchronous:
 
-1. **Database creation**: after `POST /databases`, poll `GET /databases/status` until infrastructure is ready.
-2. **Ingestion**: after `POST /context/ingest`, poll `GET /context/status` until the content is searchable or fully complete.
+1. **Database creation**: after `POST /databases`, poll `GET /databases/status` until `data.infra.ready_for_ingestion` is `true`.
+2. **Ingestion**: after `POST /context/ingest`, poll `GET /context/status` until each item is searchable or fully complete.
 
 Searchable status:
 
-- `graph_creation`: searchable, graph may still be incomplete.
+- `graph_creation`: searchable; the graph may still be incomplete.
 - `completed`: fully indexed and graphed.
 
 Failure status:
 
-- Docs use `errored`; OpenAPI also exposes `failed` in one enum. Treat both as terminal failures.
+- `errored` is the terminal failure. One OpenAPI enum also names `failed`; treat it the same way if you see it.
 
-### Search parameter naming
+### Names to use
 
-The canonical request field for `POST /query` is `type`:
-
-- `type: "knowledge"`
-- `type: "memory"`
-- `type: "all"`
-
-Use the same `type` enum across context lifecycle APIs and search. Search additionally accepts `"all"` to query knowledge and memories together.
-
-### Metadata naming
-
-- `metadata`: schema-aligned, declared at database creation, fast filter path. Sent as a top-level request field on `/context/ingest`.
-- `additional_metadata`: canonical free-form metadata; anything not present in the `metadata` schema. Also a top-level request field.
-- `document_metadata`: on file uploads only, binds a source `id` to each uploaded file. It is not a metadata envelope  -  do not nest `metadata` or `additional_metadata` inside it.
-- `metadata_filters` top-level keys match the `metadata` schema.
-- `metadata_filters.additional_metadata` scopes free-form metadata.
+- `database` (formerly `tenant_id`) is the hard isolation boundary.
+- `collection` (formerly `sub_tenant_id`) is a logical partition inside a database. `/query` also takes `collections` to search several at once.
+- `context_id` is your id for one item. The ingest response reports it as `results[].id`; query chunks carry it as `context_id`.
+- `attributes` are declared, filterable fields; `custom_attributes` are free-form and not filterable. See [Attributes guide](#10-attributes-guide).
 
 ### Sending feedback
 
-**If a query did not give you what you needed  -  nothing relevant came back, the top result was wrong, or you had to fall back to another source  -  please tell us with `POST /feedback`.** You are the only party that knows whether the retrieved context actually answered the question, and that judgement is what tunes retrieval.
+**If a query did not give you what you needed (nothing relevant came back, the top result was wrong, or you had to fall back to another source), please tell us with `POST /feedback`.** You are the only party that knows whether the retrieved context actually answered the question, and that judgement is what tunes retrieval.
 
-It is entirely optional, and there is no penalty for skipping it. Send it when you have something specific to report; a report on a query that disappointed you is worth far more than a stream of routine ones. If a query worked well and you want to say so, `rating: "positive"` is welcome too  -  it tells us what to preserve.
+It is entirely optional, and there is no penalty for skipping it. Send it when you have something specific to report; a report on a query that disappointed you is worth far more than a stream of routine ones. If a query worked well and you want to say so, `rating: "positive"` is welcome too: it tells us what to preserve.
 
-**Once you have finished the task, a short report on how the context actually performed is recommended.** The end of the task is when you know something you could not know at retrieval time: whether a chunk that looked plausible turned out to be stale, contradicted by another source, or never used at all. A single report then is worth more than one per query.
+**Once you have finished the task, a short report on how the context actually performed is recommended.** The end of the task is when you know something you could not know at retrieval time: whether a chunk that looked plausible turned out to be stale, contradicted by another item, or never used at all. A single report then is worth more than one per query.
 
-Give it context. We see only a `request_id` and whatever prose you send  -  nothing about what you were doing  -  so a report that stands on its own is far more useful than one that assumes the session can be reconstructed. Worth a sentence each:
+Give it context. We see only a `request_id` and whatever prose you send, nothing about what you were doing, so a report that stands on its own is far more useful than one that assumes the session can be reconstructed. Worth a sentence each:
 
 - What the user was actually trying to do.
 - Which chunks carried the answer, and which you discarded and why.
@@ -127,34 +119,34 @@ try:
         rating="positive",
         feedback=(
             "Task: user asked which refund window applies to EU orders. "
-            "Chunks 1 and 3 (Q3 handbook) carried the answer. Chunk 2 was the "
+            "Results [1] and [3] (Q3 handbook) carried the answer. Result [2] was the "
             "2023 policy and was discarded as superseded. No outside sources needed."
         ),
         database="acme_corp",
     )
 except Exception:
-    pass  # fire-and-forget, exactly as above
+    pass  # fire-and-forget: a failed report must never reach the user
 ```
 
-At the end of a task `rating: "positive"` is as valuable as a negative one, because by then you know which part of the context did the work  -  and that is what tells us what to keep.
+At the end of a task `rating: "positive"` is as valuable as a negative one, because by then you know which part of the context did the work, and that is what tells us what to keep.
 
 Rules, when you do send it:
 
-- **Take `request_id` from the query's own response  -  never invent one.** It is in `meta.request_id`, and in the `X-Request-ID` response header. Send it back **verbatim**: an id you made up, or one from another query, correlates to nothing.
+- **Take `request_id` from the query's own response. Never invent one.** It is in `meta.request_id`, and in the `X-Request-ID` response header. Send it back **verbatim**: an id you made up, or one from another query, correlates to nothing.
 - Set `source: "agent"`. It separates your reports from human ones, which fail in different ways.
 - Say **what** was wrong, not that something was wrong. "Returned the 2023 policy, current one is in the Q3 handbook" is actionable; "bad results" is not.
-- Do not block the user on it. Feedback is fire-and-forget: if the **feedback call itself** fails, drop it and carry on  -  never retry in a loop, and never surface that error to the user.
+- Do not block the user on it. Feedback is fire-and-forget: if the **feedback call itself** fails, drop it and carry on. Never retry in a loop, and never surface that error to the user.
 - Feedback never changes the query's result. It is a signal, not a correction, and reading it back is not possible.
 
 ```python
-result = client.query(database="acme_corp", query="What is our refund policy?")
+result = client.query(database="acme_corp", collection="support", query="What is our refund policy?")
 
-# ... use result.data.chunks to answer the user ...
+# ... answer the user from result.data.llm_prompt ...
 
 try:
     client.feedback.submit(
         request_id=result.meta.request_id,
-        feedback="Top chunk was the 2023 policy; the current one is in the Q3 handbook.",
+        feedback="Top result was the 2023 policy; the current one is in the Q3 handbook.",
         rating="negative",
         source="agent",
         database="acme_corp",
@@ -163,11 +155,11 @@ except Exception:
     pass  # fire-and-forget: a failed report must never reach the user
 ```
 
-Catch broadly. The point is that **nothing** escapes  -  narrowing to the SDK error type would still let a timeout or a DNS failure surface an error the user cannot act on, from a call they did not ask for.
+Catch broadly. The point is that **nothing** escapes: narrowing to the SDK error type would still let a timeout or a DNS failure surface an error the user cannot act on, from a call they did not ask for.
 
-**"Did not give me what I needed" is not the same as "errored".** A query that returned `200` with unhelpful results is exactly what this endpoint is for. A query that never returned  -  `4xx`/`5xx`, or the SDK raised  -  is not: handle the error and move on rather than reporting it. Feedback is a judgement about retrieval quality, and a query that produced no results has no retrieval to judge. Fix the request instead: a `404` means the database name is wrong, a `429` means back off, a `400` means the body was malformed.
+**"Did not give me what I needed" is not the same as "errored".** A query that returned `200` with unhelpful results is exactly what this endpoint is for. A query that never returned (`4xx`/`5xx`, or the SDK raised) is not: handle the error and move on rather than reporting it. Feedback is a judgement about retrieval quality, and a query that produced no results has no retrieval to judge. Fix the request instead: a `404` means the database name is wrong, a `429` means back off, a `400` means the body was malformed.
 
-**If you know the right answer, send it as `ground_truth`.** When you are running against a labelled set, or you know which document should have been returned, that is a far stronger signal than a comment  -  it can be scored without a human reading it. With `ground_truth` present, `feedback` prose is optional:
+**If you know the right answer, send it as `ground_truth`.** When you are running against a labelled set, or you know which item should have been returned, that is a far stronger signal than a comment: it can be scored without a human reading it. With `ground_truth` present, `feedback` prose is optional:
 
 ```python
 try:
@@ -175,8 +167,8 @@ try:
         request_id=result.meta.request_id,
         source="agent",
         ground_truth={
-            "answer": expected_answer,          # what a correct response looks like
-            "source_ids": ["policy_2024"],      # sources that actually contain it
+            "answer": expected_answer,        # what a correct response looks like
+            "source_ids": ["refund-policy"],  # the context_ids that actually contain it
         },
     )
 except Exception:
@@ -185,14 +177,13 @@ except Exception:
 
 Send `answer`, `source_ids`, or both. Do **not** guess: only send ground truth you actually have. A fabricated answer key is worse than none, because it is scored as if it were true.
 
-Limit: 100 submissions per minute per organization  -  far above what reporting only the queries that fell short will ever reach. If you do hit `429`, honour `Retry-After` or simply skip that report  -  never spin.
+Limit: 100 submissions per minute per organization, far above what reporting only the queries that fell short will ever reach. If you do hit `429`, honour `Retry-After` or simply skip that report. Never spin.
 
 ### Do not mix scopes accidentally
 
-- `database` (formerly `tenant_id`) is the hard isolation boundary.
-- `collection` (formerly `sub_tenant_id`) is a logical partition inside a database, typically user/workspace/team.
-- Use the same `collection` on writes and reads. Data written under one collection should not be expected to appear from another.
-- Do not use `metadata_filters` as a substitute for `collection`.
+- Use the same `collection` on writes and reads. Data written under one collection does not appear in a query that names another.
+- `context_id` lookups (`/context/status`, `/context/inspect`, `DELETE /context`) are scoped to a collection: send the collection you ingested into.
+- Do not use an `attributes` filter as a substitute for `collection`. Partition by user, team or workspace with collections; filter inside a partition with attributes.
 
 ---
 
@@ -200,100 +191,85 @@ Limit: 100 submissions per minute per organization  -  far above what reporting 
 
 ### Databases and collections
 
-A database is an isolated workspace. A collection partitions data inside a database.
+A database is an isolated workspace. A collection partitions data inside a database. Everything ingested into a collection, text or conversation, from your code or from a connector, is searched together by one query.
 
 Recommended patterns:
 
 | Use case | Pattern |
 |---|---|
-| B2B SaaS | one `database` per customer; `collection` for workspace/team/user |
-| B2C app | one app/customer database; `collection = user_id` |
-| Environment isolation | separate `database`s for prod/staging |
-| Shared knowledge | database-wide/default collection or consistent shared scope |
-| User memories | `collection = user_id` |
+| B2B SaaS | one `database` per customer; a `collection` per workspace, team or user |
+| B2C app | one database for the app; `collection = user_id` |
+| Environment isolation | separate databases for prod and staging |
+| Shared company context | a shared collection such as `company`, queried together with the user's collection through `collections` |
+| Per-user context (preferences, conversation history) | `collection = user_id` |
 
-### Knowledge
+### Context items
 
-Knowledge is shared context: documents, PDFs, Markdown, CSVs, Slack threads, Notion pages, Gmail threads, tickets, webpages, etc.
+An item is one piece of context, and carries exactly one of:
 
-- Ingest with `POST /context/ingest`, `type=knowledge`.
-- Search with `POST /query`, `type: "knowledge"`.
-- Use for content that should be reusable across users.
-- Mutability is explicit: re-ingest with the same ID and `upsert: true`, or delete.
+- `text`: a document, a note, a policy, an agent log line; anything you already have as a string. To ingest a file, extract its text first.
+- `conversation`: a list of `{ role, content, name? }` turns, the same message list you already send to OpenAI or Anthropic.
 
-### Memories
+Every item can also carry a `context_id` (your id; reuse it to replace the item), a `title`, declared `attributes` and free-form `custom_attributes`, a `happened_at` date, `forceful_relations` to other items, an `acl`, and per-item `enrich` / `upsert` / `instructions`. See [Item fields](#item-fields).
 
-Memories are user/workspace/session-scoped context: preferences, conversation history, behavioral signals, decisions, inferred traits.
-
-- Ingest with `POST /context/ingest`, `type=memory`.
-- Search with `POST /query`, `type: "memory"` or `type: "all"`.
-- Always pass the same `collection` used at ingestion.
-- Use `infer: true` when the input is raw signal and HydraDB should extract the durable preference/fact.
-- Use `infer: false` when the memory is already structured and should be stored verbatim.
+With `enrich: true` (the default) HydraDB reads each item and extracts entities, relations and preferences into the context graph. The extracted statement comes back on each chunk as `enrichment`, separate from the chunk's verbatim `content`.
 
 ### Query
 
-`POST /query` is the single retrieval endpoint.
+`POST /query` is the single retrieval endpoint. It searches every item in the collections you name.
 
-It can search:
+- Scope with `collection` (one) or `collections` (a list, or `{ "name": weight }` to rank one collection above another).
+- `query_by: "hybrid"` (default) blends semantic and BM25 retrieval; `query_by: "text"` is BM25 keyword or phrase search.
+- `mode: "auto"` (default) routes each query; `"fast"` is one low-latency pass; `"thinking"` expands the query, reranks, traverses the graph further and follows forceful relations.
+- `attributes` filters on declared attributes with operators such as `$eq` and `$in`.
 
-- Knowledge only: `type: "knowledge"`
-- Memories only: `type: "memory"`
-- Both stores together: `type: "all"`
-
-It supports:
-
-- `query_by: "hybrid"` for semantic + BM25 retrieval.
-- `query_by: "text"` for BM25 keyword/phrase search.
-- `mode: "fast"` for low latency.
-- `mode: "thinking"` for query expansion, reranking, richer graph traversal, and forceful-relation expansion.
+The response `data` is always the same four keys: `chunks`, `graph`, `forceful_relations` and `llm_prompt`. See [Query API](#8-query-api).
 
 ### Feedback
 
-`POST /feedback` records how a query performed. It is the loop that closes retrieval quality, and it is open to agents whenever a query falls short  -  and, once a task is finished, for a short report on how the context held up  -  see [Sending feedback](#sending-feedback).
+`POST /feedback` records how a query performed. See [Sending feedback](#sending-feedback) for when and how to send it.
 
 | Field | Required | Notes |
 |---|---|---|
 | `request_id` | yes | The UUID from that query's `meta.request_id`, verbatim |
 | `feedback` | yes* | What was right or wrong, up to 8000 chars. *Optional if `ground_truth` is sent |
-| `rating` | no | `positive`, `negative`, `neutral`. Omitting it ≠ `neutral` |
-| `source` | no | `user` (default) or `agent`  -  agents set `"agent"` |
+| `rating` | no | `positive`, `negative`, `neutral`. Omitting it is not the same as `neutral` |
+| `source` | no | `user` (default) or `agent`. Agents set `"agent"` |
 | `database` / `collection` | no | Optional scoping; `collection` requires `database` |
-| `ground_truth` | no | `{ answer, source_ids }`  -  what the right answer was, when you know it. Makes `feedback` optional |
-| `metadata` | no | Up to 20 string pairs of your own context (agent name, conversation id) |
+| `ground_truth` | no | `{ answer, source_ids }`: the right answer and the `context_id`s that contain it, when you know them. Makes `feedback` optional |
+| `metadata` | no | Feedback's own free-form context: up to 20 string pairs (agent name, conversation id) |
 
-Each submission is its own record  -  sending a second report about the same query adds to it rather than replacing it, so refine as you learn more.
+Each submission is its own record. Sending a second report about the same query adds to it rather than replacing it, so refine as you learn more.
 
 ### Context graph
 
-HydraDB builds a graph of entity/relation triplets from ingested content. When `graph_context: true` (default), search can return:
+HydraDB builds a graph of entities and relations from every enriched item, and from any graph you supply with `graph_payload`. With `graph_context: true` (the default), a query returns `graph[]`: paths through that graph that connect the question to the results. Each path has:
 
-- `graph_context.query_paths`
-- `graph_context.chunk_relations`
-- `graph_context.chunk_id_to_group_ids`
+- `origin`: `"query_path"` (grown from the entities in the query) or `"chunk_relation"` (the neighbourhood of a returned chunk).
+- `triplets`: the chain of `source`, `relation`, `target` hops. Every hop's `relation.chunk_id` names the chunk it was extracted from.
+- `path_summary`: one sentence describing the whole path. Never empty.
 
-Graph context augments retrieval; `chunks` remain the primary search output.
+Chunks remain the primary output; the graph explains how they connect.
 
 ### Forceful relations
 
-At ingestion, sources can declare explicit relations:
+At ingest, any item (text or conversation) can declare which other items it is linked to:
 
 ```json
 {
-  "relations": {
-    "ids": ["related-item-1", "related-item-2"],
-    "properties": { "reason": "same thread" }
-  }
+  "context_id": "refund-policy",
+  "text": "Refunds are processed within 5 business days.",
+  "forceful_relations": { "ids": ["refund-faq", "refund-escalations"], "properties": {} }
 }
 ```
 
-At search time, set or rely on default `query_forceful_relations: true` with `mode: "thinking"` to pull related chunks into `additional_context`.
+At query time, in `thinking` mode and with `follow_forceful_relations: true` (the default), a hit on `refund-policy` pulls chunks of `refund-faq` and `refund-escalations` into the response's `forceful_relations[]`, each with the `via` link that brought it in.
 
 Rules:
 
-- Forceful relation expansion only takes effect in `mode: "thinking"`.
-- Use `ids`.
-- Relations are store-local: memory-to-memory or knowledge-to-knowledge. Cross-store relation lookups may not surface anything.
+- Forceful relations are followed only in `thinking` mode (including when `mode: "auto"` routes a query to thinking).
+- `ids` are `context_id`s.
+- They are linked by the author, not ranked for the query, so do not read their `score` as relevance.
 
 ---
 
@@ -302,7 +278,7 @@ Rules:
 ### Python SDK
 
 ```bash
-pip install "hydradb-sdk>=2,<3"
+pip install "hydradb-sdk>=2.1.5,<3"
 ```
 
 ```python
@@ -324,7 +300,7 @@ client = AsyncHydraDB(token=os.environ["HYDRA_DB_API_KEY"])
 ### TypeScript SDK
 
 ```bash
-npm install @hydradb/sdk@^2
+npm install @hydradb/sdk@^2.1.5
 ```
 
 ```ts
@@ -337,14 +313,16 @@ const client = new HydraDBClient({
 
 SDK naming:
 
-- Python methods and fields: snake_case, e.g. `client.databases.collections()`, `database`, `collection`, `page_size`, `query_by`.
-- TypeScript methods and fields: camelCase, e.g. `client.databases.collections()`, `database`, `collection`, `pageSize`, `queryBy`.
-- Both SDKs return a `{ success, data, error, meta }` envelope; the payload is under `.data` (e.g. `response.data.infra`, `response.data.statuses`, `response.data.results`).
-- Values that are passed as JSON strings (`memories`, `app_knowledge`, `document_metadata`) keep snake_case keys inside the stringified payload in both SDKs, since that is raw wire data.
+- Python methods and fields: snake_case, for example `client.databases.collections()`, `max_results`, `query_by`, `result.data.llm_prompt`, `status.indexing_status`.
+- TypeScript methods and fields: camelCase, for example `maxResults`, `queryBy`, `pageSize`, `result.data.llmPrompt`, `chunk.chunkId`, `chunk.contextId`, `chunk.enrichmentKind`, `path.pathSummary`, `result.data.forcefulRelations`, `status.indexingStatus`.
+- Both SDKs return a `{ success, data, error, meta }` envelope; the payload is under `.data` (for example `response.data.infra`, `response.data.statuses`, `response.data.results`).
+- `client.context.ingest()` sends a multipart form: the item list goes in the `items` form field as a JSON string. Keys inside each item stay snake_case in every language (`context_id`, `happened_at`, `custom_attributes`), because that string is raw wire data.
 
 ---
 
 ## 4. Minimal end-to-end flow
+
+Create a database, ingest a company policy into a shared collection and a customer conversation into that customer's collection, wait for both to index, then ask a question that needs both.
 
 ### Python
 
@@ -355,64 +333,73 @@ import time
 from hydra_db import HydraDB
 
 client = HydraDB(token=os.environ["HYDRA_DB_API_KEY"])
-database = "my_first_database"
+database = "acme"
 
-# 1. Create database.
+# 1. Create a database. Its name is all it needs.
 client.databases.create(database=database)
 
 # 2. Wait until the database can accept data.
 while True:
-    status = client.databases.status(database=database)
-    if status.data.infra.ready_for_ingestion:
+    infra = client.databases.status(database=database).data.infra
+    if infra.ready_for_ingestion:
         break
     time.sleep(5)
 
-# 3. Ingest a user memory.
-ingest = client.context.ingest(
-    type="memory",
+# 3. Ingest a policy into the shared collection and a conversation into Alex's.
+#    The SDK sends the item list as a JSON string in the `items` form field.
+client.context.ingest(
+    database=database,
+    collection="company",
+    items=json.dumps([{
+        "context_id": "refund-policy",
+        "title": "Refund policy",
+        "text": "Refunds are processed within 5 business days.",
+    }]),
+)
+client.context.ingest(
     database=database,
     collection="user_alex",
-    memories=json.dumps([
-        {
-            "id": "user_alex_pref_001",
-            "text": "User prefers detailed technical explanations and dark mode.",
-            "infer": True,
-            "user_name": "Alex",
-        }
-    ]),
+    items=json.dumps([{
+        "context_id": "chat-alex-001",
+        "conversation": [
+            {"role": "user", "content": "Keep answers short, I read on my phone.", "name": "alex"},
+            {"role": "assistant", "content": "Got it, short answers."},
+        ],
+        "happened_at": "2026-09-01",
+    }]),
 )
 
-ingest_id = ingest.data.results[0].id
-
-# 4. Wait until searchable.
-while True:
-    status = client.context.status(
-        database=database,
-        collection="user_alex",
-        ids=[ingest_id],
-    ).data.statuses[0]
-
-    if status.indexing_status in ("graph_creation", "completed"):
-        break
-    if status.indexing_status in ("errored", "failed"):
-        # A wrong database/collection reports "errored" too, with FILE_NOT_FOUND.
-        # error_message is "" in that case, so branch on the code, not the text.
-        if status.error_code == "FILE_NOT_FOUND":
-            raise RuntimeError("No such id in this scope: check database/collection match ingestion")
-        raise RuntimeError(status.error_message or status.message or "Indexing failed")
+# 4. Wait until both items are searchable.
+pending = {"company": "refund-policy", "user_alex": "chat-alex-001"}
+while pending:
+    for collection, context_id in list(pending.items()):
+        status = client.context.status(
+            database=database, collection=collection, ids=[context_id]
+        ).data.statuses[0]
+        if status.indexing_status in ("graph_creation", "completed"):
+            del pending[collection]
+        elif status.indexing_status in ("errored", "failed"):
+            # A wrong database/collection reports "errored" too, with FILE_NOT_FOUND.
+            # error_message is "" in that case, so branch on the code, not the text.
+            if status.error_code == "FILE_NOT_FOUND":
+                raise RuntimeError(f"{context_id} not found in {collection}: check the scope")
+            raise RuntimeError(status.error_message or status.message or "Indexing failed")
     time.sleep(2)
 
-# 5. Search memories.
+# 5. Query both collections, weighting Alex's own context higher.
 result = client.query(
     database=database,
-    collection="user_alex",
-    query="What does the user prefer?",
-    type="memory",
-    query_by="hybrid",
-    mode="thinking",
+    collections={"user_alex": 2, "company": 1},
+    query="How should I explain our refund policy to this user?",
 )
 
-print(result.data.chunks)
+for chunk in result.data.chunks:
+    print(chunk.score, chunk.context_id, chunk.content)
+for path in result.data.graph:
+    print(path.origin, path.path_summary)
+
+# 6. The same context as one prompt-ready string, with citation labels.
+print(result.data.llm_prompt)
 ```
 
 ### TypeScript
@@ -420,70 +407,159 @@ print(result.data.chunks)
 ```ts
 import { HydraDBClient } from "@hydradb/sdk";
 
-const client = new HydraDBClient({
-  token: process.env.HYDRA_DB_API_KEY,
-});
+const client = new HydraDBClient({ token: process.env.HYDRA_DB_API_KEY });
+const database = "acme";
 
-const database = "my_first_database";
+// 1. Create a database. Its name is all it needs.
+await client.databases.create({ database });
 
-await client.databases.create({ database: database });
-
+// 2. Wait until the database can accept data.
 while (true) {
-  const status = await client.databases.status({ database: database });
-  if (status.data.infra.readyForIngestion) break;
+  const { data } = await client.databases.status({ database });
+  if (data?.infra.readyForIngestion) break;
   await new Promise((resolve) => setTimeout(resolve, 5_000));
 }
 
-const ingest = await client.context.ingest({
-  type: "memory",
-  database: database,
+// 3. Ingest a policy into the shared collection and a conversation into Alex's.
+//    The SDK sends the item list as a JSON string in the `items` form field.
+await client.context.ingest({
+  database,
+  collection: "company",
+  items: JSON.stringify([{
+    context_id: "refund-policy",
+    title: "Refund policy",
+    text: "Refunds are processed within 5 business days.",
+  }]),
+});
+await client.context.ingest({
+  database,
   collection: "user_alex",
-  memories: JSON.stringify([
-    {
-      id: "user_alex_pref_001",
-      text: "User prefers detailed technical explanations and dark mode.",
-      infer: true,
-      user_name: "Alex",
-    },
-  ]),
+  items: JSON.stringify([{
+    context_id: "chat-alex-001",
+    conversation: [
+      { role: "user", content: "Keep answers short, I read on my phone.", name: "alex" },
+      { role: "assistant", content: "Got it, short answers." },
+    ],
+    happened_at: "2026-09-01",
+  }]),
 });
 
-const ingestId = ingest.data.results[0].id;
-
-while (true) {
-  const status = (await client.context.status({
-    database: database,
-    collection: "user_alex",
-    ids: [ingestId],
-  })).data.statuses[0];
-
-  if (["graph_creation", "completed"].includes(status.indexingStatus as string)) break;
-  if (["errored", "failed"].includes(status.indexingStatus as string)) {
-    // || rather than ??: errorMessage is "" (not null) on some failures, and ??
-    // would pass the empty string through and throw an error with no message.
-    throw new Error(status.errorMessage || status.message || "Indexing failed");
+// 4. Wait until both items are searchable.
+const pending = new Map([["company", "refund-policy"], ["user_alex", "chat-alex-001"]]);
+while (pending.size > 0) {
+  for (const [collection, id] of pending) {
+    const status = (await client.context.status({ database, collection, ids: [id] })).data.statuses[0];
+    if (["graph_creation", "completed"].includes(status.indexingStatus as string)) {
+      pending.delete(collection);
+    } else if (["errored", "failed"].includes(status.indexingStatus as string)) {
+      // A scope miss reports errored too, so name the cause rather than guessing.
+      if (status.errorCode === "FILE_NOT_FOUND") {
+        throw new Error(`${id} not found in ${collection}: check the scope`);
+      }
+      // Use ||, not ??: errorMessage is "" (not null) on some failures.
+      throw new Error(status.errorMessage || status.message || "Indexing failed");
+    }
   }
-
   await new Promise((resolve) => setTimeout(resolve, 2_000));
 }
 
+// 5. Query both collections, weighting Alex's own context higher.
 const result = await client.query({
-  database: database,
-  collection: "user_alex",
-  query: "What does the user prefer?",
-  type: "memory",
-  queryBy: "hybrid",
-  mode: "thinking",
+  database,
+  collections: { user_alex: 2, company: 1 },
+  query: "How should I explain our refund policy to this user?",
 });
 
-console.log(result.data.chunks);
+console.log(result.data.chunks.map((c) => [c.score, c.contextId, c.content]));
+console.log(result.data.graph.map((p) => p.pathSummary));
+
+// 6. The same context as one prompt-ready string, with citation labels.
+console.log(result.data.llmPrompt);
+```
+
+### cURL
+
+```bash
+export HYDRA_DB_API_KEY="your_api_key"
+DATABASE="acme"
+API="https://api.hydradb.com"
+AUTH=(-H "Authorization: Bearer $HYDRA_DB_API_KEY" -H "API-Version: 2")
+
+# 1. Create a database.
+curl -s -X POST "$API/databases" "${AUTH[@]}" \
+  -H "Content-Type: application/json" \
+  -d "{\"database\":\"${DATABASE}\"}"
+
+# 2. Wait until the database can accept data.
+until curl -s "$API/databases/status?database=${DATABASE}" "${AUTH[@]}" \
+  | jq -e '.data.infra.ready_for_ingestion' > /dev/null; do
+  sleep 5
+done
+
+# 3. Ingest a policy into the shared collection and a conversation into Alex's.
+curl -s -X POST "$API/context/ingest" "${AUTH[@]}" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"database\": \"${DATABASE}\",
+    \"collection\": \"company\",
+    \"context\": [{
+      \"context_id\": \"refund-policy\",
+      \"title\": \"Refund policy\",
+      \"text\": \"Refunds are processed within 5 business days.\"
+    }]
+  }"
+curl -s -X POST "$API/context/ingest" "${AUTH[@]}" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"database\": \"${DATABASE}\",
+    \"collection\": \"user_alex\",
+    \"context\": [{
+      \"context_id\": \"chat-alex-001\",
+      \"conversation\": [
+        { \"role\": \"user\", \"content\": \"Keep answers short, I read on my phone.\", \"name\": \"alex\" },
+        { \"role\": \"assistant\", \"content\": \"Got it, short answers.\" }
+      ],
+      \"happened_at\": \"2026-09-01\"
+    }]
+  }"
+
+# 4. Wait until both items are searchable.
+for pair in "company:refund-policy" "user_alex:chat-alex-001"; do
+  COLLECTION="${pair%%:*}"; ID="${pair#*:}"
+  while true; do
+    STATUS=$(curl -s -G "$API/context/status" "${AUTH[@]}" \
+      --data-urlencode "database=${DATABASE}" \
+      --data-urlencode "collection=${COLLECTION}" \
+      --data-urlencode "ids=${ID}" \
+      | jq -r '.data.statuses[0].indexing_status')
+    if [ "$STATUS" = "completed" ] || [ "$STATUS" = "graph_creation" ]; then break; fi
+    if [ "$STATUS" = "errored" ]; then echo "$ID errored"; exit 1; fi
+    sleep 2
+  done
+done
+
+# 5. Query both collections, weighting Alex's own context higher.
+curl -s -X POST "$API/query" "${AUTH[@]}" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "database": "'"${DATABASE}"'",
+    "collections": { "user_alex": 2, "company": 1 },
+    "query": "How should I explain our refund policy to this user?"
+  }' | jq '{chunks: [.data.chunks[]?.content], paths: [.data.graph[]?.path_summary], llm_prompt: .data.llm_prompt}'
+```
+
+The response has four keys. `chunks` are the matched pieces of your items, ranked, each with a `score` and its `context_id`. `graph` is the list of relation paths connecting them, each with a one-sentence `path_summary`. `forceful_relations` holds items linked at ingest (none here). `llm_prompt` is all of that as one markdown string with citation labels, ready to drop into your model call:
+
+```python
+messages = [{"role": "system", "content": result.data.llm_prompt},
+            {"role": "user", "content": "How should I explain our refund policy to this user?"}]
 ```
 
 ---
 
 ## 5. Databases API
 
-### Create database
+### Create a database
 
 `POST /databases` · `client.databases.create()`
 
@@ -505,188 +581,182 @@ console.log(result.data.chunks);
 
 Notes:
 
-- Database creation is async.
-- `database` should be stable; docs recommend lowercase letters, numbers, and underscores for portability.
-- `database_metadata_schema` is effectively planned up front. If you need to change filterable metadata fields, expect to create a new database or re-ingest under a new schema.
-- `POST /databases` may return `409 DATABASE_ALREADY_EXISTS` for duplicate database IDs and `403 FORBIDDEN` when the API key or plan cannot create more databases.
+- `database` is the only required field. `database_metadata_schema` is optional and declares the filterable `attributes` (see [Attributes guide](#10-attributes-guide)).
+- Database creation is asynchronous.
+- `database` is a stable, case-sensitive id of up to 25 characters, immutable after creation. Lowercase letters, numbers and underscores are the most portable.
+- Plan the schema up front. You can add fields later with `PATCH /databases/{database}/metadata-schema` (additive only: no deletes, no data-type or flag changes).
+- `POST /databases` may return `409 DATABASE_ALREADY_EXISTS` for a duplicate name and `403 FORBIDDEN` when the API key or plan cannot create more databases.
 
 ### Check readiness
 
 `GET /databases/status?database=...` · `client.databases.status()`
 
-Ready when infrastructure reports usable status. Current docs show `infra.ready_for_ingestion`; SDK examples also check:
-
-- `infra.scheduler_status`
-- `infra.graph_status`
-- `infra.vectorstore_status.knowledge`
-- `infra.vectorstore_status.memories`
-
-Use SDK autocomplete/returned object shape for the exact field spelling.
+Poll until `data.infra.ready_for_ingestion` is `true` (TypeScript: `data.infra.readyForIngestion`). The `infra` object also carries per-component flags (`scheduler_status`, `graph_status`, `vectorstore_status`); poll `ready_for_ingestion`, not the individual flags.
 
 ### Other database endpoints
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /databases` | list database IDs |
-| `DELETE /databases?database=...` | delete a database and all data |
+| `GET /databases` | list databases |
+| `DELETE /databases?database=...` | delete a database and all its data |
 | `GET /databases/collections?database=...` | list active collections |
-| `GET /databases/stats?database=...` | collection counts |
+| `GET /databases/stats?database=...` | row counts |
+| `PATCH /databases/{database}/metadata-schema` | add declared attribute fields |
+
+`GET /databases/stats` keeps two historical field names, `knowledge_collection.row_count` and `memory_collection.row_count`. Both count the same rows, so the two numbers are equal: read one, do not add them.
 
 ---
 
-## 6. Source ingestion
+## 6. Ingesting context
 
-`POST /context/ingest` is the unified write endpoint for knowledge and memories.
+`POST /context/ingest` · `client.context.ingest()`
 
-### Common form fields
+One endpoint takes every item, text or conversation, into any collection of a database. The raw HTTP body is JSON and the list is called `context`.
 
-| Field | Description |
-|---|---|
-| `type` | `"knowledge"` or `"memory"`; default is `"knowledge"` |
-| `database` | target database |
-| `collection` | optional logical partition; default collection if omitted |
-| `upsert` | default `true`; replaces existing sources with same ID |
-| `documents` | binary uploads for knowledge |
-| `metadata` | schema-aligned filterable fields; top-level `metadata_filters` match these |
-| `additional_metadata` | free-form fields; anything you want as metadata that is not in the `metadata` schema |
-| `document_metadata` | JSON-stringified array, one item per uploaded file; assigns a source `id` to that file |
-| `app_knowledge` | JSON-stringified object/array of pre-extracted app sources |
-| `memories` | JSON-stringified array of memory items |
-
-`metadata` and `additional_metadata` are top-level request fields. They are not nested inside `document_metadata`.
-
-### Knowledge from files
-
-Use for PDFs, DOCX, Markdown, CSV, TXT, and other files HydraDB should parse.
-
-```python
-import json
-
-with open("policy.pdf", "rb") as f:
-    result = client.context.ingest(
-        type="knowledge",
-        database="acme_corp",
-        documents=[("policy.pdf", f, "application/pdf")],
-        metadata={"department": "support", "status": "approved"},
-        additional_metadata={"author": "Alice", "version": 2},
-        document_metadata=json.dumps([{"id": "policy_v2"}]),
-    )
-```
-
-`metadata` carries the schema-aligned fields declared on the database; top-level `metadata_filters` match these. Anything you want as metadata that is not present in the `metadata` schema goes in `additional_metadata`.
-
-`document_metadata` exists for one reason: when you upload a file there is otherwise no way to assign it a specific source ID. Use it to bind an `id` to each uploaded file.
-
-`document_metadata` item fields:
-
-| Field | Purpose |
-|---|---|
-| `id` | stable source ID / upsert key for the uploaded file |
-| `relations` | explicit forceful relations, e.g. `{ "ids": [...] }` |
-
-### Knowledge from app sources
-
-Use `app_knowledge` when your connector already extracted text from Slack, Gmail, Jira, Linear, Zendesk, Notion, Confluence, Salesforce, webpages, etc.
-
-```ts
-await client.context.ingest({
-  type: "knowledge",
-  database: "acme_corp",
-  appKnowledge: JSON.stringify([
+```json
+{
+  "database": "acme",
+  "collection": "company",
+  "enrich": true,
+  "upsert": true,
+  "instructions": "Extract owners and due dates for every action item.",
+  "context": [
     {
-      id: "slack_C123_1715012345_000100",
-      database: "acme_corp",
-      collection: "default",
-      title: "Pricing discussion - Slack #product",
-      type: "slack",
-      url: "https://slack.com/archives/C123/p1715012345000100",
-      timestamp: "2025-01-15T12:30:00Z",
-      content: {
-        text: "We agreed on three tiers: Starter, Pro, and Enterprise."
-      },
-      tenant_metadata: {
-        channel: "product",
-        workspace: "acme"
-      },
-      additional_metadata: {
-        author: "alice",
-        slack_ts: "1715012345.000100"
-      },
-      relations: {
-        ids: ["slack_thread_root_001"]
-      }
+      "context_id": "refund-policy",
+      "title": "Refund policy",
+      "text": "Refunds are processed within 5 business days.",
+      "attributes": { "department": "support" },
+      "custom_attributes": { "owner": "sam@acme.com" },
+      "forceful_relations": { "ids": ["refund-faq"], "properties": {} }
+    },
+    {
+      "context_id": "chat-alex-001",
+      "conversation": [
+        { "role": "user", "content": "Keep answers short, I read on my phone.", "name": "alex" },
+        { "role": "assistant", "content": "Got it, short answers." }
+      ],
+      "happened_at": "2026-09-01",
+      "acl": ["user_email:alex@acme.com"],
+      "instructions": "Extract the customer's stated preferences. Ignore small talk."
     }
-  ]),
-});
+  ]
+}
 ```
 
-Recommended app-source fields:
+### Request body
 
-| Field | Why send it |
+| Field | Notes |
 |---|---|
-| `id` | stable HydraDB ID and upsert key |
-| `title` | readable result/citation title |
-| `type` | category such as `slack`, `gmail`, `jira`, `notion`, `webpage` |
-| `content.text` / `content.markdown` | primary searchable content |
-| `tenant_metadata` | fast filters such as channel, project, region, workspace |
-| `additional_metadata` | provider IDs, author, status, assignee, timestamps |
-| `url` | citation / navigation link |
-| `timestamp` | freshness and chronology |
-| `relations.ids` | thread, parent/child, linked issue, related source expansion |
+| `database` | Required. The database to write to. |
+| `collection` | Optional. The collection to write to; the default collection when omitted. |
+| `context` | The list of items, at most 100. |
+| `enrich` | Request-level default for every item's `enrich`. Default `true`. |
+| `upsert` | Request-level default for every item's `upsert`. Default `true`. |
+| `instructions` | Request-level default for every item's `instructions`. Default empty. |
+| `graph_payload` | Optional. A graph you built yourself, keyed by `context_id`. See [Bring your own graph](#bring-your-own-graph). |
 
-App-source object kinds in OpenAPI include:
+The request-level values apply to any item that does not set the field itself, so one call can enrich some items and store others as they are, or replace some items and append others.
 
-- `email`
-- `message`
-- `ticket`
-- `knowledge_base`
-- `comment`
-- `custom`
+### Item fields
 
-Modern docs show both a generic `content` shape and a richer app shape with `kind`, `provider`, `external_id`, `fields`, `attachments`, `comments`, and `relations`. Use the richer shape when building app-aware search; at minimum provide stable IDs, content, source type, metadata, and relations.
+Each item carries exactly one of `text` or `conversation`.
 
-### Memories
+| Field | Notes |
+|---|---|
+| `context_id` | Your id for the item. Generated from `title` when omitted, so two untitled items without ids and with the same text collide. Must not contain commas. |
+| `title` | Optional readable name, printed in `llm_prompt` and matchable with `titles` on `/query`. |
+| `text` | Plain text or markdown. |
+| `conversation` | A list of `{ role, content, name? }` turns. |
+| `enrich` | Extract entities, relations and preferences from this item. Default: the request's `enrich`, else `true`. Set `false` to store the item only as searchable text. |
+| `upsert` | Replace an existing item with the same `context_id`. Default: the request's `upsert`, else `true`. |
+| `instructions` | Steer enrichment for this item. Default: the request's `instructions`. |
+| `happened_at` | The date the item is about, `YYYY-MM-DD` only; a timestamp is a `400`. HydraDB records when it received the item separately. |
+| `attributes` | Declared, filterable fields from the database's `database_metadata_schema`. |
+| `custom_attributes` | Free-form fields. Not filterable. |
+| `forceful_relations` | `{ "ids": [...], "properties": {} }`: the `context_id`s this item is linked to. |
+| `acl` | Principals allowed to retrieve the item: `user_email:a@x.com` (or a bare email), `group:<provider>:<id>`, `domain:acme.com`, `__public__`. Omit for unrestricted, `[]` for nobody. A malformed principal rejects the whole request with `400`. |
+| `is_markdown` | Chunk `text` on its markdown structure instead of as flat prose. |
+| `user_name` | The speaker for a text item. On a conversation, the per-turn `name` wins. |
 
-Use `type="memory"` and a JSON-stringified `memories` array.
+A key an item does not recognise is dropped without an error, so check spelling against this table.
 
-```python
-import json
+### Conversations
 
-client.context.ingest(
-    type="memory",
-    database="acme_corp",
-    collection="user_alex",
-    memories=json.dumps([
-        {
-            "id": "pref_dark_mode",
-            "title": "Dark mode preference",
-            "text": "User prefers dark mode and concise answers.",
-            "infer": True,
-            "user_name": "Alex",
-            "tenant_metadata": json.dumps({"team": "engineering"}),
-            "additional_metadata": {"source": "onboarding"},
-            "relations": {"ids": ["pref_concise"]}
-        }
-    ]),
-)
+- Roles are `user`, `assistant` and `system`. Any other role is a `400`; map roles such as `tool` or `human` before sending.
+- `system` turns shape enrichment but are never stored as facts. A conversation of only `system` turns is a `400`.
+- Consecutive turns with the same role are accepted and joined.
+- Set `name` per turn when several people speak, so preferences are attributed to the right person.
+- An empty list, or a turn with empty `content`, is a `400`.
+
+### IDs and replacement
+
+- `upsert: true` (the default) **replaces**: re-ingesting a `context_id` deletes everything derived from the previous version (its chunks and its graph contribution) before writing the new one. It does not merge.
+- `upsert` is per item, with the request value as the default.
+- Give repeated text either a `context_id` or a distinct `title`, or the second item replaces the first.
+
+### Bring your own graph
+
+Skip extraction for an item and supply its entities and relations yourself with `graph_payload`, a map keyed by `context_id`:
+
+```json
+{
+  "database": "acme",
+  "context": [
+    { "context_id": "billing-policy", "text": "Alice Carter owns the billing policy." }
+  ],
+  "graph_payload": {
+    "billing-policy": {
+      "entities": {
+        "alice":   { "name": "Alice Carter",   "type": "PERSON" },
+        "billing": { "name": "Billing Policy", "type": "POLICY" }
+      },
+      "relations": [
+        { "source": "alice", "target": "billing", "predicate": "OWNS", "context": "Alice Carter owns the billing policy." }
+      ]
+    }
+  }
+}
 ```
 
-Memory item fields:
+Every key in `graph_payload` must equal the `context_id` of an item in the same request; a key that matches nothing is a `400`. A keyed item is still chunked and embedded, so it stays searchable. Entity and relation shapes and caps are on [Bring your own graph](/essentials/v2/bring-your-own-graph).
 
-| Field | Description |
-|---|---|
-| `id` | optional stable upsert key |
-| `title` | label for listing/search display |
-| `text` | raw text or Markdown; required unless `user_assistant_pairs` provided |
-| `user_assistant_pairs` | dialogue pairs `{ user, assistant }`; useful for implied preferences |
-| `is_markdown` | preserve Markdown structure during chunking |
-| `infer` | extract durable preference/fact from raw signal |
-| `custom_instructions` | guide inference when `infer: true` |
-| `user_name` | helps inference |
-| `expiry_time` | TTL in seconds |
-| `tenant_metadata` | schema-aligned fields; for memory items, encode as a JSON string inside the JSON-stringified `memories` field |
-| `additional_metadata` | free-form fields; keep as objects |
-| `relations` | explicit memory-to-memory links |
+### Limits and validation
+
+- At most **100 items** per request, **1 MiB** of text per item, **8 MiB** of text per request. Split larger batches.
+- `attributes` are capped at **16 KiB** and `custom_attributes` at **1 KiB** per item, measured on the compact JSON encoding in UTF-8 bytes (keys and punctuation count).
+- A validation error names the item it refers to as `context[N]`.
+- Ingest takes text only. To ingest a PDF, DOCX or CMS export, extract its text in your application and send it as `text`, one item per document. For tools such as Slack, Notion or Google Drive, use a [connector](/essentials/v2/connectors): synced content lands in the same database and is queried together with your items.
+
+### SDKs: the `items` form field
+
+The SDKs send a multipart form rather than a JSON body. The item array goes in the `items` form field as a JSON string, next to `database`, `collection`, `upsert` and `graph_payload`; the server runs the same validation on both entry points. Set `enrich` and `instructions` on each item. Python: `client.context.ingest(database=..., collection=..., items=json.dumps([...]))`. TypeScript: `await client.context.ingest({ database, collection, items: JSON.stringify([...]) })`. Keys inside each item stay snake_case in both. Full examples are in [Minimal end-to-end flow](#4-minimal-end-to-end-flow).
+
+### Response
+
+`202 Accepted`:
+
+```json
+{
+  "success": true,
+  "data": {
+    "success": true,
+    "message": "Context queued for ingestion successfully. ...",
+    "results": [
+      { "id": "refund-policy", "title": "Refund policy", "status": "queued", "infer": true, "error": null, "error_code": null },
+      { "id": "chat-alex-001", "title": null, "status": "queued", "infer": true, "error": null, "error_code": null }
+    ],
+    "success_count": 2,
+    "failed_count": 0
+  },
+  "error": null,
+  "meta": { "request_id": "9d13aef4-02f4-4e73-8c62-4c2601d04f9d" }
+}
+```
+
+- `results[].id` is the item's `context_id`: the one you sent, or the generated one. Pass it to `GET /context/status`.
+- `results[].infer` mirrors the item's `enrich`.
+- `results[].status` is `queued` or `failed`. A failed item carries `error` and `error_code`; the other items in the request are still queued.
+- A `202` means queued, not searchable. Poll status before querying.
 
 ---
 
@@ -698,49 +768,23 @@ Memory item fields:
 
 Parameters:
 
-- `database` required
-- `ids` required array
-- `collection`  -  **required if you ingested into one.** The lookup is scoped: omitting `collection`, or sending the wrong one, returns `indexing_status: "errored"` with `error_code: "FILE_NOT_FOUND"` and `message: "ID not found"` for a source that exists and is fully searchable. That is a scope miss, not an indexing failure, and it is indistinguishable from one unless you read `error_code`.
-
-Status meanings from docs:
+- `database`: required.
+- `ids`: one or more `context_id`s (repeat the parameter, or comma-separate).
+- `collection`: **required if you ingested into one.** The lookup is scoped: omitting `collection`, or sending the wrong one, returns `indexing_status: "errored"` with `error_code: "FILE_NOT_FOUND"` and `message: "ID not found"` for an item that exists and is fully searchable. That is a scope miss, not an indexing failure, and it is indistinguishable from one unless you read `error_code`.
 
 | Status | Searchable? | Meaning |
 |---|---:|---|
 | `queued` | No | accepted, not picked up |
-| `processing` | No | parsing/chunking/embedding |
+| `processing` | No | chunking, embedding, enriching |
 | `graph_creation` | Yes | chunks indexed; graph still building |
 | `completed` | Yes | fully indexed and graphed |
-| `errored` / `failed` | No | terminal failure |
+| `errored` | No | terminal failure |
 
-Pattern:
-
-```ts
-while (true) {
-  const status = (await client.context.status({
-    database: "acme_corp",
-    collection: "support_docs", // must match the ingestion scope, or you get FILE_NOT_FOUND
-    ids: ["policy_v2"],
-  })).data.statuses[0];
-
-  if (["graph_creation", "completed"].includes(status.indexingStatus as string)) break;
-  if (["errored", "failed"].includes(status.indexingStatus as string)) {
-    // A scope miss reports errored too, so name the cause rather than guessing.
-    if (status.errorCode === "FILE_NOT_FOUND") {
-      throw new Error(`No such id in this scope: check database/collection match ingestion`);
-    }
-    // Use ||, not ??: errorMessage comes back as "" (not null) on some failures,
-    // and ?? passes an empty string straight through to an empty error.
-    throw new Error(status.errorMessage || status.message || "Indexing failed");
-  }
-  await new Promise((r) => setTimeout(r, 2_000));
-}
-```
+The polling loops in [Minimal end-to-end flow](#4-minimal-end-to-end-flow) handle every case, including the scope miss. On a failure, read `error_message || message`: `error_message` is `""` (not null) on some failures, so `??` would pass the empty string through. Wait for `completed` only when you need full graph traversal in the results.
 
 ### Webhooks instead of polling
 
 Use `/webhooks/indexing` to receive terminal indexing events.
-
-Endpoints:
 
 | Endpoint | Purpose |
 |---|---|
@@ -752,17 +796,15 @@ Endpoints:
 | `GET /webhooks/indexing/deliveries/{delivery_id}` | get one delivery |
 | `POST /webhooks/indexing/deliveries/{delivery_id}/retry` | retry delivery |
 
-Supported event:
+Supported event: `indexing.status_changed`.
 
-- `indexing.status_changed`
-
-Payload shape:
+Payload shape (`id` is the item's `context_id`):
 
 ```json
 {
   "event": "indexing.status_changed",
   "delivery_id": "<delivery_id>",
-  "id": "<id>",
+  "id": "<context_id>",
   "database": "<database>",
   "collection": "<collection>",
   "status": "completed",
@@ -797,9 +839,9 @@ Managing the secret:
 
 Rules:
 
-- Webhook URL must be public HTTPS; localhost/private networks are blocked.
+- Webhook URL must be public HTTPS; localhost and private networks are blocked.
 - Store `delivery_id` to deduplicate retries.
-- Verify `X-HydraDB-Signature` with a constant-time comparison. Use `verify_webhook_signature` (Python SDK) or `verifyWebhookSignature` (TypeScript SDK) from the SDK helpers module.
+- Verify `X-HydraDB-Signature` with a constant-time comparison. Use `verify_webhook_signature` (Python, `hydra_db.helpers`) or `verifyWebhookSignature` (TypeScript SDK helpers).
 - Fail closed: reject the request when the signing secret is absent from the environment, rather than skipping verification.
 
 ---
@@ -808,349 +850,473 @@ Rules:
 
 `POST /query` · `client.query()`
 
-### Request fields that matter
+### Request fields
 
 | Field | Values | Notes |
 |---|---|---|
-| `database` | string | required |
-| `collection` | string/null | required for per-user memory searches |
-| `query` | string | required |
-| `type` | `knowledge`, `memory`, `all` | store selector for knowledge, memories, or both |
-| `query_by` | `hybrid`, `text` | default hybrid |
-| `operator` | `or`, `and`, `phrase` | only for `query_by: "text"` |
-| `mode` | `fast`, `thinking` | applies to hybrid; thinking improves quality but adds latency |
-| `max_results` | integer/null | default around 10; max documented as 50 |
-| `alpha` | `0.0`–`1.0` or `auto` | hybrid weight; `1.0` semantic, `0.0` BM25 |
-| `recency_bias` | `0.0`–`1.0` | boost newer content |
-| `graph_context` | boolean | default true; include graph slice |
-| `query_forceful_relations` | boolean | only effective in `thinking` mode |
-| `additional_context` | string | short factual hint; not a hard filter |
-| `metadata_filters` | object | deterministic filters before/around ranking |
-| `query_apps` | boolean | app-aware retrieval lane for app sources; still searches the full selected knowledge scope |
+| `database` | string | Required. |
+| `collection` | string | Search one collection; the default collection when neither this nor `collections` is sent. |
+| `collections` | `string[]` or `{ [collection]: weight }` | Search several. A list weights them equally; an object ranks one above another (weights rank, they do not exclude). Maximum 100. |
+| `query` | string | Required. The question or search terms. |
+| `max_results` | integer | Default `10`, maximum `50`. Caps the merged result across collections. |
+| `mode` | `auto`, `fast`, `thinking` | `auto` (default) routes each query. `thinking` expands the query, reranks, traverses the graph further and follows forceful relations; `fast` is one pass. |
+| `query_by` | `hybrid`, `text` | `hybrid` (default) blends semantic and BM25; `text` is BM25 only. |
+| `operator` | `or`, `and`, `phrase` | BM25 term matching; only for `query_by: "text"`. Default `or`. |
+| `alpha` | `0.0` to `1.0`, or `"auto"` | Semantic versus keyword blend for `hybrid`. `1.0` is fully semantic, `0.0` fully BM25. Default `0.8`. |
+| `recency_bias` | `0.0` to `1.0` | Boost newer content. `0` disables it. |
+| `ids` | `string[]` | Restrict retrieval to these `context_id`s. |
+| `titles` | `string[]` | Restrict retrieval to items with one of these exact titles (case-insensitive). |
+| `attributes` | object | Filter on declared attributes with operators. See [Filtering with attributes](#filtering-with-attributes). |
+| `acl` | `string[]` | Query on behalf of an identity: only items it may retrieve are returned. Omitted, empty or `["*"]` disables filtering. |
+| `query_apps` | boolean | App-aware lane for connector content (exact ids, actors, threads), on top of normal retrieval. |
+| `graph_context` | boolean | Default `true`: include `graph[]`. |
+| `follow_forceful_relations` | boolean | Default `true`: pull declared forceful relations into `forceful_relations[]` (`thinking` mode only). |
+| `temporal_reasoning` | boolean | Default `true`. Resolve time-based questions (current, as of, ranges); matched facts come back in `chunks[].temporal`. Never changes which chunks are returned. |
+| `temporal_now` | ISO 8601 string | The time to treat as now, for example when replaying a past conversation. |
+| `temporal_intent` | object | Override the temporal intent HydraDB would infer from the query. |
 
 ### Recommended configurations
 
 | Goal | Request shape |
 |---|---|
-| Fast document RAG | `type: "knowledge"`, `query_by: "hybrid"`, `mode: "fast"`, `graph_context: false`, `max_results: 5-10` |
-| Highest-quality document RAG | `type: "knowledge"`, `query_by: "hybrid"`, `mode: "thinking"`, `graph_context: true`, `alpha: "auto"` |
-| Personalized grounded answer | `type: "all"`, include `collection`, `query_by: "hybrid"`, `mode: "thinking"` |
-| User preferences only | `type: "memory"`, include `collection`, `query_by: "hybrid"` |
-| Exact keyword / phrase | `type: "knowledge"`, `query_by: "text"`, `operator: "phrase"` |
-| Recent operational updates | `query_by: "hybrid"`, `recency_bias: 0.2-0.4`, metadata filter to doc type/status |
-| App search | `type: "knowledge"`, `query_by: "hybrid"`, `mode: "thinking"`, `query_apps: true`; still searches non-app knowledge too |
+| Fast RAG | `mode: "fast"`, `graph_context: false`, `max_results: 5` to `10` |
+| Highest-quality RAG | `mode: "thinking"`, `alpha: "auto"` (graph on by default) |
+| Personalized grounded answer | `collections: { "user_alex": 2, "company": 1 }`, `mode: "thinking"` |
+| One person's context only | `collection: "user_alex"` |
+| Exact keyword or phrase | `query_by: "text"`, `operator: "phrase"` |
+| Error codes, SKUs, product names | `query_by: "hybrid"`, `alpha: 0.3` to `0.5` |
+| Recent operational updates | `recency_bias: 0.2` to `0.4`, plus an `attributes` filter on status or doc type |
+| Connector content (Slack, Jira, Gmail) | `query_apps: true`, `mode: "thinking"` |
+| Follow linked items | `mode: "thinking"` (`follow_forceful_relations` is on by default) |
+| A known item or document | `ids: [...]` or `titles: [...]` |
 
-### Search examples
-
-Knowledge RAG:
-
-```ts
-const result = await client.query({
-  database: "acme_corp",
-  query: "What is our refund policy?",
-  type: "knowledge",
-  queryBy: "hybrid",
-  mode: "thinking",
-  maxResults: 10,
-  graphContext: true,
-});
-```
-
-Personalized answer using knowledge and memories:
-
-```ts
-const result = await client.query({
-  database: "acme_corp",
-  collection: "user_alex",
-  query: "What is our refund policy, and how should I explain it to this user?",
-  type: "all",
-  queryBy: "hybrid",
-  mode: "thinking",
-  alpha: "auto",
-});
-```
+### Examples
 
 Exact phrase:
 
 ```python
 result = client.query(
     database="acme_corp",
+    collection="support",
     query="ERROR_429 rate limit",
-    type="knowledge",
     query_by="text",
     operator="phrase",
 )
 ```
 
-Metadata-scoped search:
+Attribute-filtered search, on behalf of one user:
 
 ```json
 {
   "database": "acme_corp",
-  "query": "authentication control review",
-  "type": "knowledge",
-  "query_by": "hybrid",
-  "metadata_filters": {
-    "compliance_framework": "SOC2",
-    "additional_metadata": {
-      "author": "alice"
-    }
-  }
+  "collection": "company",
+  "query": "What is the refund window for enterprise customers?",
+  "attributes": {
+    "$and": [
+      { "department": { "$eq": "support" } },
+      { "region": { "$in": ["us", "eu"] } }
+    ]
+  },
+  "acl": ["user_email:grace@acme.com"]
 }
 ```
 
 ### Search response
 
-The successful `data` object / SDK return is a `RetrievalResult`:
+`data` is exactly `chunks`, `graph`, `forceful_relations` and `llm_prompt`:
 
 ```json
 {
-  "chunks": [
-    {
-      "chunk_uuid": "...",
-      "id": "...",
-      "chunk_content": "...",
-      "source_title": "...",
-      "source_type": "...",
-      "source_upload_time": "...",
-      "source_last_updated_time": "...",
-      "relevancy_score": 0.91,
-      "metadata": {},
-      "additional_metadata": {},
-      "extra_context_ids": []
-    }
-  ],
-  "sources": [
-    {
-      "id": "...",
-      "title": "...",
-      "type": "...",
-      "url": "...",
-      "timestamp": "...",
-      "metadata": {},
-      "additional_metadata": {},
-      "app_kind": "message",
-      "app_provider": "slack",
-      "app_external_id": "..."
-    }
-  ],
-  "graph_context": {
-    "query_paths": [],
-    "chunk_relations": [],
-    "chunk_id_to_group_ids": {}
+  "success": true,
+  "data": {
+    "chunks": [
+      {
+        "chunk_id": "ck_policy_3",
+        "context_id": "refund-policy",
+        "score": 0.91,
+        "content": "Refunds are processed within 30 days of purchase by the Finance Department.",
+        "enrichment": "Refund window is 30 days; Finance owns refund processing.",
+        "temporal": [
+          { "content": "Refund policy effective_from June 2026. Start: 2026-06-01", "start_date": "2026-06-01", "end_date": null }
+        ]
+      },
+      {
+        "chunk_id": "ck_chat_1",
+        "context_id": "chat-2026-07-29",
+        "score": 0.84,
+        "content": "user: Keep refund answers short please\nassistant: Got it.",
+        "enrichment": "User prefers short answers about refunds."
+      }
+    ],
+    "graph": [
+      {
+        "origin": "query_path",
+        "triplets": [
+          {
+            "source": { "entity_id": "ent_refunds", "name": "Refund Processing" },
+            "relation": {
+              "predicate": "managed by",
+              "context": "Refund processing is managed by the Finance Department.",
+              "relationship_id": "rel_managed_by",
+              "chunk_id": "ck_policy_3"
+            },
+            "target": { "entity_id": "ent_finance", "name": "Finance Department" }
+          }
+        ],
+        "path_summary": "Refund processing is managed by the Finance Department."
+      },
+      {
+        "origin": "chunk_relation",
+        "triplets": [
+          {
+            "source": { "entity_id": "ent_user", "name": "User" },
+            "relation": { "predicate": "prefers", "context": "The user prefers short answers about refunds.", "relationship_id": "rel_prefers", "chunk_id": "ck_chat_1" },
+            "target": { "entity_id": "ent_short", "name": "short answers" }
+          }
+        ],
+        "path_summary": "The user prefers short answers about refunds."
+      }
+    ],
+    "forceful_relations": [
+      {
+        "via": { "from": "refund-policy", "to": "refund-faq" },
+        "chunk": { "chunk_id": "ck_faq_1", "context_id": "refund-faq", "score": 0, "content": "FAQ: refunds to a card take 5 to 7 business days to appear." }
+      }
+    ],
+    "llm_prompt": "# Query results\n\n**Query:** who owns refund processing?\n..."
   },
-  "additional_context": {}
+  "error": null,
+  "meta": { "request_id": "9d13aef4-02f4-4e73-8c62-4c2601d04f9d", "api_version": "2.0.1", "latency_ms": 412.7, "database": "acme_corp", "collection": "support" }
 }
 ```
 
-Use `chunks` as the primary LLM context. Preserve server order; do not re-sort unless you have a deliberate reranking step.
+`chunks[]`: the matched pieces of your items, ranked. Preserve the order; it is the server ranking.
+
+| Field | Meaning |
+|---|---|
+| `chunk_id` | The chunk's id. Referenced from `graph[].triplets[].relation.chunk_id`. |
+| `context_id` | The item this chunk came from. |
+| `score` | Relevance. Always present. |
+| `content` | The chunk's own text, verbatim. Enrichment is never concatenated into it. |
+| `enrichment` | A plain string: what enrichment extracted from this chunk (a preference, a fact). Omitted when there is none. |
+| `enrichment_kind` | An optional label; omitted when none was set. |
+| `temporal` | Present only when the query engaged temporal reasoning: `{ content, start_date, end_date }` entries, where `content` reads `<fact>. Start: YYYY-MM-DD, End: YYYY-MM-DD` and either date may be `null`. |
+
+Chunks carry nothing about their source: no title, url, collection or attributes. `llm_prompt` prints the title, collection, last-updated date and url for the model. To read an item's stored content yourself, call `GET /context/inspect` with the chunk's `context_id`; to read its title and attributes, call `POST /context/list` with `ids: [context_id]`.
+
+`graph[]`: paths through the context graph, query paths first, then paths expanded from the returned chunks. The list is deduplicated across both lanes (a path both found is reported once, as a `query_path`) and is not capped. `[]` when `graph_context` is `false` or nothing connects.
+
+| Field | Meaning |
+|---|---|
+| `origin` | `"query_path"`: grown from the entities in the query. `"chunk_relation"`: the neighbourhood of a returned chunk. |
+| `triplets[].source` / `triplets[].target` | `{ entity_id, name }`. |
+| `triplets[].relation.predicate` | The relation, for example `managed by`. |
+| `triplets[].relation.context` | The sentence the relation was extracted from. |
+| `triplets[].relation.temporal_details` | When the relation holds, for example `since June`. Omitted when empty. |
+| `triplets[].relation.timestamp` | Epoch seconds (a float) for the edge. Omitted when the edge has none. |
+| `triplets[].relation.relationship_id` | The relation's id. |
+| `triplets[].relation.chunk_id` | The chunk the relation was extracted from. |
+| `path_summary` | One sentence summarizing the path. Never empty. |
+
+`forceful_relations[]`: chunks pulled in because an item declared `forceful_relations` at ingest. Followed only in `thinking` mode; `[]` when none were declared, the query ran in `fast` mode, or `follow_forceful_relations` is `false`.
+
+| Field | Meaning |
+|---|---|
+| `via.from` | The `context_id` whose declared relation pulled this chunk in. May be `""`. |
+| `via.to` | The returned chunk's own `context_id`. |
+| `chunk` | The same shape as an entry of `chunks[]`. |
+
+`llm_prompt`: a server-built markdown string of everything above, ready to inject into a model call. See the next section.
+
+`meta` carries `request_id`, `api_version`, `latency_ms`, `database` and `collection` (omitted on a `collections` fan-out), plus `deprecation` when the request used a deprecated name.
 
 ---
 
 ## 9. Turning search results into LLM prompts
 
-Practical guidance from `essentials/v2/api-results.mdx`:
+**Inject `llm_prompt` verbatim.** It is the whole context block, already ranked, deduplicated and labelled for citation. You do not build a string from the other three keys.
 
-- Preserve the order of `chunks`; it is the server ranking.
-- Use graph context only when it helps the question.
-- Use `additional_context` to attach forcefully related chunks by `chunk_uuid` / `extra_context_ids`.
-- For personalized answers, `type: "all"` is simplest: one result set already merges knowledge and memories.
-- Do not pass raw JSON directly to the LLM if token budget matters; use the SDK formatting helper to produce a compact context string.
-- Include a grounding instruction: answer only from provided context, and say when context is insufficient.
+### What `llm_prompt` contains
 
-Use the SDK helper from `essentials/v2/api-results.mdx`:
+Sections, in order (a section with nothing in it is left out; when the query returns nothing at all, `llm_prompt` is `""`):
 
-- Python: `build_string(result)` from `hydra_db.helpers`
-- TypeScript: `buildString(result)` from `@hydradb/sdk`
+| Section | Contents |
+|---|---|
+| `# Query results` | The query, an `**Interpreted:**` line when an alias or resolved reference widened it, a `**Found:**` line counting what follows, a `**Note:**` line when a lookup degraded, and (when there is a result) the line telling the model to cite it by its number. |
+| `## Results` | One `### 1. title` block per chunk, in ranked order: relevance, collection, type, category (`enrichment_kind`, when set), id and last-updated date, the chunk's `content`, then `**Enrichment:**`. |
+| `## Forceful relations` | One `### R1. title` block per forceful-relation chunk, with `**Linked from:**` naming the item that pulled it in. |
+| `## Related facts` | One line per graph path, such as `- [P1] **Refunds** -managed_by→ **Finance** (relevance 0.81) [1]`, with the `path_summary` indented under it unless it only restates the chain. A path without a reranked score has no parenthetical. |
+| `## Temporal facts` | A `**Duration:**` line first for a "how long between" question, then one line per dated fact the query engaged, with its resolved window, citing its result. |
+| `## Source facts` | App-native facts about the sources behind the results (who, role, where, thread, connector, synced). Prompt only. |
+| `## Profiles` | The entity profiles the query selected. Prompt only. |
+| `## Code search` | The repository code-search answer. Prompt only. |
+| `## Sources` | Each item once: title, type, id, url and last-updated date. |
 
-Python:
+Citation labels:
+
+| Label | Refers to |
+|---|---|
+| `[1]`, `[2]`, ... | Result `### 1.`, `### 2.`: that entry of `chunks[]`. Its `**Id:**` is the `context_id`. |
+| `[R1]`, `[R2]`, ... | Forceful relation `### R1.`, `### R2.`: that entry of `forceful_relations[]`. |
+| `[P1]`, `[P2]`, ... | A related fact: path 1, 2, ... of `graph[]`. |
+
+A related fact or a temporal fact ends with the labels of the results it was extracted from. The numbers in `## Sources` count items, not results, and are not citation labels.
+
+A trimmed example:
+
+```markdown
+# Query results
+
+**Query:** who owns refund processing?
+**Found:** 2 results across 2 sources · 2 related facts · 1 temporal fact · 1 forceful relation
+Cite a result by its number in brackets, e.g. [1].
+
+## Results
+
+### 1. Refund policy
+- **Relevance:** 0.91 · **Collection:** support · **Type:** file
+- **Id:** refund-policy · **Last updated:** 2026-07-02
+
+Refunds are processed within 30 days of purchase by the Finance Department.
+
+**Enrichment:** Refund window is 30 days; Finance owns refund processing.
+
+---
+
+### 2. Support chat with Priya
+- **Relevance:** 0.84 · **Collection:** support · **Type:** message
+- **Id:** chat-2026-07-29 · **Last updated:** 2026-07-29
+
+user: Keep refund answers short please
+assistant: Got it.
+
+**Enrichment:** User prefers short answers about refunds.
+
+## Forceful relations
+
+Linked to a result by the author at ingest time (forceful_relations), not by relevance to this query.
+
+### R1. Refund FAQ
+- **Linked from:** refund-policy · **Collection:** support
+- **Id:** refund-faq
+
+FAQ: refunds to a card take 5 to 7 business days to appear.
+
+## Related facts
+
+- [P1] **Refund Processing** -managed by→ **Finance Department** (relevance 0.81) [1]
+  Refund processing is managed by the Finance Department.
+- [P2] **User** -prefers→ **short answers** (relevance 0.74) [2]
+  The user prefers short answers about refunds.
+
+## Sources
+
+1. **Refund policy** (file, id: refund-policy) · https://docs.acme.com/refunds · updated 2026-07-02
+2. **Support chat with Priya** (message, id: chat-2026-07-29) · updated 2026-07-29
+3. **Refund FAQ** (id: refund-faq)
+```
+
+### Injecting it
 
 ```python
-import os
-from hydra_db import HydraDB
-from hydra_db.helpers import build_string
-from openai import OpenAI
+question = "How should I explain our refund policy to this user?"
 
-hydra = HydraDB(token=os.environ["HYDRA_DB_API_KEY"])
-openai = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-
-question = "How does authentication work?"
-
-result = hydra.query(
-    database="your-database",
-    collection="your-collection",
+result = client.query(
+    database="acme",
+    collections={"user_alex": 2, "company": 1},
     query=question,
-    type="knowledge",
-    query_by="hybrid",
     max_results=5,
 )
-
-context = build_string(result)
 
 messages = [
     {
         "role": "system",
-        "content": "Answer using only the provided HydraDB context. If the answer is not in the context, say so. Cite source titles or URLs when available.",
+        "content": (
+            "Answer using only the context below. Cite results by their bracketed labels. "
+            "If the answer is not in the context, say so.\n\n" + result.data.llm_prompt
+        ),
     },
-    {
-        "role": "user",
-        "content": f"{context}\n\nQuestion: {question}",
-    },
+    {"role": "user", "content": question},
 ]
 ```
 
-TypeScript:
-
 ```ts
-import { HydraDBClient } from "@hydradb/sdk";
-import { buildString } from "@hydradb/sdk/helpers";
-import OpenAI from "openai";
-
-const hydra = new HydraDBClient({ token: process.env.HYDRA_DB_API_KEY });
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
-const question = "How does authentication work?";
-
-const result = await hydra.query({
-  database: "your-database",
-  collection: "your-collection",
+const result = await client.query({
+  database: "acme",
+  collections: { user_alex: 2, company: 1 },
   query: question,
-  type: "knowledge",
-  queryBy: "hybrid",
   maxResults: 5,
 });
 
-const context = buildString(result);
-
 const messages = [
-  {
-    role: "system",
-    content: "Answer using only the provided HydraDB context. If the answer is not in the context, say so. Cite source titles or URLs when available.",
-  },
-  {
-    role: "user",
-    content: `${context}\n\nQuestion: ${question}`,
-  },
+  { role: "system", content: "Answer using only the context below. Cite results by their bracketed labels. If the answer is not in the context, say so.\n\n" + result.data.llmPrompt },
+  { role: "user", content: question },
 ];
 ```
 
-Common mistakes:
+Surface `llm_prompt` to the model as it is and let the model cite the labels. Map a cited `[1]` back to `chunks[0].context_id` (and `[R1]` to `forceful_relations[0].chunk.context_id`) when you need to link a citation to an item.
+
+### Structured output instead of a prompt
+
+When you render results yourself (a UI, a reranker, an eval), read `chunks[].content`, `chunks[].enrichment`, `graph[].path_summary` and `forceful_relations[]`. To hang graph hops under the chunk they came from:
+
+- Build a `chunk_id` to `context_id` map from `chunks[]` and `forceful_relations[].chunk`. Do not parse the chunk id string.
+- Group hops by `relation.chunk_id` and match against that map.
+- A `chunk_relation` path always has a hop from a returned chunk (or a forceful-relation chunk): hang it under that chunk. Show `query_path` paths as their own group; a query-path hop whose `chunk_id` matches a returned chunk may also sit under that chunk.
+
+### Common mistakes
 
 | Mistake | Fix |
 |---|---|
-| Passing raw retrieval JSON to the LLM | Use SDK `build_string(result)` / `buildString(result)` |
-| Omitting `collection` for memories | Use the same scope as ingestion |
-| Including too many chunks | Start with `max_results: 10`; reduce for tight windows |
+| Building your own context string from the JSON | Inject `llm_prompt` verbatim |
+| Looking for a title or url on a chunk | Read it from `llm_prompt`, or call `POST /context/list` with `ids: ["<context_id>"]` for the title and attributes |
+| Querying one collection when the answer spans two | Send `collections`, with the person's collection weighted higher |
+| Including too many chunks | Start with `max_results: 10`; reduce for tight context windows |
 | Re-sorting chunks client-side | Preserve HydraDB ranking |
-| Setting `graph_context: false` then expecting graph fields | Leave default true or set true explicitly |
-| Using `query_forceful_relations` in `fast` mode | Use `mode: "thinking"` |
+| Expecting `graph` after setting `graph_context: false` | Leave it at the default `true` |
+| Expecting `forceful_relations` in `mode: "fast"` | Use `mode: "thinking"` |
 
 ---
 
-## 10. Metadata guide
+## 10. Attributes guide
 
-### Database schema
+Two kinds of structured fields travel with an item:
 
-Declared at `POST /databases`:
+| Field | Declared? | Filterable? | Use for |
+|---|---|---|---|
+| `attributes` | Yes, in the database's `database_metadata_schema` | Yes, with the `/query` `attributes` filter | Hard scopes you know before retrieval runs: department, region, status, plan |
+| `custom_attributes` | No | No | Free-form bookkeeping: author, provider ids, version |
+
+Neither is returned on query chunks. A user, team or workspace partition is a `collection`, not an attribute.
+
+### Declaring attributes
+
+Declared at `POST /databases` (or added later with `PATCH /databases/{database}/metadata-schema`):
 
 ```json
 {
   "database_metadata_schema": [
-    {
-      "name": "department",
-      "data_type": "VARCHAR",
-      "enable_match": true,
-      "enable_dense_embedding": false,
-      "enable_sparse_embedding": false,
-      "max_length": 1024
-    }
+    { "name": "department", "data_type": "VARCHAR", "enable_match": true },
+    { "name": "priority", "data_type": "INT64", "enable_match": true },
+    { "name": "summary_label", "data_type": "VARCHAR", "enable_dense_embedding": true, "enable_sparse_embedding": true }
   ]
 }
 ```
 
-Field options:
-
 | Field | Purpose |
 |---|---|
-| `name` | metadata key; must be valid and non-reserved |
-| `data_type` | friendly names like `string`, `integer`, `float`, `boolean`, or backend types like `VARCHAR`, `INT*`, `JSON` |
-| `enable_match` | allows exact matching in top-level `metadata_filters` |
-| `enable_dense_embedding` | semantically embed `VARCHAR` field |
-| `enable_sparse_embedding` | BM25 index `VARCHAR` field |
-| `max_length` | max string length |
-| `searchable` | shorthand for dense + sparse embedding in docs |
-| `filterable` | shorthand for `enable_match` in docs |
+| `name` | Attribute key. Starts with a letter or `_`; letters, numbers and underscores only; not a reserved system name such as `chunk_id`. |
+| `data_type` | `VARCHAR`, `BOOL`, `INT8`, `INT16`, `INT32`, `INT64`, `FLOAT`, `DOUBLE`, `JSON`, or the aliases `string`, `boolean`, `integer`, `float`, `object`. Default `VARCHAR`. Arrays are not supported. |
+| `enable_match` | Fast exact-match path for a field you filter on often. |
+| `enable_dense_embedding` | Semantic search over a `VARCHAR` field. |
+| `enable_sparse_embedding` | BM25 search over a `VARCHAR` field. |
+| `max_length` | Max `VARCHAR` length. Default `1024`, maximum `65535`; cannot be raised later. |
 
-### Where metadata belongs
+Limits: up to 32 declared fields, and up to 6 embedding flags per database (`enable_dense_embedding` and `enable_sparse_embedding` each count as one). Field names are unique case-insensitively.
 
-| Need | Put it in | Filter with |
-|---|---|---|
-| Hot-path exact filters: department, region, environment, status | `tenant_metadata` | top-level `metadata_filters` |
-| Free-form display/bookkeeping: author, provider IDs, version | `additional_metadata` | `metadata_filters.additional_metadata` |
-| Provider app fields for UI/citations | `additional_metadata` or app `fields` | usually not filtered unless needed |
-| User/workspace partition | `collection` | not metadata |
+### Attaching attributes at ingest
+
+```json
+{
+  "context_id": "refund-policy",
+  "text": "Refunds are processed within 5 business days.",
+  "attributes": { "department": "support", "region": "us" },
+  "custom_attributes": { "owner": "sam@acme.com", "reviewed": "2026-08-01" }
+}
+```
+
+To change an indexed item's attributes, re-ingest it with the same `context_id` (`upsert: true` replaces it), or merge new values in place with `PATCH /context/{id}/metadata`, whose body names the two maps `database_metadata` (declared attributes) and `additional_metadata` (custom attributes).
+
+### Filtering with attributes
+
+`attributes` on `POST /query` is an operator filter over declared attributes. It applies to chunks, forceful relations and graph paths alike.
+
+| Operator | Meaning |
+|---|---|
+| `$eq`, `$ne` | equal, not equal (a bare scalar value means `$eq`) |
+| `$gt`, `$gte`, `$lt`, `$lte` | numeric or ordered comparison |
+| `$in`, `$nin` | value is, or is not, in an array |
+| `$exists` | the field is, or is not, set (`true` / `false`) |
+| `$and`, `$or` | an array of sub-filters |
+| `$not` | a sub-filter to negate |
+
+```json
+{
+  "attributes": {
+    "$or": [
+      { "department": "support" },
+      { "$and": [ { "priority": { "$gte": 7 } }, { "region": { "$in": ["us", "eu"] } } ] }
+    ]
+  }
+}
+```
 
 Rules:
 
-- Plan hot filter fields before first ingest; undeclared scope keys can be ignored.
-- Use exact equality filters; range/contains/fuzzy matching should be in the query or downstream reranker.
-- To change metadata on an indexed context item, re-ingest with the same `id` and `upsert: true`.
-- Do not rename metadata keys without re-ingesting affected sources.
+- There is no `$contains` and no fuzzy match. Put fuzzy concepts in `query`, or declare a `VARCHAR` field with `enable_dense_embedding` and include the concept in the query.
+- `custom_attributes` cannot be filtered. Declare the field and send it in `attributes` instead.
+- A field the database's schema does not declare is a `400`, as is an empty object (`{}`) anywhere in the filter.
+- Each list holds at most 500 values, the whole filter is capped at 64 KiB, and nesting is capped at 10 levels.
+- Filters are hard constraints, not hints: a valid filter that matches nothing returns an empty result rather than widening the search.
+- Plan hot filter fields before the first ingest, and keep attribute names stable.
 
 ---
 
 ## 11. Browse, fetch, relations, delete
 
-### List documents or memories
+None of these calls takes anything beyond `database`, an optional `collection`, and the fields shown. Send the collection you ingested into.
+
+### List items
 
 `POST /context/list` · `client.context.list()`
 
+Lists every item in the collection, text and conversation alike, in one paginated listing.
+
 ```ts
-const sources = await client.context.list({
-  database: "acme_corp",
-  type: "knowledge",
+const page = await client.context.list({
+  database: "acme",
+  collection: "company",
   page: 1,
   pageSize: 50,
   filters: {
-    tenant_metadata: { department: "support" },
-    additional_metadata: { author: "alice" },
-    source_fields: { type: "slack" },
+    source_fields: { title: "Refund policy" },
   },
+  includeFields: ["title", "timestamp"],
 });
 ```
 
 Parameters:
 
-- `database`
-- `collection`
-- `type: "knowledge" | "memory"`
-- `ids`
-- `page`, `page_size` (1–100)
-- `filters.tenant_metadata`
-- `filters.additional_metadata`
-- `filters.source_fields`
-- `include_fields` for projection
+- `database`, `collection`
+- `ids`: only these `context_id`s (filters and paging still apply)
+- `page` (1-indexed, default `1`), `page_size` (`1` to `100`, default `50`)
+- `filters`: exact-match constraints, ANDed. `source_fields` matches built-in fields such as `title`, `url`, `timestamp` and, for connector content, `app_provider`, `app_kind`, `app_external_id`, `app_parent_id`. The list filter keeps its own wire names for the two attribute maps: `filters.metadata` matches declared `attributes` and `filters.additional_metadata` matches `custom_attributes`.
+- `include_fields`: projection, for example `["title", "timestamp"]`. `content` and `url` are not projectable (a `400`); read an item's content with `GET /context/inspect`.
+- `acl`: list as an identity; only items it may see are returned.
 
-### Fetch original content
+Response `data`: `{ success, message, sources: [...], total, pagination }`. `sources` is the wire name for the listed items: one row per item with its `id`, title, timestamp and stored attributes, without content. `pagination` carries `page`, `page_size`, `total`, `total_pages`, `has_next` and `has_previous`.
+
+### Fetch an item's stored content
 
 `GET /context/inspect` · `client.context.inspect()`
 
 ```python
-file = client.context.inspect(
-    database="acme_corp",
-    id="policy_v2",
+item = client.context.inspect(
+    database="acme",
+    collection="company",
+    id="refund-policy",
     mode="both",
     expiry_seconds=3600,
 )
 ```
 
-Modes:
-
 | Mode | Returns |
 |---|---|
-| `content` | parsed text or base64 for binary files |
-| `url` | presigned URL |
-| `both` | content plus presigned URL |
+| `content` | the stored content in `content` |
+| `url` | a time-limited `presigned_url` |
+| `both` (default) | content plus presigned URL |
+
+`expiry_seconds` sets the URL lifetime (default `3600`). With `acl`, the item must be visible to that identity or the response is `404`.
 
 ### Inspect graph relations
 
@@ -1158,28 +1324,39 @@ Modes:
 
 ```ts
 const relations = await client.context.relations({
-  database: "acme_corp",
-  id: "policy_v2",
-  type: "knowledge",
-  limit: 5000,
+  database: "acme",
+  collection: "company",
+  id: "refund-policy",
+  limit: 500,
 });
 ```
 
-Use it for graph debugging and provenance inspection. It supports pagination via `cursor`.
+Returns `relations[]`, triplet groups with their evidence (predicate, the sentence it came from, `chunk_id`, confidence). Omit `id` for relations across the whole collection. Page with `cursor`: pass back `next_cursor` until it is `null`. Use it for graph debugging and provenance.
 
-### Delete sources or memories
+### Walk connected items
+
+`GET /context/{id}/subgraph` · `client.context.subgraph()` (the SDKs call the query-string form, `GET /context/subgraph`, which also accepts an id containing `/`)
+
+Returns every item reachable from one item through item-level links (declared forceful relations, a shared thread, parent and child), breadth-first up to `depth` hops, with the relations among them. An unknown id returns an empty subgraph, not an error.
+
+### Delete items
 
 `DELETE /context` · `client.context.delete()`
 
 ```ts
-await client.context.delete({
-  type: "knowledge",
-  database: "acme_corp",
-  ids: ["policy_v2"],
+const res = await client.context.delete({
+  database: "acme",
+  collection: "company",
+  ids: ["refund-policy", "chat-alex-001"],
 });
 ```
 
-Use `type: "memory"` to delete memory IDs.
+One call deletes each item and everything derived from it (chunks and graph contribution), whatever its shape.
+
+Response `data`: `results[]` (per id: `id`, `deleted`, `error`), `deleted_count` and `message`. Read `deleted_count` and each `results[].deleted`; the nested `data.success` is deprecated and only mirrors `deleted_count > 0`.
+
+- `deleted_count: 0` means the ids matched nothing in that scope. Check `collection`.
+- An item that is still indexing refuses the whole request: nothing is deleted. By default the response is still `200`, with `deleted_count: 0`. Send the header `X-HydraDB-Delete-Status: strict` to get honest codes instead: `404` when nothing matched, `409` while an item is still indexing (retry after `Retry-After`), `500` when a store failed (retryable).
 
 ---
 
@@ -1189,12 +1366,12 @@ Use `type: "memory"` to delete memory IDs.
 
 | Code | Meaning | Retry? |
 |---|---|---|
-| `400` | invalid parameters / malformed request | No |
-| `401` | missing/invalid API key | No |
+| `400` | invalid parameters or malformed request | No |
+| `401` | missing or invalid API key | No |
 | `403` | authenticated but not permitted | No |
-| `404` | database/context item/memory not found | No |
-| `409` | conflict, e.g. existing database or context item ID | Usually no |
-| `413` | upload too large | No |
+| `404` | database or context item not found | No |
+| `409` | conflict: existing database, or (strict delete) an item still indexing | Usually no; retry a strict-delete `409` after indexing finishes |
+| `413` | request body too large | No |
 | `422` | semantic validation failure, including `TENANT_INFRA_NOT_READY` | Only for `TENANT_INFRA_NOT_READY`, after polling readiness |
 | `429` | rate limited | Yes with backoff |
 | `500` | internal error | Yes with backoff |
@@ -1205,44 +1382,45 @@ Use `type: "memory"` to delete memory IDs.
 
 | Code | Meaning |
 |---|---|
-| `INVALID_INPUT` | required, malformed, or conflicting parameter. This is the code for essentially every `400`  -  branch on it, not on a generic name |
+| `INVALID_INPUT` | required, malformed or conflicting parameter. This is the code for essentially every `400`: branch on it, not on a generic name |
 | `VALIDATION_ERROR` | request shape valid but failed validation |
-| `UNAUTHORIZED` | missing/invalid bearer token |
-| `FORBIDDEN` | key lacks access |
-| `DATABASE_ALREADY_EXISTS` | duplicate database ID |
-| `DATABASE_NOT_FOUND` | database missing/not visible |
-| `TENANT_INFRA_NOT_READY` | `422`  -  the database exists but its infrastructure is still provisioning. This is what querying before polling readiness returns |
-| `FILE_NOT_FOUND` | id not found **in the selected scope**  -  usually a `collection` mismatch rather than a missing source |
-| `SOURCE_PROCESSING` | the source is still indexing and cannot serve this request yet |
+| `UNAUTHORIZED` | missing or invalid bearer token |
+| `FORBIDDEN` | key lacks access, or a plan limit prevents the operation |
+| `DATABASE_ALREADY_EXISTS` | duplicate database name |
+| `DATABASE_NOT_FOUND` | database missing or not visible to this key |
+| `TENANT_INFRA_NOT_READY` | `422`: the database exists but its infrastructure is still provisioning. This is what calling it before polling readiness returns |
+| `FILE_NOT_FOUND` | id not found **in the selected scope**: usually a `collection` mismatch rather than a missing item |
+| `SOURCE_PROCESSING` | the item is still indexing and cannot serve this request yet |
 | `NOT_FOUND` | requested resource does not exist |
-| `PARSE_ERROR` | a document could not be parsed |
-| `PROCESSING_FAILED` | indexing failed for a source |
+| `PROCESSING_FAILED` | indexing failed for an item |
 | `RATE_LIMITED` | rate limit exceeded |
 | `INTERNAL_ERROR` | unexpected server error |
-| `BACKEND_ERROR` | `502`  -  an upstream dependency returned an error |
-| `SERVICE_UNAVAILABLE` | dependency unavailable / under load |
+| `BACKEND_ERROR` | `502`: an upstream dependency returned an error |
+| `SERVICE_UNAVAILABLE` | dependency unavailable or under load |
 
-There is no `INVALID_PARAMETERS` and no `SOURCE_NOT_FOUND`  -  earlier revisions of this guide listed both, and no HydraDB response has ever carried either. Match on `INVALID_INPUT` and `FILE_NOT_FOUND` instead.
+### Ingest validation (`400`)
 
-Retry only `429`, `500`, `503`; use bounded exponential backoff with jitter.
+The whole request is rejected, and the message names the item as `context[N]`, when an item has both `text` and `conversation` (or neither), a conversation breaks the rules in [Conversations](#conversations), `happened_at` is malformed, an `acl` principal is malformed, a `graph_payload` key matches no item, or a size limit in [Limits and validation](#limits-and-validation) is exceeded.
+
+Retry only `429`, `500`, `502` and `503`; use bounded exponential backoff with jitter.
 
 SDK errors:
 
 ```python
 from hydra_db.core.api_error import ApiError
 
-RETRYABLE = (429, 500, 503)
+RETRYABLE = (429, 500, 502, 503)
 
 try:
     result = client.query(
         database="acme_corp",
+        collection="support",
         query="pricing tiers",
-        type="knowledge",
     )
 except ApiError as exc:
     # 500 and 503 have typed subclasses (InternalServerError,
     # ServiceUnavailableError); 429 does not, so branch on status_code to cover
-    # all three uniformly. Back off and retry.
+    # all of them uniformly. Back off and retry.
     if exc.status_code not in RETRYABLE:
         raise
 ```
@@ -1253,8 +1431,8 @@ import { HydraDBError } from "@hydradb/sdk";
 try {
   const result = await client.query({
     database: "acme_corp",
+    collection: "support",
     query: "pricing tiers",
-    type: "knowledge",
   });
 } catch (error) {
   if (error instanceof HydraDBError) {
@@ -1268,211 +1446,83 @@ try {
 
 ---
 
-## 13. Cookbook patterns
+## 13. Common patterns
 
-The cookbooks show production patterns. Click the links below to read the raw Markdown guides with complete setup code and schemas:
+Most production integrations share one shape:
 
-| Cookbook Guide | Purpose & Retrieval Patterns | Link to Guide |
-|---|---|---|
-| **Cursor for Docs** | Ingest codebase, PRs, Slack; multi-hop reasoning | [Guide Link](https://docs.hydradb.com/cookbooks/v2/cookbook-01-build-cursor-for-docs.md) |
-| **Build your own Glean** | Enterprise workplace search across SaaS platforms | [Guide Link](https://docs.hydradb.com/cookbooks/v2/glean-clone.md) |
-| **Internal Search Perplexity** | Citations and answer synthesis over Confluence/Slack | [Guide Link](https://docs.hydradb.com/cookbooks/v2/internal-search-perplexity.md) |
-| **Customer Support Agent** | Personalizing help with user/plan-specific memory | [Guide Link](https://docs.hydradb.com/cookbooks/v2/customer-support-agent.md) |
-| **IT Support / Notion AI** | Relational reasoning across Notion and Slack threads | [Guide Link](https://docs.hydradb.com/cookbooks/v2/cookbook-04-build-notion-ai.md) |
-| **Financial Analyst** | Trend analysis, temporal metadata, precise citations | [Guide Link](https://docs.hydradb.com/cookbooks/v2/cookbook-10-ai-financial-analyst.md) |
-| **LinkedIn Recruiter** | Exact skill/experience matching and post-filtering | [Guide Link](https://docs.hydradb.com/cookbooks/v2/ai-linkedin-recruiter.md) |
-| **AI Travel Planner** | Collaborative planning using personalized context | [Guide Link](https://docs.hydradb.com/cookbooks/v2/ai-travel-planner.md) |
-| **AI Onboarding Agent** | Org charts, specifications, and meeting transcripts | [Guide Link](https://docs.hydradb.com/cookbooks/v2/ai-onboarding-agent.md) |
-| **Competitive Intelligence** | Competitor announcements, job listings, pricing | [Guide Link](https://docs.hydradb.com/cookbooks/v2/competitive-intelligence-agent.md) |
-| **Chief of Staff / Actions** | Function routing, task tracking, and planning | [Guide Link](https://docs.hydradb.com/cookbooks/v2/ai-chief-of-staff.md) |
+1. Create a database, and declare in `database_metadata_schema` the attributes you will filter on.
+2. Ingest shared context (policies, docs, tickets, extracted file text) into a shared collection with stable `context_id`s. Sync SaaS tools with [connectors](/essentials/v2/connectors) instead of re-implementing them.
+3. Ingest each user's conversations and stated preferences into their own collection (`collection = user_id`).
+4. Link items that belong together (a ticket and its follow-ups, a policy and its FAQ) with `forceful_relations`.
+5. Poll `GET /context/status` or register a webhook.
+6. Query with `collections: { "<user_id>": 2, "company": 1 }`, `mode: "thinking"` for quality or `"fast"` for latency, and an `attributes` filter for hard scopes.
+7. Inject `llm_prompt` into the model call with a grounding instruction, and let the model cite `[1]`, `[R1]`, `[P1]`.
+8. Say so explicitly when the context does not contain the answer, and report it with `POST /feedback`.
 
-Common architecture across cookbooks:
-
-1. Create database and schema for hot filters.
-2. Ingest shared knowledge/app sources with stable IDs.
-3. Ingest user/session memories with `collection`.
-4. Poll status or use webhooks.
-5. Query `/query` with `type: "knowledge"`, `"memory"`, or `"all"`.
-6. Format chunks, graph paths, and additional context into an LLM prompt.
-7. Cite sources and handle missing context explicitly.
+Typical uses of that shape: a support agent that answers from policy while respecting each customer's stated preferences; workplace search over Slack, Notion and Drive with citations; an onboarding assistant over org charts, specs and meeting notes; an agent that records its own decisions as items and consults them before acting again.
 
 ---
 
 ## 14. Common mistakes checklist
 
 - [ ] Forgetting `API-Version: 2` in raw HTTP calls.
-- [ ] Parsing raw HTTP response from the top level instead of `data`.
+- [ ] Parsing raw HTTP responses from the top level instead of `data`.
 - [ ] Assuming the SDK unwraps the envelope; it returns the full envelope, so read the payload from `data`.
-- [ ] Searching immediately after database creation without polling readiness.
-- [ ] Searching immediately after ingestion without polling `context.status` or using webhooks.
-- [ ] Treating `processing`/`queued` content as searchable.
-- [ ] Not handling both `errored` and `failed` as failure statuses.
+- [ ] Ingesting immediately after database creation without polling readiness.
+- [ ] Querying immediately after ingestion without polling `context.status` or using webhooks.
+- [ ] Treating `queued` or `processing` content as searchable.
+- [ ] Not handling `errored` (and `failed`) as terminal failures.
 - [ ] Omitting `collection` on `context.status` and reading the resulting `FILE_NOT_FOUND` as a genuine indexing failure.
 - [ ] Using `??` on `errorMessage`, which is `""` rather than null on some failures, so the fallback never fires.
-- [ ] Omitting `collection` for user memories.
+- [ ] Sending both `text` and `conversation` on one item.
+- [ ] Sending a full timestamp in `happened_at`.
+- [ ] Reusing untitled text without a `context_id`, so the second item replaces the first.
 - [ ] Writing with one `collection` and reading with another.
-- [ ] Using metadata filters for user partitioning instead of `collection`.
-- [ ] Using undeclared `tenant_metadata` keys in `metadata_filters`.
-- [ ] Putting hot filters in free-form metadata instead of database schema.
-- [ ] Expecting `query_forceful_relations` to work in `mode: "fast"`.
-- [ ] Setting `graph_context: false` and expecting graph fields.
+- [ ] Using attributes for user partitioning instead of `collection`.
+- [ ] Filtering on `custom_attributes`, or on an attribute the schema does not declare.
+- [ ] Building a prompt string by hand instead of injecting `llm_prompt`.
+- [ ] Expecting a title, url or attributes on a chunk.
+- [ ] Expecting `forceful_relations` in `mode: "fast"`.
+- [ ] Setting `graph_context: false` and expecting graph paths.
 - [ ] Re-sorting chunks before prompting without a deliberate reranker.
-- [ ] Passing too many chunks to the LLM.
 - [ ] Using `operator` without `query_by: "text"`.
 - [ ] Forgetting to verify webhook signatures when a signing secret is configured.
 
 ---
 
-## 15. SDK Method Reference
+## 15. SDK method reference
 
-### 15.1 TypeScript SDK
+Method names are the same in both SDKs except where noted; Python takes snake_case keyword arguments, TypeScript takes one camelCase object.
 
 | Method | Endpoint | Purpose |
 |---|---|---|
-| `client.context.ingest()` | `POST /context/ingest` | Ingest documents, app sources, or memories |
-| `client.context.status()` | `GET /context/status` | Check processing status of ingested items |
-| `client.context.inspect()` | `GET /context/inspect` | Inspect original source content or get a presigned URL |
-| `client.context.list()` | `POST /context/list` | Browse knowledge or memories |
-| `client.context.delete()` | `DELETE /context` | Delete sources or memories |
-| `client.context.relations()` | `GET /context/relations` | Inspect graph relationships |
-| `client.query()` | `POST /query` | Unified search over knowledge, memories, or both |
-| `client.databases.create()` | `POST /databases` | Create a new isolated workspace |
-| `client.databases.list()` | `GET /databases` | List all databases registered for the organization |
+| `client.databases.create()` | `POST /databases` | Create an isolated database |
+| `client.databases.status()` | `GET /databases/status` | Check provisioning readiness |
+| `client.databases.list()` | `GET /databases` | List the organization's databases |
 | `client.databases.delete()` | `DELETE /databases` | Permanently remove a database |
-| `client.databases.status()` | `GET /databases/status` | Check provisioning readiness of a database's infrastructure |
 | `client.databases.collections()` | `GET /databases/collections` | List active collections |
-| `client.databases.stats()` | `GET /databases/stats` | Get database usage stats |
+| `client.databases.stats()` | `GET /databases/stats` | Row counts |
+| `client.databases.update_metadata_schema()` (TS `updateMetadataSchema()`) | `PATCH /databases/{database}/metadata-schema` | Add declared attribute fields |
+| `client.context.ingest()` | `POST /context/ingest` | Ingest text and conversation items |
+| `client.context.status()` | `GET /context/status` | Check indexing status |
+| `client.query()` | `POST /query` | Search; returns `chunks`, `graph`, `forceful_relations`, `llm_prompt` |
+| `client.feedback.submit()` | `POST /feedback` | Report how a query performed |
+| `client.context.list()` | `POST /context/list` | List items |
+| `client.context.inspect()` | `GET /context/inspect` | Read an item's stored content or a presigned URL |
+| `client.context.relations()` | `GET /context/relations` | Inspect graph relations |
+| `client.context.subgraph()` | `GET /context/subgraph` | Walk an item's connected items |
+| `client.context.update_source_metadata()` (TS `updateSourceMetadata()`) | `PATCH /context/{id}/metadata` | Merge new attribute values into an indexed item |
+| `client.context.delete()` | `DELETE /context` | Delete items |
 
-### 15.2 Python SDK
-
-| Group | Method | Endpoint | Description |
-|---|---|---|---|
-| Context | `client.context.ingest()` | `POST /context/ingest` | Ingest documents, app sources, or memories |
-| Context | `client.context.status()` | `GET /context/status` | Check processing status of ingested items |
-| Context | `client.context.inspect()` | `GET /context/inspect` | Inspect original source content or get a presigned URL |
-| Context | `client.context.list()` | `POST /context/list` | Browse knowledge or memories |
-| Context | `client.context.delete()` | `DELETE /context` | Delete sources or memories |
-| Context | `client.context.relations()` | `GET /context/relations` | Inspect graph relationships |
-| Search | `client.query()` | `POST /query` | Unified search over knowledge, memories, or both |
-| Databases | `client.databases.create()` | `POST /databases` | Create a new isolated workspace |
-| Databases | `client.databases.list()` | `GET /databases` | List all databases registered for the organization |
-| Databases | `client.databases.delete()` | `DELETE /databases` | Permanently remove a database |
-| Databases | `client.databases.status()` | `GET /databases/status` | Check provisioning readiness of a database's infrastructure |
-| Databases | `client.databases.collections()` | `GET /databases/collections` | List active collections |
-| Databases | `client.databases.stats()` | `GET /databases/stats` | Get database usage stats |
-
-### 15.3 Minimal cURL example
-
-Use `type` on raw `/query` requests to select `knowledge`, `memory`, or `all`. The raw API response is wrapped; read payloads from `.data`.
-
-```bash
-export HYDRA_DB_API_KEY="your_api_key"
-DATABASE="agent_docs_demo"
-COLLECTION="user_alex"
-
-# 1. Create a database.
-curl -s -X POST 'https://api.hydradb.com/databases' \
-  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
-  -H "API-Version: 2" \
-  -H "Content-Type: application/json" \
-  -d "{\"database\":\"${DATABASE}\"}"
-
-# 2. Check readiness. Poll this until .data.infra.ready_for_ingestion is true.
-curl -s "https://api.hydradb.com/databases/status?database=${DATABASE}" \
-  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
-  -H "API-Version: 2" | jq '.data.infra'
-
-# 3. Ingest a memory.
-INGEST_ID=$(curl -s -X POST 'https://api.hydradb.com/context/ingest' \
-  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
-  -H "API-Version: 2" \
-  -F "type=memory" \
-  -F "database=${DATABASE}" \
-  -F "collection=${COLLECTION}" \
-  -F 'memories=[{"id":"alex_pref_001","text":"Alex prefers concise technical answers.","infer":true,"user_name":"Alex"}]' \
-  | jq -r '.data.results[0].id')
-
-# 4. Poll indexing.
-curl -s -G 'https://api.hydradb.com/context/status' \
-  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
-  -H "API-Version: 2" \
-  --data-urlencode "database=${DATABASE}" \
-  --data-urlencode "collection=${COLLECTION}" \
-  --data-urlencode "ids=${INGEST_ID}" \
-  | jq '.data.statuses[0]'
-
-# 5. Search memories.
-curl -s -X POST 'https://api.hydradb.com/query' \
-  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
-  -H "API-Version: 2" \
-  -H "Content-Type: application/json" \
-  -d "{\"database\":\"${DATABASE}\",\"collection\":\"${COLLECTION}\",\"query\":\"How should I answer Alex?\",\"type\":\"memory\",\"query_by\":\"hybrid\",\"mode\":\"thinking\"}" \
-  | jq '.data.chunks'
-```
-
-### 15.4 Raw HTTP: ingest app-source knowledge
-
-Use this for connector output where your app already extracted the text. `app_knowledge` must be a JSON string in multipart form data.
-
-```bash
-curl -s -X POST 'https://api.hydradb.com/context/ingest' \
-  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
-  -H "API-Version: 2" \
-  -F "type=knowledge" \
-  -F "database=acme_corp" \
-  -F 'app_knowledge=[
-    {
-      "id": "slack_C123_1715012345_000100",
-      "database": "acme_corp",
-      "collection": "default",
-      "title": "Pricing discussion - Slack #product",
-      "type": "slack",
-      "url": "https://slack.com/archives/C123/p1715012345000100",
-      "timestamp": "2025-01-15T12:30:00Z",
-      "content": {
-        "text": "We agreed on three tiers: Starter at $29, Pro at $79, Enterprise at $199."
-      },
-      "tenant_metadata": {
-        "channel": "product",
-        "workspace": "acme"
-      },
-      "additional_metadata": {
-        "author": "alice",
-        "slack_ts": "1715012345.000100"
-      },
-      "relations": {
-        "ids": ["slack_thread_root_001"],
-        "properties": { "relation": "same_thread" }
-      }
-    }
-  ]'
-```
-
-Search it with app-aware retrieval:
-
-```bash
-curl -s -X POST 'https://api.hydradb.com/query' \
-  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
-  -H "API-Version: 2" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "database": "acme_corp",
-    "query": "What pricing tiers did product agree on?",
-    "type": "knowledge",
-    "query_by": "hybrid",
-    "mode": "thinking",
-    "query_apps": true,
-    "graph_context": true
-  }' | jq '.data.chunks'
-```
+Helpers: `verify_webhook_signature` (Python, `hydra_db.helpers`) and `verifyWebhookSignature` (TypeScript) verify webhook signatures.
 
 ---
 
 ## 16. Navigation and support
 
-- Docs root for v2: `get-started/v2`, `essentials/v2`, `api-reference/v2`, `cookbooks/v2`
+- Docs for v2: [Introduction](/get-started/v2/introduction), [Quickstart](/get-started/v2/quickstart), [Ingest context](/essentials/v2/ingest), [Query](/essentials/v2/query), [Attributes](/essentials/v2/attributes), [API reference](/api-reference/v2)
 - API reference OpenAPI: `api-reference/v2/openapi.json`
-- Python package: `hydradb-sdk>=2,<3`
-- TypeScript package: `@hydradb/sdk@^2`
-- Dashboard/API keys: `https://app.hydradb.com`
-- Support email in docs: `founders@hydradb.com`
+- Python package: `hydradb-sdk>=2.1.5,<3`
+- TypeScript package: `@hydradb/sdk@^2.1.5`
+- Dashboard and API keys: `https://app.hydradb.com`
+- Support email: `founders@hydradb.com`

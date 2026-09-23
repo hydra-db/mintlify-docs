@@ -4,18 +4,15 @@ description: "Retrieve ranked chunks, graph paths, forceful relations and a prom
 ---
 
 import { Field } from "/snippets/field.jsx";
-import LegacyLine from "/snippets/legacy-line.mdx";
 
 The single retrieval endpoint. Use it any time you need to feed an LLM with grounded, personalized context, or fetch chunks ranked by relevance.
 
-Two dimensions control behavior on a unified database:
+Two dimensions control behavior:
 
 - **`query_by`** picks **how** to match: `"hybrid"` (semantic + BM25, the default) or `"text"` (BM25 only, pair with `operator`).
 - **`mode`** picks **how much** retrieval work to spend: `"fast"` (single pass, low latency), `"thinking"` (expands the query, reranks, follows declared relations) or `"auto"` (scores the query and routes to one of the two, defaulting to `"thinking"` when the signal is inconclusive; **the default when `mode` is omitted**).
 
-There is no `type`: a unified database is one corpus. Scope with `collection` or `collections`. The guide is [Query](/essentials/v2/query); this page is the field reference.
-
-<LegacyLine />
+Scope with `collection` or `collections`. The guide is [Query](/essentials/v2/query); this page is the field reference.
 
 <Note>
 `database` and `collection` are the current field names (formerly `tenant_id` and `sub_tenant_id`). The old names remain accepted as deprecated aliases for full backward compatibility.
@@ -130,7 +127,7 @@ A list gives every collection equal normalized weight. An object treats values a
 
 ### Using the response
 
-`data.llm_prompt` is the whole context block as one markdown document: `# Query results`, then `## Results` (cited `[1]`), `## Forceful relations` (`[R1]`), `## Related facts` (`[P1]`, one per path in `graph[]`), `## Temporal facts` and `## Sources`. The SDK `build_string` / `buildString` helpers return it verbatim on a unified database. Inject it directly:
+`data.llm_prompt` is the whole context block as one markdown document: `# Query results`, then `## Results` (cited `[1]`), `## Forceful relations` (`[R1]`), `## Related facts` (`[P1]`, one per path in `graph[]`), `## Temporal facts`, the prompt-only `## Source facts`, `## Profiles` and `## Code search` when the query produced them, and `## Sources`. Inject it directly:
 
 ```python
 messages = [{"role": "system", "content": result.data.llm_prompt},
@@ -361,15 +358,11 @@ result = client.query(
 | <Field name="acl" type="string[]" /> | Principals to answer as: only items they may retrieve are returned. Omit, or send `[]` or `["*"]`, for no access scoping. See [Access control](/essentials/v2/access-control). |
 | <Field name="attributes" type="object" /> | Hard filter on declared attributes with operators: `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$nin`, `$and`, `$or`, `$not`, `$exists`. Applies to chunks, forceful relations and graph paths alike. See [Filters](#decision-matrix). |
 | <Field name="graph_context" type="boolean" /> | When `true`, includes graph paths in `graph[]`. Set to `false` when you only need ranked chunks; `graph` is then `[]`. Relations you supplied via [Bring Your Own Graph](/essentials/v2/bring-your-own-graph) appear identically to extracted ones. (default=`true`) **Under `mode: "auto"`, this value is overridden by the resolved mode.** |
-| <Field name="follow_forceful_relations" type="boolean" /> | Pull the items each hit declared with `forceful_relations` at ingest into `forceful_relations[]`. Set to `false` for `forceful_relations: []`. `query_forceful_relations` is the deprecated alias. (default=`true`) |
+| <Field name="follow_forceful_relations" type="boolean" /> | Pull the items each hit declared with `forceful_relations` at ingest into `forceful_relations[]`. Declared relations are followed only in `thinking` mode. Set to `false` for `forceful_relations: []`. `query_forceful_relations` is the deprecated alias. (default=`true`) |
 | <Field name="temporal_reasoning" type="boolean" /> | Resolve time-based questions (current, as of, ranges, upcoming) and return matched facts in `chunks[].temporal`. Never changes which chunks are returned. (default=`true`) |
 | <Field name="temporal_now" type="string" /> | ISO 8601 time to treat as now for temporal reasoning. Set it when replaying past conversations. |
 | <Field name="temporal_intent" type="object" /> | Override the temporal intent HydraDB would infer from the query. |
-| <Field name="metadata_filters" type="object or null" /> | Deprecated. The older filter language; still accepted on every database and ANDed with `attributes` when both are sent. See [Split databases](#split-databases). |
-
-<Warning>
-**Do not send `type` on a unified database.** Absent, `"all"` and `"unified"` are accepted and mean the one corpus. `"knowledge"` and `"memory"` return `400 CORPUS_TYPE_UNSUPPORTED`. Detect a database's layout once from `GET /databases` (`details[].type`) rather than branching on a request flag.
-</Warning>
+| <Field name="metadata_filters" type="object or null" /> | The older filter language, ANDed with `attributes` when both are sent. Prefer `attributes`; use `metadata_filters` only to filter on connector fields under `additional_metadata`, which `attributes` does not reach (see [Connectors](/essentials/v2/connectors)). |
 
 <Tip>
 **Tuning heuristics.**
@@ -442,7 +435,6 @@ result = client.query(
         "score": 0.91,
         "content": "Refunds are processed within 30 days of purchase by the Finance Department.",
         "enrichment": "Refund window is 30 days; Finance owns refund processing.",
-        "enrichment_kind": "business_knowledge",
         "temporal": [
           {
             "content": "Refund policy effective_from June 2026. Start: 2026-06-01",
@@ -456,8 +448,7 @@ result = client.query(
         "context_id": "chat-2026-07-29",
         "score": 0.84,
         "content": "user: Keep refund answers short please\nassistant: Got it.",
-        "enrichment": "User prefers short answers about refunds.",
-        "enrichment_kind": "user_preference"
+        "enrichment": "User prefers short answers about refunds."
       }
     ],
     "graph": [
@@ -472,6 +463,7 @@ result = client.query(
             "relation": {
               "predicate": "managed by",
               "context": "Refund processing is managed by the Finance Department.",
+              "timestamp": 1782984600.0,
               "relationship_id": "rel_managed_by",
               "chunk_id": "ck_policy_3"
             },
@@ -520,7 +512,7 @@ result = client.query(
         }
       }
     ],
-    "llm_prompt": "# Query results\n\n**Query:** who owns refund processing?\n**Found:** 2 results across 2 sources · 2 related facts · 1 temporal fact · 1 forceful relation\nCite a result by its number in brackets, e.g. [1].\n\n## Results\n\n### 1. Refund policy\n- **Relevance:** 0.91 · **Collection:** support · **Type:** file · **Category:** business_knowledge\n- **Id:** refund-policy · **Last updated:** 2026-07-02\n\nRefunds are processed within 30 days of purchase by the Finance Department.\n\n**Enrichment:** Refund window is 30 days; Finance owns refund processing.\n\n---\n\n### 2. Support chat with Priya\n- **Relevance:** 0.84 · **Collection:** support · **Type:** message · **Category:** user_preference\n- **Id:** chat-2026-07-29 · **Last updated:** 2026-07-29\n\nuser: Keep refund answers short please\nassistant: Got it.\n\n**Enrichment:** User prefers short answers about refunds.\n\n## Forceful relations\n\nLinked to a result by the author at ingest time (forceful_relations), not by relevance to this query.\n\n### R1. Refund FAQ\n- **Linked from:** refund-policy · **Collection:** support\n- **Id:** refund-faq\n\nFAQ: refunds to a card take 5 to 7 business days to appear.\n\n## Related facts\n\n- [P1] **Refund Processing** -managed by→ **Finance Department** (query path, relevance 0.81) [1]\n  Refund processing is managed by the Finance Department.\n- [P2] **User** -prefers→ **short answers** (chunk relation, relevance 0.74) [2]\n  The user prefers short answers about refunds.\n\n## Temporal facts\n\n- **Refund policy** *effective_from* → **June 2026** (from 2026-06-01, precision: month, status: ongoing; evidence: \"from June\") [1]\n\n## Sources\n\n1. **Refund policy** (file, id: refund-policy) · https://docs.acme.com/refunds · updated 2026-07-02\n2. **Support chat with Priya** (message, id: chat-2026-07-29) · updated 2026-07-29\n3. **Refund FAQ** (id: refund-faq)"
+    "llm_prompt": "# Query results\n\n**Query:** How are refunds processed, and how should I answer this user?\n**Found:** 2 results across 2 sources · 2 related facts · 1 temporal fact · 1 forceful relation\nCite a result by its number in brackets, e.g. [1].\n\n## Results\n\n### 1. Refund policy\n- **Relevance:** 0.91 · **Collection:** support · **Type:** file\n- **Id:** refund-policy · **Last updated:** 2026-07-02\n\nRefunds are processed within 30 days of purchase by the Finance Department.\n\n**Enrichment:** Refund window is 30 days; Finance owns refund processing.\n\n---\n\n### 2. Support chat with Priya\n- **Relevance:** 0.84 · **Collection:** support · **Type:** message\n- **Id:** chat-2026-07-29 · **Last updated:** 2026-07-29\n\nuser: Keep refund answers short please\nassistant: Got it.\n\n**Enrichment:** User prefers short answers about refunds.\n\n## Forceful relations\n\nLinked to a result by the author at ingest time (forceful_relations), not by relevance to this query.\n\n### R1. Refund FAQ\n- **Linked from:** refund-policy · **Collection:** support\n- **Id:** refund-faq\n\nFAQ: refunds to a card take 5 to 7 business days to appear.\n\n## Related facts\n\n- [P1] **Refund Processing** -managed by→ **Finance Department** (relevance 0.81) [1]\n  Refund processing is managed by the Finance Department.\n- [P2] **User** -prefers→ **short answers** (relevance 0.74) [2]\n  The user prefers short answers about refunds.\n\n## Temporal facts\n\n- **Refund policy** *effective_from* → **June 2026** (from 2026-06-01, precision: month, status: ongoing; evidence: \"from June\") [1]\n\n## Sources\n\n1. **Refund policy** (file, id: refund-policy) · https://docs.acme.com/refunds · updated 2026-07-02\n2. **Support chat with Priya** (message, id: chat-2026-07-29) · updated 2026-07-29\n3. **Refund FAQ** (id: refund-faq)"
   },
   "error": null,
   "meta": {
@@ -538,8 +530,8 @@ result = client.query(
   "success": false,
   "data": null,
   "error": {
-    "code": "INVALID_PARAMETERS",
-    "message": "query must not be empty"
+    "code": "INVALID_INPUT",
+    "message": "query cannot be empty"
   },
   "meta": {
     "request_id": "9d13aef4-02f4-4e73-8c62-4c2601d04f9d",
@@ -555,17 +547,17 @@ result = client.query(
 
 | Key | Contents |
 | --- | --- |
-| `chunks[]` | Ranked matches: `chunk_id`, `context_id`, `score`, `content` (verbatim), `enrichment` (the extracted statement as a string, omitted when empty), `enrichment_kind` (the item's declared `context_category`: `user_preference`, `business_knowledge` or `decision_trace`; omitted when none was declared, present even without `enrichment`), `temporal[]` (only when temporal reasoning engaged; `{ content, start_date, end_date }`, dates may be `null`). |
-| `graph[]` | Paths through the context graph, query paths first then chunk expansions, deduplicated: `origin`, `triplets[]` of `source` / `relation` / `target`, plus `path_summary`. `origin` is `"query_path"` (grown from the entities in the query) or `"chunk_relation"` (the neighbourhood of a returned chunk, only returned when one of its hops came from a returned chunk or a `forceful_relations` chunk). `path_summary` is never empty: when the server wrote no summary, it narrates the hops. Entities are `{ entity_id, name }`; relations are `{ predicate, context, temporal_details?, relationship_id, chunk_id }`. `[]` when `graph_context` is `false`. |
-| `forceful_relations[]` | Chunks pulled in through `forceful_relations` declared at ingest: `via.from` (the context whose declaration pulled it in, may be `""`), `via.to` (the chunk's own `context_id`), `chunk` (same shape as `chunks[]`). `[]` when none or `follow_forceful_relations` is `false`. |
-| `llm_prompt` | A server-built markdown string ready to inject into a model call: `# Query results`, then `## Results`, `## Forceful relations`, `## Related facts`, `## Temporal facts` and `## Sources`, each left out when empty. Results are cited `[1]` and forceful relations `[R1]`; related facts are labelled `[P1]`, `[P2]`, ... in `graph[]` order, carry the path's relevance after reranking when it has one, and end with the results they were extracted from. Sources print only web (`http` or `https`) links. `""` when nothing matched. The layout is on [Query](/essentials/v2/query#llm_prompt). |
+| `chunks[]` | Ranked matches: `chunk_id`, `context_id`, `score`, `content` (verbatim), `enrichment` (the extracted statement as a plain string, omitted when there is none), `enrichment_kind` (an optional label; omitted when none was set), `temporal[]` (only when the query engaged temporal reasoning; `{ content, start_date, end_date }`, where `content` reads `<fact>. Start: YYYY-MM-DD, End: YYYY-MM-DD` and either date may be `null`). |
+| `graph[]` | Paths through the context graph, query paths first then chunk expansions: `origin`, `triplets[]` of `source` / `relation` / `target`, plus `path_summary`. `origin` is `"query_path"` (grown from the entities in the query) or `"chunk_relation"` (the neighbourhood of a returned chunk, only returned when one of its hops came from a returned chunk or a `forceful_relations` chunk). The array is deduplicated across both lanes and is not capped. `path_summary` is never empty: when the server wrote no summary, it narrates the hops. Entities are `{ entity_id, name }`; relations are `{ predicate, context, temporal_details?, timestamp?, relationship_id, chunk_id }`, where `temporal_details` is omitted when empty and `timestamp` (Unix epoch seconds, a float) is omitted when the edge has none. `[]` when `graph_context` is `false`. |
+| `forceful_relations[]` | Chunks pulled in through `forceful_relations` declared at ingest, followed only in `thinking` mode: `via.from` (the context whose declaration pulled it in, may be `""`), `via.to` (the chunk's own `context_id`), `chunk` (same shape as `chunks[]`). `[]` when none, when `follow_forceful_relations` is `false`, or when the query ran in `fast` mode. |
+| `llm_prompt` | A server-built markdown string ready to inject into a model call: `# Query results`, then `## Results`, `## Forceful relations`, `## Related facts`, `## Temporal facts` (with a `**Duration:**` line for a "how long between" question), `## Source facts`, `## Profiles`, `## Code search` and `## Sources`, each left out when empty. Source facts, profiles, code-search answers and the duration are prompt only: no JSON key carries them. Results are cited `[1]` and forceful relations `[R1]`; related facts are labelled `[P1]`, `[P2]`, ... in `graph[]` order, as in `- [P1] **Refunds** -managed_by→ **Finance** (relevance 0.81) [1]`: the parenthetical is the path's relevance after reranking and is left out when the path has none, and the line ends with the results the path was extracted from. Sources print only web (`http` or `https`) links. `""` only when the query found nothing at all. The layout is on [Query](/essentials/v2/query#llm_prompt). |
 
-To show a chunk's graph paths under that chunk, group hops by `triplets[].relation.chunk_id` and match it against `chunks[].chunk_id` (and `forceful_relations[].chunk.chunk_id`). This replaces the split response's `chunk_id_to_group_ids`. See [Attaching graph paths to chunks](/essentials/v2/query#attaching-graph-paths-to-chunks).
+To show a chunk's graph paths under that chunk, group hops by `triplets[].relation.chunk_id` and match it against `chunks[].chunk_id` (and `forceful_relations[].chunk.chunk_id`). See [Attaching graph paths to chunks](/essentials/v2/query#attaching-graph-paths-to-chunks).
 
-`meta` on a unified response carries `request_id`, `api_version`, `latency_ms`, `database` and `collection`, plus a `deprecation` list when the request used a deprecated name. It has no `tenant_id`, `sub_tenant_id` or `source_type`. `collection` is present when the query searched one collection (named, or the default); a `collections` fan-out omits it.
+`meta` carries `request_id`, `api_version`, `latency_ms`, `database` and `collection`, plus a `deprecation` list when the request used a deprecated name. `collection` is present when the query searched one collection (named, or the default); a `collections` fan-out omits it.
 
 <Info>
-**Chunks carry no source details.** No title, url, collection, timestamps or attributes. `llm_prompt` prints the title, url, collection and last-updated date for the model; call [`GET /context/inspect`](/api-reference/v2/endpoint/fetch-content) with `id=<context_id>` to show them yourself.
+**Chunks carry no source details.** No title, url, collection, timestamps or attributes. `llm_prompt` prints the title, url, collection and last-updated date for the model. To show an item's title, timestamp or attributes yourself, call [`POST /context/list`](/api-reference/v2/endpoint/list-documents) with `ids: ["<context_id>"]`; [`GET /context/inspect`](/api-reference/v2/endpoint/fetch-content) returns its stored content.
 </Info>
 
 ## Behavior notes
@@ -580,106 +572,15 @@ To show a chunk's graph paths under that chunk, group hops by `triplets[].relati
 <Warning>
 **Important Considerations & Common Mistakes**
 - **`mode: "auto"` overrides `graph_context`.** Whatever you send for `graph_context` is replaced to match the resolved mode: `true` if auto escalates to `thinking`, `false` if it resolves to `fast`. This also applies when `mode` is omitted. Set `graph_context` explicitly only when calling `"fast"` or `"thinking"` directly.
-- **`type` is refused.** `"knowledge"` or `"memory"` on a unified database is a `400`. Scope with `collection` or `collections`.
-- **Filter with `attributes`, on declared fields.** A key that is not in `database_metadata_schema`, or a value sent in `custom_attributes`, never matches. `metadata_filters` still works but is deprecated.
-- **Parse by shape.** A response with `llm_prompt` and a `graph` array is this shape; one with `graph_context` or `chunk_content` came from a split database. Stored logs and split databases keep producing the old one.
+- **Filter with `attributes`, on declared fields.** A key that is not in `database_metadata_schema`, or a value sent in `custom_attributes`, never matches.
 - **Common mistakes.** Check [Ingestion Status](/api-reference/v2/endpoint/source-status) for recently ingested items before querying. If you omit `collection` and `collections`, HydraDB queries the default collection; use [List Collections](/api-reference/v2/endpoint/list-sub-tenants) to discover available IDs.
 </Warning>
 
 ## Errors
 
-Common codes: `400 INVALID_PARAMETERS` (empty `query`), `400 CORPUS_TYPE_UNSUPPORTED` (`type: "knowledge"` or `"memory"` on a unified database), `404 DATABASE_NOT_FOUND`, `422 VALIDATION_ERROR`, `500 INTERNAL_ERROR`. See [Error Responses](/api-reference/v2/error-responses) for the full list.
+Common codes: `400 INVALID_INPUT` (empty `query`), `400 VALIDATION_ERROR` (a malformed `attributes` filter), `404 DATABASE_NOT_FOUND`, `500 INTERNAL_ERROR`. See [Error Responses](/api-reference/v2/error-responses) for the full list.
 
-`400` also covers oversized filters: a `metadata_filters` list above 500 values, or a `metadata_filters` object above 64 KiB of compact JSON. The message names the offending key or reports the actual byte count. See [Filter size limits](/essentials/v2/attributes#filter-size-limits).
-
-## Split databases
-
-Everything above describes a unified database. A database created with `type: "split"` keeps the request and response it always had. The differences:
-
-### `type` selects the corpus
-
-| Value | Queries | Best for |
-|---|---|---|
-| `"knowledge"` *(default)* | Knowledge documents, files, and app sources | Document Q&A, RAG context. |
-| `"memory"` | User memories | Personalization and user preferences. |
-| `"all"` | Both, merged in one ranked result set | Personalized answers grounded in both shared and user-specific context. |
-
-```json
-{
-  "database": "legacy-app",
-  "collection": "user_alex",
-  "query": "What is our refund policy, and how should I explain it to this user?",
-  "type": "all",
-  "query_by": "hybrid",
-  "mode": "thinking",
-  "query_forceful_relations": true,
-  "metadata_filters": {
-    "department": "support",
-    "additional_metadata": { "source": "policy" }
-  },
-  "additional_context": "User is asking from the billing help center."
-}
-```
-
-- `query_forceful_relations` pulls author-declared related sources into the response's `additional_context`. It only takes effect when `mode` resolves to `"thinking"`; in `fast` mode the flag is silently ignored.
-- `additional_context` on the request is a short factual hint to guide retrieval. It is different from the response `additional_context` map.
-- `metadata_filters` is the split-era filter language. Top-level keys match schema-backed `metadata` and take an operator object (`equals`, `contains`, `contains_any`); free-form per-source fields go under `additional_metadata`, where a bare scalar is an exact match and a bare array matches any listed value. Each list holds at most 500 values and the whole object is capped at 64 KiB. The full semantics are on [Split databases and legacy fields](/essentials/v2/split-databases#metadata_filters).
-
-### The split response
-
-```json
-{
-  "success": true,
-  "data": {
-    "chunks": [
-      {
-        "chunk_uuid": "policy_main_chunk_3",
-        "id": "policy_main",
-        "chunk_content": "Refunds are issued within 30 days...",
-        "source_type": "pdf",
-        "source_title": "Compliance Policy",
-        "source_upload_time": "2026-05-12T08:14:00Z",
-        "source_last_updated_time": "2026-05-12T08:14:00Z",
-        "relevancy_score": 0.91,
-        "extra_context_ids": ["pref-tone"],
-        "metadata": { "department": "legal" },
-        "additional_metadata": { "author": "Legal Team" }
-      }
-    ],
-    "sources": [
-      { "id": "policy_main", "title": "Compliance Policy", "type": "pdf", "timestamp": "2026-05-12T08:14:00Z" }
-    ],
-    "graph_context": {
-      "query_paths": [
-        {
-          "triplets": [
-            {
-              "source": { "name": "Compliance Policy", "type": "DOCUMENT", "entity_id": "entity_compliance_policy" },
-              "relation": { "canonical_predicate": "GOVERNS", "context": "The compliance policy governs the refund timeline.", "timestamp": 1778573640.0, "chunk_id": "policy_main_chunk_3" },
-              "target": { "name": "Refund Processing", "type": "PROCESS", "entity_id": "entity_refund_processing" }
-            }
-          ],
-          "relevancy_score": 0.89,
-          "combined_context": "The Compliance Policy governs the Refund Processing.",
-          "source_chunk_ids": ["policy_main_chunk_3"]
-        }
-      ],
-      "chunk_relations": [],
-      "chunk_id_to_group_ids": { "policy_main_chunk_3": ["p_0"] }
-    },
-    "additional_context": {
-      "pref-tone": { "chunk_uuid": "pref-tone", "id": "mem_user_alex_tone", "chunk_content": "Prefers concise answers.", "source_type": "memory", "source_title": "User preferences" }
-    }
-  },
-  "error": null,
-  "meta": { "request_id": "9d13aef4-02f4-4e73-8c62-4c2601d04f9d", "latency_ms": 12.3 }
-}
-```
-
-- Relation `timestamp` in `graph_context` is a Unix epoch float (seconds). The dedicated [Context Relations](/api-reference/v2/endpoint/source-relations) endpoint returns the same field as an ISO-8601 string; normalize before comparing across endpoints.
-- There is no `llm_prompt`. Format the split response for a model with the SDK's `build_string` / `buildString` helper; see [How to Use API Results](/essentials/v2/api-results#7-split-databases).
-
-The field-by-field mapping between the two shapes is on [Split databases and legacy fields](/essentials/v2/split-databases#4-legacy-query-and-response-fields).
+`400` also covers oversized filters: an `attributes` list above 500 values, or an `attributes` object above 64 KiB of compact JSON. The message names the offending key or reports the actual byte count. See [Attributes](/essentials/v2/attributes).
 
 <div className="api-before-related-resources" />
 
@@ -688,7 +589,7 @@ The field-by-field mapping between the two shapes is on [Split databases and leg
 
 - **Setup first:** [Ingest Context](/api-reference/v2/endpoint/ingest-context): content must be indexed
 - **Confirm indexing:** [Ingestion Status](/api-reference/v2/endpoint/source-status): wait for `completed` (or `graph_creation`)
-- **Source details:** [Inspect Context](/api-reference/v2/endpoint/fetch-content): title, attributes and content for a `context_id`
+- **Source details:** [List Context](/api-reference/v2/endpoint/list-documents) with `ids` for an item's title and attributes, [Inspect Context](/api-reference/v2/endpoint/fetch-content) for its stored content
 - **Graph follow-up:** [Context Relations](/api-reference/v2/endpoint/source-relations): inspect relationships in detail
 - **Concepts:** [Usage: Query](/essentials/v2/query)
 - **Concepts:** [Concepts: Context Graphs](/essentials/v2/context-graphs)

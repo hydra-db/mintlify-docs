@@ -24,10 +24,10 @@ description: "HydraDB plugin for OpenClaw. Automatically captures conversations,
   <Step title="Run interactive onboarding (recommended)">
     ```bash
     # Basic onboarding
-    openclaw hydra onboard
+    openclaw hydradb onboard
 
     # Advanced onboarding
-    openclaw hydra onboard --advanced
+    openclaw hydradb onboard --advanced
     ```
 
     The wizard writes credentials to `plugins.entries.openclaw.config` inside your OpenClaw settings file.
@@ -59,25 +59,29 @@ description: "HydraDB plugin for OpenClaw. Automatically captures conversations,
 
 If you prefer not to use the onboarding wizard, configure credentials directly.
 
-Two required values: your **API key** and **Tenant ID**.
+Two required values: your **API key** and your **database** (the `tenantId` key).
 
 **Environment variables (recommended for secrets):**
 
 <Tabs>
   <Tab title="macOS/Linux (bash or zsh)">
     ```bash
-    export HYDRA_OPENCLAW_API_KEY="your-api-key"
-    export HYDRA_OPENCLAW_TENANT_ID="your-tenant-id"
+    export HYDRADB_API_KEY="your-api-key"
+    export HYDRADB_DATABASE="your-database"
     ```
   </Tab>
 
   <Tab title="Windows (PowerShell)">
     ```powershell
-    [System.Environment]::SetEnvironmentVariable("HYDRA_OPENCLAW_API_KEY", "your-api-key", "User")
-    [System.Environment]::SetEnvironmentVariable("HYDRA_OPENCLAW_TENANT_ID", "your-tenant-id", "User")
+    [System.Environment]::SetEnvironmentVariable("HYDRADB_API_KEY", "your-api-key", "User")
+    [System.Environment]::SetEnvironmentVariable("HYDRADB_DATABASE", "your-database", "User")
     ```
   </Tab>
 </Tabs>
+
+<Note>
+  The older `HYDRA_OPENCLAW_API_KEY` and `HYDRA_OPENCLAW_TENANT_ID` variables still work, but each prints a one-time deprecation warning. The canonical name wins when both are set.
+</Note>
 
 **Or set them directly in your OpenClaw settings file:**
 
@@ -97,8 +101,8 @@ Two required values: your **API key** and **Tenant ID**.
       "openclaw": {
         "enabled": true,
         "config": {
-          "apiKey": "${HYDRA_OPENCLAW_API_KEY}",
-          "tenantId": "${HYDRA_OPENCLAW_TENANT_ID}"
+          "apiKey": "${HYDRADB_API_KEY}",
+          "tenantId": "${HYDRADB_DATABASE}"
         }
       }
     }
@@ -118,12 +122,12 @@ openclaw gateway restart
 
 | Key                  | Type      | Default                   | Description                                                                     |
 | -------------------- | --------- | ------------------------- | ------------------------------------------------------------------------------- |
-| `subTenantId`        | `string`  | `"hydra-openclaw-plugin"` | Sub-tenant for data partitioning within your tenant                             |
-| `autoRecall`         | `boolean` | `true`                    | Inject relevant memories before every AI turn                                   |
-| `autoCapture`        | `boolean` | `true`                    | Store conversation exchanges after every AI turn                                |
-| `maxRecallResults`   | `number`  | `10`                      | Max memory chunks injected into context per turn                                |
-| `recallMode`         | `string`  | `"fast"`                  | `"fast"` for low latency; `"thinking"` for deeper graph-traversal recall        |
-| `graphContext`       | `boolean` | `true`                    | Include knowledge graph relations in recalled context                           |
+| `subTenantId`        | `string`  | `"hydra-openclaw-plugin"` | Collection within your database (also read from `HYDRADB_COLLECTION`)           |
+| `autoRecall`         | `boolean` | `true`                    | Query HydraDB before every AI turn and inject the result                        |
+| `autoCapture`        | `boolean` | `true`                    | Save the conversation after every AI turn                                       |
+| `maxRecallResults`   | `number`  | `10`                      | Max chunks the query returns per turn (1 to 50)                                 |
+| `recallMode`         | `string`  | `"fast"`                  | `"fast"` for low latency; `"thinking"` for deeper graph-traversal recall, which also follows forceful relations |
+| `graphContext`       | `boolean` | `true`                    | Include related facts from the context graph in recalled context                |
 | `ignoreTerm`         | `string`  | `"hydra-ignore"`          | Messages containing this string are excluded from recall and capture            |
 | `debug`              | `boolean` | `false`                   | Verbose debug logs                                                              |
 
@@ -134,11 +138,11 @@ openclaw gateway restart
 ```mermaid
 flowchart LR
   A([User Turn]) --> B([Auto-Recall])
-  B -->|POST /recall/recall_preferences| C([HydraDB])
-  C -->|graph-enriched context| D([Injected into prompt])
+  B -->|POST /query| C([HydraDB])
+  C -->|llm_prompt| D([Injected into prompt])
   D --> E([AI Response])
   E --> F([Auto-Capture])
-  F -->|POST /memories/add_memory| C
+  F -->|POST /context/ingest| C
 
   style A fill:#0f172a,stroke:#334155,stroke-width:2px,color:#f8fafc
   style B fill:#0f172a,stroke:#334155,stroke-width:2px,color:#f8fafc
@@ -148,56 +152,74 @@ flowchart LR
   style F fill:#0f172a,stroke:#334155,stroke-width:2px,color:#f8fafc
 ```
 
-- **Auto-Recall** - Before every AI turn, queries HydraDB (`POST /recall/recall_preferences`) for relevant memories and injects graph-enriched context: entity paths, chunk relations, and linked extra context.
-- **Auto-Capture** - After every AI turn, the last user/assistant exchange is sent to HydraDB (`POST /memories/add_memory`) with `infer: true` and `upsert: true`. The session ID is used as `source_id` so HydraDB groups exchanges per session and builds the knowledge graph automatically.
+- **Auto-Recall**: Before every AI turn, sends the prompt to `POST /query` (`max_results` from `maxRecallResults`, `mode` from `recallMode`, `graph_context` from `graphContext`, and `follow_forceful_relations` on) and injects the server-built `llm_prompt` verbatim. See [Context Injection](#context-injection).
+- **Auto-Capture**: After every AI turn, sends the conversation (the user and assistant turns OpenClaw hands the plugin) to `POST /context/ingest` as one `conversation` item of `role` and `content` turns, with enrichment on and `upsert: true`. The item's `context_id` is derived from the session ID, so each capture replaces the session's earlier item, and HydraDB adds what it extracts to the context graph.
 
 ---
 
 ## Slash Commands
 
-| Command                     | Description                            |
-| --------------------------- | -------------------------------------- |
-| `/hydra-onboard`            | Show current configuration status      |
-| `/hydra-remember <text>`    | Save something to HydraDB memory       |
-| `/hydra-recall <query>`     | Search memories with relevance scores  |
-| `/hydra-list`               | List all stored user memories          |
-| `/hydra-delete <id>`        | Delete a specific memory by its ID     |
-| `/hydra-get <source_id>`    | Fetch the full content of a source     |
+The earlier `/hydra-*` names still work and print a one-time deprecation warning.
+
+| Command                        | Earlier name      | Description                                    |
+| ------------------------------ | ----------------- | ---------------------------------------------- |
+| `/hydradb-ingest <text>`       | `/hydra-remember` | Save a note to HydraDB as a text item          |
+| `/hydradb-query <query>`       | `/hydra-recall`   | Query HydraDB and list the results with scores |
+| `/hydradb-list`                | `/hydra-list`     | List everything stored in the collection       |
+| `/hydradb-delete <id>`         | `/hydra-delete`   | Delete one stored item by its ID               |
+| `/hydradb-inspect <id>`        | `/hydra-get`      | Fetch the full content of an item              |
+| `/hydra-onboard`               | -                 | Show current configuration status              |
 
 ---
 
 ## AI Tools
 
-| Tool                   | Description                                                    |
-| ---------------------- | -------------------------------------------------------------- |
-| `hydra_store`          | Save the recent conversation history to HydraDB as memory      |
-| `hydra_search`         | Search HydraDB memories (returns graph-enriched context)       |
-| `hydra_list_memories`  | List all stored user memories (IDs and summaries)              |
-| `hydra_get_content`    | Fetch full content for a specific `source_id`                  |
-| `hydra_delete_memory`  | Delete a memory by `memory_id` - use only on explicit request  |
+The earlier `hydra_*` names still work and print a one-time deprecation warning.
+
+| Tool               | Earlier name           | Description                                                    |
+| ------------------ | ---------------------- | -------------------------------------------------------------- |
+| `hydradb_ingest`   | `hydra_store`          | Save the recent conversation (up to the last 10 turns) as a conversation item, or the given text when there is no conversation |
+| `hydradb_query`    | `hydra_search`         | Query HydraDB; returns the server-built `llm_prompt`           |
+| `hydradb_list`     | `hydra_list_memories`  | List everything stored (IDs and summaries)                     |
+| `hydradb_inspect`  | `hydra_get_content`    | Fetch the full content of an item by its ID (`source_id`)      |
+| `hydradb_delete`   | `hydra_delete_memory`  | Delete one stored item by its ID (`memory_id`); use only on explicit request |
 
 ---
 
 ## CLI Reference
 
 ```bash
-openclaw hydra onboard             # Interactive onboarding wizard
-openclaw hydra onboard --advanced  # Advanced onboarding wizard
-openclaw hydra search <query>      # Search memories
-openclaw hydra list                # List all user memories
-openclaw hydra delete <id>         # Delete a memory
-openclaw hydra get <source_id>     # Fetch source content
-openclaw hydra status              # Show plugin configuration
+openclaw hydradb onboard             # Interactive onboarding wizard
+openclaw hydradb onboard --advanced  # Advanced onboarding wizard
+openclaw hydradb query <query>       # Query HydraDB
+openclaw hydradb ingest <text>       # Save a note
+openclaw hydradb list                # List everything stored
+openclaw hydradb delete <id>         # Delete an item
+openclaw hydradb inspect <id>        # Fetch an item's content
+openclaw hydradb status              # Show plugin configuration
 ```
+
+The earlier `openclaw hydra` root still works and prints a one-time deprecation warning.
 
 ---
 
 ## Context Injection
 
-Recalled context is injected inside `<hydra-context>` tags containing:
+Recalled context is injected inside `<hydra-context>` tags. The body is the server-built `llm_prompt` from `POST /query`, verbatim and whole: it is never truncated, summarised or held to a character budget. It is markdown:
 
-- **Entity Paths** - Knowledge graph paths connecting entities relevant to the query
-- **Context Chunks** - Retrieved memory chunks with source titles, graph relations, and linked extra context
+- `# Query results`, with the query and a count of what was found
+- `## Results`: one `### 1.` entry per result with its relevance and category, the content, and its enrichment when there is any
+- `## Forceful relations`: `### R1.` entries, context the author linked to a result at ingest time rather than matched by the query
+- `## Related facts`: facts from the context graph, labelled `[P1]`
+- `## Temporal facts` (a `**Duration:**` line first for a "how long between" question)
+- `## Source facts`, `## Profiles` and `## Code search`, when the query produced them
+- `## Sources`
+
+Each section appears only when there is something to show. The `hydradb_query` tool returns the same `llm_prompt`. `/hydradb-query` and `openclaw hydradb query` print the response's structured fields instead: each chunk's `context_id`, score, `content`, `enrichment` and temporal facts, then the `graph` path summaries, then the `forceful_relations`. See [Query](/essentials/v2/query) for every field.
+
+<Note>
+  OpenClaw caps a single tool result at `agents.defaults.contextLimits.toolResultMaxChars` (16,000 characters by default), so a longer `hydradb_query` result is cut by OpenClaw itself; raise that setting if you need more. The injected context is not a tool result and is not subject to that cap.
+</Note>
 
 ---
 
@@ -208,7 +230,7 @@ Recalled context is injected inside `<hydra-context>` tags containing:
     The plugin is enabled but credentials are missing. Run:
 
     ```bash
-    openclaw hydra onboard
+    openclaw hydradb onboard
     openclaw gateway restart
     ```
   </Accordion>

@@ -3,8 +3,6 @@ title: "Context Graphs"
 description: "How HydraDB models relationships between the entities in your context as triplets, and returns them as paths on every query."
 ---
 
-import LegacyLine from "/snippets/legacy-line.mdx";
-
 ## 1. What it is
 
 A context graph is a structured map of the entities in your database and the relationships between them, built from everything you ingest.
@@ -12,8 +10,6 @@ A context graph is a structured map of the entities in your database and the rel
 It represents those relationships as **triplets**: `source`, `relation`, `target`. Each triplet is a directional connection between two entities, returned as structured objects, not plain strings. A query returns the triplets that connect what you asked about to what is relevant, grouped into **paths**.
 
 Context graphs augment retrieval. They do not replace it.
-
-<LegacyLine />
 
 ---
 
@@ -41,13 +37,13 @@ Skip them for direct factual lookups. Graph traversal adds response size and can
 
 Context graphs are hybrid: relationships are extracted at ingestion time and traversed at query time.
 
-**At ingestion**, with `enrich: true` (the default), HydraDB extracts entities and relations from each item and stores them in the graph. An item can also declare its own links to other items with [`forceful_relations`](/essentials/v2/ingest#11-declared-relations), or skip extraction and supply its entities and relations with [`graph_payload`](/essentials/v2/ingest#12-bring-your-own-graph).
+**At ingestion**, with `enrich: true` (the default), HydraDB extracts entities and relations from each item and stores them in the graph. An item can also declare its own links to other items with [`forceful_relations`](/essentials/v2/ingest#10-declared-relations), or skip extraction and supply its entities and relations with [`graph_payload`](/essentials/v2/ingest#11-bring-your-own-graph).
 
 **At query**, with `graph_context: true`:
 
 1. HydraDB runs hybrid retrieval to find relevant chunks.
 2. It traverses the graph from the query and from the retrieved chunks.
-3. It returns the paths it found in `graph[]`: paths grown from the query first (`origin: "query_path"`), then paths expanded from the returned chunks (`origin: "chunk_relation"`), deduplicated.
+3. It returns the paths it found in `graph[]`: paths grown from the query first (`origin: "query_path"`), then paths expanded from the returned chunks (`origin: "chunk_relation"`). The list is deduplicated across both lanes, so a path both found appears once, and it is not capped.
 
 When no relevant relationships are found, `graph` is `[]`. That is not an error; it is the absence of structure for that query.
 
@@ -55,7 +51,7 @@ When no relevant relationships are found, `graph` is `[]`. That is not an error;
 
 ## 5. Key concepts
 
-**Triplets.** The unit of the graph. `source` and `target` are entities, `{ entity_id, name }`. `relation` describes the connection: `predicate`, the sentence it was extracted from (`context`), when it holds (`temporal_details`, absent when unknown), its `relationship_id`, and the `chunk_id` of the chunk that is evidence for it.
+**Triplets.** The unit of the graph. `source` and `target` are entities, `{ entity_id, name }`. `relation` describes the connection: `predicate`, the sentence it was extracted from (`context`), when it holds (`temporal_details`, omitted when empty), the edge's `timestamp` in Unix epoch seconds (a float, omitted when the edge has none), its `relationship_id`, and the `chunk_id` of the chunk that is evidence for it.
 
 Example: `Alex`, `prefers`, `short answers`, from chunk `ck_9f2`.
 
@@ -63,7 +59,7 @@ Example: `Alex`, `prefers`, `short answers`, from chunk `ck_9f2`.
 
 **Evidence.** `relation.chunk_id` names the chunk every step of a path was extracted from. Group hops by it against `chunks[].chunk_id` to show a chunk's relations under that chunk: a `chunk_relation` path is only returned when one of its hops came from a returned chunk (or a `forceful_relations` chunk), and hangs under that chunk; a `query_path` hop may also sit under the chunk it came from. See [Attaching graph paths to chunks](/essentials/v2/query#attaching-graph-paths-to-chunks).
 
-**Forceful relations.** Links between items rather than between entities, which you declare at ingest with `forceful_relations`. They come back in `forceful_relations[]`, not in `graph[]`.
+**Forceful relations.** Links between items rather than between entities, which you declare at ingest with `forceful_relations`. A `thinking` query follows them, and they come back in `forceful_relations[]`, not in `graph[]`.
 
 **Connected subgraph.** The graph also holds relations between items themselves: a Slack reply and the message it answers, a page and the pages it links to, a comment and its ticket. Given one item's id, [Connected Subgraph](/api-reference/v2/endpoint/subgraph) walks those links breadth-first and returns everything reachable with the relations among them. Reach for it when one query result is not enough and you need what surrounds it; it is also what the dashboard's **Subgraph** button opens.
 
@@ -133,6 +129,7 @@ The `graph` key of the response looks like:
           "relation": {
             "predicate": "governs",
             "context": "The billing policy governs how failed payments are retried.",
+            "timestamp": 1782984600.0,
             "relationship_id": "rel_41",
             "chunk_id": "ck_2aa"
           },
@@ -160,14 +157,14 @@ The `graph` key of the response looks like:
 
 ## 7. Using graph context in your prompt
 
-You do not format the graph yourself. The `llm_prompt` returned by the same query already contains a `## Related facts` section with one line per path in `graph[]`: its label (`[P1]`, `[P2]`, ... in `graph[]` order, so an agent can cite a fact by it), its chain of hops, `query path` or `chunk relation` for its `origin` with the path's relevance after reranking when it has one, and the numbers of the results its hops were extracted from. The `path_summary` is indented on the line under it, unless it only narrates the hops the chain already shows. From the [example response on Query](/essentials/v2/query#1-one-call):
+You do not format the graph yourself. The `llm_prompt` returned by the same query already contains a `## Related facts` section with one line per path in `graph[]`: its label (`[P1]`, `[P2]`, ... in `graph[]` order, so an agent can cite a fact by it), its chain of hops, the path's relevance after reranking in parentheses when it has one (a path with no reranked score has no parenthetical), and the numbers of the results its hops were extracted from. The line does not say which lane found the path; read `graph[].origin` for that. The `path_summary` is indented on the line under it, unless it only narrates the hops the chain already shows. From the [example response on Query](/essentials/v2/query#1-one-call):
 
 ```markdown
 ## Related facts
 
-- [P1] **Refund Processing** -managed by→ **Finance Department** (query path, relevance 0.81) [1]
+- [P1] **Refund Processing** -managed by→ **Finance Department** (relevance 0.81) [1]
   Refund processing is managed by the Finance Department.
-- [P2] **User** -prefers→ **short answers** (chunk relation, relevance 0.74) [2]
+- [P2] **User** -prefers→ **short answers** (relevance 0.74) [2]
   The user prefers short answers about refunds.
 ```
 
@@ -196,12 +193,6 @@ Inject `llm_prompt` and the model can reason over the paths and cite them. See [
 **Looking for forceful relations in `graph[]`.** Items you linked with `forceful_relations` come back in `forceful_relations[]`, with the `via` link that brought them in.
 
 **Expecting relationships that do not exist.** If the retrieved chunks do not share entities or declared relations, `graph` is `[]`.
-
----
-
-## 9. Split databases
-
-A database created with `type: "split"` returns the graph under `graph_context` as `query_paths`, `chunk_relations` and `chunk_id_to_group_ids`, with `canonical_predicate` and `relevancy_score` on each path. The mapping to `graph[]` is on [Split databases and legacy fields](/essentials/v2/split-databases#4-legacy-query-and-response-fields).
 
 ---
 

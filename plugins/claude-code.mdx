@@ -25,27 +25,27 @@ description: "HydraDB plugin for Claude Code. Persistent memory and contextual a
     <Tabs>
       <Tab title="macOS/Linux (bash)">
         ```bash
-        echo 'export HYDRA_DB_API_KEY="your-api-key"' >> ~/.bashrc
-        echo 'export HYDRADB_TENANT_ID="your-tenant-id"' >> ~/.bashrc
-        echo 'export HYDRADB_SUB_TENANT_ID=""' >> ~/.bashrc
+        echo 'export HYDRADB_API_KEY="your-api-key"' >> ~/.bashrc
+        echo 'export HYDRADB_DATABASE="your-database"' >> ~/.bashrc
+        echo 'export HYDRADB_COLLECTION=""' >> ~/.bashrc
         source ~/.bashrc
         ```
       </Tab>
 
       <Tab title="macOS/Linux (zsh)">
         ```bash
-        echo 'export HYDRA_DB_API_KEY="your-api-key"' >> ~/.zshrc
-        echo 'export HYDRADB_TENANT_ID="your-tenant-id"' >> ~/.zshrc
-        echo 'export HYDRADB_SUB_TENANT_ID=""' >> ~/.zshrc
+        echo 'export HYDRADB_API_KEY="your-api-key"' >> ~/.zshrc
+        echo 'export HYDRADB_DATABASE="your-database"' >> ~/.zshrc
+        echo 'export HYDRADB_COLLECTION=""' >> ~/.zshrc
         source ~/.zshrc
         ```
       </Tab>
 
       <Tab title="Windows (PowerShell)">
         ```powershell
-        [System.Environment]::SetEnvironmentVariable("HYDRA_DB_API_KEY", "your-api-key", "User")
-        [System.Environment]::SetEnvironmentVariable("HYDRADB_TENANT_ID", "your-tenant-id", "User")
-        [System.Environment]::SetEnvironmentVariable("HYDRADB_SUB_TENANT_ID", "", "User")
+        [System.Environment]::SetEnvironmentVariable("HYDRADB_API_KEY", "your-api-key", "User")
+        [System.Environment]::SetEnvironmentVariable("HYDRADB_DATABASE", "your-database", "User")
+        [System.Environment]::SetEnvironmentVariable("HYDRADB_COLLECTION", "", "User")
         ```
       </Tab>
     </Tabs>
@@ -55,14 +55,14 @@ description: "HydraDB plugin for Claude Code. Persistent memory and contextual a
     <Tabs>
       <Tab title="macOS/Linux">
         ```bash
-        echo $HYDRA_DB_API_KEY
-        echo $HYDRADB_TENANT_ID
+        echo $HYDRADB_API_KEY
+        echo $HYDRADB_DATABASE
         ```
       </Tab>
       <Tab title="Windows (PowerShell)">
         ```powershell
-        echo $env:HYDRA_DB_API_KEY
-        echo $env:HYDRADB_TENANT_ID
+        echo $env:HYDRADB_API_KEY
+        echo $env:HYDRADB_DATABASE
         ```
       </Tab>
     </Tabs>
@@ -71,20 +71,41 @@ description: "HydraDB plugin for Claude Code. Persistent memory and contextual a
   <Step title="Run setup and verify">
     ```bash
     /hydradb:setup
-    /hydradb:status
+    /hydradb:doctor
     ```
   </Step>
 </Steps>
 
 <Note>
-  `HYDRADB_SUB_TENANT_ID` must be set explicitly. If you want the plugin to use its default sub-tenant, set it to an empty string (`""`) rather than omitting it entirely.
+  `HYDRADB_COLLECTION` must be set explicitly. If you want the plugin to use the database's default collection, set it to an empty string (`""`) rather than omitting it entirely.
 </Note>
 
-**`HYDRADB_SUB_TENANT_ID` strategy:**
+<Note>
+  The older `HYDRA_DB_API_KEY`, `HYDRADB_TENANT_ID` and `HYDRADB_SUB_TENANT_ID` spellings still work, but each prints a one-line deprecation warning. The canonical name wins when both are set.
+</Note>
+
+**`HYDRADB_COLLECTION` strategy:**
 - Use a workspace-specific value (e.g., `claude-my-project`) for project-isolated memory.
 - Use a shared value to carry memory across all sessions and workspaces.
 
-Once configured, the plugin runs in the background: it syncs workspace docs on session start, recalls relevant context before each prompt, and captures conversation memory after each response.
+Once configured, the plugin runs in the background: it syncs workspace docs on session start, queries HydraDB before each prompt and injects what it finds, and captures the conversation after each response.
+
+---
+
+## How it works
+
+The plugin talks to your database through two endpoints.
+
+- **Recall.** Before each prompt, it sends the prompt text to `POST /query`, with `mode` from `recallMode`, `graph_context` from `graphContext`, `follow_forceful_relations` from `followForcefulRelations`, and `max_results` set to `maxMemoryResults + maxKnowledgeResults` (10 by default). It injects the server-built `llm_prompt` verbatim, and whole, inside a `<hydradb-context>` block: ranked results, forceful relations, related facts from the context graph, temporal facts and sources, labelled `[1]`, `[R1]` and `[P1]` for citation.
+- **Capture.** Conversations, notes and workspace docs are sent to `POST /context/ingest` as `context` items with enrichment on:
+  - `turn` capture sends each exchange as a `conversation` item, with your turns named after `userName` when it is set.
+  - `session-upsert` capture keeps one `text` item per session, holding the session transcript, and replaces it after each response.
+  - `/hydradb:ingest --note` sends the note as a `text` item.
+  - Workspace sync sends each matching file as a `text` item titled with its relative path. A changed file replaces its item, and a full sync removes the item of a deleted or excluded file.
+
+  `memoryCustomInstructions` steers enrichment for conversations, sessions and notes, and `workspaceMemoryCustomInstructions` for workspace docs. Secret-looking content is redacted before anything leaves the workspace.
+
+See [Query](/essentials/v2/query) and [Ingest](/essentials/v2/ingest) for the full request and response shapes.
 
 ---
 
@@ -93,11 +114,14 @@ Once configured, the plugin runs in the background: it syncs workspace docs on s
 | Command | Description |
 | ------- | ----------- |
 | `/hydradb:setup` | Interactive configuration wizard |
-| `/hydradb:status` | Show current config and connection status |
-| `/hydradb:search <query>` | Search HydraDB manually |
-| `/hydradb:remember <note>` | Save a note to memory |
-| `/hydradb:save-session` | Manually save the full session to HydraDB |
-| `/hydradb:sync-workspace [--force]` | Force re-sync workspace docs |
+| `/hydradb:doctor` | Show current config, sync state and connection status |
+| `/hydradb:query <query>` | Query HydraDB manually |
+| `/hydradb:ingest --note <note>` | Save a note to HydraDB |
+| `/hydradb:ingest --session` | Manually save the full session to HydraDB |
+| `/hydradb:ingest [--force]` | Sync workspace docs now (`--force` re-sends unchanged files) |
+| `/hydradb:last-recall` | Show what the most recent automatic recall returned and injected |
+
+The earlier names `/hydradb:status`, `/hydradb:search`, `/hydradb:remember`, `/hydradb:save-session` and `/hydradb:sync-workspace` still work.
 
 ---
 
@@ -108,35 +132,19 @@ Once configured, the plugin runs in the background: it syncs workspace docs on s
 | Value            | Behavior                                                                                    |
 | ---------------- | ------------------------------------------------------------------------------------------- |
 | `session-upsert` | **(default)** Maintains one evolving session transcript, upserted after each response       |
-| `turn`           | Saves each user/assistant exchange as an isolated memory                                    |
-| `both`           | Saves isolated turns and a rolling session transcript                                       |
-| `off`            | No automatic saves; manual saves still work via `/hydradb:save-session`                    |
-
-### `searchMode` - what is recalled at prompt time
-
-| Value       | Behavior                                                               |
-| ----------- | ---------------------------------------------------------------------- |
-| `memory`    | **(default)** Recalls from [Memories](/essentials/memories) only       |
-| `knowledge` | Recalls from [Knowledge](/essentials/knowledge) only                   |
-| `both`      | Recalls from both in parallel, then merges results                     |
-
-### `ingestionMode` - where workspace docs are synced
-
-| Value       | Behavior                                                                                               |
-| ----------- | ------------------------------------------------------------------------------------------------------ |
-| `memory`    | **(default)** Syncs workspace docs into [Memories](/essentials/memories) using `infer`                 |
-| `knowledge` | Syncs workspace docs into the [Knowledge](/essentials/knowledge) base                                  |
-| `auto`      | Prefers memory; falls back to knowledge for larger files. Pair with `searchMode: "both"`               |
+| `turn`           | Saves each user/assistant exchange as its own conversation item                             |
+| `both`           | Saves individual turns and a rolling session transcript                                     |
+| `off`            | No automatic saves; manual saves still work via `/hydradb:ingest --session`                 |
 
 ### `recallMode` - speed vs. depth
 
 | Value      | Behavior                                       |
 | ---------- | ---------------------------------------------- |
 | `fast`     | **(default)** Lower latency, standard recall   |
-| `thinking` | Deeper reasoning-based recall via graph traversal |
+| `thinking` | Deeper reasoning-based recall via graph traversal; also follows forceful relations |
 
 <Warning>
-  By default, HydraDB syncs each conversation pair (user and assistant) that does not include the `ignoreMarker` (`hydra-ignore`). For manual-only capture, set `captureMode` to `off` and use `/hydradb:save-session` or `/hydradb:remember <text>`.
+  By default, HydraDB syncs each conversation pair (user and assistant) that does not include the `ignoreMarker` (`hydra-ignore`). For manual-only capture, set `captureMode` to `off` and use `/hydradb:ingest --session` or `/hydradb:ingest --note <text>`.
 </Warning>
 
 ---
@@ -147,33 +155,30 @@ Once configured, the plugin runs in the background: it syncs workspace docs on s
 
 | Variable      | Env var                  | Description                                    |
 | ------------- | ------------------------ | ---------------------------------------------- |
-| `apiKey`      | `HYDRA_DB_API_KEY`        | Your HydraDB API key                           |
-| `tenantId`    | `HYDRADB_TENANT_ID`      | Your HydraDB tenant ID                         |
-| `subTenantId` | `HYDRADB_SUB_TENANT_ID`  | Sub-tenant scope. Set to `""` for default      |
+| `apiKey`      | `HYDRADB_API_KEY`        | Your HydraDB API key                           |
+| `tenantId`    | `HYDRADB_DATABASE`       | Your HydraDB database                          |
+| `subTenantId` | `HYDRADB_COLLECTION`     | Collection within the database. Set to `""` for the default collection |
 
 ### Core behavior
 
-| Variable       | Default          | Description                                                          |
-| -------------- | ---------------- | -------------------------------------------------------------------- |
-| `autoRecall`   | `true`           | Inject HydraDB context before every prompt automatically             |
-| `autoIngest`   | `true`           | Sync workspace docs on session start and file edits automatically    |
-| `captureMode`  | `session-upsert` | How conversations are saved (see [Modes](#modes))                    |
-| `searchMode`   | `memory`         | What to recall at prompt time (see [Modes](#modes))                  |
-| `ingestionMode`| `memory`         | Where workspace docs are synced (see [Modes](#modes))                |
-| `recallMode`   | `fast`           | Recall depth: `fast` or `thinking`                                   |
-| `graphContext` | `true`           | Include entity paths and graph relations in recalled context         |
+| Variable                  | Default          | Description                                                          |
+| ------------------------- | ---------------- | -------------------------------------------------------------------- |
+| `autoRecall`              | `true`           | Query HydraDB before every prompt and inject the result automatically |
+| `autoIngest`              | `true`           | Sync workspace docs on session start and file edits automatically    |
+| `captureMode`             | `session-upsert` | How conversations are saved (see [Modes](#modes))                    |
+| `recallMode`              | `fast`           | Recall depth: `fast` or `thinking`, sent as the query `mode`          |
+| `graphContext`            | `true`           | Include related facts from the context graph in recalled context     |
+| `followForcefulRelations` | `true`           | Follow the relations declared at ingest, so recall also returns the linked items under Forceful relations. The server follows them in `thinking` mode. Env var: `HYDRADB_FOLLOW_FORCEFUL_RELATIONS` |
 
 ### Limits
 
 | Variable                  | Default        | Description                                                         |
 | ------------------------- | -------------- | ------------------------------------------------------------------- |
-| `maxContextChars`         | `7000`         | Max characters injected into the prompt from HydraDB                |
-| `maxMemoryResults`        | `6`            | Max memory chunks returned per recall                               |
-| `maxKnowledgeResults`     | `4`            | Max knowledge chunks returned per recall                            |
+| `maxMemoryResults`        | `6`            | Added to `maxKnowledgeResults` to set how many chunks each recall asks for (`max_results`, 10 by default) |
+| `maxKnowledgeResults`     | `4`            | Added to `maxMemoryResults`, as above                               |
 | `maxFileSizeBytes`        | `52428800` (50 MB) | Max file size for workspace sync                                |
 | `maxFilesPerSync`         | `25`           | Max files synced per pass                                           |
-| `maxMemoryCharsPerChunk`  | `52428800` (50 MB) | Max chars per memory chunk                                      |
-| `maxMemoryChunksPerFile`  | `1`            | Max chunks per file                                                 |
+| `maxMemoryCharsPerChunk`  | `52428800` (50 MB) | Max characters per synced item; a longer file is split into numbered parts, each its own item |
 
 ### Timeouts
 
@@ -198,11 +203,11 @@ Once configured, the plugin runs in the background: it syncs workspace docs on s
 
 | Variable                             | Default                  | Description                                               |
 | ------------------------------------ | ------------------------ | --------------------------------------------------------- |
-| `subTenantId`                        | -                        | Workspace-level namespace within your tenant              |
-| `userName`                           | -                        | Optional user name attached to memories                   |
+| `subTenantId`                        | -                        | Workspace-level collection within your database           |
+| `userName`                           | -                        | Your name: the speaker name on your conversation turns, also stored with notes and session transcripts |
 | `apiBaseUrl`                         | `https://api.hydradb.com`| HydraDB API base URL                                      |
-| `memoryCustomInstructions`           | -                        | Custom instructions for how conversation memories are extracted |
-| `workspaceMemoryCustomInstructions`  | -                        | Custom instructions for how workspace doc memories are extracted |
+| `memoryCustomInstructions`           | -                        | Instructions that steer enrichment of saved conversations, sessions and notes |
+| `workspaceMemoryCustomInstructions`  | -                        | Instructions that steer enrichment of synced workspace docs |
 | `debug`                              | `false`                  | Enable debug logging to `.hydradb-plugin-data/debug.log`  |
 
 ---
@@ -223,14 +228,14 @@ The plugin resolves config in this order (later sources override earlier ones):
 
 ## Suggested Modes
 
-| Use case                      | `captureMode`    | `searchMode` | `ingestionMode` |
-| ----------------------------- | ---------------- | ------------ | --------------- |
-| Default / everyday use        | `session-upsert` | `memory`     | `memory`        |
-| Cross-session continuity      | `session-upsert` | `memory`     | `memory`        |
-| Team shared knowledge base    | `session-upsert` | `memory`     | `memory`        |
-| Maximum recall coverage       | `both`           | `both`       | `auto`          |
-| Recall only, no auto-save     | `off`            | `memory`     | `memory`        |
-| Isolated turn snapshots       | `turn`           | `memory`     | `memory`        |
+| Use case                      | `captureMode`    | `recallMode` |
+| ----------------------------- | ---------------- | ------------ |
+| Default / everyday use        | `session-upsert` | `fast`       |
+| Cross-session continuity      | `session-upsert` | `fast`       |
+| Shared team context           | `session-upsert` | `fast`       |
+| Maximum recall coverage       | `both`           | `thinking`   |
+| Recall only, no auto-save     | `off`            | `fast`       |
+| Isolated turn snapshots       | `turn`           | `fast`       |
 
 ---
 
@@ -239,26 +244,23 @@ The plugin resolves config in this order (later sources override earlier ones):
 ### Minimal (env vars only)
 
 ```bash
-export HYDRA_DB_API_KEY="your-api-key"
-export HYDRADB_TENANT_ID="your-tenant-id"
-export HYDRADB_SUB_TENANT_ID=""
+export HYDRADB_API_KEY="your-api-key"
+export HYDRADB_DATABASE="your-database"
+export HYDRADB_COLLECTION=""
 ```
 
 ### Recommended workspace config (`.hydradb-plugin.json`)
 
 ```json
 {
-  "apiKey": "${HYDRA_DB_API_KEY}",
-  "tenantId": "${HYDRADB_TENANT_ID}",
+  "apiKey": "${HYDRADB_API_KEY}",
+  "tenantId": "${HYDRADB_DATABASE}",
   "subTenantId": "claude-my-workspace",
   "autoRecall": true,
   "autoIngest": true,
   "captureMode": "session-upsert",
-  "searchMode": "memory",
-  "ingestionMode": "memory",
   "recallMode": "fast",
   "graphContext": true,
-  "maxContextChars": 7000,
   "requestTimeoutMs": 15000,
   "writeTimeoutMs": 15000
 }
@@ -269,11 +271,10 @@ export HYDRADB_SUB_TENANT_ID=""
 ```json
 {
   "captureMode": "both",
-  "searchMode": "both",
-  "ingestionMode": "auto",
-  "maxContextChars": 10000,
-  "maxMemoryResults": 8,
-  "maxKnowledgeResults": 6
+  "recallMode": "thinking",
+  "followForcefulRelations": true,
+  "maxMemoryResults": 12,
+  "maxKnowledgeResults": 8
 }
 ```
 
