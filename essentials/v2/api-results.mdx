@@ -13,7 +13,7 @@ import LegacyLine from "/snippets/legacy-line.mdx";
 
 ## 1. Inject `llm_prompt`
 
-The server builds `llm_prompt` from the chunks, the forceful relations and the graph paths, with a citation label on every entry. Pass it to your model as is:
+The server builds `llm_prompt`, one markdown document, from the chunks, the forceful relations, the graph paths and the dated facts, labelled for citation. Pass it to your model as is:
 
 <CodeGroup>
 ```python Python SDK
@@ -82,7 +82,7 @@ curl -s -X POST 'https://api.hydradb.com/query' \
 ```
 </CodeGroup>
 
-There is no client-side string building on a unified database. Do not concatenate `chunks[].content` yourself; the prompt already contains it, in ranked order, with labels the model can cite.
+There is no client-side string building on a unified database. Do not concatenate `chunks[].content` yourself; the prompt already contains it, in ranked order, with labels the model can cite. The SDK `build_string` / `buildString` helpers return `llm_prompt` verbatim on a unified database.
 
 ---
 
@@ -90,43 +90,72 @@ There is no client-side string building on a unified database. Do not concatenat
 
 For the [example response on Query](/essentials/v2/query#1-one-call), `llm_prompt` is:
 
-```text
-=== CONTEXT ===
-Cite anything you use from this context with its bracketed label, e.g. [1].
+```markdown
+# Query results
 
-[1] context_id: refund-policy
+**Query:** who owns refund processing?
+**Found:** 2 results across 2 sources · 2 related facts · 1 temporal fact · 1 forceful relation
+Cite a result by its number in brackets, e.g. [1].
+
+## Results
+
+### 1. Refund policy
+- **Relevance:** 0.91 · **Collection:** support · **Type:** file · **Category:** business_knowledge
+- **Id:** refund-policy · **Last updated:** 2026-07-02
+
 Refunds are processed within 30 days of purchase by the Finance Department.
-Enrichment: Refund window is 30 days; Finance owns refund processing.
-Dated: Refund policy effective from 2026-06-01. Start: 2026-06-01
 
-[2] context_id: chat-2026-07-29
+**Enrichment:** Refund window is 30 days; Finance owns refund processing.
+
+---
+
+### 2. Support chat with Priya
+- **Relevance:** 0.84 · **Collection:** support · **Type:** message · **Category:** user_preference
+- **Id:** chat-2026-07-29 · **Last updated:** 2026-07-29
+
 user: Keep refund answers short please
 assistant: Got it.
-Enrichment: User prefers short answers about refunds.
 
-=== FORCEFUL RELATIONS ===
+**Enrichment:** User prefers short answers about refunds.
+
+## Forceful relations
+
 Linked to a result by the author at ingest time (forceful_relations), not by relevance to this query.
 
-[R1] context_id: refund-faq, linked from: refund-policy
+### R1. Refund FAQ
+- **Linked from:** refund-policy · **Collection:** support
+- **Id:** refund-faq
+
 FAQ: refunds to a card take 5 to 7 business days to appear.
 
-=== GRAPH ===
-Facts extracted from this context. A label after a fact is the context it came from.
+## Related facts
 
-[P1] Refund processing is managed by the Finance Department.
-    Refund Processing -> managed by -> Finance Department [1]
+- [P1] **Refund Processing** -managed by→ **Finance Department** (query path) [1]
+  Refund processing is managed by the Finance Department.
+- [P2] **User** -prefers→ **short answers** (chunk relation) [2]
+  The user prefers short answers about refunds.
 
-[P2] The user prefers short answers about refunds.
-    User -> prefers -> short answers [2]
+## Temporal facts
+
+- **Refund policy** *effective_from* → **June 2026** (from 2026-06-01, precision: month, status: ongoing, evidence: "from June") [1]
+
+## Sources
+
+1. **Refund policy** (file, id: refund-policy) · https://docs.acme.com/refunds · updated 2026-07-02
+2. **Support chat with Priya** (message, id: chat-2026-07-29) · updated 2026-07-29
+3. **Refund FAQ** (id: refund-faq)
 ```
 
 | Section | Built from | Labels |
 | --- | --- | --- |
-| `=== CONTEXT ===` | `chunks[]`, in ranked order, each with its `enrichment.text` and any `temporal` facts | `[1]`, `[2]`, ... Each entry names its `context_id`. |
-| `=== FORCEFUL RELATIONS ===` | `forceful_relations[]`, the items the hits declared with `forceful_relations` at ingest | `[R1]`, `[R2]`, ... Each entry names its `context_id` and, after `linked from:`, the context whose declaration pulled it in. |
-| `=== GRAPH ===` | `graph[]`, one line per path with its `path_summary`, then each step | `[P1]`, `[P2]`, ... A step cites the label of the chunk it was extracted from, when that chunk is in the response. |
+| `# Query results` | The query, a `**Found:**` line counting what follows, and the instruction to cite a result by its number | None |
+| `## Results` | `chunks[]`, in ranked order: a `### 1. title` heading, a line with relevance (`score`), collection, type and category (`enrichment.kind`), a line with the id (`context_id`) and last-updated date, the `content`, then `**Enrichment:**` (`enrichment.text`). Results are separated by `---`. | `[1]`, `[2]`, ... |
+| `## Forceful relations` | `forceful_relations[]`, the items the hits declared with `forceful_relations` at ingest: a guide line, then `### R1. title` blocks laid out like results, with `**Linked from:**` (`via.from`) in place of relevance | `[R1]`, `[R2]`, ... |
+| `## Related facts` | `graph[]`, one line per path: its chain of hops (`**A** -pred→ **B**`), `(query path)` or `(chunk relation)` for its `origin`, and the results its hops were extracted from, with the `path_summary` indented under it | `[P1]`, `[P2]`, ... in `graph[]` order; each line also cites its results |
+| `## Temporal facts` | The dated facts behind `chunks[].temporal`, with window, precision, status and evidence phrase | None; each fact cites its result |
+| `## Sources` | Each context once, in order of first appearance: title, type, id, url and last-updated date | None; the numbers count contexts, not results |
 
-A section is omitted when its array is empty. Ask the model to cite the labels and you get answers you can trace: a `[1]` in the reply is `context_id: refund-policy`, which you can open with [`GET /context/inspect`](/api-reference/v2/endpoint/fetch-content).
+A section with nothing in it is left out, and a query that returns nothing gets an empty `llm_prompt`. Ask the model to cite the labels and you get answers you can trace: a `[1]` in the reply is result 1, whose `**Id:**` is `refund-policy`, which you can open with [`GET /context/inspect`](/api-reference/v2/endpoint/fetch-content); a `[P1]` is the first path in `graph[]`. How a multi-hop chain reads is on [Query](/essentials/v2/query#llm_prompt).
 
 ---
 
@@ -173,7 +202,7 @@ for (const rel of result.data.forcefulRelations) {
 
 ## 4. Showing source details
 
-A chunk carries only `chunk_id`, `context_id`, `score`, `content`, `enrichment` and `temporal`. It has no title, url, collection, timestamps or attributes. To show any of that, call [`GET /context/inspect`](/api-reference/v2/endpoint/fetch-content) with the chunk's `context_id`:
+A chunk carries only `chunk_id`, `context_id`, `score`, `content`, `enrichment` and `temporal`. It has no title, url, collection, timestamps or attributes. `llm_prompt` prints the title, url, collection and last-updated date for the model; to show any of that in your own UI, call [`GET /context/inspect`](/api-reference/v2/endpoint/fetch-content) with the chunk's `context_id`:
 
 ```bash
 curl -G 'https://api.hydradb.com/context/inspect' \
