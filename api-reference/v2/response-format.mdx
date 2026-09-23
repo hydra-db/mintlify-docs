@@ -1,0 +1,236 @@
+---
+title: "Response Format"
+description: "The success envelope and the response metadata every core endpoint returns."
+---
+
+Core v2 endpoints under `/databases`, `/context/*`, and `/query` wrap every response in the same top-level envelope. The resource-specific payload lives under `data`. Request tracing, scope echo, and deprecation signals live under `meta`.
+
+<Info>
+This page is the canonical reference for the **success** envelope and the full `meta` object. For HTTP status codes, error codes, and retry patterns, see [Error Responses](/api-reference/v2/error-responses).
+</Info>
+
+## The success envelope
+
+```json
+{
+  "success": true,
+  "data": {
+    "database": "my_first_database",
+    "org_id": "org_abc123",
+    "infra": {
+      "scheduler_status": true,
+      "graph_status": true,
+      "vectorstore_status": {
+        "knowledge": true,
+        "memories": true
+      },
+      "ready_for_ingestion": true
+    },
+    "message": "Deployed infrastructure status"
+  },
+  "error": null,
+  "meta": {
+    "request_id": "9d13aef4-02f4-4e73-8c62-4c2601d04f9d",
+    "latency_ms": 12.3,
+    "api_version": "0.1.0",
+    "database": "my_first_database"
+  }
+}
+```
+
+The example above is a successful [`GET /databases/status`](/api-reference/v2/endpoint/tenant-status) response. Endpoint pages show the same envelope; only the shape of `data` changes per route.
+
+| Field | Type | Description |
+|---|---|---|
+| `success` | boolean | `true` when the HTTP request succeeded. |
+| `data` | object | Endpoint-specific payload. Read this for the operation result. |
+| `error` | `null` or object | `null` on success. On failure, an object with `code` and `message` (see [Error side](#the-error-side)). |
+| `meta` | object | Request metadata: tracing IDs, latency, API version, resolved scope, and optional deprecation notices. |
+
+<Note>
+List endpoints such as [`POST /context/list`](/api-reference/v2/endpoint/list-documents) may also return a **pagination** block inside `data` (for example `page`, `page_size`, `total`). That pagination object is not part of `meta`. Do not conflate list pagination fields with `meta.request_id` / `meta.api_version`.
+</Note>
+
+## The `meta` object
+
+`meta` is defined by the OpenAPI schema `handler.responseMeta`. Fields present on a given response depend on the endpoint and whether the request used deprecated aliases.
+
+| Field | Type | Always present? | Description |
+|---|---|---|---|
+| `request_id` | string | Yes (typical) | Unique identifier for this request. Log it and include it when contacting support. |
+| `latency_ms` | number | Yes (typical) | Server-side processing time in milliseconds. |
+| `api_version` | string | Yes | Echo of the API version that served the request (same value as OpenAPI `info.version`). Always present; useful for clients that pin or assert a version. |
+| `database` | string | When scoped | Resolved owning database for the request. Formerly `tenant_id`; the `tenant_id` alias is still accepted (deprecated). |
+| `collection` | string | When scoped | Resolved collection scope. Defaults to the default collection when omitted on the request. Formerly `sub_tenant_id`; the `sub_tenant_id` alias is still accepted (deprecated). |
+| `source_type` | string | When applicable | Type of the parent source (for example `file`, `slack`, `notion`). |
+| `deprecation` | array | Only when relevant | Non-breaking migration nudges. Absent (`omitempty`) for fully migrated requests. See [Detecting deprecations](#detecting-deprecations-at-runtime). |
+| `tenant_id` | string | Deprecated alias | Deprecated echo of `database`. Prefer `meta.database`. |
+| `sub_tenant_id` | string | Deprecated alias | Deprecated echo of `collection`. Prefer `meta.collection`. |
+
+<Warning>
+`meta.database` / `meta.collection` are the canonical scope fields. If you still send `tenant_id` or `sub_tenant_id` on the request, you may also see those names echoed in `meta`, and a `deprecation` entry may appear. Migrate to `database` / `collection` using [Migrating from `tenant_id` and `sub_tenant_id`](/essentials/v2/multi-tenant#7-migrating-from-the-legacy-tenant-and-sub-tenant-fields).
+</Warning>
+
+## Request tracing with `request_id`
+
+Capture `meta.request_id` on **both** successful and failed calls. Pair it with your own correlation ID in logs so support can locate the exact server trace.
+
+<CodeGroup>
+
+```python Python SDK
+import os
+from hydra_db import HydraDB, HydraDBError
+
+client = HydraDB(token=os.environ["HYDRA_DB_API_KEY"])
+
+try:
+    response = client.databases.status(database="my_first_database")
+    request_id = response.meta.request_id
+    print("ok", request_id, response.meta.api_version)
+except HydraDBError as exc:
+    request_id = (exc.body or {}).get("meta", {}).get("request_id")
+    print("failed", request_id, getattr(exc, "error_code", None))
+    raise
+```
+
+```typescript TypeScript SDK
+import { HydraDBClient, HydraDBError } from "@hydradb/sdk";
+
+const client = new HydraDBClient({
+  token: process.env.HYDRA_DB_API_KEY,
+});
+
+try {
+  const response = await client.databases.status({
+    database: "my_first_database",
+  });
+  const requestId = response.meta?.request_id;
+  console.log("ok", requestId, response.meta?.api_version);
+} catch (error) {
+  if (error instanceof HydraDBError) {
+    const requestId = error.body?.meta?.request_id;
+    console.error("failed", requestId, error.body?.error?.code);
+  }
+  throw error;
+}
+```
+
+```bash cURL
+curl -sS -G 'https://api.hydradb.com/databases/status' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  --data-urlencode "database=my_first_database" \
+  | jq '{success, request_id: .meta.request_id, api_version: .meta.api_version, ready: .data.infra.ready_for_ingestion}'
+```
+
+</CodeGroup>
+
+<Tip>
+Response fields use the snake_case wire names shown in the JSON above (`request_id`, `api_version`, `deprecated_field`, `preferred_field`) in both the raw HTTP response and the SDK response objects. On failure, `HydraDBError.body` preserves the same wire shape, so `error.body?.meta?.request_id` reads identically to the success path.
+</Tip>
+
+## Detecting deprecations at runtime
+
+When a request uses a legacy `/tenants` route, a deprecated field (`tenant_id` / `sub_tenant_id`), or the deprecated `sub_tenant_ids` selector on `/query`, `meta.deprecation` is a list of notices. The HTTP status is unchanged; this is a migration signal, not a failure.
+
+Each entry matches `handler.deprecationNotice`:
+
+| Field | Type | Description |
+|---|---|---|
+| `deprecated` | boolean | Whether this notice concerns a deprecated field or route. |
+| `deprecated_field` | string | The deprecated field name (when the notice is field-level). |
+| `preferred_field` | string | The canonical replacement (for example `database` instead of `tenant_id`). |
+| `deprecated_since` | string | API version when the field or route was deprecated. |
+| `message` | string | Human-readable migration guidance. |
+
+```json
+{
+  "success": true,
+  "data": {},
+  "error": null,
+  "meta": {
+    "request_id": "9d13aef4-02f4-4e73-8c62-4c2601d04f9d",
+    "latency_ms": 8.1,
+    "api_version": "0.1.0",
+    "database": "my_first_database",
+    "deprecation": [
+      {
+        "deprecated": true,
+        "deprecated_field": "tenant_id",
+        "preferred_field": "database",
+        "deprecated_since": "2.0.1",
+        "message": "tenant_id is deprecated; use database instead."
+      }
+    ]
+  }
+}
+```
+
+<CodeGroup>
+
+```python Python SDK
+response = client.databases.status(database="my_first_database")
+notices = getattr(response.meta, "deprecation", None) or []
+for notice in notices:
+    # Log and alert; do not treat as a hard failure.
+    print(notice.message, notice.deprecated_field, "->", notice.preferred_field)
+```
+
+```typescript TypeScript SDK
+const response = await client.databases.status({
+  database: "my_first_database",
+});
+
+for (const notice of response.meta?.deprecation ?? []) {
+  // Log and alert; do not treat as a hard failure.
+  console.warn(notice.message, notice.deprecated_field, "->", notice.preferred_field);
+}
+```
+
+</CodeGroup>
+
+Existing docs also note a `Deprecation: true` response header alongside these notices. Prefer migrating away from deprecated fields using [Migrating from `tenant_id` and `sub_tenant_id`](/essentials/v2/multi-tenant#7-migrating-from-the-legacy-tenant-and-sub-tenant-fields) rather than parsing the header alone.
+
+## The error side
+
+Failed requests use the same envelope with `success: false`, `data: null`, and an `error` object:
+
+```json
+{
+  "success": false,
+  "data": null,
+  "error": {
+    "code": "DATABASE_NOT_FOUND",
+    "message": "Database not found"
+  },
+  "meta": {
+    "request_id": "9d13aef4-02f4-4e73-8c62-4c2601d04f9d",
+    "latency_ms": 4.8
+  }
+}
+```
+
+| Field | Description |
+|---|---|
+| `error.code` | Machine-readable code (for example `DATABASE_NOT_FOUND`). Branch on this, not on `message` text. |
+| `error.message` | Human-readable explanation. |
+| `meta.request_id` | Still present on errors. Always log it. |
+
+Some validation or deprecation-related failures may also include a structured `detail` object with fields such as `error_code`, `deprecated_field`, and `preferred_field`. Treat `detail` as supplemental; keep `error.code` as the primary branch key.
+
+For the full status-code table, common codes, ingestion `E####` codes, and retry patterns, see [Error Responses](/api-reference/v2/error-responses).
+
+## Scope of this envelope
+
+This envelope applies to the core database, context, and query endpoints documented under [API Reference](/api-reference/v2).
+
+Connector and webhook management routes have their own response shapes. Use each endpoint page (and its OpenAPI operation) as the source of truth for those responses rather than assuming they match the core envelope above.
+
+## Related resources
+
+- [Error Responses](/api-reference/v2/error-responses) - status codes, error codes, and retry
+- [API Reference](/api-reference/v2) - endpoint inventory and conventions
+- [Database Status](/api-reference/v2/endpoint/tenant-status) - read-only example used above
+- [Ingestion Status](/api-reference/v2/endpoint/source-status) - async item status under the same envelope
+- [List Documents](/api-reference/v2/endpoint/list-documents) - list payloads with pagination inside `data`
+- [Migrating from `tenant_id` and `sub_tenant_id`](/essentials/v2/multi-tenant#7-migrating-from-the-legacy-tenant-and-sub-tenant-fields) - deprecation migration contract
