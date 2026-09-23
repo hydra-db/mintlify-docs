@@ -14,7 +14,7 @@ HydraDB organizes its work into three logical planes. You interact only with the
 | Plane | What it handles | Endpoints |
 |---|---|---|
 | **Control** | API authentication, database lifecycle, provisioning, and status | [`/databases`](/api-reference/v2/endpoint/tenants-overview) family |
-| **Ingestion** | File and app-source uploads, memory writes, parsing, chunking, embedding, and graph construction | [`POST /context/ingest`](/api-reference/v2/endpoint/ingest-context), [`GET /context/status`](/api-reference/v2/endpoint/source-status) |
+| **Ingestion** | Context item writes, connector syncs, parsing, chunking, embedding, and graph construction | [`POST /context/ingest`](/api-reference/v2/endpoint/ingest-context), [`GET /context/status`](/api-reference/v2/endpoint/source-status) |
 | **Retrieval** | Hybrid query, metadata filtering, graph context, keyword bm25 search, and response shaping | [`POST /query`](/api-reference/v2/endpoint/query), [`GET /context/relations`](/api-reference/v2/endpoint/source-relations) |
 
 ```mermaid
@@ -47,14 +47,12 @@ flowchart LR
   subgraph Retrieval[Retrieval Plane - sync]
     direction LR
     Query([Query Orchestrator])
-    MemVec([Memories Vector Store])
-    KnowVec([Knowledge Vector Store])
+    Vec([Vector Store])
     KeywordBM25([Keyword BM25 Index])
     ContextGraph([Context Graph])
     Sources([Source Store])
     style Query fill:#1e293b,stroke:#334155,stroke-width:2px,color:#f8fafc,stroke-linecap:round
-    style MemVec fill:#0f172a,stroke:#334155,stroke-width:2px,color:#f8fafc,stroke-linecap:round
-    style KnowVec fill:#0f172a,stroke:#334155,stroke-width:2px,color:#f8fafc,stroke-linecap:round
+    style Vec fill:#0f172a,stroke:#334155,stroke-width:2px,color:#f8fafc,stroke-linecap:round
     style KeywordBM25 fill:#0f172a,stroke:#334155,stroke-width:2px,color:#f8fafc,stroke-linecap:round
     style ContextGraph fill:#FF571A,stroke:#FF571A,stroke-width:2px,color:#f8fafc,stroke-linecap:round
     style Sources fill:#0f172a,stroke:#334155,stroke-width:2px,color:#f8fafc,stroke-linecap:round
@@ -67,15 +65,13 @@ flowchart LR
   Queue --> Parser
   Parser --> Sources
   Parser --> Embed
-  Embed --> MemVec
-  Embed --> KnowVec
+  Embed --> Vec
   Embed --> KeywordBM25
   Parser --> Graph
   Graph --> ContextGraph
 
   API --|POST /query|--> Query
-  Query --> MemVec
-  Query --> KnowVec
+  Query --> Vec
   Query --> KeywordBM25
   Query --> ContextGraph
   Query --> Sources
@@ -83,7 +79,7 @@ flowchart LR
 
 Two details to notice in the diagram:
 
-- **One ingest endpoint, one corpus.** [`POST /context/ingest`](/api-reference/v2/endpoint/ingest-context) takes `context` items, text or conversations, and writes them to the database. Collections partition them per user, team or project. A database created with `type: "split"` keeps two stores instead, [Knowledge](/essentials/v2/knowledge) and [Memories](/essentials/v2/memories), selected with `type`.
+- **One ingest endpoint, one database of context items.** [`POST /context/ingest`](/api-reference/v2/endpoint/ingest-context) takes `context` items, text or conversations, and writes them to the database. [Connectors](/essentials/v2/connectors) sync provider content into the same database. Collections partition it per user, team or project.
 - **One query endpoint, every retrieval method.** [`POST /query`](/api-reference/v2/endpoint/query) is the only retrieval entry point. `collections` decides where to look and `query_by` how to match; see [Query](/essentials/v2/query) for the full picture.
 
 ---
@@ -94,7 +90,7 @@ Ingestion is asynchronous. A successful upload means HydraDB accepted the work a
 
 ```mermaid
 flowchart LR
-  Upload([Upload Knowledge or Memory])
+  Upload([Ingest context items])
   Queued([Queued])
   Processing([Processing])
   Graph([Graph Creation])
@@ -151,7 +147,7 @@ The right mapping depends on your product shape:
 | **B2C app** | One database for your application | One collection per end user |
 | **Internal tools** | One database per company or environment | One collection per department or project |
 
-The deeper trade-offs  -  when to spin up a new database vs. a new collection, how scoping interacts with [metadata filters](/essentials/v2/attributes), and how this affects [Memories](/essentials/v2/memories)  -  are covered in [Multi-Tenant Support](/essentials/v2/databases-and-collections).
+The deeper trade-offs (when to spin up a new database vs. a new collection, how scoping interacts with [attribute filters](/essentials/v2/attributes), and how collections keep each person's context apart from shared context) are covered in [Databases and collections](/essentials/v2/databases-and-collections).
 
 ---
 
@@ -163,7 +159,7 @@ The deeper trade-offs  -  when to spin up a new database vs. a new collection, h
 2. **Filter before ranking.** Apply `attributes` to narrow the candidate set (see [Attributes](/essentials/v2/attributes)).
 3. **Retrieve.** Run hybrid retrieval over the semantic vector store and the keyword bm25 index, or BM25-only retrieval when `query_by: "text"`.
 4. **Blend.** Use `alpha` to weight semantic vs. keyword bm25 contributions (`1.0` = pure semantic, `0.0` = pure BM25).
-5. **Enrich.** When `graph_context: true`, traverse the [context graph](/essentials/v2/context-graphs) and attach related paths. When `mode: "thinking"`, expand the query, rerank, and pull in the relations items declared at ingest.
+5. **Enrich.** With `graph_context` on (the default), traverse the [context graph](/essentials/v2/context-graphs) and attach related paths. When `mode: "thinking"`, expand the query, rerank, and pull in the relations items declared at ingest.
 6. **Shape the response.** Return ranked `chunks`, graph paths in `graph`, declared links in `forceful_relations`, and `llm_prompt`, the same context as one prompt-ready string with citation labels.
 
 The response is *retrieved context*, not a final LLM answer. You inject `llm_prompt` into your own agent or model prompt; see [How to Use API Results](/essentials/v2/api-results).
@@ -183,7 +179,7 @@ A short cheat sheet for the parameters you'll touch most often, and where each o
 | `custom_attributes` | [Ingest](/api-reference/v2/endpoint/ingest-context) | Free-form per-item fields. Stored with the item; not filterable. |
 | `attributes` | [Query](/api-reference/v2/endpoint/query) | Deterministic narrowing with operators (`$eq`, `$in`, `$gte`, `$and`, ...) on declared attributes. |
 | `alpha` | [Query](/api-reference/v2/endpoint/query) | Blends semantic vs. keyword bm25 scores in `query_by: "hybrid"`. |
-| `graph_context` | [Query](/api-reference/v2/endpoint/query) | When `true`, attaches the relevant slice of the [context graph](/essentials/v2/context-graphs) to the response. |
+| `graph_context` | [Query](/api-reference/v2/endpoint/query) | On by default: returns relation paths from the [context graph](/essentials/v2/context-graphs) in `graph[]`. |
 | `mode` | [Query](/api-reference/v2/endpoint/query) | `"fast"` for low-latency single-pass retrieval; `"thinking"` for multi-query expansion and reranking. |
 
 ---
@@ -202,9 +198,9 @@ This order catches almost every "I uploaded but query returns nothing" debugging
 
 ## Related
 
-- [Core Concepts](/get-started/core-concepts)  -  the five primitives: Memories, Knowledge, Query, Databases, Metadata
+- [Core Concepts](/get-started/v2/core-concepts): the primitives, from databases and collections to the context graph
 - [Quickstart](/get-started/v2/quickstart)  -  build your first integration in five minutes
-- [Knowledge](/essentials/v2/knowledge) and [Memories](/essentials/v2/memories)  -  the two content models
+- [Ingest context](/essentials/v2/ingest): one database of context items, text or conversations
 - [Query](/essentials/v2/query)  -  deep dive on `POST /query`
 - [Multi-Tenant Support](/essentials/v2/databases-and-collections)  -  scoping patterns and pitfalls
 - [Context Graphs](/essentials/v2/context-graphs)  -  how the graph layer enriches retrieval
