@@ -410,6 +410,7 @@ class AIRecruitingSearch {
       collections: options.collections || [this.collection],
       query: enrichedQuery,
       attributes: options.attributes, // exact-match filters, e.g. { job_search_status: "actively_looking" }
+      acl: options.acl, // caller principals, e.g. ["priya@firm.com"] - enforces stored ACLs
 
       // Hiring-specific configurations
       maxResults: 20, // More candidates for review
@@ -621,7 +622,10 @@ class PersonalizedRecruitingSearch extends AIRecruitingSearch {
     return `recruiter-${recruiterId}`;
   }
 
-  async recordSearchSignal(recruiterId, query, outcome = "") {
+  // recruiter is the authenticated session principal - never accept it from
+  // request input, or a caller could read another recruiter's signals.
+  // Signal items are stamped with an acl so only that recruiter can retrieve them.
+  async recordSearchSignal(recruiter, query, outcome = "") {
     // Ingest one context item per signal. enrich: true lets HydraDB
     // extract implicit preferences from the text.
     await fetch(`${BASE_URL}/context/ingest`, {
@@ -629,35 +633,38 @@ class PersonalizedRecruitingSearch extends AIRecruitingSearch {
       headers: HEADERS,
       body: JSON.stringify({
         database: this.database,
-        collection: this.recruiterCollection(recruiterId),
+        collection: this.recruiterCollection(recruiter.id),
         upsert: true,
         context: [{
           text: `Recruiter searched: "${query}". ${outcome}`,
-          user_name: recruiterId,
+          user_name: recruiter.id,
           enrich: true,
+          acl: [`user_email:${recruiter.email}`],
         }],
       }),
     });
   }
 
-  async searchWithPersonalization(query, recruiterId, options = {}) {
+  async searchWithPersonalization(query, recruiter, options = {}) {
     // Query candidates and the recruiter's own history in one call.
     // The recruiter collection contributes preference signals that
     // re-rank candidates toward this recruiter's successful patterns.
+    // acl filters stored items to what this recruiter may see.
     const results = await this.findCandidates(query, {
       ...options,
-      collections: [this.collection, this.recruiterCollection(recruiterId)],
+      collections: [this.collection, this.recruiterCollection(recruiter.id)],
+      acl: [recruiter.email],
     });
 
-    await this.recordSearchSignal(recruiterId, query);
+    await this.recordSearchSignal(recruiter, query);
 
     // Add personalized insights based on recruiter's history
-    return this.addPersonalizedInsights(results, recruiterId);
+    return this.addPersonalizedInsights(results, recruiter);
   }
 
-  async addPersonalizedInsights(results, recruiterId) {
+  async addPersonalizedInsights(results, recruiter) {
     // Retrieve the recruiter's profile signals
-    const recruiterProfile = await this.getRecruiterProfile(recruiterId);
+    const recruiterProfile = await this.getRecruiterProfile(recruiter);
 
     const personalizedResults = {
       ...results,
@@ -670,10 +677,11 @@ class PersonalizedRecruitingSearch extends AIRecruitingSearch {
     return personalizedResults;
   }
 
-  async getRecruiterProfile(recruiterId) {
+  async getRecruiterProfile(recruiter) {
     const profile = await this.client.query({
       database: this.database,
-      collection: this.recruiterCollection(recruiterId),
+      collection: this.recruiterCollection(recruiter.id),
+      acl: [recruiter.email],
       query: "preferred skills company types experience levels successful hires",
       maxResults: 10,
       mode: "thinking",
