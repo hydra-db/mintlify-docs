@@ -1,109 +1,764 @@
 ---
-title: "Bring Your Own Graph"
-description: "Supply your own entities and relations for a document and skip LLM graph extraction."
+title: "Bring Your Own Graph (BYOG)"
+description: "Model, load, and query your graph in HydraDB."
 ---
 
-## 1. What it is
+Bring Your Own Graph (BYOG) lets you use **Cypher** to read and write data in
+[HydraDB's core graph database](https://github.com/hydra-db/hydradb), which we
+host and scale for you in our cloud.
 
-Bring Your Own Graph (BYOG) lets you attach a `graph_payload` - your own entities and relations - to a **source** (a document, an `app_knowledge` source, or a memory) on [`POST /context/ingest`](/api-reference/v2/endpoint/ingest-context). For that source, HydraDB **uses your graph instead of running LLM extraction**.
+<Tip>
+  Migrating from an existing graph database? Jump to
+  [Migrating from Neo4j or another Cypher-compatible database](#migrating-from-neo4j-or-another-cypher-compatible-database).
+</Tip>
 
-Your graph is stored in exactly the same shape extraction produces (`source → relation → target` triplets), so it answers queries identically - it shows up in the `graph_context` slice and its relations point back at the source's chunks. No query-side changes are needed.
+Want to bring your own entities and relations without writing Cypher? Attach
+them to a document at ingest instead - see
+[Using BYOG without Cypher](#using-byog-without-cypher).
 
----
+## How to use Cypher with HydraDB
 
-## 2. When to use it
+### Quickstart
 
-Use BYOG when you already know the relationships and want them used verbatim:
+```bash
+BASE=https://api.hydradb.com
+KEY=<your API key>
 
-- You maintain a curated knowledge graph, an ontology, or a database export and want those exact facts in HydraDB.
-- You need deterministic, reproducible relations rather than model-extracted ones.
-- You want faster ingestion - a BYOG document skips the extraction LLM call entirely.
+# 1. Create a database (ready immediately)
+curl -X POST "$BASE/byog/databases" \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"database": "crm"}'
 
-Pick the right tool:
+# 2. Write data - the collection is created on first write
+curl -X POST "$BASE/byog/query" \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{
+    "database": "crm",
+    "collection": "contacts",
+    "query": "UNWIND $rows AS row CREATE (p:Person) SET p = row RETURN count(p) AS created",
+    "params": {"rows": [{"name": "Alice", "role": "admin"},
+                        {"name": "Bob",   "role": "analyst"}]}
+  }'
 
-| You want… | Use |
-| --- | --- |
-| HydraDB to discover relationships for you | [Context Graphs](/essentials/v2/context-graphs) (auto-extraction, the default) |
-| To declare links **between whole sources** | [Forceful relations](/essentials/v2/knowledge) (`relations` on a document/app source) |
-| To supply the **full entity/relation graph for one source** | **Bring Your Own Graph** (this page) |
+# 3. Read it back
+curl -X POST "$BASE/byog/query" \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{
+    "database": "crm",
+    "collection": "contacts",
+    "query": "MATCH (p:Person) RETURN p.name AS name, p.role AS role ORDER BY name"
+  }'
+```
 
----
+Agents can run the same Cypher through the [HydraDB MCP](/plugins/mcp#graph-tools-byog-opencypher)
+graph tools (`hydradb_graph_query`, `hydradb_graph_collections`, `hydradb_graph_admin`).
 
-## 3. The `graph_payload` shape
+### Authentication
 
-`graph_payload` is a JSON string: a **map keyed by source id** - a document's `document_metadata` `id`, an `app_knowledge` item's `id`, or a memory's `id` - where each value is that source's graph (an `entities` map + a `relations` list). Attach graphs to several sources in one request by adding more keys.
+Every request needs your HydraDB API key:
+
+```
+Authorization: Bearer <api key>
+```
+
+A missing or invalid key returns `403`. Your databases are visible only to
+your organization: another organization's databases look like names that
+don't exist, and `MATCH (n) RETURN n` returns only your own nodes.
+
+### Endpoints
+
+#### `POST /byog/databases` - create a database
+
+A database groups your collections. BYOG databases are created only through
+this endpoint, and they are ready immediately. Creating a name that already
+exists returns `409`.
+
+<CodeGroup>
+```bash Request
+curl -X POST "$BASE/byog/databases" \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"database": "crm"}'
+```
+
+```json Response
+{
+  "success": true,
+  "data": { "database": "crm", "status": "ready", "cluster": "shared" },
+  "error": null,
+  "meta": { "request_id": "9280b5f7-…", "api_version": "2.0.1", "latency_ms": 90.8 }
+}
+```
+</CodeGroup>
+
+#### `POST /byog/query` - run Cypher
+
+<CodeGroup>
+```bash Request
+curl -X POST "$BASE/byog/query" \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{
+    "database": "crm",
+    "collection": "contacts",
+    "query": "CREATE (n:Person {name: $name}) RETURN n",
+    "params": {"name": "Alice"}
+  }'
+```
+
+```json Response
+{
+  "success": true,
+  "data": [
+    { "n": { "id": 0, "labels": ["Person"], "name": "Alice" } }
+  ],
+  "error": null,
+  "meta": { "request_id": "0f345406-…", "api_version": "2.0.1", "latency_ms": 142.4 }
+}
+```
+</CodeGroup>
+
+- Each collection is an isolated graph. A query runs against one collection
+  and cannot see data in any other.
+- Collections are created automatically on the first write. Reading a
+  collection that doesn't exist yet returns zero rows.
+- Pass user data through `params` instead of building it into the query string.
+- Collection names can use letters, digits, `_` and `-`, must start with a
+  letter or digit, and can be up to 64 characters long.
+
+#### `GET /byog/collections` - list collections
+
+An unknown database returns `404`.
+
+<CodeGroup>
+```bash Request
+curl "$BASE/byog/collections?database=crm" \
+  -H "Authorization: Bearer $KEY"
+```
+
+```json Response
+{
+  "success": true,
+  "data": { "database": "crm", "collections": ["contacts", "sample"] },
+  "error": null,
+  "meta": { "request_id": "d4744632-…", "api_version": "2.0.1", "latency_ms": 55.6 }
+}
+```
+</CodeGroup>
+
+#### `DELETE /byog/collections` - drop one collection
+
+Drops the collection and all its data. Deleting a collection that does not
+exist also succeeds.
+
+<CodeGroup>
+```bash Request
+curl -X DELETE "$BASE/byog/collections" \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"database": "crm", "collection": "contacts"}'
+```
+
+```json Response
+{
+  "success": true,
+  "data": { "database": "crm", "collection": "contacts", "deleted": true },
+  "error": null,
+  "meta": { "request_id": "d7b2b080-…", "api_version": "2.0.1", "latency_ms": 131.1 }
+}
+```
+</CodeGroup>
+
+#### `DELETE /byog/databases` - drop a database
+
+Drops the database and every collection in it.
+
+<CodeGroup>
+```bash Request
+curl -X DELETE "$BASE/byog/databases" \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"database": "crm"}'
+```
+
+```json Response
+{
+  "success": true,
+  "data": {
+    "database": "crm",
+    "cluster": "shared",
+    "deleted": true,
+    "deleted_collections": ["contacts", "sample"]
+  },
+  "error": null,
+  "meta": { "request_id": "1ba6ecb8-…", "api_version": "2.0.1", "latency_ms": 130.8 }
+}
+```
+</CodeGroup>
+
+### Supported Cypher
+
+Essentially all of openCypher is supported. Only server-side procedures and
+file loading are excluded.
+
+**1. Modelling and CRUD**
+
+- Create, read, update and delete: `CREATE`, `MATCH`, `MERGE`, `SET`,
+  `REMOVE`, `DELETE` / `DETACH DELETE`
+- Pattern matching, `WHERE` filters, aggregation, `ORDER BY` / `SKIP` / `LIMIT`
+- `UNWIND` and `WITH` pipelines
+- Indexes: `CREATE INDEX FOR (n:Label) ON (n.prop)`
+- `CALL { ... }` subqueries
+
+**2. Graph traversal and exploration**
+
+- **Multi-hop patterns** - chain relationships in one `MATCH`:
+  `MATCH (a:Person)-[:KNOWS]->(b)-[:WORKS_AT]->(c:Company) RETURN c.name`.
+- **Variable-length traversal** - follow a relationship a bounded or unbounded
+  number of hops with `*`:
+  `MATCH (a:Person {name:$n})-[:KNOWS*1..4]->(reach) RETURN DISTINCT reach.name`.
+- **Neighborhood expansion** - a node's edges and neighbors in any direction:
+  `MATCH (p:Person {name:$n})-[r]-(nbr) RETURN type(r) AS rel, nbr.name AS neighbor`.
+- **Path finding** - `shortestPath` returns the full path (nodes and edges in
+  traversal order), not just the endpoints.
+- **Directed, typed, filtered traversal** - outgoing (`->`), incoming (`<-`)
+  or either (`-`) edges, filtered by relationship type and by node or edge
+  properties anywhere along the walk.
+
+**3. Not supported**
+
+<Warning>
+  These are rejected with `400` before the query runs - nothing is executed,
+  and retrying the same query fails the same way:
+
+  - **Procedure calls** - `CALL some.procedure(...)`, including `db.*` and
+    `apoc.*`. (`CALL { ... }` *subqueries* are fine.)
+  - **`LOAD CSV`** - send data through `params` instead.
+</Warning>
+
+Dialect notes:
+
+- **Existence checks** are bare pattern predicates -
+  `MATCH (p:Person) WHERE (p)-[:KNOWS]->() RETURN p.name AS name`.
+  The `EXISTS { ... }` block form and the `exists()` function are not
+  accepted.
+- **`shortestPath`** goes in a `RETURN` or `WITH` clause (not `MATCH p = …`)
+  and the traversal must be directed.
+
+### Common Cypher queries
+
+**Load the sample graph** - Five people, two companies, and the `KNOWS` / `WORKS_AT` edges between them.
+
+```cypher
+CREATE (alice:Person {ext_id: "u1", name: "Alice", role: "admin"}),
+       (bob:Person   {ext_id: "u2", name: "Bob",   role: "analyst"}),
+       (carol:Person {ext_id: "u3", name: "Carol", role: "engineer"}),
+       (dan:Person   {ext_id: "u4", name: "Dan",   role: "engineer"}),
+       (eve:Person   {ext_id: "u5", name: "Eve",   role: "designer"}),
+       (acme:Company   {ext_id: "c1", name: "Acme",   sector: "fintech"}),
+       (globex:Company {ext_id: "c2", name: "Globex", sector: "retail"}),
+       (alice)-[:KNOWS {since: 2020}]->(bob),
+       (bob)-[:KNOWS {since: 2021}]->(carol),
+       (carol)-[:KNOWS {since: 2022}]->(dan),
+       (alice)-[:KNOWS {since: 2023}]->(eve),
+       (bob)-[:WORKS_AT]->(acme),
+       (carol)-[:WORKS_AT]->(acme),
+       (dan)-[:WORKS_AT]->(globex)
+RETURN count(*) AS created
+```
+
+<Accordion title="Result">
+
+```json
+[{"created": 1}]
+```
+
+</Accordion>
+
+**Upsert a node on your own key** - Updates Alice's role, or creates her if `u1` doesn't exist.
+
+```cypher
+MERGE (p:Person {ext_id: "u1"})
+SET p.role = "owner"
+RETURN p.ext_id AS id, p.name AS name, p.role AS role
+```
+
+<Accordion title="Result">
+
+```json
+[{"id": "u1", "name": "Alice", "role": "owner"}]
+```
+
+</Accordion>
+
+**Connect two existing nodes** - Eve starts working at Acme.
+
+```cypher
+MATCH (a:Person {ext_id: "u5"}), (b:Company {ext_id: "c1"})
+MERGE (a)-[w:WORKS_AT]->(b)
+SET w.since = 2024
+RETURN a.name AS person, type(w) AS rel, b.name AS company, w.since AS since
+```
+
+<Accordion title="Result">
+
+```json
+[{"company": "Acme", "person": "Eve", "rel": "WORKS_AT", "since": 2024}]
+```
+
+</Accordion>
+
+**Expand a node's neighborhood** - Every relationship on Bob, in any direction, and the node on the other end.
+
+```cypher
+MATCH (p:Person {name: "Bob"})-[r]-(nbr)
+RETURN type(r) AS rel, labels(nbr) AS kind, nbr.name AS neighbor
+ORDER BY rel, neighbor
+```
+
+<Accordion title="Result">
+
+```json
+[
+  {"kind": ["Person"], "neighbor": "Alice", "rel": "KNOWS"},
+  {"kind": ["Person"], "neighbor": "Carol", "rel": "KNOWS"},
+  {"kind": ["Company"], "neighbor": "Acme", "rel": "WORKS_AT"}
+]
+```
+
+</Accordion>
+
+**Multi-hop expansion** - Everyone up to 3 hops from Alice along outgoing `KNOWS` edges.
+
+```cypher
+MATCH (a:Person {name: "Alice"})-[:KNOWS*1..3]->(reach:Person)
+WHERE reach.name <> "Alice"
+RETURN DISTINCT reach.name AS name
+ORDER BY name
+```
+
+<Accordion title="Result">
+
+```json
+[
+  {"name": "Bob"},
+  {"name": "Carol"},
+  {"name": "Dan"},
+  {"name": "Eve"}
+]
+```
+
+</Accordion>
+
+**Shortest path between two nodes** - Returns the whole path - nodes and edges in order - not just the endpoints.
+
+```cypher
+MATCH (a:Person {name: "Alice"}), (b:Person {name: "Carol"})
+RETURN shortestPath((a)-[:KNOWS*..8]->(b)) AS path
+```
+
+<Accordion title="Result">
+
+```json
+[
+  {
+    "path": {
+      "edges": [
+        {
+          "id": 0,
+          "relation": "KNOWS",
+          "since": 2020,
+          "source_node_id": 0,
+          "target_node_id": 1
+        },
+        {
+          "id": 1,
+          "relation": "KNOWS",
+          "since": 2021,
+          "source_node_id": 1,
+          "target_node_id": 2
+        }
+      ],
+      "nodes": [
+        {
+          "ext_id": "u1",
+          "id": 0,
+          "labels": [
+            "Person"
+          ],
+          "name": "Alice",
+          "role": "owner"
+        },
+        {
+          "ext_id": "u2",
+          "id": 1,
+          "labels": [
+            "Person"
+          ],
+          "name": "Bob",
+          "role": "analyst"
+        },
+        {
+          "ext_id": "u3",
+          "id": 2,
+          "labels": [
+            "Person"
+          ],
+          "name": "Carol",
+          "role": "engineer"
+        }
+      ]
+    }
+  }
+]
+```
+
+</Accordion>
+
+**Filtered, typed traversal** - Who does Alice know that works at a fintech company?
+
+```cypher
+MATCH (a:Person {name: "Alice"})-[:KNOWS]->(f:Person)-[:WORKS_AT]->(c:Company)
+WHERE c.sector = "fintech"
+RETURN f.name AS person, c.name AS company
+ORDER BY person
+```
+
+<Accordion title="Result">
+
+```json
+[
+  {"company": "Acme", "person": "Bob"},
+  {"company": "Acme", "person": "Eve"}
+]
+```
+
+</Accordion>
+
+**Aggregate** - Headcount per company, largest first.
+
+```cypher
+MATCH (p:Person)-[:WORKS_AT]->(c:Company)
+RETURN c.name AS company, count(p) AS headcount
+ORDER BY headcount DESC
+```
+
+<Accordion title="Result">
+
+```json
+[
+  {"company": "Acme", "headcount": 3},
+  {"company": "Globex", "headcount": 1}
+]
+```
+
+</Accordion>
+
+**Index a property you filter on** - Speeds up lookups by `ext_id`. A write with no `RETURN` returns an empty list.
+
+```cypher
+CREATE INDEX FOR (n:Person) ON (n.ext_id)
+```
+
+<Accordion title="Result">
+
+```json
+[]
+```
+
+</Accordion>
+
+**Delete a node and its edges** - Removes Eve and every relationship attached to her.
+
+```cypher
+MATCH (p:Person {ext_id: "u5"})
+DETACH DELETE p
+RETURN count(*) AS deleted
+```
+
+<Accordion title="Result">
+
+```json
+[{"deleted": 1}]
+```
+
+</Accordion>
+
+### Response format
+
+Rows come back in `data` - one object per result row, keyed by your `RETURN`
+aliases:
 
 ```json
 {
-  "billing-policy-doc": {
-    "entities": {
-      "alice":   { "name": "Alice Carter",  "type": "PERSON", "namespace": "employees", "identifier": "alice@acme.com" },
-      "billing": { "name": "Billing Policy", "type": "POLICY", "namespace": "policies" }
-    },
-    "relations": [
-      {
-        "source": "alice",
-        "target": "billing",
-        "predicate": "OWNS",
-        "context": "Alice Carter owns the billing policy.",
-        "temporal_details": "since 2021"
-      }
-    ]
-  }
+  "success": true,
+  "data": [
+    { "name": "Alice", "role": "admin" },
+    { "name": "Bob", "role": "analyst" }
+  ],
+  "error": null,
+  "meta": { "request_id": "9be86a4e-…", "latency_ms": 12.4 }
 }
 ```
 
-- **Top-level key** - the id of the source this graph belongs to (a document's `document_metadata` `id`, an `app_knowledge` item's `id`, or a memory's `id`). A key matching no source in the request is rejected with `400`.
-- **`entities`** - a map keyed by a caller-local id. Each entity has a `name` (required), `type`, `namespace`, and optional `identifier` (an external id - display-only). The entity key is just a handle for relations to reference; it is not stored.
-- **`relations`** - a list of edges. `source` and `target` are entity-map keys; `predicate` is any plain string; `context` and `temporal_details` are optional per relation.
-- **No `chunk_id`** - you never supply or see chunk ids; HydraDB resolves them server-side when it links your relations to the source's chunks.
-- Entity names are **normalized (lowercased)** so they match at query time, just like extracted entities. Entities that no relation references are dropped.
+- **Alias every column you read** (`RETURN n.name AS name`). An unaliased
+  column is keyed by its expression text (`"n.name"`).
+- A write with no `RETURN` succeeds with `data: []`.
+
+What each kind of value looks like inside a row:
+
+| You return | Example | Row in `data` |
+|---|---|---|
+| Scalar | `RETURN p.name AS name` | `{"name": "Alice"}` |
+| Node | `RETURN p` | `{"p": {"id": 0, "labels": ["Person"], "name": "Alice"}}` |
+| Relationship | `RETURN k` | `{"k": {"id": 7, "relation": "KNOWS", "source_node_id": 0, "target_node_id": 1, "since": 2020}}` |
+| Path | `RETURN shortestPath(...) AS path` | `{"path": {"nodes": [...], "edges": [...]}}` |
+| List / map | `RETURN collect(p.name) AS names` | `{"names": ["Alice", "Bob"]}` |
+
+- Nodes and relationships are flat objects: their properties plus the keys
+  shown above. A stored property with one of those names (`id`, `labels`,
+  `relation`, `source_node_id`, `target_node_id`) is hidden in the response -
+  alias it (`RETURN n.id AS my_id`).
+- `id` is internal: it can be reused after deletes and does not survive an
+  export/re-import. Key your data on a property you own (`ext_id`, `email`, …).
+- Integers are 64-bit. Values beyond 2⁵³ lose precision in languages that
+  parse JSON numbers as doubles - return them as strings.
+
+### Using results in your code
+
+#### A minimal client
+
+Wrap the endpoint once. Success puts rows in `data`; errors are wrapped in
+`detail`.
+
+```python
+import requests
+
+class HydraGraph:
+    def __init__(self, base_url, api_key, database, collection="default"):
+        self.base, self.db, self.col = base_url, database, collection
+        self.headers = {"Authorization": f"Bearer {api_key}"}
+
+    def query(self, cypher, params=None):
+        r = requests.post(f"{self.base}/byog/query", headers=self.headers, json={
+            "database": self.db, "collection": self.col,
+            "query": cypher, "params": params or {},
+        })
+        body = r.json()
+        if not r.ok:
+            err = body.get("detail", {})
+            raise RuntimeError(f"{r.status_code} {err.get('error_code')}: {err.get('message')}")
+        return body["data"]          # always a list of row dicts
+
+g = HydraGraph("https://api.hydradb.com", "<api key>", "crm", "contacts")
+```
+
+```typescript
+async function query(cypher: string, params: object = {}): Promise<Record<string, any>[]> {
+  const res = await fetch(`${BASE}/byog/query`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${KEY}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ database: "crm", collection: "contacts", query: cypher, params }),
+  });
+  const body = await res.json();
+  if (!res.ok) throw new Error(`${res.status} ${body.detail?.error_code}: ${body.detail?.message}`);
+  return body.data;                 // always an array of row objects
+}
+```
+
+#### Reading rows
+
+```python
+# Scalars - project and alias exactly what you need.
+rows = g.query("MATCH (p:Person) RETURN p.name AS name, p.role AS role ORDER BY name")
+names = [r["name"] for r in rows]                  # ["Alice", "Bob"]
+
+# Nodes - one flat object: properties plus id and labels.
+alice = g.query("MATCH (p:Person {name: $n}) RETURN p", {"n": "Alice"})[0]["p"]
+props = {k: v for k, v in alice.items() if k not in ("id", "labels")}
+
+# Relationships - project both ends in the same query.
+for row in g.query("MATCH (a:Person)-[k:KNOWS]->(b:Person) "
+                   "RETURN a.name AS a, b.name AS b, k.since AS since"):
+    print(f'{row["a"]} knows {row["b"]} since {row["since"]}')
+
+# Paths - nodes and edges in traversal order.
+path = g.query("MATCH (a:Person {name:$x}), (b:Person {name:$y}) "
+               "RETURN shortestPath((a)-[*..6]->(b)) AS path",
+               {"x": "Alice", "y": "Bob"})[0]["path"]
+hops = [n["name"] for n in path["nodes"]]          # ["Alice", ..., "Bob"]
+```
+
+#### Pagination
+
+Result sets past the deployment cap are silently truncated, so page any read
+that *could* be large. A stable `ORDER BY` keeps pages consistent:
+
+```python
+def all_rows(cypher_body, page=500, params=None):
+    offset = 0
+    while True:
+        rows = g.query(f"{cypher_body} SKIP $offset LIMIT $limit",
+                       {**(params or {}), "offset": offset, "limit": page})
+        yield from rows
+        if len(rows) < page:
+            return
+        offset += page
+
+people = list(all_rows("MATCH (p:Person) RETURN p.name AS name ORDER BY name"))
+```
+
+#### Bulk loading
+
+Chunk rows to stay inside the 256 KiB body cap and the 30 s write budget;
+`MERGE` on your own key makes the load re-runnable after a failure:
+
+```python
+def load(rows, chunk=500):
+    for i in range(0, len(rows), chunk):
+        g.query("""
+            UNWIND $rows AS row
+            MERGE (n:Person {ext_id: row.ext_id})
+            SET n += row
+        """, {"rows": rows[i:i+chunk]})
+```
+
+#### Handling failures
+
+- **`400`** - the message tells you what to fix: your Cypher (compiler
+  feedback is passed through) or a query that needs `LIMIT`/an index (budget
+  timeout). Retrying unchanged will fail identically.
+- **`429` / `500`** - transient; retry with backoff. Writes built on `MERGE`
+  (as above) are safe to retry; bare `CREATE` batches are not idempotent, so
+  a retried chunk can duplicate nodes.
+
+### Errors and limits
+
+<AccordionGroup>
+<Accordion title="Errors">
+
+Errors come back with `success: false` and the reason in `error` (also
+mirrored in `detail`):
+
+```json
+{
+  "success": false,
+  "data": null,
+  "error": { "code": "DATABASE_ALREADY_EXISTS", "message": "database 'crm' already exists" },
+  "detail": { "success": false, "error_code": "DATABASE_ALREADY_EXISTS", "message": "database 'crm' already exists" }
+}
+```
+
+| Status | Meaning |
+|---|---|
+| `400` | Invalid request (missing fields, bad collection name), unsupported construct, **Cypher errors** (the compiler's message is passed through so you can fix the query), or **query timeout** |
+| `403` | Missing or invalid API key |
+| `404` | Unknown database - create it with `POST /byog/databases` |
+| `409` | `POST /byog/databases` with a name that already exists |
+| `413` | Request body over 256 KiB |
+| `429` | Rate limit exceeded - back off and retry |
+| `500` | Something failed on our side - safe to retry; nothing for you to fix |
+
+</Accordion>
+
+<Accordion title="Limits and timeouts">
+
+| Limit | Value | On exceeding |
+|---|---|---|
+| Request body | 256 KiB | `413` |
+| Read query execution | 8 s | `400` - "query exceeded the execution time budget; simplify it, add LIMIT, or create an index" |
+| Write query execution | 30 s | same `400` |
+| Result set size | deployment-configured cap; rows beyond it are **silently dropped** | no error - paginate |
+
+A query counts as a **write** (and gets the larger budget) when it contains
+any write clause - `CREATE`, `MERGE`, `SET`, `DELETE`, `REMOVE`, `FOREACH`.
+
+- **Paginate anything potentially large**:
+  `ORDER BY … SKIP $offset LIMIT $page`. Without an `ORDER BY`, rows dropped
+  at the result-set cap are arbitrary.
+- **Chunk bulk imports** into `UNWIND $rows` batches sized to finish inside
+  the 30 s write budget (and the 256 KiB body cap).
+- **Create indexes** for properties you filter on -
+  `CREATE INDEX FOR (n:Person) ON (n.name)`. A slow read usually needs one.
+
+</Accordion>
+</AccordionGroup>
 
 ---
 
-## 4. How it behaves
+## Migrating from Neo4j or another Cypher-compatible database
 
-- **Replace mode.** A BYOG document's graph is your `graph_payload`; LLM extraction is skipped for it. The document is still chunked and embedded, so it stays fully vector-searchable.
-- **Chunk linking.** Each relation is linked to the source's most relevant chunk(s), so `graph_context` results hydrate the right passages. Linking is permissive (see [Limitations](#8-limitations)).
-- **Queryable like any graph.** Your relations appear in the `/query` `graph_context` slice (tagged `origin: "byog"` in metadata) and traverse exactly like extracted ones - see [Context Graphs](/essentials/v2/context-graphs).
-- **Durable across re-ingest.** Your graph is persisted server-side, so it outlives a single upload. Re-ingesting the same source **without** a `graph_payload` - a connector re-sync, or just iterating on the document's content - re-applies your stored graph: HydraDB does **not** fall back to LLM extraction and does **not** error. Your facts are never silently lost. To change the graph, re-ingest **with** a new `graph_payload`; it replaces the stored copy (replace mode).
+Most application Cypher from Neo4j, Memgraph, or any other Cypher-compatible database
+ports directly. The differences you are most likely to notice:
+
+- Procedure calls (for example Neo4j's `CALL db.*` / `CALL apoc.*`) are not
+  available - the equivalents are either plain Cypher or not part of the
+  supported surface.
+- `LOAD CSV` is not available - batch data in through `params`.
+- Internal node ids are not portable - migrate using your own key properties,
+  for example
+  `UNWIND $rows AS row MERGE (n:Person {ext_id: row.ext_id}) SET n += row`.
+
+Migrate one collection at a time: export a graph, replay it into one
+collection, and verify the counts.
+
+The script below reads from Neo4j with the official driver and writes to
+HydraDB with the [`HydraGraph` client](#a-minimal-client). Any source you can
+read nodes and relationships from works the same way. It loads nodes first,
+then relationships matched on your own key. Cypher doesn't allow a
+relationship type as a parameter, so it writes one batch per type:
+
+```python
+from neo4j import GraphDatabase
+
+src = GraphDatabase.driver("neo4j://localhost:7687", auth=("neo4j", "<password>"))
+g = HydraGraph("https://api.hydradb.com", "<api key>", "crm", "contacts")
+
+def batches(rows, n=500):
+    for i in range(0, len(rows), n):
+        yield rows[i:i + n]
+
+# Index the key first so the relationship MATCH below stays fast.
+g.query("CREATE INDEX FOR (n:Person) ON (n.ext_id)")
+
+with src.session() as s:
+    # 1. Nodes, keyed on a property you own.
+    people = [r["p"] for r in s.run("MATCH (p:Person) RETURN properties(p) AS p")]
+    for chunk in batches(people):
+        g.query("UNWIND $rows AS row MERGE (n:Person {ext_id: row.ext_id}) SET n += row",
+                {"rows": chunk})
+
+    # 2. Relationships, one type at a time.
+    knows = s.run("""
+        MATCH (a:Person)-[k:KNOWS]->(b:Person)
+        RETURN a.ext_id AS src, b.ext_id AS dst, properties(k) AS props
+    """).data()
+    for chunk in batches(knows):
+        g.query("""
+            UNWIND $rows AS row
+            MATCH (a:Person {ext_id: row.src}), (b:Person {ext_id: row.dst})
+            MERGE (a)-[k:KNOWS]->(b)
+            SET k += row.props
+        """, {"rows": chunk})
+
+# 3. Verify counts match.
+print(g.query("MATCH (p:Person) RETURN count(p) AS people"))
+```
 
 ---
 
-## 5. Limits
+## Using BYOG without Cypher
 
-`graph_payload` is validated up front; oversized payloads are rejected with `400`.
+To use your own entities and relations for a document or memory instead of
+HydraDB's LLM extraction, pass a `graph_payload` on
+[`POST /context/ingest`](/api-reference/v2/endpoint/ingest-context). It is a
+JSON map keyed by source id (a `document_metadata` `id`, an `app_knowledge`
+`id`, or a memory `id`):
 
-| Limit | Value |
-| --- | --- |
-| Entities | ≤ 5,000 |
-| Relations | ≤ 10,000 |
-| Relations per entity (degree) | ≤ 500 |
-| `context` length | ≤ 2,000 chars |
-| `name` / `predicate` length | ≤ 256 chars |
-
-<Note>
-`graph_payload` is **per-source**: each top-level key must match the `id` of a source in the same request - a document's `document_metadata` `id`, an `app_knowledge` item's `id`, or (when `type=memory`) a memory's `id`. Attach graphs to multiple sources at once. A source must carry an explicit `id` to be targeted (that `id` is the map key). Works for both `type=knowledge` and `type=memory` - a single request is one or the other, so its `graph_payload` keys target only that type's sources.
-</Note>
-
----
-
-## 6. Example: multiple sources in one request
-
-`graph_payload` is a map, so one request can carry graphs for several sources at once - here **two documents and one app_knowledge source**, each keyed by its own id. Then query, and each source's triples surface.
-
-<CodeGroup>
-
-```bash cURL
+```bash
 curl -X POST 'https://api.hydradb.com/context/ingest' \
   -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
   -H "API-Version: 2" \
   -F "type=knowledge" \
   -F "database=acme_corp" \
   -F "documents=@/path/to/billing-policy.pdf" \
-  -F "documents=@/path/to/deploy-runbook.pdf" \
-  -F 'document_metadata=[{ "id": "billing-policy-doc" }, { "id": "deploy-runbook-doc" }]' \
-  -F 'app_knowledge=[{ "id": "slack-incident-42", "kind": "message", "provider": "slack", "external_id": "slack-incident-42", "fields": { "kind": "message", "body": "Platform team paged for the payments outage." } }]' \
+  -F 'document_metadata=[{ "id": "billing-policy-doc" }]' \
   -F 'graph_payload={
     "billing-policy-doc": {
       "entities": {
@@ -114,215 +769,20 @@ curl -X POST 'https://api.hydradb.com/context/ingest' \
         { "source": "alice", "target": "billing", "predicate": "OWNS",
           "context": "Alice Carter owns the billing policy.", "temporal_details": "since 2021" }
       ]
-    },
-    "deploy-runbook-doc": {
-      "entities": {
-        "team": { "name": "Platform Team",    "type": "TEAM",    "namespace": "teams" },
-        "svc":  { "name": "Payments Service", "type": "SERVICE", "namespace": "services" }
-      },
-      "relations": [
-        { "source": "team", "target": "svc", "predicate": "OPERATES",
-          "context": "The platform team operates the payments service." }
-      ]
-    },
-    "slack-incident-42": {
-      "entities": {
-        "team": { "name": "Platform Team",   "type": "TEAM",     "namespace": "teams" },
-        "inc":  { "name": "Payments Outage", "type": "INCIDENT", "namespace": "incidents" }
-      },
-      "relations": [
-        { "source": "team", "target": "inc", "predicate": "RESPONDED_TO",
-          "context": "The platform team was paged for the payments outage." }
-      ]
     }
   }'
 ```
 
-```python Python SDK
-import json
+- **Replaces extraction** for each keyed source; the source is still chunked
+  and embedded. Relations surface in `/query` `graph_context` (tagged
+  `origin: "byog"`) - no query-side changes.
+- **Persists across re-ingest** - re-ingesting without a `graph_payload`
+  re-applies the stored graph; sending a new one replaces it.
+- **Limits** - ≤ 5,000 entities, ≤ 10,000 relations, ≤ 500 relations per
+  entity; oversized payloads return `400`. A key matching no source in the
+  request is rejected with `400`.
+- Whole-graph only: no per-triple updates, and relations link to their
+  best-matching chunk even when the match is weak.
 
-graphs = {
-    "billing-policy-doc": {
-        "entities": {
-            "alice":   {"name": "Alice Carter",  "type": "PERSON", "namespace": "employees"},
-            "billing": {"name": "Billing Policy", "type": "POLICY", "namespace": "policies"},
-        },
-        "relations": [
-            {"source": "alice", "target": "billing", "predicate": "OWNS",
-             "context": "Alice Carter owns the billing policy.", "temporal_details": "since 2021"},
-        ],
-    },
-    "deploy-runbook-doc": {
-        "entities": {
-            "team": {"name": "Platform Team",    "type": "TEAM",    "namespace": "teams"},
-            "svc":  {"name": "Payments Service", "type": "SERVICE", "namespace": "services"},
-        },
-        "relations": [
-            {"source": "team", "target": "svc", "predicate": "OPERATES",
-             "context": "The platform team operates the payments service."},
-        ],
-    },
-    "slack-incident-42": {
-        "entities": {
-            "team": {"name": "Platform Team",   "type": "TEAM",     "namespace": "teams"},
-            "inc":  {"name": "Payments Outage", "type": "INCIDENT", "namespace": "incidents"},
-        },
-        "relations": [
-            {"source": "team", "target": "inc", "predicate": "RESPONDED_TO",
-             "context": "The platform team was paged for the payments outage."},
-        ],
-    },
-}
-
-with open("/path/to/billing-policy.pdf", "rb") as f1, open("/path/to/deploy-runbook.pdf", "rb") as f2:
-    client.context.ingest(
-        type="knowledge",
-        database="acme_corp",
-        documents=[
-            ("billing-policy.pdf", f1, "application/pdf"),
-            ("deploy-runbook.pdf", f2, "application/pdf"),
-        ],
-        document_metadata=json.dumps([{"id": "billing-policy-doc"}, {"id": "deploy-runbook-doc"}]),
-        app_knowledge=json.dumps([
-            {"id": "slack-incident-42", "kind": "message", "provider": "slack",
-             "external_id": "slack-incident-42",
-             "fields": {"kind": "message", "body": "Platform team paged for the payments outage."}},
-        ]),
-        graph_payload=json.dumps(graphs),
-    )
-```
-
-```typescript TypeScript SDK
-const graphs = {
-  "billing-policy-doc": {
-    entities: {
-      alice:   { name: "Alice Carter",  type: "PERSON", namespace: "employees" },
-      billing: { name: "Billing Policy", type: "POLICY", namespace: "policies" },
-    },
-    relations: [
-      { source: "alice", target: "billing", predicate: "OWNS",
-        context: "Alice Carter owns the billing policy.", temporal_details: "since 2021" },
-    ],
-  },
-  "deploy-runbook-doc": {
-    entities: {
-      team: { name: "Platform Team",    type: "TEAM",    namespace: "teams" },
-      svc:  { name: "Payments Service", type: "SERVICE", namespace: "services" },
-    },
-    relations: [
-      { source: "team", target: "svc", predicate: "OPERATES",
-        context: "The platform team operates the payments service." },
-    ],
-  },
-  "slack-incident-42": {
-    entities: {
-      team: { name: "Platform Team",   type: "TEAM",     namespace: "teams" },
-      inc:  { name: "Payments Outage", type: "INCIDENT", namespace: "incidents" },
-    },
-    relations: [
-      { source: "team", target: "inc", predicate: "RESPONDED_TO",
-        context: "The platform team was paged for the payments outage." },
-    ],
-  },
-};
-
-await client.context.ingest({
-  type: "knowledge",
-  database: "acme_corp",
-  documents: [
-    { path: "/path/to/billing-policy.pdf", filename: "billing-policy.pdf", contentType: "application/pdf" },
-    { path: "/path/to/deploy-runbook.pdf", filename: "deploy-runbook.pdf", contentType: "application/pdf" },
-  ],
-  documentMetadata: JSON.stringify([{ id: "billing-policy-doc" }, { id: "deploy-runbook-doc" }]),
-  appKnowledge: JSON.stringify([
-    { id: "slack-incident-42", kind: "message", provider: "slack", external_id: "slack-incident-42",
-      fields: { kind: "message", body: "Platform team paged for the payments outage." } },
-  ]),
-  graphPayload: JSON.stringify(graphs),
-});
-```
-
-</CodeGroup>
-
-Poll [Ingestion Status](/api-reference/v2/endpoint/source-status) until the source is ready, then query with `graph_context: true`:
-
-```bash cURL
-curl -X POST 'https://api.hydradb.com/query' \
-  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
-  -H "API-Version: 2" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "database": "acme_corp",
-    "query": "Who owns the billing policy?",
-    "type": "knowledge",
-    "query_by": "hybrid",
-    "mode": "thinking",
-    "graph_context": true
-  }'
-```
-
-Your triplet comes back in `graph_context` and traverses just like an extracted one - the `origin: "byog"` tag on the relation marks it as yours:
-
-```json
-{
-  "graph_context": {
-    "query_paths": [
-      {
-        "triplets": [
-          {
-            "source": { "name": "alice carter", "type": "PERSON" },
-            "relation": { "canonical_predicate": "OWNS", "context": "Alice Carter owns the billing policy.", "origin": "byog" },
-            "target": { "name": "billing policy", "type": "POLICY" }
-          }
-        ]
-      }
-    ]
-  }
-}
-```
-
----
-
-## 7. Memories
-
-Memories accept a `graph_payload` too - send `type=memory`, give each memory an `id`, and key the graph by that `id`. The graph shape is identical; relations link to the memory's chunks and surface in `/query` with `type=memory` and `graph_context: true`.
-
-```bash cURL
-curl -X POST 'https://api.hydradb.com/context/ingest' \
-  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
-  -H "API-Version: 2" \
-  -F "type=memory" \
-  -F "database=acme_corp" \
-  -F 'memories=[{ "id": "mem-oncall-1", "text": "Dana Kim owns the incident playbook and leads the on-call rotation." }]' \
-  -F 'graph_payload={
-    "mem-oncall-1": {
-      "entities": {
-        "dana": { "name": "Dana Kim",         "type": "PERSON",   "namespace": "employees" },
-        "pb":   { "name": "Incident Playbook", "type": "DOCUMENT", "namespace": "runbooks" }
-      },
-      "relations": [
-        { "source": "dana", "target": "pb", "predicate": "OWNS",
-          "context": "Dana Kim owns the incident playbook.", "temporal_details": "since 2024" }
-      ]
-    }
-  }'
-```
-
-A memory must carry an explicit `id` to receive a graph (an id-less memory gets a server-generated id and can't be targeted). The `memories` form field stays plural even though `type` is the singular `memory`.
-
----
-
-## 8. Limitations
-
-- **Replace, not augment.** A BYOG source has no LLM-extracted facts - only the graph you supply (plus normal chunk search). Augment mode is a future enhancement.
-- **Permissive linking → possible false positives.** Every relation links to its best-matching chunk even if the match is weak; there is no reject floor yet. A linked relation is **sourced** (similar to a chunk), not necessarily **supported** (stated by the source).
-- **Bulk, one-shot.** You supply the whole graph with the source. Per-triple add/update/delete is not yet available.
-
----
-
-## Related
-
-- [Context Graphs](/essentials/v2/context-graphs) - the auto-extracted graph BYOG replaces; HydraDB builds it for you, BYOG lets you supply it
-- [Knowledge](/essentials/v2/knowledge) - documents, and forceful relations between sources
-- [Ingest Context](/api-reference/v2/endpoint/ingest-context) - the `graph_payload` form field reference
-- [Query](/essentials/v2/query) - how chunks and graph context are retrieved together
+See the [`graph_payload` field reference](/api-reference/v2/endpoint/ingest-context)
+for the full shape.
