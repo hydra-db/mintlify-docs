@@ -1,9 +1,9 @@
 ---
 title: "Attributes"
-description: "Declare filterable attributes in the database schema, attach attributes and custom attributes to context at ingest, and filter queries with the attributes operator language."
+description: "Declare filterable attributes in the database schema, attach attributes and custom attributes to context at ingest, and filter queries with attributes."
 ---
 
-Attributes are structured values you attach to each context you ingest. Use them when you already know a hard constraint before retrieval runs, such as `department=legal`, `region=us`, `status=published` or `priority >= 5`.
+Attributes are structured values you attach to each context you ingest. Use them when you already know a hard constraint before retrieval runs, such as `department=legal`, `region=us` or `status=published`.
 
 A context carries two kinds:
 
@@ -32,7 +32,7 @@ A query then filters on the declared fields:
   "query": "How do access control reviews work?",
   "attributes": {
     "department": "security",
-    "priority": { "$gte": 5 }
+    "priority": 7
   }
 }
 ```
@@ -44,7 +44,7 @@ A query then filters on the declared fields:
 | I want to... | Put it in... | Then... |
 | --- | --- | --- |
 | Scope most queries by a field like department, region, plan, customer or status | `attributes` | Declare the field in `database_metadata_schema` and filter with `"attributes": { "department": "legal" }`. |
-| Filter by a number or a date range | `attributes` | Store a number, or a date string in one fixed format such as `YYYY-MM-DD`, and filter with `$gt`, `$gte`, `$lt`, `$lte`. |
+| Filter by a number or a flag | `attributes` | Declare an integer or `BOOL` field and filter on one exact value, such as `{"priority": 7}`. |
 | Keep source details like author, a Slack timestamp, an external ID or a document version | `custom_attributes` | No schema needed. Stored with the context, not filterable with `attributes`. |
 | Combine a hard scope with semantic search | `attributes` | Send the filter plus your natural-language `query`. The filter narrows the candidates; ranking still uses the query. |
 | Search semantically over a text attribute | `attributes`, on a `VARCHAR` field with `enable_dense_embedding: true` | Put the concept in `query`. Do not put fuzzy concepts in the filter. |
@@ -132,7 +132,7 @@ await client.databases.create({
 | Field | Type / values | Purpose |
 | --- | --- | --- |
 | `name` | string | The attribute key: a letter, then letters, numbers or underscores, at most 255 characters. Reserved system names such as `source_id` are rejected. |
-| `data_type` | `VARCHAR`, `BOOL`, `INT8`, `INT16`, `INT32`, `INT64`, `FLOAT`, `DOUBLE`, `JSON`, or the aliases `string`, `boolean`, `integer`, `float`, `object` | Default `VARCHAR`. `array` is rejected with `400`; see [No containment on multi-valued fields](#no-containment-on-multi-valued-fields). |
+| `data_type` | `VARCHAR`, `BOOL`, `INT8`, `INT16`, `INT32`, `INT64`, `FLOAT`, `DOUBLE`, `JSON`, or the aliases `string`, `boolean`, `integer`, `float`, `object` | Default `VARCHAR`. `array` is rejected with `400`. |
 | `max_length` | integer | Maximum length of one `VARCHAR` value. Default `1024`, maximum `65535`; cannot be raised later. |
 | `enable_match` | boolean | Turns on keyword matching (a text analyzer) for the field. An `attributes` filter works on every declared field whether or not this is set. |
 | `enable_dense_embedding` | boolean | Adds dense semantic search over a `VARCHAR` field. |
@@ -171,7 +171,7 @@ The update is additive only:
 `GET /databases/{database}/metadata-schema` returns the current `fields` in the same shape `add_fields` accepts.
 
 <Warning>
-  Context ingested before a field existed has no value for it, so a comparison on the new field does not match it. Re-ingest that context with the value to include it.
+  Context ingested before a field existed has no value for it, so a filter on the new field does not match it. Re-ingest that context with the value to include it.
 </Warning>
 
 ---
@@ -299,7 +299,7 @@ Exceeding either cap fails the whole request with `400 INVALID_INPUT` before any
 
 ## 4. Filter a query with `attributes`
 
-`attributes` on [`POST /query`](/essentials/v2/query#2-request) is an operator object over the declared fields. Several fields in one object must all match.
+`attributes` on [`POST /query`](/essentials/v2/query#2-request) is a set of key-value pairs. Each key is a field declared in `database_metadata_schema`, each value must match that field's type, and a context matches only when every pair matches, with one value per key.
 
 <CodeGroup>
 ```bash cURL
@@ -313,8 +313,7 @@ curl -X POST 'https://api.hydradb.com/query' \
     "query": "How do access control reviews work?",
     "attributes": {
       "department": "security",
-      "region": { "$in": ["us", "eu"] },
-      "priority": { "$gte": 5 }
+      "priority": 7
     }
   }'
 ```
@@ -323,11 +322,7 @@ result = client.query(
     database="acme_corp",
     collection="company",
     query="How do access control reviews work?",
-    attributes={
-        "department": "security",
-        "region": {"$in": ["us", "eu"]},
-        "priority": {"$gte": 5},
-    },
+    attributes={"department": "security", "priority": 7},
 )
 ```
 ```typescript TypeScript SDK
@@ -335,125 +330,24 @@ const result = await client.query({
   database: "acme_corp",
   collection: "company",
   query: "How do access control reviews work?",
-  attributes: {
-    department: "security",
-    region: { $in: ["us", "eu"] },
-    priority: { $gte: 5 },
-  },
+  attributes: { department: "security", priority: 7 },
 });
 ```
 </CodeGroup>
 
-Query chunks do not carry attributes. The filter decides which context can appear; see [Query](/essentials/v2/query) for what the response contains.
-
-### Operators
-
-| Operator | Operand | Matches context whose value... |
-| --- | --- | --- |
-| a bare value | a value of the field's type | equals it. `{"department": "legal"}` is the same as `{"department": {"$eq": "legal"}}`. |
-| `$eq` | a value of the field's type | equals it. |
-| `$ne` | a value of the field's type | is present and differs from it. |
-| `$gt`, `$gte`, `$lt`, `$lte` | a value of the field's type | is greater than, at least, less than, or at most the operand. Numbers compare numerically; `VARCHAR` values compare as strings, character by character. |
-| `$in` | a non-empty array, at most 500 values | equals any one of the listed values. |
-| `$nin` | a non-empty array, at most 500 values | is present and equals none of the listed values. |
-| `$exists` | `true` or `false` | has a value (`true`), or has none (`false`). |
-| `$and` | a non-empty array of filter objects | matches every one of them. |
-| `$or` | a non-empty array of filter objects | matches at least one of them. |
-| `$not` | one filter object | does not match it, and has a value for every field it names. |
-
-Operators combine and nest:
-
-```json
-{
-  "attributes": {
-    "$or": [
-      { "department": "legal" },
-      {
-        "$and": [
-          { "department": "security" },
-          { "priority": { "$gte": 8 } }
-        ]
-      }
-    ],
-    "$not": { "region": "cn" },
-    "priority": { "$gte": 3, "$lte": 9 }
-  }
-}
-```
-
-### How the filter behaves
-
-| Behavior | Contract |
-| --- | --- |
-| Several fields in one object | AND. Every clause must match. |
-| Several operators on one field | AND. `{"priority": {"$gte": 3, "$lte": 7}}` is a range. |
-| Equality | Exact, against the **whole** stored value. Strings are case-sensitive. |
-| Value types | Each operand must match the field's declared type. `{"priority": "7"}` on an `INT64` field is a `400`, not an empty result. |
-| `JSON` fields | Only `$exists` applies. Any other operator on a `JSON` field is a `400`. |
-| Missing values | A context with no value for a field never matches a comparison on it, including `$ne`, `$nin` and `$not`. Add `{"$exists": false}` in an `$or` to keep it. |
-| Field names | Must be declared in `database_metadata_schema`; an undeclared or reserved field is a `400`. Without any schema, every field compares as a string. |
-| Custom attributes | Cannot be filtered with `attributes`. Naming the custom attributes namespace inside `attributes` is a `400`. |
-| Empty pieces | An empty object, an empty operator object, or an empty `$and`, `$or`, `$in` or `$nin` array is a `400`, not a filter that matches everything. |
-| Unknown operators | A `400`. There is no `$contains`, `$regex` or fuzzy operator. |
-| Nesting | At most 10 levels deep through `$and`, `$or` and `$not`. |
-| Graph and forceful relations | The filter applies to chunks, forceful relations and graph paths alike. A graph path that touches a context the filter excludes is removed. |
-| No matches | A valid filter that matches nothing returns an empty result. HydraDB never drops or widens the filter to find something. |
-| Size | At most 500 values in each `$in` or `$nin` list, and 64 KiB for the whole object. See [Filter size limits](#filter-size-limits). |
+The filter applies to chunks, forceful relations and graph paths alike. A filter that matches nothing returns an empty result; HydraDB never drops or widens it.
 
 <Warning>
   `attributes` are hard constraints, not semantic hints. `{"mood": "happy"}` requires that exact stored value; it does not expand to "joyful" or "cheerful". To search attribute text semantically, declare a `VARCHAR` field with `enable_dense_embedding` and put the concept in the main `query`.
 </Warning>
 
-### No containment on multi-valued fields
-
-`attributes` compares a context's single stored value. There is no containment operator, so a multi-valued field cannot be matched by "does this context's list include X":
-
-- A declared field cannot be an array: `data_type: "array"` is rejected with `400`.
-- A list sent as the value of a `VARCHAR` attribute is rejected at ingest.
-- A `JSON` attribute cannot be compared at all (only `$exists` applies).
-- A string that joins several values, such as `"alpha,beta"`, is one value: `$eq` and `$in` match it only as the whole string.
-
-`$in` runs the other way round: it asks whether the context's one value is among the values you list.
-
-If you need to select context by one member of a set:
-
-- Give each member you filter on its own `BOOL` attribute, such as `"tag_billing": true`, and filter with `{"tag_billing": true}`. This counts against the 32-field limit, so it suits a small, known set.
-- If the set is really "who may see this context", use `acl` instead. See [Access control](/essentials/v2/access-control).
-
-### Filter size limits
-
-The [size limits](#size-limits) above bound the values you **store**. `attributes` on `/query` has its own, separate pair, which bound what you **send** at query time:
-
-| Limit | Cap |
-| --- | --- |
-| Values in one `$in` or `$nin` list | **500** |
-| The whole `attributes` object | **64 KiB** (65,536 bytes) |
-
-The object total is measured on its compact JSON encoding in UTF-8 bytes, with field names, operator names and punctuation all counted. The per-list cap catches one runaway list; the object cap catches many individually legal lists adding up.
-
-Over either limit returns `400` before the query runs:
-
-```
-$in for "customer_id" must contain at most 500 values (got 743)
-
-attributes is too large (130251 bytes when serialized; the maximum is 65536). Reduce the number or size of filter values.
-```
-
-<Tip>
-  Needing far more than 500 values in one filter usually means the constraint belongs in the data rather than the query. Add an attribute that groups those values (a segment, tier or cohort key) and filter on that instead.
-</Tip>
-
 ### Errors
 
-Every malformed filter is a `400` with code `VALIDATION_ERROR` and a message naming the problem, for example:
-
-```
-unknown attribute "regoin"
-value for "priority" does not match its type INT64
-$in for "region" expects an array
-unsupported operator "$contains" for attribute "tags"
-attributes filter nests deeper than 10 levels
-```
+| You send | Result |
+| --- | --- |
+| A key not declared in `database_metadata_schema` | `400`, such as `unknown attribute "regoin"`. |
+| A value that does not match the field's type, such as `"7"` for an `INT64` field | `400`, such as `value for "priority" does not match its type INT64`. |
+| A `custom_attributes` key, nested under `additional_metadata` | `400` telling you to use `metadata_filters`, the deprecated filter that still covers `custom_attributes`. |
 
 ---
 
@@ -504,9 +398,7 @@ To page through context rather than run retrieval, use [`POST /context/list`](/a
 | Ingest returns `400` naming an undeclared field | An `attributes` key is not in the schema | Declare the field, or move it to `custom_attributes` if you never filter on it. |
 | A filter on a custom attribute is rejected | `attributes` cannot filter on `custom_attributes` | Declare the field, send it in `attributes`, and re-ingest. |
 | `400 value for "priority" does not match its type` | The operand's JSON type differs from the declared type, such as `"7"` for an `INT64` field | Send the declared type: `{"priority": 7}`. |
-| `$in` does not find a context whose field holds several values | There is no containment | See [No containment on multi-valued fields](#no-containment-on-multi-valued-fields). |
-| `$ne` or `$not` drops context that has no value for the field | Missing values never match a comparison | Add `{"field": {"$exists": false}}` under `$or`. |
-| Query returns 0 results after adding a filter | Over-scoping: the combined constraints exclude everything, or the context predates the field | Start with one constraint, add the others one at a time, and check with `$exists`. |
+| Query returns 0 results after adding a filter | The pairs together exclude everything, or the context predates the field | Start with one pair and add the others one at a time. Re-ingest context that predates the field. |
 | A value edited with `PATCH /context/{id}/metadata` still filters as the old value | The filter runs against the values indexed at ingest | Re-ingest the context with `upsert: true` and the same `context_id`. |
 | A schema field cannot be changed | Declared fields are immutable | Add a new field, or create a new database with the corrected schema and re-ingest. |
 | Adding a field with `enable_dense_embedding` or `enable_sparse_embedding` returns `400` | Embedding flags can only be set at database creation | Create a new database with the final schema and re-ingest. |
@@ -524,7 +416,7 @@ To page through context rather than run retrieval, use [`POST /context/list`](/a
 
 **Multi-language corpora.** Declare a `language` field and route each query to the right language by passing `"attributes": { "language": "<detected language>" }`.
 
-**Date windows.** Declare a `published_on` field as `VARCHAR`, store every date in one fixed format such as `YYYY-MM-DD` so string order is date order, and filter with `{"published_on": {"$gte": "2026-01-01", "$lt": "2026-07-01"}}`.
+**Tags.** A field holds one value per context, so to select context by one member of a small, known set, give each member its own `BOOL` field, such as `"tag_billing": true`, and filter with `{"tag_billing": true}`. Each counts against the 32-field limit. If the set is really "who may see this context", use [`acl`](/essentials/v2/access-control) instead.
 
 **Schema as a contract.** Treat `database_metadata_schema` as part of your data contract and review it like a database migration. Getting it wrong costs a re-ingest, because declared fields are immutable; getting it right costs one extra review.
 
