@@ -8,7 +8,7 @@ import { Field } from "/snippets/field.jsx";
 
 Since ingestion is asynchronous, use this endpoint to determine when context is ready to be retrieved.
 
-Pass one or more IDs in `ids` to retrieve status. Works for every context item, whether you ingested it or a connector synced it. When passing multiple IDs on the query string, use either repeated params (`?ids=policy_main&ids=runbook_deploy`) or a single comma-joined value (`?ids=policy_main,runbook_deploy`); both forms are equivalent and can be mixed. Surrounding whitespace is trimmed and empty entries are dropped. For more information, see the [Ingest](/essentials/v2/ingest) guide.
+Pass one or more IDs in `ids` to retrieve status. Works for every context, whether you ingested it or a connector synced it. For more information, see the [Ingest](/essentials/v2/ingest) guide.
 
 <Info>
   **Prefer webhooks over polling?** Register a webhook for `indexing.status_changed` events and HydraDB will `POST` to your endpoint when content reaches a terminal state (`completed` or `errored`). See [Webhooks](/essentials/v2/webhooks) for setup and receiver examples.
@@ -47,9 +47,9 @@ curl -G 'https://api.hydradb.com/context/status' \
 
 | Name | Description |
 | --- | --- |
-| <Field name="ids" type="string[]" required /> | One or more `id` values returned at ingestion. Accepts the ID of any context item, including connector items. Pass either repeated params (`ids=a&ids=b`) or a single comma-joined value (`ids=a,b`). Source IDs never contain commas (they are rejected at ingest), so the comma-joined form always splits unambiguously. |
-| <Field name="database" type="string" required /> | Database the items belong to. Formerly `tenant_id`; the `tenant_id` alias is still accepted (deprecated). |
-| <Field name="collection" type="string or null" /> | Collection scope. If omitted, the default collection is used. Formerly `sub_tenant_id`; the `sub_tenant_id` alias is still accepted (deprecated). (default=`null`) |
+| <Field name="ids" type="string[]" required /> | Context ids, including connector-synced ones. Repeat the param (`ids=a&ids=b`) or comma-join (`ids=a,b`). |
+| <Field name="database" type="string" required /> | Database the context belongs to. Formerly `tenant_id`; the `tenant_id` alias is still accepted (deprecated). |
+| <Field name="collection" type="string or null" /> | Collection scope; the default collection when omitted. Alias `sub_tenant_id` (deprecated). (default=`null`) |
 
 <ResponseExample>
 
@@ -62,6 +62,7 @@ curl -G 'https://api.hydradb.com/context/status' \
         "id": "policy_main",
         "indexing_status": "completed",
         "error_code": "",
+        "error_message": "",
         "success": true,
         "message": "Processing status retrieved successfully"
       },
@@ -69,6 +70,7 @@ curl -G 'https://api.hydradb.com/context/status' \
         "id": "runbook_deploy",
         "indexing_status": "graph_creation",
         "error_code": "",
+        "error_message": "",
         "success": true,
         "message": "Processing status retrieved successfully"
       },
@@ -76,9 +78,9 @@ curl -G 'https://api.hydradb.com/context/status' \
         "id": "typo_in_id",
         "indexing_status": "errored",
         "error_code": "FILE_NOT_FOUND",
-        "error_message": "ID not found",
+        "error_message": "",
         "success": false,
-        "message": "Processing status retrieved successfully"
+        "message": "ID not found"
       }
     ]
   },
@@ -96,7 +98,7 @@ curl -G 'https://api.hydradb.com/context/status' \
   "data": null,
   "error": {
     "code": "DATABASE_NOT_FOUND",
-    "message": "Database not found"
+    "message": "Database 'acme_corp' not found. Use GET /databases to list active databases."
   },
   "meta": {
     "request_id": "9d13aef4-02f4-4e73-8c62-4c2601d04f9d",
@@ -107,31 +109,30 @@ curl -G 'https://api.hydradb.com/context/status' \
 
 </ResponseExample>
 
-## Status item fields
+## Status result fields
 
 Each entry in `data.statuses` describes one requested `id`:
 
 | Field | Type | Description |
 | --- | --- | --- |
-| `id` | string | The context item ID you asked about (echoed back). |
+| `id` | string | The context ID you asked about (echoed back). |
 | `indexing_status` | string | One of the [status values](#status-values) below. `errored` is terminal. |
 | `error_code` | string | Machine-readable reason an entry is `errored`; **empty string (`""`) when the entry is not errored.** See [`error_code` values](#error-code-values). |
-| `error_message` | string | Human-readable explanation that accompanies a non-empty `error_code`; empty otherwise. |
-| `success` | boolean | `false` when `indexing_status` is `errored`, otherwise `true`. Describes the item, **not** the HTTP request - a `200` response can contain `errored` items. |
-| `message` | string | Status of the *lookup* itself ("Processing status retrieved successfully"). It does **not** describe the ingestion outcome - read `indexing_status` / `error_code` for that. |
+| `error_message` | string | Human-readable explanation of an ingestion-pipeline `error_code`. Empty otherwise, including for `FILE_NOT_FOUND`. |
+| `success` | boolean | `false` when `indexing_status` is `errored`, otherwise `true`. Describes the context, **not** the HTTP request: a `200` response can contain `errored` entries. |
+| `message` | string | Result of the lookup, such as "ID not found". For the ingestion outcome, read `indexing_status` and `error_code`. |
 
 ### Error code values
 
-`error_code` is the field that lets you tell a **caller mistake** apart from a **real ingestion failure** - a distinction you cannot make from `indexing_status: "errored"` alone. It is empty on any non-errored entry.
+`error_code` tells a **caller mistake** apart from a **real ingestion failure**, which `indexing_status: "errored"` alone cannot. It is empty on any non-errored entry.
 
 | `error_code` | Meaning | What to do |
 | --- | --- | --- |
-| `FILE_NOT_FOUND` | No source with this `id` exists in the given `database`/`collection` - usually a typo or an `id` that was never ingested (or whose status has expired). | Fix the `id`, or (re-)ingest the source. Not a processing failure - retrying the status call will not change it. |
-| `INVALID_FILE_ID` | The `id` was empty or blank. | Send a non-empty `id`. |
-| *ingestion-pipeline codes* | A genuine processing failure (e.g. `PARSE_FAILED`, `UNSUPPORTED_FORMAT`, `PROCESSING_FAILED`, `EMBEDDING_FAILED`, …). | Act on the specific code - see the [Error Responses reference](/api-reference/v2/error-responses#common-error-codes). Many are re-ingest-and-retry; some are terminal (unsupported format, empty content). |
+| `FILE_NOT_FOUND` | No context with this `id` exists in the given `database` and `collection`: usually a typo, an `id` that was never ingested, or a context that was deleted. | Fix the `id`, or ingest the context. Not a processing failure: retrying the status call will not change it. |
+| *ingestion-pipeline codes* | A processing failure as an `E####` code, such as `E1001` parse failed. | Act on the code; see [Ingestion error codes](/api-reference/v2/error-responses#ingestion-error-codes). |
 
 <Info>
-  Branch on `error_code`, not on the text in `message` or `error_message`. `message` describes the lookup, not the ingestion result, and human-readable text may change. The full list of codes an `errored` entry can carry is in the [Error Responses reference](/api-reference/v2/error-responses#common-error-codes).
+  Branch on `error_code`, not on the text in `message` or `error_message`. `message` describes the lookup, not the ingestion result, and human-readable text may change. The codes an `errored` entry can carry are listed under [Ingestion error codes](/api-reference/v2/error-responses#ingestion-error-codes).
 </Info>
 
 ## Status values
@@ -245,17 +246,17 @@ while True:
 
 Typical processing time:
 
-- **Short text and conversation items:** seconds
-- **Long text items** (the extracted text of a document under 50 pages): 1 to 5 minutes
-- **Very long text items** (50\+ pages of extracted text): 5 to 15 minutes
+- **Short text and conversations:** seconds
+- **Long text** (the extracted text of a document under 50 pages): 1 to 5 minutes
+- **Very long text** (50\+ pages of extracted text): 5 to 15 minutes
 
 ## Behavior notes
 
 <Info>
-  **`graph_creation` is searchable.** Items in this state are already retrievable via `/query`. Wait for `completed` only when you specifically need full graph traversal (graph paths in `graph[]`, which the `graph_context` request flag turns on).
+  **`graph_creation` is searchable.** Context in this state are already retrievable via `/query`. Wait for `completed` only when you specifically need full graph traversal (graph paths in `graph[]`, which the `graph_context` request flag turns on).
 </Info>
 
-- **Unknown IDs return as `errored`:** If you pass an ID that does not exist (e.g., a typo), HydraDB returns an entry with `indexing_status: "errored"` and `error_code: "FILE_NOT_FOUND"` rather than silently dropping it. Use `error_code` to distinguish this from a genuine ingestion failure - see [`error_code` values](#error-code-values).
+- **Unknown IDs return as `errored`:** If you pass an ID that does not exist (e.g., a typo), HydraDB returns an entry with `indexing_status: "errored"` and `error_code: "FILE_NOT_FOUND"` rather than silently dropping it. Use `error_code` to distinguish this from a genuine ingestion failure; see [`error_code` values](#error-code-values).
 
 ## Errors
 
@@ -266,9 +267,9 @@ Common codes: `400 INVALID_INPUT`, `404 DATABASE_NOT_FOUND`, `422 VALIDATION_ERR
 <Tip>
   **Related Resources**
 
-  - **Before this:** [Ingest Context](/api-reference/v2/endpoint/ingest-context) - to get the IDs
+  - **Before this:** [Ingest Context](/api-reference/v2/endpoint/ingest-context): to get the IDs
   - **After completion:** [Query](/api-reference/v2/endpoint/query)
-  - **After completion:** [Fetch Content](/api-reference/v2/endpoint/fetch-content)
+  - **After completion:** [Inspect Context](/api-reference/v2/endpoint/fetch-content)
   - **After completion:** [Context Relations](/api-reference/v2/endpoint/source-relations)
-  - **Read more:** [Usage → Ingest](/essentials/v2/ingest)
+  - **Read more:** [Ingest](/essentials/v2/ingest)
 </Tip>

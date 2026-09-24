@@ -1,16 +1,16 @@
 ---
 title: "Attributes"
-description: "Declare filterable attributes in the database schema, attach attributes and custom attributes to items at ingest, and filter queries with the attributes operator language."
+description: "Declare filterable attributes in the database schema, attach attributes and custom attributes to context at ingest, and filter queries with attributes."
 ---
 
-Attributes are structured values you attach to each item you ingest. Use them when you already know a hard constraint before retrieval runs, such as `department=legal`, `region=us`, `status=published` or `priority >= 5`.
+Attributes are structured values you attach to each context you ingest. Use them when you already know a hard constraint before retrieval runs, such as `department=legal`, `region=us` or `status=published`.
 
-An item carries two kinds:
+A context carries two kinds:
 
-| Kind | Sent on an item as | Declared in the schema | Filterable at query time | Stored cap per item |
+| Kind | Sent on a context as | Declared in the schema | Filterable at query time | Stored cap per context |
 | --- | --- | --- | --- | --- |
 | Attributes | `attributes` | Yes, in `database_metadata_schema` | Yes, with `attributes` on `POST /query` | 16 KiB |
-| Custom attributes | `custom_attributes` | No | Never | 1 KiB |
+| Custom attributes | `custom_attributes` | No | No, `attributes` cannot filter them | 1 KiB |
 
 If a field scopes your queries, declare it in the [database schema](/api-reference/v2/endpoint/create-tenant) and send it in `attributes`. If it is there for display, citations, debugging or an external ID, send it in `custom_attributes`.
 
@@ -32,7 +32,7 @@ A query then filters on the declared fields:
   "query": "How do access control reviews work?",
   "attributes": {
     "department": "security",
-    "priority": { "$gte": 5 }
+    "priority": 7
   }
 }
 ```
@@ -44,13 +44,13 @@ A query then filters on the declared fields:
 | I want to... | Put it in... | Then... |
 | --- | --- | --- |
 | Scope most queries by a field like department, region, plan, customer or status | `attributes` | Declare the field in `database_metadata_schema` and filter with `"attributes": { "department": "legal" }`. |
-| Filter by a number or a date range | `attributes` | Store a number, or a date string in one fixed format such as `YYYY-MM-DD`, and filter with `$gt`, `$gte`, `$lt`, `$lte`. |
-| Keep source details like author, a Slack timestamp, an external ID or a document version | `custom_attributes` | No schema needed. Stored with the item, never filterable. |
+| Filter by a number or a flag | `attributes` | Declare an integer or `BOOL` field and filter on one exact value, such as `{"priority": 7}`. |
+| Keep source details like author, a Slack timestamp, an external ID or a document version | `custom_attributes` | No schema needed. Stored with the context, not filterable with `attributes`. |
 | Combine a hard scope with semantic search | `attributes` | Send the filter plus your natural-language `query`. The filter narrows the candidates; ranking still uses the query. |
 | Search semantically over a text attribute | `attributes`, on a `VARCHAR` field with `enable_dense_embedding: true` | Put the concept in `query`. Do not put fuzzy concepts in the filter. |
 | Search by keyword over a text attribute | `attributes`, on a `VARCHAR` field with `enable_sparse_embedding: true` | Normal `/query` keyword (BM25) matching covers it. |
 | Partition by user, workspace or team | `collection` | Send `collection` on every request, and filter with `attributes` inside that partition, not as a replacement for it. |
-| Restrict who may retrieve an item | `acl` | An attribute filter is not a permission. See [Access control](/essentials/v2/access-control). |
+| Restrict who may retrieve a context | `acl` | An attribute filter is not a permission. See [Access control](/essentials/v2/access-control). |
 
 The `database` field was formerly `tenant_id` and `collection` was formerly `sub_tenant_id`; the old names still work as deprecated aliases. See [when to use `database` and `collection`](/essentials/v2/databases-and-collections#2-when-to-use-each).
 
@@ -58,7 +58,7 @@ The `database` field was formerly `tenant_id` and `collection` was formerly `sub
 
 ## 2. Declare the schema
 
-The schema lives on the database; values land on each item at ingest. Declare the schema when you create the database, before any ingest.
+The schema lives on the database; values land on each context at ingest. Declare the schema when you create the database, before any ingest.
 
 <CodeGroup>
 ```bash cURL
@@ -131,9 +131,9 @@ await client.databases.create({
 
 | Field | Type / values | Purpose |
 | --- | --- | --- |
-| `name` | string | The attribute key. Must start with a letter and contain only letters, numbers and underscores, at most 255 characters. Reserved system names such as `chunk_id`, `source_id`, `source_title` and `description` are rejected; the error lists every reserved name. |
-| `data_type` | `VARCHAR`, `BOOL`, `INT8`, `INT16`, `INT32`, `INT64`, `FLOAT`, `DOUBLE`, `JSON`, or the friendly aliases `string`, `boolean`, `integer`, `float`, `object` | Defaults to `VARCHAR`. `array` is **not** supported and is rejected with `400`; see [No containment on multi-valued fields](#no-containment-on-multi-valued-fields). |
-| `max_length` | integer | Maximum length of a `VARCHAR` value. Default `1024`, maximum `65535`. It sizes one field and cannot be raised later, so declare it large enough up front. It is **not** the per-item budget for all attributes; for that see [Size limits](#size-limits). |
+| `name` | string | The attribute key: a letter, then letters, numbers or underscores, at most 255 characters. Reserved system names such as `source_id` are rejected. |
+| `data_type` | `VARCHAR`, `BOOL`, `INT8`, `INT16`, `INT32`, `INT64`, `FLOAT`, `DOUBLE`, `JSON`, or the aliases `string`, `boolean`, `integer`, `float`, `object` | Default `VARCHAR`. `array` is rejected with `400`. |
+| `max_length` | integer | Maximum length of one `VARCHAR` value. Default `1024`, maximum `65535`; cannot be raised later. |
 | `enable_match` | boolean | Turns on keyword matching (a text analyzer) for the field. An `attributes` filter works on every declared field whether or not this is set. |
 | `enable_dense_embedding` | boolean | Adds dense semantic search over a `VARCHAR` field. |
 | `enable_sparse_embedding` | boolean | Adds sparse (BM25) keyword search over a `VARCHAR` field. |
@@ -171,14 +171,14 @@ The update is additive only:
 `GET /databases/{database}/metadata-schema` returns the current `fields` in the same shape `add_fields` accepts.
 
 <Warning>
-  Items ingested before a field existed have no value for it, so a comparison on the new field does not match them. Re-ingest those items with the value to include them.
+  Context ingested before a field existed has no value for it, so a filter on the new field does not match it. Re-ingest that context with the value to include it.
 </Warning>
 
 ---
 
 ## 3. Attach attributes at ingest
 
-Send `attributes` and `custom_attributes` on each item in `context` on [`POST /context/ingest`](/essentials/v2/ingest). The SDKs send the same item array, as a JSON string, in the `items` form field; keys inside each item stay snake_case in every language.
+Send `attributes` and `custom_attributes` on each entry in `context` on [`POST /context/ingest`](/essentials/v2/ingest). The SDKs send the same array, as a JSON string, in the `context` form field; keys inside each context stay snake_case in every language.
 
 <CodeGroup>
 ```bash cURL
@@ -214,7 +214,7 @@ import json
 client.context.ingest(
     database="acme_corp",
     collection="company",
-    items=json.dumps([
+    context=json.dumps([
         {
             "context_id": "auth-controls-001",
             "title": "Authentication controls",
@@ -234,7 +234,7 @@ client.context.ingest(
 await client.context.ingest({
   database: "acme_corp",
   collection: "company",
-  items: JSON.stringify([
+  context: JSON.stringify([
     {
       context_id: "auth-controls-001",
       title: "Authentication controls",
@@ -257,13 +257,13 @@ Rules checked before anything is queued:
 - When the database has a schema, every `attributes` key must be declared in it, and every value must match the declared type: a string for `VARCHAR`, `true` or `false` for `BOOL`, a whole number for the integer types, a number for `FLOAT` and `DOUBLE`, an object for `JSON`. `null` is accepted for any declared field. An undeclared key or a wrong type rejects the request with `400`.
 - `custom_attributes` take any keys, with no schema.
 - In both maps, keys must not start with `_`, must not be a reserved system name, and must not contain control characters. A value may be a scalar, a list or an object, but not a list or object nested inside another.
-- Errors name the item they refer to, such as `context[0]: ...`.
+- Structural and size errors name the context they refer to, such as `context[0]: ...`.
 
-**Attributes are set at ingest.** The `attributes` query filter runs against the values indexed with the item. To change them, re-ingest the item with `upsert: true` and the same `context_id`, which replaces the item. See [IDs and replacement](/essentials/v2/ingest#12-ids-and-replacement).
+**Attributes are set at ingest.** The `attributes` query filter runs against the values indexed with the context. To change them, re-ingest the context with `upsert: true` and the same `context_id`, which replaces the context. See [IDs and replacement](/essentials/v2/ingest#12-ids-and-replacement).
 
 ### Size limits
 
-Every item is checked against two caps:
+Every context is checked against two caps:
 
 | Map | Cap |
 | --- | --- |
@@ -276,13 +276,13 @@ The cap applies to the **whole map**, not to any one value, and it is measured o
 
 - **Keys and punctuation count.** Quotes, colons, commas and braces are all part of the payload that is measured.
 - **Bytes, not characters.** Accented Latin characters cost 2 bytes, most CJK characters 3, and emoji 4.
-- **Budget in bytes from the start.** A 950-character summary sounds comfortably under a 1 KiB cap, but with two small sibling keys it serializes to 1,014 bytes: 64 bytes of that is structure alone. Push the summary to 1,000 characters and the request is rejected at 1,064 bytes.
+- **Budget in bytes from the start.** A 950-character summary sounds comfortably under a 1 KiB cap, but with two small sibling keys it serializes to 1,014 bytes: 64 bytes of that is everything except the summary. Push the summary to 1,000 characters and the request is rejected at 1,064 bytes.
 
 ```json custom_attributes: 1,014 bytes, just inside the 1 KiB cap
 {"deck":"Q3 Board Deck","author":"ada@example.com","summary":"<950 characters>"}
 ```
 
-Exceeding either cap fails the whole request with `400 INVALID_INPUT` before anything is ingested. The message names the item and the map, and reports both numbers, so you can see exactly how far over you are:
+Exceeding either cap fails the whole request with `400 INVALID_INPUT` before anything is ingested. The message names the context and the map, and reports both numbers, so you can see exactly how far over you are:
 
 ```json
 {
@@ -292,14 +292,14 @@ Exceeding either cap fails the whole request with `400 INVALID_INPUT` before any
 ```
 
 <Tip>
-  If an item needs more than 1 KiB of descriptive detail, put the long text in the item's `text`, where it gets chunked and embedded, and keep `custom_attributes` for short values.
+  If a context needs more than 1 KiB of descriptive detail, put the long text in the context's `text`, where it gets chunked and embedded, and keep `custom_attributes` for short values.
 </Tip>
 
 ---
 
 ## 4. Filter a query with `attributes`
 
-`attributes` on [`POST /query`](/essentials/v2/query#2-request) is an operator object over the declared fields. Several fields in one object must all match.
+`attributes` on [`POST /query`](/essentials/v2/query#2-request) is a set of key-value pairs. Each key is a field declared in `database_metadata_schema`, each value must match that field's type, and a context matches only when every pair matches, with one value per key.
 
 <CodeGroup>
 ```bash cURL
@@ -313,8 +313,7 @@ curl -X POST 'https://api.hydradb.com/query' \
     "query": "How do access control reviews work?",
     "attributes": {
       "department": "security",
-      "region": { "$in": ["us", "eu"] },
-      "priority": { "$gte": 5 }
+      "priority": 7
     }
   }'
 ```
@@ -323,11 +322,7 @@ result = client.query(
     database="acme_corp",
     collection="company",
     query="How do access control reviews work?",
-    attributes={
-        "department": "security",
-        "region": {"$in": ["us", "eu"]},
-        "priority": {"$gte": 5},
-    },
+    attributes={"department": "security", "priority": 7},
 )
 ```
 ```typescript TypeScript SDK
@@ -335,131 +330,30 @@ const result = await client.query({
   database: "acme_corp",
   collection: "company",
   query: "How do access control reviews work?",
-  attributes: {
-    department: "security",
-    region: { $in: ["us", "eu"] },
-    priority: { $gte: 5 },
-  },
+  attributes: { department: "security", priority: 7 },
 });
 ```
 </CodeGroup>
 
-Query chunks do not carry attributes. The filter decides which items can appear; see [Query](/essentials/v2/query) for what the response contains.
-
-### Operators
-
-| Operator | Operand | Matches items whose value... |
-| --- | --- | --- |
-| a bare value | a value of the field's type | equals it. `{"department": "legal"}` is the same as `{"department": {"$eq": "legal"}}`. |
-| `$eq` | a value of the field's type | equals it. |
-| `$ne` | a value of the field's type | is present and differs from it. |
-| `$gt`, `$gte`, `$lt`, `$lte` | a value of the field's type | is greater than, at least, less than, or at most the operand. Numbers compare numerically; `VARCHAR` values compare as strings, character by character. |
-| `$in` | a non-empty array, at most 500 values | equals any one of the listed values. |
-| `$nin` | a non-empty array, at most 500 values | is present and equals none of the listed values. |
-| `$exists` | `true` or `false` | has a value (`true`), or has none (`false`). |
-| `$and` | a non-empty array of filter objects | matches every one of them. |
-| `$or` | a non-empty array of filter objects | matches at least one of them. |
-| `$not` | one filter object | does not match it, and has a value for every field it names. |
-
-Operators combine and nest:
-
-```json
-{
-  "attributes": {
-    "$or": [
-      { "department": "legal" },
-      {
-        "$and": [
-          { "department": "security" },
-          { "priority": { "$gte": 8 } }
-        ]
-      }
-    ],
-    "$not": { "region": "cn" },
-    "priority": { "$gte": 3, "$lte": 9 }
-  }
-}
-```
-
-### How the filter behaves
-
-| Behavior | Contract |
-| --- | --- |
-| Several fields in one object | AND. Every clause must match. |
-| Several operators on one field | AND. `{"priority": {"$gte": 3, "$lte": 7}}` is a range. |
-| Equality | Exact, against the **whole** stored value. Strings are case-sensitive. |
-| Value types | Every operand must match the field's declared type: a string for `VARCHAR`, `true` or `false` for `BOOL`, a whole number for the integer types, a number for `FLOAT` and `DOUBLE`. `{"priority": "7"}` on an `INT64` field is a `400`, not an empty result. |
-| `JSON` fields | Only `$exists` applies. Any other operator on a `JSON` field is a `400`. |
-| Missing values | An item with no value for a field never matches a comparison on that field. `$ne`, `$nin` and `$not` exclude it too. To keep such items, say so: `{"$or": [{"region": {"$ne": "eu"}}, {"region": {"$exists": false}}]}`. |
-| Field names | Must be declared in `database_metadata_schema`. An undeclared field is a `400` (`unknown attribute`), never silently ignored. A reserved system column is a `400`. On a database created without any schema, every field is compared as a string. |
-| Custom attributes | Cannot be filtered. Naming the custom attributes namespace inside `attributes` is a `400`. |
-| Empty pieces | An empty object, an empty operator object, or an empty `$and`, `$or`, `$in` or `$nin` array is a `400`, not a filter that matches everything. |
-| Unknown operators | A `400`. There is no `$contains`, `$regex` or fuzzy operator. |
-| Nesting | At most 10 levels deep through `$and`, `$or` and `$not`. |
-| Graph and forceful relations | The filter applies to chunks, forceful relations and graph paths alike. A graph path that touches an item the filter excludes is removed. |
-| No matches | A valid filter that matches nothing returns an empty result. HydraDB never drops or widens the filter to find something. |
-| Size | At most 500 values in each `$in` or `$nin` list, and 64 KiB for the whole object. See [Filter size limits](#filter-size-limits). |
+The filter applies to chunks, forceful relations and graph paths alike. A filter that matches nothing returns an empty result; HydraDB never drops or widens it.
 
 <Warning>
   `attributes` are hard constraints, not semantic hints. `{"mood": "happy"}` requires that exact stored value; it does not expand to "joyful" or "cheerful". To search attribute text semantically, declare a `VARCHAR` field with `enable_dense_embedding` and put the concept in the main `query`.
 </Warning>
 
-### No containment on multi-valued fields
-
-`attributes` compares an item's single stored value. There is no containment operator, so a multi-valued field cannot be matched by "does this item's list include X":
-
-- A declared field cannot be an array: `data_type: "array"` is rejected with `400`.
-- A list sent as the value of a `VARCHAR` attribute is rejected at ingest.
-- A `JSON` attribute cannot be compared at all (only `$exists` applies).
-- A string that joins several values, such as `"alpha,beta"`, is one value: `$eq` and `$in` match it only as the whole string.
-
-`$in` runs the other way round: it asks whether the item's one value is among the values you list.
-
-If you need to select items by one member of a set:
-
-- Give each member you filter on its own `BOOL` attribute, such as `"tag_billing": true`, and filter with `{"tag_billing": true}`. This counts against the 32-field limit, so it suits a small, known set.
-- If the set is really "who may see this item", use `acl` instead. See [Access control](/essentials/v2/access-control).
-
-### Filter size limits
-
-The [size limits](#size-limits) above bound the values you **store**. `attributes` on `/query` has its own, separate pair, which bound what you **send** at query time:
-
-| Limit | Cap |
-| --- | --- |
-| Values in one `$in` or `$nin` list | **500** |
-| The whole `attributes` object | **64 KiB** (65,536 bytes) |
-
-The object total is measured on its compact JSON encoding in UTF-8 bytes, with field names, operator names and punctuation all counted. The per-list cap catches one runaway list; the object cap catches many individually legal lists adding up.
-
-Over either limit returns `400` before the query runs:
-
-```
-$in for "customer_id" must contain at most 500 values (got 743)
-
-attributes is too large (130251 bytes when serialized; the maximum is 65536). Reduce the number or size of filter values.
-```
-
-<Tip>
-  Needing far more than 500 values in one filter usually means the constraint belongs in the data rather than the query. Add an attribute that groups those values (a segment, tier or cohort key) and filter on that instead.
-</Tip>
-
 ### Errors
 
-Every malformed filter is a `400` with code `VALIDATION_ERROR` and a message naming the problem, for example:
-
-```
-unknown attribute "regoin"
-value for "priority" does not match its type INT64
-$in for "region" expects an array
-unsupported operator "$contains" for attribute "tags"
-attributes filter nests deeper than 10 levels
-```
+| You send | Result |
+| --- | --- |
+| A key not declared in `database_metadata_schema` | `400`, such as `unknown attribute "regoin"`. |
+| A value that does not match the field's type, such as `"7"` for an `INT64` field | `400`, such as `value for "priority" does not match its type INT64`. |
+| A `custom_attributes` key, nested under `additional_metadata` | `400` telling you to use `metadata_filters`, the deprecated filter that still covers `custom_attributes`. |
 
 ---
 
 ## 5. Edit values in place
 
-[`PATCH /context/{id}/metadata`](/api-reference/v2/endpoint/update-source-metadata) edits the stored values of one item you know the `context_id` of. This endpoint's body names the two maps `database_metadata`, which edits the item's `attributes`, and `additional_metadata`, which edits its `custom_attributes`:
+[`PATCH /context/{id}/metadata`](/api-reference/v2/endpoint/update-source-metadata) edits the stored values of one context you know the `context_id` of. This endpoint's body names the two maps `database_metadata`, which edits the context's `attributes`, and `additional_metadata`, which edits its `custom_attributes`:
 
 ```json
 {
@@ -476,23 +370,23 @@ attributes filter nests deeper than 10 levels
 
 Behavior:
 
-- The item must already exist.
+- The context must already exist.
 - `collection` is required.
 - At least one of `database_metadata`, `additional_metadata` or `acl` is required.
 - The update is a merge: sent keys are inserted or overwritten; omitted keys are preserved.
 - `database_metadata` is checked against the schema exactly as `attributes` are at ingest, and both maps are held to the same [16 KiB and 1 KiB caps](#size-limits). A rejected edit's message is prefixed with `invalid metadata edit:`.
-- The same endpoint accepts `acl` to change who may retrieve the item. Unlike the two maps, `acl` **replaces** rather than merges, and an `acl`-only body is a valid edit. See [Access control](/essentials/v2/access-control).
+- The same endpoint accepts `acl` to change who may retrieve the context. Unlike the two maps, `acl` **replaces** rather than merges, and an `acl`-only body is a valid edit. See [Access control](/essentials/v2/access-control).
 - If an edited attribute has `enable_dense_embedding` or `enable_sparse_embedding`, HydraDB updates its search index synchronously and reports `vector_sync_required` / `vector_synced` in the response. A `null` for such a field is rejected.
 
 <Warning>
-  An edit here is not guaranteed to change what the `attributes` query filter sees, because the filter runs against the values indexed at ingest. To change a value you filter on, re-ingest the item with `upsert: true` and the same `context_id`.
+  An edit here is not guaranteed to change what the `attributes` query filter sees, because the filter runs against the values indexed at ingest. To change a value you filter on, re-ingest the context with `upsert: true` and the same `context_id`.
 </Warning>
 
 ---
 
-## 6. Browse items by attribute
+## 6. Browse context by attribute
 
-To page through items rather than run retrieval, use [`POST /context/list`](/api-reference/v2/endpoint/list-documents). Its `filters` object matches stored values exactly; the endpoint page documents its keys, `include_fields` and paging.
+To page through context rather than run retrieval, use [`POST /context/list`](/api-reference/v2/endpoint/list-documents). Its `filters` object matches stored values exactly; the endpoint page documents its keys, `include_fields` and paging.
 
 ---
 
@@ -500,17 +394,15 @@ To page through items rather than run retrieval, use [`POST /context/list`](/api
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
-| Query returns `400 unknown attribute` | The field is not declared in `database_metadata_schema` | Declare it with `PATCH /databases/{database}/metadata-schema`, then re-ingest the items that should carry it. |
+| Query returns `400 unknown attribute` | The field is not declared in `database_metadata_schema` | Declare it with `PATCH /databases/{database}/metadata-schema`, then re-ingest the context that should carry it. |
 | Ingest returns `400` naming an undeclared field | An `attributes` key is not in the schema | Declare the field, or move it to `custom_attributes` if you never filter on it. |
-| A filter on a custom attribute is rejected | `custom_attributes` are never filterable | Declare the field, send it in `attributes`, and re-ingest. |
+| A filter on a custom attribute is rejected | `attributes` cannot filter on `custom_attributes` | Declare the field, send it in `attributes`, and re-ingest. |
 | `400 value for "priority" does not match its type` | The operand's JSON type differs from the declared type, such as `"7"` for an `INT64` field | Send the declared type: `{"priority": 7}`. |
-| `$in` does not find an item whose field holds several values | There is no containment | See [No containment on multi-valued fields](#no-containment-on-multi-valued-fields). |
-| `$ne` or `$not` drops items that have no value for the field | Missing values never match a comparison | Add `{"field": {"$exists": false}}` under `$or`. |
-| Query returns 0 results after adding a filter | Over-scoping: the combined constraints exclude everything, or the items predate the field | Start with one constraint, add the others one at a time, and check with `$exists`. |
-| A value edited with `PATCH /context/{id}/metadata` still filters as the old value | The filter runs against the values indexed at ingest | Re-ingest the item with `upsert: true` and the same `context_id`. |
+| Query returns 0 results after adding a filter | The pairs together exclude everything, or the context predates the field | Start with one pair and add the others one at a time. Re-ingest context that predates the field. |
+| A value edited with `PATCH /context/{id}/metadata` still filters as the old value | The filter runs against the values indexed at ingest | Re-ingest the context with `upsert: true` and the same `context_id`. |
 | A schema field cannot be changed | Declared fields are immutable | Add a new field, or create a new database with the corrected schema and re-ingest. |
 | Adding a field with `enable_dense_embedding` or `enable_sparse_embedding` returns `400` | Embedding flags can only be set at database creation | Create a new database with the final schema and re-ingest. |
-| Ingest or edit returns `400 ... is too large` | Over the 16 KiB `attributes` or 1 KiB `custom_attributes` cap | Trim the map; move long text into the item's `text`. See [Size limits](#size-limits). |
+| Ingest or edit returns `400 ... is too large` | Over the 16 KiB `attributes` or 1 KiB `custom_attributes` cap | Trim the map; move long text into the context's `text`. See [Size limits](#size-limits). |
 | An edit returns `400` | Unknown key, wrong type, over-size map, too-deep nesting, reserved key, or missing `collection` | Check the schema and the [size limits](#size-limits). |
 | A dense or sparse attribute edit rejects `null` | A null would leave stale search vectors | Set a non-null value, or re-ingest with the desired value. |
 
@@ -520,11 +412,11 @@ To page through items rather than run retrieval, use [`POST /context/list`](/api
 
 **Stacked scopes with collection partitioning.** Use `collection` for the partition (per user, per workspace), and use `attributes` to scope *inside* that partition. They are complementary, not interchangeable. See [Databases and collections](/essentials/v2/databases-and-collections).
 
-**Published versus draft.** Declare a `status` field; tag every item with `"attributes": { "status": "draft" }` or `"published"`; pass `"attributes": { "status": "published" }` on user-facing queries. Work in progress stays out of customer answers automatically.
+**Published versus draft.** Declare a `status` field; tag every context with `"attributes": { "status": "draft" }` or `"published"`; pass `"attributes": { "status": "published" }` on user-facing queries. Work in progress stays out of customer answers automatically.
 
 **Multi-language corpora.** Declare a `language` field and route each query to the right language by passing `"attributes": { "language": "<detected language>" }`.
 
-**Date windows.** Declare a `published_on` field as `VARCHAR`, store every date in one fixed format such as `YYYY-MM-DD` so string order is date order, and filter with `{"published_on": {"$gte": "2026-01-01", "$lt": "2026-07-01"}}`.
+**Tags.** A field holds one value per context, so to select context by one member of a small, known set, give each member its own `BOOL` field, such as `"tag_billing": true`, and filter with `{"tag_billing": true}`. Each counts against the 32-field limit. If the set is really "who may see this context", use [`acl`](/essentials/v2/access-control) instead.
 
 **Schema as a contract.** Treat `database_metadata_schema` as part of your data contract and review it like a database migration. Getting it wrong costs a re-ingest, because declared fields are immutable; getting it right costs one extra review.
 
@@ -532,13 +424,13 @@ To page through items rather than run retrieval, use [`POST /context/list`](/api
 
 ## Related
 
-- [Ingest context](/essentials/v2/ingest): every item field, including `attributes` and `custom_attributes`
+- [Ingest context](/essentials/v2/ingest): every context field, including `attributes` and `custom_attributes`
 - [Query](/essentials/v2/query): how `attributes` sits alongside ranking, graph and forceful relations
 - [Databases and collections](/essentials/v2/databases-and-collections): partitioning versus filtering
-- [Access control](/essentials/v2/access-control): restricting who may retrieve an item, which is not an attribute filter
+- [Access control](/essentials/v2/access-control): restricting who may retrieve a context, which is not an attribute filter
 - [Create Database API reference](/api-reference/v2/endpoint/create-tenant): the full `database_metadata_schema` reference
-- [Ingest API reference](/api-reference/v2/endpoint/ingest-context): the full item reference
+- [Ingest API reference](/api-reference/v2/endpoint/ingest-context): the full field reference
 - [Query API reference](/api-reference/v2/endpoint/query): the full `attributes` request reference
-- [List Context](/api-reference/v2/endpoint/list-documents): browsing items with exact-match filters
+- [List Context](/api-reference/v2/endpoint/list-documents): browsing context with exact-match filters
 - [Update Source Metadata](/api-reference/v2/endpoint/update-source-metadata): in-place value edits
 - [Update Metadata Schema](/api-reference/v2/endpoint/update-metadata-schema): additive schema changes
