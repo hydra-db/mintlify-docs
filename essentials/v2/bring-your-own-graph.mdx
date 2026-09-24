@@ -3,12 +3,12 @@ title: "Bring Your Own Graph (BYOG)"
 description: "Model, load, and query your property graph in HydraDB."
 ---
 
-Bring Your Own Graph (BYOG) lets you read and write
-[HydraDB's core graph database](https://github.com/hydra-db/hydradb) with
-**Cypher** - fully hosted and autoscaling.
+Bring Your Own Graph (BYOG) lets you use **Cypher** to read and write data in
+[HydraDB's core graph database](https://github.com/hydra-db/hydradb), which we
+host and scale for you.
 
 <Tip>
-  Moving an existing graph? Jump to
+  Migrating from an existing graph database? Jump to
   [Migrating from Neo4j or another Cypher database](#migrating-from-neo4j-or-another-cypher-database).
 </Tip>
 
@@ -29,7 +29,7 @@ curl -X POST "$BASE/byog/databases" \
   -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
   -d '{"database": "crm"}'
 
-# 2. Write data - collections auto-create on first use
+# 2. Write data - the collection is created on first write
 curl -X POST "$BASE/byog/query" \
   -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
   -d '{
@@ -61,10 +61,9 @@ Every request needs your HydraDB API key:
 Authorization: Bearer <api key>
 ```
 
-A missing or invalid key returns `403`. Databases are scoped to the
-organization that owns the API key - another organization's database names
-are invisible to you (they behave exactly like names that don't exist), and
-`MATCH (n) RETURN n` only ever returns your own nodes.
+A missing or invalid key returns `403`. Your databases are visible only to
+your organization: another organization's databases look like names that
+don't exist, and `MATCH (n) RETURN n` returns only your own nodes.
 
 ### Endpoints
 
@@ -89,17 +88,25 @@ provisioning wait. Creating a name that already exists returns `409`.
 }
 ```
 
-- **One collection per query.** A collection is an independent graph inside
-  the database; its data is isolated from every other collection.
-- **Collections auto-create** - there is no create-collection call. The first
-  write brings the collection into existence; reading a collection you never
-  wrote to simply returns zero rows.
-- Collection names must match `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`.
-  Database names have no charset restriction.
+- **Isolation.** Each collection is a separate graph. A query runs against one
+  collection and cannot see data in any other.
+- **Collections are created automatically** on the first write. Reading a
+  collection that doesn't exist yet returns zero rows.
+- **Collection names** use letters, digits, `_` and `-`, start with a letter or
+  digit, and are at most 64 characters. Anything else returns `400` (see the
+  examples below). Database names have no such restriction - `Acme Corp (EU)`
+  is fine.
 - Always pass user data through `params` rather than string-building it into
   the query - parameters are bound safely and keep query plans cacheable.
 - Request bodies are capped at **256 KiB** (`413` beyond that). For bulk
   loads, send batches of rows with `UNWIND $rows AS row CREATE ...`.
+
+| Collection name | Valid? |
+|---|---|
+| `contacts`, `crm_2024`, `Team-A`, `7eleven` | Yes |
+| `_contacts`, `-contacts` | No - must start with a letter or digit |
+| `my contacts`, `crm.v2`, `café` | No - only letters, digits, `_` and `-` |
+| A 65-character name | No - 64 characters at most |
 
 #### `GET /byog/collections?database=crm` - list collections
 
@@ -183,13 +190,12 @@ Dialect notes:
 Every example below runs against the same small sample graph, in order. Load
 it into a fresh collection first to follow along - send each query as the
 `query` of [`POST /byog/query`](#endpoints), with the
-`params` shown in its first comment. The **Response** tab is the `data` the
-query returns.
+`params` shown in its first comment. Expand **Response** under a query to see
+the `data` it returns.
 
 **Load the sample graph**
 
-<CodeGroup>
-```cypher Query
+```cypher
 CREATE (alice:Person {ext_id: "u1", name: "Alice", role: "admin"}),
        (bob:Person   {ext_id: "u2", name: "Bob",   role: "analyst"}),
        (carol:Person {ext_id: "u3", name: "Carol", role: "engineer"}),
@@ -207,30 +213,34 @@ CREATE (alice:Person {ext_id: "u1", name: "Alice", role: "admin"}),
 RETURN count(*) AS created
 ```
 
-```json Response
+<Accordion title="Response">
+
+```json
 [{ "created": 1 }]
 ```
-</CodeGroup>
+
+</Accordion>
 
 **Upsert a node on your own key**
 
-<CodeGroup>
-```cypher Query
+```cypher
 // params: {"id": "u1", "props": {"role": "owner"}}
 MERGE (p:Person {ext_id: $id})
 SET p += $props
 RETURN p.ext_id AS id, p.name AS name, p.role AS role
 ```
 
-```json Response
+<Accordion title="Response">
+
+```json
 [{ "id": "u1", "name": "Alice", "role": "owner" }]
 ```
-</CodeGroup>
+
+</Accordion>
 
 **Connect two existing nodes**
 
-<CodeGroup>
-```cypher Query
+```cypher
 // params: {"from": "u5", "to": "c1", "since": 2024}
 MATCH (a:Person {ext_id: $from}), (b:Company {ext_id: $to})
 MERGE (a)-[w:WORKS_AT]->(b)
@@ -238,15 +248,17 @@ SET w.since = $since
 RETURN a.name AS person, type(w) AS rel, b.name AS company, w.since AS since
 ```
 
-```json Response
+<Accordion title="Response">
+
+```json
 [{ "person": "Eve", "rel": "WORKS_AT", "company": "Acme", "since": 2024 }]
 ```
-</CodeGroup>
+
+</Accordion>
 
 **Expand a node's neighborhood**
 
-<CodeGroup>
-```cypher Query
+```cypher
 // params: {"name": "Bob"}
 // Every relationship on Bob and the node on the other end, in any direction.
 MATCH (p:Person {name: $name})-[r]-(nbr)
@@ -254,19 +266,21 @@ RETURN type(r) AS rel, labels(nbr) AS kind, nbr.name AS neighbor
 ORDER BY rel, neighbor
 ```
 
-```json Response
+<Accordion title="Response">
+
+```json
 [
   { "rel": "KNOWS",    "kind": ["Person"],  "neighbor": "Alice" },
   { "rel": "KNOWS",    "kind": ["Person"],  "neighbor": "Carol" },
   { "rel": "WORKS_AT", "kind": ["Company"], "neighbor": "Acme" }
 ]
 ```
-</CodeGroup>
+
+</Accordion>
 
 **Multi-hop relationship expansion**
 
-<CodeGroup>
-```cypher Query
+```cypher
 // params: {"name": "Alice"}
 // Everyone up to 3 hops away, following only outgoing KNOWS edges.
 MATCH (a:Person {name: $name})-[:KNOWS*1..3]->(reach:Person)
@@ -275,22 +289,26 @@ RETURN DISTINCT reach.name AS name
 ORDER BY name
 ```
 
-```json Response
+<Accordion title="Response">
+
+```json
 [{ "name": "Bob" }, { "name": "Carol" }, { "name": "Dan" }, { "name": "Eve" }]
 ```
-</CodeGroup>
+
+</Accordion>
 
 **Shortest path between two nodes**
 
-<CodeGroup>
-```cypher Query
+```cypher
 // params: {"from": "Alice", "to": "Carol"}
 // The actual path (nodes + edges in order), not just the endpoints.
 MATCH (a:Person {name: $from}), (b:Person {name: $to})
 RETURN shortestPath((a)-[:KNOWS*..8]->(b)) AS path
 ```
 
-```json Response
+<Accordion title="Response">
+
+```json
 [
   {
     "path": {
@@ -307,12 +325,12 @@ RETURN shortestPath((a)-[:KNOWS*..8]->(b)) AS path
   }
 ]
 ```
-</CodeGroup>
+
+</Accordion>
 
 **Filtered, typed traversal**
 
-<CodeGroup>
-```cypher Query
+```cypher
 // params: {"name": "Alice"}
 // Who does Alice know that works at a fintech company?
 MATCH (a:Person {name: $name})-[:KNOWS]->(f:Person)-[:WORKS_AT]->(c:Company)
@@ -321,58 +339,67 @@ RETURN f.name AS person, c.name AS company
 ORDER BY person
 ```
 
-```json Response
+<Accordion title="Response">
+
+```json
 [
   { "person": "Bob", "company": "Acme" },
   { "person": "Eve", "company": "Acme" }
 ]
 ```
-</CodeGroup>
+
+</Accordion>
 
 **Aggregate**
 
-<CodeGroup>
-```cypher Query
+```cypher
 // Headcount per company, largest first.
 MATCH (p:Person)-[:WORKS_AT]->(c:Company)
 RETURN c.name AS company, count(p) AS headcount
 ORDER BY headcount DESC
 ```
 
-```json Response
+<Accordion title="Response">
+
+```json
 [
   { "company": "Acme",   "headcount": 3 },
   { "company": "Globex", "headcount": 1 }
 ]
 ```
-</CodeGroup>
+
+</Accordion>
 
 **Index a property you filter on**
 
-<CodeGroup>
-```cypher Query
+```cypher
 CREATE INDEX FOR (n:Person) ON (n.ext_id)
 ```
 
-```json Response
+<Accordion title="Response">
+
+```json
 []
 ```
-</CodeGroup>
+
+</Accordion>
 
 **Delete a node and its edges**
 
-<CodeGroup>
-```cypher Query
+```cypher
 // params: {"id": "u5"}
 MATCH (p:Person {ext_id: $id})
 DETACH DELETE p
 RETURN count(*) AS deleted
 ```
 
-```json Response
+<Accordion title="Response">
+
+```json
 [{ "deleted": 1 }]
 ```
-</CodeGroup>
+
+</Accordion>
 
 ### Response format
 
@@ -520,7 +547,7 @@ def load(rows, chunk=500):
   timeout). Retrying unchanged will fail identically.
 - **`429` / `500`** - transient; retry with backoff. Writes built on `MERGE`
   (as above) are safe to retry; bare `CREATE` batches are not idempotent, so
-  a retried chunk can duplicate nodes - one more reason to key on your own id.
+  a retried chunk can duplicate nodes.
 
 ### Errors
 
@@ -558,8 +585,7 @@ any write clause - `CREATE`, `MERGE`, `SET`, `DELETE`, `REMOVE`, `FOREACH`.
 - **Chunk bulk imports** into `UNWIND $rows` batches sized to finish inside
   the 30 s write budget (and the 256 KiB body cap).
 - **Create indexes** for properties you filter on -
-  `CREATE INDEX FOR (n:Person) ON (n.name)` - long-running reads are usually
-  missing one.
+  `CREATE INDEX FOR (n:Person) ON (n.name)`. A slow read usually needs one.
 
 ---
 
@@ -572,16 +598,18 @@ ports directly. The differences you are most likely to notice:
   available - the equivalents are either plain Cypher or not part of the
   supported surface.
 - `LOAD CSV` is not available - batch data in through `params`.
-- Internal node ids are not portable (true in most graph databases) - migrate using
-  your own key properties, e.g.
+- Internal node ids are not portable - migrate using your own key properties,
+  for example
   `UNWIND $rows AS row MERGE (n:Person {ext_id: row.ext_id}) SET n += row`.
 
-One collection is a natural migration unit: export a graph, replay it into
-one collection, verify, repeat. The example below reads from Neo4j with the
-official driver; any source you can read nodes and relationships from works
-the same way. It replays into HydraDB with the [`HydraGraph` client](#a-minimal-client) -
-nodes first, then relationships matched on your own key. Relationship types
-can't be parameters in Cypher, so write one batch per type:
+Migrate one collection at a time: export a graph, replay it into one
+collection, and verify the counts.
+
+The script below reads from Neo4j with the official driver and writes to
+HydraDB with the [`HydraGraph` client](#a-minimal-client). Any source you can
+read nodes and relationships from works the same way. It loads nodes first,
+then relationships matched on your own key. Cypher doesn't allow a
+relationship type as a parameter, so it writes one batch per type:
 
 ```python
 from neo4j import GraphDatabase
@@ -624,11 +652,11 @@ print(g.query("MATCH (p:Person) RETURN count(p) AS people"))
 
 ## Without Cypher: attach a graph at ingest
 
-If you only need your own entities and relations used for a document or memory
-you are already ingesting - instead of HydraDB's LLM extraction - pass a
-`graph_payload` on [`POST /context/ingest`](/api-reference/v2/endpoint/ingest-context).
-It is a JSON map keyed by source id (a `document_metadata` `id`, an
-`app_knowledge` `id`, or a memory `id`):
+To use your own entities and relations for a document or memory instead of
+HydraDB's LLM extraction, pass a `graph_payload` on
+[`POST /context/ingest`](/api-reference/v2/endpoint/ingest-context). It is a
+JSON map keyed by source id (a `document_metadata` `id`, an `app_knowledge`
+`id`, or a memory `id`):
 
 ```bash
 curl -X POST 'https://api.hydradb.com/context/ingest' \
