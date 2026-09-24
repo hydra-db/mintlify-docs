@@ -1,16 +1,13 @@
 ---
 title: "Perplexity for Internal Knowledge"
 description: "Ingest Slack, Gmail, Confluence, GitHub, and Linear into one HydraDB database. Ask any question in natural language and get a cited, synthesized answer drawing from across all your company's knowledge - including 'what led to the decision to sunset Project X?' with full decision provenance."
-noindex: true
 ---
-
-<Warning>This page is deprecated: it documents the knowledge and memory API, which unified databases replace. See [Ingest context](/essentials/v2/ingest) and [Query](/essentials/v2/query).</Warning>
 
 This guide walks you through building a **company-wide internal search engine** powered by HydraDB. Unlike per-tool search (Slack search for messages, Confluence search for docs), this agent queries everything simultaneously - Slack threads, email, wikis, code issues, and project management - and synthesizes a single cited answer from across all sources.
 
-> **Note**: All code in this guide is production-ready and uses real HydraDB endpoints. Base URL: `https://api.hydradb.com`. Get your API key at [app.hydradb.com](https://app.hydradb.com).
+> **Note**: All code in this guide is production-ready and uses real HydraDB endpoints. Base URL: `https://api.hydradb.com`. Get your API key at [app.hydradb.com](https://app.hydradb.com). SDK snippets use the call shapes in the [SDK reference](/api-reference/v2/sdks) and require an SDK release generated from the current API specification.
 
-> **Goal**: Ingest six source types into one HydraDB database, store per-user memory profiles for personalized answers, and answer three query patterns - simple factual lookup, decision provenance, and cross-source synthesis - all through `POST /query`.
+> **Goal**: Ingest six source types into one HydraDB database, store per-user context profiles for personalized answers, and answer three query patterns - simple factual lookup, decision provenance, and cross-source synthesis - all through `POST /query`.
 
 ---
 
@@ -40,7 +37,7 @@ By the end of this cookbook, you'll be able to:
 - Ingest Slack threads, Gmail, Confluence pages, GitHub issues, and Linear tickets into a single HydraDB database
 - Answer cross-source questions like "Why did we move to a monorepo?" that span multiple tools and time periods
 - Use `recency_bias` and `graph_context: true` to surface the most relevant, connected context across all sources
-- Store per-user memory so answers are personalized to each employee's role and project context
+- Store per-user context so answers are personalized to each employee's role and project context
 
 ---
 
@@ -58,17 +55,17 @@ The critical capability that makes this possible is HydraDB's context graph. It 
 
 ```mermaid
 graph LR
-    A["Slack · Gmail · Confluence<br/>GitHub · Linear · Notion"] -->|"multipart upload"| B["Ingestion Layer<br/>connectors/slack.py<br/>connectors/gmail.py<br/>connectors/confluence.py<br/>connectors/github.py"]
+    A["Slack · Gmail · Confluence<br/>GitHub · Linear · Notion"] -->|"context items"| B["Ingestion Layer<br/>connectors/slack.py<br/>connectors/gmail.py<br/>connectors/confluence.py<br/>connectors/github.py"]
     B -->|"POST /context/ingest"| C["HydraDB<br/>database: company-knowledge<br/>collections: slack, email, docs, github"]
     D["User / Slack bot / Web UI"] -->|"POST /query"| C
-    C -->|"ranked chunks + graph_context"| D
+    C -->|"ranked chunks + graph"| D
     E["POST /context/ingest"] -->|"user profile"| C
     C -->|"POST /query"| D
 ```
 
-- **Ingestion Layer**: Six connector scripts that format source content and upload to HydraDB via `POST /context/ingest` using multipart form-data.
+- **Ingestion Layer**: Six connector scripts that format source content into `context` items and upload to HydraDB via `POST /context/ingest`.
 - **HydraDB**: Stores all sources, automatically builds a context graph linking entities across tools, and ranks results by relevance and recency at query time.
-- **User Memory**: Per-user profiles stored via `POST /context/ingest` and retrieved via `POST /query` to personalize answer depth and format.
+- **User Context**: Per-user profiles stored via `POST /context/ingest` and retrieved via `POST /query` to personalize answer depth and format.
 
 ---
 
@@ -79,8 +76,9 @@ One database for all company knowledge. Use `collection` to isolate by source ty
 ```bash
 curl -X POST 'https://api.hydradb.com/databases' \
   -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "API-Version: 2" \
   -H "Content-Type: application/json" \
-  -d '{"database": "company-knowledge"}'
+  -d '{"database": "company-knowledge", "database_metadata_schema": [{"name": "source_type", "data_type": "VARCHAR"}, {"name": "doc_type", "data_type": "VARCHAR"}, {"name": "channel", "data_type": "VARCHAR"}, {"name": "space", "data_type": "VARCHAR"}, {"name": "repo", "data_type": "VARCHAR"}]}'
 ```
 
 <CodeGroup>
@@ -92,7 +90,21 @@ from hydra_db import HydraDB
 client = HydraDB(token=os.environ["HYDRA_DB_API_KEY"])
 TENANT_ID = "company-knowledge"
 
-client.databases.create(database=TENANT_ID)
+client.databases.create(
+    database=TENANT_ID,
+    database_metadata_schema=[
+        {"name": "source_type", "data_type": "VARCHAR"},
+        {"name": "doc_type",    "data_type": "VARCHAR"},
+        {"name": "channel",     "data_type": "VARCHAR"},
+        {"name": "space",       "data_type": "VARCHAR"},
+        {"name": "repo",        "data_type": "VARCHAR"},
+    ],
+)
+
+# Database creation is asynchronous - poll until ready before ingesting
+import time
+while not client.databases.status(database=TENANT_ID).data.infra.ready_for_ingestion:
+    time.sleep(4)
 ```
 
 ```typescript TypeScript SDK
@@ -102,7 +114,21 @@ import { HydraDBClient } from "@hydradb/sdk";
 const client = new HydraDBClient({ token: process.env.HYDRA_DB_API_KEY! });
 const TENANT_ID = "company-knowledge";
 
-await client.databases.create({ database: TENANT_ID });
+await client.databases.create({
+  database: TENANT_ID,
+  databaseMetadataSchema: [
+    { name: "source_type", data_type: "VARCHAR" },
+    { name: "doc_type",    data_type: "VARCHAR" },
+    { name: "channel",     data_type: "VARCHAR" },
+    { name: "space",       data_type: "VARCHAR" },
+    { name: "repo",        data_type: "VARCHAR" },
+  ],
+});
+
+// Database creation is asynchronous - poll until ready before ingesting
+while (!(await client.databases.status({ database: TENANT_ID })).data?.infra?.readyForIngestion) {
+  await new Promise((resolve) => setTimeout(resolve, 4000));
+}
 ```
 </CodeGroup>
 
@@ -110,32 +136,26 @@ await client.databases.create({ database: TENANT_ID });
 
 ## Step 2 - Ingest Company Knowledge
 
-All connectors use the same endpoint: `POST /context/ingest`. This endpoint uses **multipart form-data** - not JSON. `database` and `collection` are form fields alongside the file.
+All connectors use the same endpoint: `POST /context/ingest` with a JSON body. Each source document becomes a `context` item - `{context_id, title, text, happened_at, attributes}` - and each source type gets its own collection (`slack`, `email`, `docs`, `github`) so queries can scope per source. Ingest is asynchronous: it returns `202 Accepted` and queues indexing.
 
-> **Important**: Do not set `Content-Type: application/json`. Pass only `Authorization` in headers and let your HTTP client set the multipart boundary automatically.
+> **Important**: There is no file upload on a unified database. Format source content into `text` client-side and send it inside `context` items.
 
-> **Batch limit**: Max 20 sources per request. Wait 1 second between batches. Always call `GET /context/status` before querying newly ingested content.
+> **Batch limit**: Up to 100 items per request. Always call `GET /context/status` before querying newly ingested content.
 
-The upload response for all connectors looks like this:
+The ingest response for all connectors looks like this:
 
 ```json
 {
-  "success": true,
-  "message": "Knowledge uploaded successfully",
   "results": [
     {
-      "id": "d25fb5a6-0378-4bcb-8cbc-2012c3d12ca2",
-      "filename": "slack-engineering-2024-11-15.txt",
-      "status": "queued",
-      "error": null
+      "id": "slack-engineering-1699430400.000001",
+      "status": "accepted"
     }
-  ],
-  "success_count": 1,
-  "failed_count": 0
+  ]
 }
 ```
 
-Save `results[0].id` - you need it to verify indexing.
+`results[].id` echoes the `context_id` you set - keep it stable across syncs so `upsert` replaces content instead of duplicating it.
 
 ### 2.1 Slack Channels
 
@@ -144,7 +164,7 @@ Combine each thread (parent message + all replies) into one document. HydraDB's 
 <CodeGroup>
 ```python Python SDK
 # connectors/slack.py
-import os, time
+import json, os, time
 from slack_sdk  import WebClient
 from datetime   import datetime, timezone
 from hydra_db import HydraDB
@@ -157,7 +177,7 @@ slack     = WebClient(token=os.environ["SLACK_BOT_TOKEN"])
 def ingest_slack_channel(channel_id: str, channel_name: str, days_back: int = 365):
     """
     Ingest messages + threaded replies from a Slack channel.
-    Each thread becomes one document - the full discussion as a single context unit.
+    Each thread becomes one context item - the full discussion as a single context unit.
     """
     oldest  = str(datetime.now(timezone.utc).timestamp() - days_back * 86400)
     batch   = []
@@ -181,56 +201,74 @@ def ingest_slack_channel(channel_id: str, channel_name: str, days_back: int = 36
                 thread_text += "\n".join(f"\n↳ {r.get('text','')}" for r in replies)
 
             ts_dt    = datetime.fromtimestamp(float(msg["ts"]), tz=timezone.utc)
-            content  = (
-                f"Source: Slack #{channel_name}\n"
-                f"Date: {ts_dt.strftime('%Y-%m-%d')}\n\n"
-                f"{thread_text}"
-            )
-            filename = f"slack-{channel_name}-{msg['ts']}.txt"
+            context_id = f"slack-{channel_name}-{msg['ts']}"
+            batch.append({
+                "context_id":  context_id,
+                "title":       f"Slack #{channel_name} thread {ts_dt:%Y-%m-%d}",
+                "happened_at": ts_dt.isoformat(),
+                "text":        (
+                    f"Source: Slack #{channel_name}\n"
+                    f"Date: {ts_dt.strftime('%Y-%m-%d')}\n\n"
+                    f"{thread_text}"
+                ),
+                "attributes":  {"source_type": "slack", "channel": channel_name},
+            })
 
-            batch.append((filename, content))
-
-            if len(batch) == 20:
-                all_ids += _upload_batch(batch, "slack")
+            if len(batch) == 100:
+                all_ids += _ingest_batch(batch, "slack")
                 batch = []
-                time.sleep(1)
 
         if not resp["has_more"]:
             break
         cursor = resp["response_metadata"]["next_cursor"]
 
     if batch:
-        all_ids += _upload_batch(batch, "slack")
+        all_ids += _ingest_batch(batch, "slack")
 
     print(f"Slack #{channel_name}: {len(all_ids)} threads uploaded")
     return all_ids
 
 
-def _upload_batch(batch: list, sub_tenant: str) -> list:
-    """Upload a batch of (filename, content) tuples as multipart form-data."""
-    ids = []
-    for filename, content in batch:
-        result = client.context.ingest(
-            database=TENANT_ID,
-            collection=sub_tenant,
-            documents=[(filename, content.encode("utf-8"), "text/plain")],
-        )
-        items = result.data.results or []
-        if items:
-            ids.append(items[0].id)
-        time.sleep(0.1)   # brief pause between individual uploads in a batch
-    return ids
+def _ingest_batch(batch: list, collection: str) -> list:
+    """Ingest up to 100 context items in one POST /context/ingest call."""
+    result = client.context.ingest(
+        database=TENANT_ID,
+        collection=collection,
+        upsert=True,
+        context=json.dumps(batch),
+    )
+    return [r.id for r in (result.data.results or [])]
 ```
 
-```typescript TypeScript SDK
+```typescript TypeScript
 // connectors/slack.ts
-import { HydraDBClient } from "@hydradb/sdk";
-import { readFileSync, writeFileSync } from "fs";
+// REST/fetch (works against the current spec). ingestContext() is reused by every
+// connector below - keep it in a shared module, e.g. ./hydradb.ts
 import { WebClient } from "@slack/web-api";
 
-const client = new HydraDBClient({ token: process.env.HYDRA_DB_API_KEY! });
+const BASE_URL = "https://api.hydradb.com";
+const HEADERS = {
+  Authorization: `Bearer ${process.env.HYDRA_DB_API_KEY}`,
+  "API-Version": "2",
+  "Content-Type": "application/json",
+};
 const TENANT_ID = "company-knowledge";
 const slack = new WebClient(process.env.SLACK_BOT_TOKEN);
+
+async function ingestContext(collection: string, items: unknown[]) {
+  const res = await fetch(`${BASE_URL}/context/ingest`, {
+    method: "POST",
+    headers: HEADERS,
+    body: JSON.stringify({
+      database: TENANT_ID,
+      collection,
+      upsert: true,
+      context: items,
+    }),
+  });
+  const json = await res.json();
+  return (json.data?.results ?? []).map((r: any) => r.id as string);
+}
 
 async function ingestSlackChannel(
   channelId: string,
@@ -239,6 +277,7 @@ async function ingestSlackChannel(
 ): Promise<string[]> {
   const oldest = String(Date.now() / 1000 - daysBack * 86400);
   const allIds: string[] = [];
+  let batch: any[] = [];
   let cursor: string | undefined;
 
   while (true) {
@@ -263,26 +302,27 @@ async function ingestSlackChannel(
           .map((r) => `\n↳ ${r.text ?? ""}`)
           .join("");
       }
-      const tsDate = new Date(Number(msg.ts) * 1000)
-        .toISOString()
-        .slice(0, 10);
-      const content =
-        `Source: Slack #${channelName}\nDate: ${tsDate}\n\n${threadText}`;
-      const filename = `/tmp/slack-${channelName}-${msg.ts}.txt`;
-      writeFileSync(filename, content, "utf-8");
-
-      const result = await client.context.ingest({
-        database: TENANT_ID,
-        collection: "slack",
-        documents: [{ data: readFileSync(filename), filename, contentType: "application/octet-stream" }],
+      const tsDate = new Date(Number(msg.ts) * 1000);
+      batch.push({
+        context_id: `slack-${channelName}-${msg.ts}`,
+        title: `Slack #${channelName} thread ${tsDate.toISOString().slice(0, 10)}`,
+        happened_at: tsDate.toISOString(),
+        text:
+          `Source: Slack #${channelName}\nDate: ${tsDate.toISOString().slice(0, 10)}\n\n${threadText}`,
+        attributes: { source_type: "slack", channel: channelName },
       });
-      const results = result.data?.results ?? [];
-      if (results[0]?.id) allIds.push(results[0].id);
+
+      if (batch.length === 100) {
+        allIds.push(...(await ingestContext("slack", batch)));
+        batch = [];
+      }
     }
 
     if (!resp.has_more) break;
     cursor = (resp.response_metadata as any)?.next_cursor;
   }
+
+  if (batch.length) allIds.push(...(await ingestContext("slack", batch)));
 
   console.log(`Slack #${channelName}: ${allIds.length} threads uploaded`);
   return allIds;
@@ -319,6 +359,7 @@ def ingest_gmail_threads(credentials_path: str, query: str, max_threads: int = 2
     threads = results.get("threads", [])
 
     all_ids = []
+    batch   = []
     for thread in threads:
         thread_data = service.users().threads().get(userId="me", id=thread["id"]).execute()
         messages    = thread_data.get("messages", [])
@@ -349,30 +390,28 @@ def ingest_gmail_threads(credentials_path: str, query: str, max_threads: int = 2
             continue
 
         content  = f"Source: Gmail\nSubject: {subject}\nDate: {date}\n\n" + "\n\n---\n\n".join(parts)
-        filename = f"email-{thread['id']}.txt"
 
-        result = client.context.ingest(
-            database=TENANT_ID,
-            collection="email",
-            documents=[(filename, content.encode("utf-8"), "text/plain")],
-        )
-        items = result.data.results or []
-        if items:
-            all_ids.append(items[0].id)
+        batch.append({
+            "context_id": f"email-{thread['id']}",
+            "title":      f"Gmail: {subject}",
+            "text":       content,
+            "attributes": {"source_type": "email"},
+        })
 
-        time.sleep(0.2)
+        if len(batch) == 100:
+            all_ids += _ingest_batch(batch, "email")   # _ingest_batch from connectors/slack.py
+            batch = []
+
+    if batch:
+        all_ids += _ingest_batch(batch, "email")
 
     print(f"Gmail: {len(all_ids)} threads uploaded")
     return all_ids
 ```
 
-```typescript TypeScript SDK
+```typescript TypeScript
 // connectors/gmail.ts
-import { HydraDBClient } from "@hydradb/sdk";
-import { readFileSync, writeFileSync } from "fs";
-
-const client = new HydraDBClient({ token: process.env.HYDRA_DB_API_KEY! });
-const TENANT_ID = "company-knowledge";
+// uses ingestContext() from ./hydradb (defined in connectors/slack.ts above)
 
 async function ingestGmailThreads(
   gmailService: any,
@@ -380,6 +419,7 @@ async function ingestGmailThreads(
   maxThreads: number = 200
 ): Promise<string[]> {
   const allIds: string[] = [];
+  let batch: any[] = [];
   const listResp = await gmailService.users.threads.list({
     userId: "me",
     q: query,
@@ -424,17 +464,21 @@ async function ingestGmailThreads(
     const content =
       `Source: Gmail\nSubject: ${subject}\nDate: ${date}\n\n` +
       parts.join("\n\n---\n\n");
-    const filename = `/tmp/email-${thread.id}.txt`;
-    writeFileSync(filename, content, "utf-8");
 
-    const result = await client.context.ingest({
-      database: TENANT_ID,
-      collection: "email",
-      documents: [{ data: readFileSync(filename), filename, contentType: "application/octet-stream" }],
+    batch.push({
+      context_id: `email-${thread.id}`,
+      title: `Gmail: ${subject}`,
+      text: content,
+      attributes: { source_type: "email" },
     });
-    const results = result.data?.results ?? [];
-    if (results[0]?.id) allIds.push(results[0].id);
+
+    if (batch.length === 100) {
+      allIds.push(...(await ingestContext("email", batch)));
+      batch = [];
+    }
   }
+
+  if (batch.length) allIds.push(...(await ingestContext("email", batch)));
 
   console.log(`Gmail: ${allIds.length} threads uploaded`);
   return allIds;
@@ -466,6 +510,7 @@ def ingest_confluence_space(space_key: str):
     import requests as req
     start   = 0
     all_ids = []
+    batch   = []
 
     while True:
         resp = req.get(
@@ -491,35 +536,34 @@ def ingest_confluence_space(space_key: str):
                 f"Version: {page['version']['number']}\n\n"
                 f"{text}"
             )
-            filename = f"confluence-{space_key}-{page['id']}.txt"
+            batch.append({
+                "context_id": f"confluence-{space_key}-{page['id']}",
+                "title":      f"Confluence {space_key}: {page['title']}",
+                "text":       content,
+                "attributes": {"source_type": "confluence", "space": space_key},
+            })
 
-            result = client.context.ingest(
-                database=TENANT_ID,
-                collection="docs",
-                documents=[(filename, content.encode("utf-8"), "text/plain")],
-            )
-            items = result.data.results or []
-            if items:
-                all_ids.append(items[0].id)
-            time.sleep(0.1)
+            if len(batch) == 100:
+                all_ids += _ingest_batch(batch, "docs")   # _ingest_batch from connectors/slack.py
+                batch = []
 
         if data.get("_links", {}).get("next"):
             start += 50
         else:
             break
 
+    if batch:
+        all_ids += _ingest_batch(batch, "docs")
+
     print(f"Confluence {space_key}: {len(all_ids)} pages uploaded")
     return all_ids
 ```
 
-```typescript TypeScript SDK
+```typescript TypeScript
 // connectors/confluence.ts
-import { HydraDBClient } from "@hydradb/sdk";
-import { readFileSync, writeFileSync } from "fs";
+// uses ingestContext() from ./hydradb (defined in connectors/slack.ts above)
 import axios from "axios";
 
-const client = new HydraDBClient({ token: process.env.HYDRA_DB_API_KEY! });
-const TENANT_ID = "company-knowledge";
 const CONFLUENCE_URL = process.env.CONFLUENCE_BASE_URL!;
 const CONFLUENCE_AUTH = {
   username: process.env.CONFLUENCE_EMAIL!,
@@ -529,6 +573,7 @@ const CONFLUENCE_AUTH = {
 async function ingestConfluenceSpace(spaceKey: string): Promise<string[]> {
   let start = 0;
   const allIds: string[] = [];
+  let batch: any[] = [];
 
   while (true) {
     const resp = await axios.get(`${CONFLUENCE_URL}/wiki/rest/api/content`, {
@@ -549,16 +594,18 @@ async function ingestConfluenceSpace(spaceKey: string): Promise<string[]> {
       const content =
         `Source: Confluence\nSpace: ${spaceKey}\nTitle: ${page.title}\n` +
         `Version: ${page.version.number}\n\n${text}`;
-      const filename = `/tmp/confluence-${spaceKey}-${page.id}.txt`;
-      writeFileSync(filename, content, "utf-8");
 
-      const result = await client.context.ingest({
-        database: TENANT_ID,
-        collection: "docs",
-        documents: [{ data: readFileSync(filename), filename, contentType: "application/octet-stream" }],
+      batch.push({
+        context_id: `confluence-${spaceKey}-${page.id}`,
+        title: `Confluence ${spaceKey}: ${page.title}`,
+        text: content,
+        attributes: { source_type: "confluence", space: spaceKey },
       });
-      const results = result.data?.results ?? [];
-      if (results[0]?.id) allIds.push(results[0].id);
+
+      if (batch.length === 100) {
+        allIds.push(...(await ingestContext("docs", batch)));
+        batch = [];
+      }
     }
 
     if (resp.data._links?.next) {
@@ -567,6 +614,8 @@ async function ingestConfluenceSpace(spaceKey: string): Promise<string[]> {
       break;
     }
   }
+
+  if (batch.length) allIds.push(...(await ingestContext("docs", batch)));
 
   console.log(`Confluence ${spaceKey}: ${allIds.length} pages uploaded`);
   return allIds;
@@ -599,6 +648,7 @@ def ingest_github_issues(repo_name: str, state: str = "all", limit: int = 500):
     repo    = gh.get_repo(repo_name)
     sub     = repo_name.lower().replace("/", "-")
     all_ids = []
+    batch   = []
     count   = 0
 
     for issue in repo.get_issues(state=state, sort="updated", direction="desc"):
@@ -617,30 +667,30 @@ def ingest_github_issues(repo_name: str, state: str = "all", limit: int = 500):
             f"{issue.body or ''}\n\n"
             f"Discussion:\n" + "\n\n".join(comments)
         )
-        filename = f"github-{sub}-issue-{issue.number}.txt"
+        batch.append({
+            "context_id": f"github-{sub}-issue-{issue.number}",
+            "title":      f"GitHub {repo_name} issue #{issue.number}: {issue.title}",
+            "happened_at": issue.created_at.isoformat(),
+            "text":       content,
+            "attributes": {"source_type": "github", "repo": repo_name},
+        })
 
-        result = client.context.ingest(
-            database=TENANT_ID,
-            collection="github",
-            documents=[(filename, content.encode("utf-8"), "text/plain")],
-        )
-        items = result.data.results or []
-        if items:
-            all_ids.append(items[0].id)
-        time.sleep(0.1)
+        if len(batch) == 100:
+            all_ids += _ingest_batch(batch, "github")   # _ingest_batch from connectors/slack.py
+            batch = []
+
+    if batch:
+        all_ids += _ingest_batch(batch, "github")
 
     print(f"GitHub {repo_name}: {len(all_ids)} issues uploaded")
     return all_ids
 ```
 
-```typescript TypeScript SDK
+```typescript TypeScript
 // connectors/github.ts
-import { HydraDBClient } from "@hydradb/sdk";
-import { readFileSync, writeFileSync } from "fs";
+// uses ingestContext() from ./hydradb (defined in connectors/slack.ts above)
 import { Octokit } from "@octokit/rest";
 
-const client = new HydraDBClient({ token: process.env.HYDRA_DB_API_KEY! });
-const TENANT_ID = "company-knowledge";
 const octokit = new Octokit({ auth: process.env.GITHUB_TOKEN });
 
 async function ingestGithubIssues(
@@ -651,6 +701,7 @@ async function ingestGithubIssues(
   const [owner, repo] = repoName.split("/");
   const sub = repoName.toLowerCase().replace("/", "-");
   const allIds: string[] = [];
+  let batch: any[] = [];
   let count = 0;
 
   for await (const issue of octokit.paginate.iterator(
@@ -678,19 +729,24 @@ async function ingestGithubIssues(
         `Issue #${item.number}: ${item.title}\n` +
         `State: ${item.state}\nLabels: ${labelList}\n\n` +
         `${item.body ?? ""}\n\nDiscussion:\n${comments.join("\n\n")}`;
-      const filename = `/tmp/github-${sub}-issue-${item.number}.txt`;
-      writeFileSync(filename, content, "utf-8");
 
-      const result = await client.context.ingest({
-        database: TENANT_ID,
-        collection: "github",
-        documents: [{ data: readFileSync(filename), filename, contentType: "application/octet-stream" }],
+      batch.push({
+        context_id: `github-${sub}-issue-${item.number}`,
+        title: `GitHub ${repoName} issue #${item.number}: ${item.title}`,
+        happened_at: item.created_at,
+        text: content,
+        attributes: { source_type: "github", repo: repoName },
       });
-      const results = result.data?.results ?? [];
-      if (results[0]?.id) allIds.push(results[0].id);
+
+      if (batch.length === 100) {
+        allIds.push(...(await ingestContext("github", batch)));
+        batch = [];
+      }
     }
     if (count >= limit) break;
   }
+
+  if (batch.length) allIds.push(...(await ingestContext("github", batch)));
 
   console.log(`GitHub ${repoName}: ${allIds.length} issues uploaded`);
   return allIds;
@@ -698,13 +754,13 @@ async function ingestGithubIssues(
 ```
 </CodeGroup>
 
-> **Linear connector**: Use the Linear GraphQL API (`https://api.linear.app/graphql`) with your API key. Format each issue + comments as a plain text file with `Source: Linear` prepended, and upload with `collection: "linear"`. The same multipart upload pattern applies.
+> **Linear connector**: Use the Linear GraphQL API (`https://api.linear.app/graphql`) with your API key. Format each issue + comments as a `context` item with `Source: Linear` prepended to `text`, and ingest with `collection: "linear"`. The same batching pattern applies.
 
 ---
 
 ## Step 3 - Verify Indexing
 
-After uploading, poll `GET /context/status` until `indexing_status` is `completed` before running any queries. HydraDB indexes asynchronously - typically 10–30 seconds per file.
+After ingesting, poll `GET /context/status` until `indexing_status` is `completed` before running any queries. HydraDB indexes asynchronously - typically 10-30 seconds per item.
 
 > **Note**: [`GET /context/status`](/api-reference/v2/endpoint/source-status) takes `ids` and `database` as **query parameters**. Pass multiple `ids` to check a batch in one call.
 
@@ -770,7 +826,6 @@ const TENANT_ID = "company-knowledge";
 
 async function waitUntilIndexed(
   id: string,
-  subTenant: string,
   maxTries: number = 20,
   intervalMs: number = 3000
 ): Promise<void> {
@@ -778,7 +833,6 @@ async function waitUntilIndexed(
     await new Promise((r) => setTimeout(r, intervalMs));
     const result = await client.context.status({
       database: TENANT_ID,
-      collection: subTenant,
       ids: [id],
     });
     const statuses = result.data.statuses ?? [];
@@ -800,42 +854,38 @@ async function waitUntilIndexed(
 
 ---
 
-## Step 4 - Store User Memory Profiles
+## Step 4 - Store User Context Profiles
 
-Each user gets a persistent memory profile. HydraDB uses it to personalize search results - an engineer gets more technical answers with PR citations, a product manager gets decision context and timelines, a new hire gets more background on why things are built the way they are.
+Each user gets a persistent profile stored in their own collection (`user-<id>`). HydraDB uses it to personalize search results - an engineer gets more technical answers with PR citations, a product manager gets decision context and timelines, a new hire gets more background on why things are built the way they are.
 
 ```bash
 curl -X POST 'https://api.hydradb.com/context/ingest' \
   -H "Authorization: Bearer YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "memories": [{
-      "text": "Alice is a senior engineer on the platform team. She owns the auth service and data pipeline. Prefers technical depth with references to PRs and ADRs.",
-      "infer": true,
-      "user_name": "alice"
-    }],
     "database": "company-knowledge",
     "collection": "user-alice",
-    "upsert": true
+    "upsert": true,
+    "context": [{
+      "context_id": "profile-alice",
+      "title": "Alice profile",
+      "text": "Alice is a senior engineer on the platform team. She owns the auth service and data pipeline. Prefers technical depth with references to PRs and ADRs.",
+      "user_name": "alice",
+      "enrich": true,
+      "attributes": {"doc_type": "user_profile"}
+    }]
   }'
 ```
 
 **Response**:
 ```json
 {
-  "success": true,
-  "message": "Memories queued for ingestion successfully",
   "results": [
     {
-      "id": "ddb780a2-354f-4a71-8e1b-5101c91c69ce",
-      "title": "First Document",
-      "status": "queued",
-      "infer": false,
-      "error": null
+      "id": "profile-alice",
+      "status": "accepted"
     }
-  ],
-  "success_count": 1,
-  "failed_count": 0
+  ]
 }
 ```
 
@@ -855,24 +905,26 @@ def store_user_profile(user_id: str, profile_text: str) -> str:
     Store a user profile for personalized search.
     user_id:      their Slack/email handle - must be consistent across sessions.
     profile_text: free-text description of their role, expertise, and preferences.
-    infer: true   - HydraDB extracts expertise signals and builds graph links.
-    Returns:      id of the stored memory.
+    enrich: true  - HydraDB extracts expertise signals and builds graph links.
+    Returns:      context_id of the stored profile.
     """
     result = client.context.ingest(
-        type='memory',
         database=TENANT_ID,
         collection=f"user-{user_id}",
         upsert=True,
-        memories=json.dumps([{
-            "text":      profile_text,
-            "infer":     True,
-            "user_name": user_id,
+        context=json.dumps([{
+            "context_id": f"profile-{user_id}",
+            "title":      f"{user_id} profile",
+            "text":       profile_text,
+            "user_name":  user_id,
+            "enrich":     True,
+            "attributes": {"doc_type": "user_profile"},
         }]),
     )
     items = result.data.results or []
-    id = items[0].id if items else None
-    print(f"Profile stored for {user_id} → id: {id}")
-    return id
+    cid = items[0].id if items else None
+    print(f"Profile stored for {user_id} → context_id: {cid}")
+    return cid
 ```
 
 ```typescript TypeScript SDK
@@ -890,25 +942,27 @@ async function storeUserProfile(
    * Store a user profile for personalized search.
    * userId:      their Slack/email handle - must be consistent across sessions.
    * profileText: free-text description of their role, expertise, and preferences.
-   * infer: true  - HydraDB extracts expertise signals and builds graph links.
-   * Returns:     id of the stored memory.
+   * enrich: true - HydraDB extracts expertise signals and builds graph links.
+   * Returns:     context_id of the stored profile.
    */
   const result = await client.context.ingest({
-    type: 'memory',
     database: TENANT_ID,
     collection: `user-${userId}`,
     upsert: true,
-    memories: JSON.stringify([
+    context: JSON.stringify([
       {
+        context_id: `profile-${userId}`,
+        title: `${userId} profile`,
         text: profileText,
-        infer: true,
         user_name: userId,
+        enrich: true,
+        attributes: { doc_type: "user_profile" },
       },
     ]),
   });
   const results = result.data?.results ?? [];
   const id: string | null = results[0]?.id ?? null;
-  console.log(`Profile stored for ${userId} → id: ${id}`);
+  console.log(`Profile stored for ${userId} → context_id: ${id}`);
   return id;
 }
 
@@ -961,12 +1015,12 @@ client    = HydraDB(token=os.environ["HYDRA_DB_API_KEY"])
 def search(
     question:     str,
     user_id:      str,
-    sub_tenant:   str   = None,   # restrict to "slack"|"docs"|"email"|"github" or omit for all
+    collection:   str   = None,   # restrict to "slack"|"docs"|"email"|"github" or omit for all
     recency_bias: float = 0.5,
     max_results:  int   = 15,
 ) -> dict:
     """
-    Core search function. Returns chunks + graph_context.
+    Core search function. Returns chunks + graph + llm_prompt.
     user_id personalizes answer depth based on stored profile.
     mode="thinking" enables multi-query reranking automatically.
     """
@@ -978,7 +1032,7 @@ def search(
         mode="thinking",
         alpha=0.5,
         recency_bias=recency_bias,
-        **(sub_tenant and {"collection": sub_tenant} or {}),
+        **(collection and {"collection": collection} or {}),
     )
 
 
@@ -986,10 +1040,9 @@ def print_results(result) -> None:
     chunks = result.data.chunks or []
     print(f"\n{len(chunks)} chunks retrieved:\n")
     for chunk in chunks:
-        fname = chunk.additional_metadata or {}
-        score = chunk.relevancy_score or 0
-        print(f"  [{fname.get('filename', 'memory')} - {score:.2f}]")
-        print(f"  {(chunk.chunk_content or '')[:200]}...")
+        score = chunk.score or 0
+        print(f"  [{chunk.context_id} - {score:.2f}]")
+        print(f"  {(chunk.content or '')[:200]}...")
         print()
 
 
@@ -1011,12 +1064,12 @@ const TENANT_ID = "company-knowledge";
 async function search(
   question: string,
   userId: string,
-  subTenant?: string,
+  collection?: string,
   recencyBias: number = 0.5,
   maxResults: number = 15
 ): Promise<any> {
   /**
-   * Core search function. Returns chunks + graph_context.
+   * Core search function. Returns chunks + graph + llm_prompt.
    * userId personalizes answer depth based on stored profile.
    * mode="thinking" enables multi-query reranking automatically.
    */
@@ -1029,7 +1082,7 @@ async function search(
     alpha: 0.5,
     recencyBias: recencyBias,
   };
-  if (subTenant) payload["collection"] = subTenant;
+  if (collection) payload["collection"] = collection;
 
   return await client.query(payload);
 }
@@ -1038,10 +1091,9 @@ function printResults(result: any): void {
   const chunks = result?.data?.chunks ?? [];
   console.log(`\n${chunks.length} chunks retrieved:\n`);
   for (const chunk of chunks) {
-    const fname = chunk?.additional_metadata?.filename ?? "memory";
-    const score = chunk?.relevancy_score ?? 0;
-    console.log(`  [${fname} - ${score.toFixed(2)}]`);
-    console.log(`  ${(chunk.chunk_content as string).slice(0, 200)}...`);
+    const score = chunk?.score ?? 0;
+    console.log(`  [${chunk?.context_id ?? "context"} - ${score.toFixed(2)}]`);
+    console.log(`  ${(chunk?.content ?? "").slice(0, 200)}...`);
     console.log();
   }
 }
@@ -1057,7 +1109,7 @@ printResults(result);
 
 ### 5.2 Decision Provenance - "Why did we decide X?" / "What led to Y?"
 
-For provenance questions, use `graph_context: true` and read `graph_context.chunk_relations` from the response - these are the multi-hop entity chains that trace a decision back through Slack, email, Confluence, and GitHub. Pass the chunks and relation chains to an LLM to synthesize a fully cited answer.
+For provenance questions, use `graph_context: true` and read `data.graph` from the response - each entry carries `path_summary` and `triplets`, the multi-hop entity chains that trace a decision back through Slack, email, Confluence, and GitHub. Pass `data.llm_prompt` plus the graph paths to an LLM to synthesize a fully cited answer.
 
 <CodeGroup>
 ```python Python SDK
@@ -1072,9 +1124,8 @@ openai_client = OpenAI()
 
 
 def get_user_profile(user_id: str) -> str:
-    """Retrieve a user's stored memory profile via /query with type: "memory"."""
+    """Retrieve a user's stored profile via /query against their user-<id> collection."""
     result = client.query(
-        type="memory",
         database=TENANT_ID,
         collection=f"user-{user_id}",
         query="expertise background role preferences",
@@ -1082,19 +1133,19 @@ def get_user_profile(user_id: str) -> str:
     )
     chunks = result.data.chunks or []
     if chunks:
-        return chunks[0].chunk_content or ""
+        return chunks[0].content or ""
     return ""
 
 
 def explain_decision(question: str, user_id: str) -> str:
     """
     Answer 'why' / 'what led to' questions with full provenance.
-    Step 1: search chunks + graph relations from /query (type="knowledge").
-    Step 2: retrieve user profile from /query (type="memory").
+    Step 1: search chunks + graph paths from /query.
+    Step 2: retrieve user profile from /query.
     Step 3: synthesize with citations via LLM.
     """
     # Step 1: Search with graph context
-    data            = client.query(
+    data   = client.query(
         database=TENANT_ID,
         query=question,
         max_results=18,
@@ -1102,20 +1153,19 @@ def explain_decision(question: str, user_id: str) -> str:
         mode="thinking",
         recency_bias=0.4,   # low = surfaces both old and recent for decision trails
     )
-    chunks          = data.data.chunks or []
-    chunk_relations = (data.data.graph_context.chunk_relations if data.data.graph_context else [])
+    chunks = data.data.chunks or []
+    graph  = data.data.graph or []
 
     # Build context with source attribution
     ctx_parts = []
     for c in chunks:
-        fname = (c.additional_metadata or {}).get("filename", "unknown source")
-        score = c.relevancy_score or 0
-        ctx_parts.append(f"[{fname} | score:{score:.2f}]\n{c.chunk_content or ''}")
+        score = c.score or 0
+        ctx_parts.append(f"[{c.context_id} | score:{score:.2f}]\n{c.content or ''}")
 
-    for rel in chunk_relations[:6]:
-        combined = rel.get("combined_context", "")
-        if combined:
-            ctx_parts.append(f"[Entity relationship]: {combined}")
+    for path in graph[:6]:
+        summary = path.get("path_summary") if isinstance(path, dict) else getattr(path, "path_summary", "")
+        if summary:
+            ctx_parts.append(f"[Entity relationship]: {summary}")
 
     # Step 2: Get user profile for answer calibration
     profile = get_user_profile(user_id)
@@ -1170,16 +1220,15 @@ const TENANT_ID = "company-knowledge";
 const openai = new OpenAI();
 
 async function getUserProfile(userId: string): Promise<string> {
-  /** Retrieve a user's stored memory profile via recallPreferences. */
+  /** Retrieve a user's stored profile via /query against their user-<id> collection. */
   const resp = await client.query({
-    type: "memory",
     database: TENANT_ID,
     collection: `user-${userId}`,
     query: "expertise background role preferences",
     mode: "thinking",
   });
   const chunks = resp.data?.chunks ?? [];
-  return chunks[0]?.chunk_content ?? "";
+  return chunks[0]?.content ?? "";
 }
 
 async function explainDecision(
@@ -1188,8 +1237,8 @@ async function explainDecision(
 ): Promise<string> {
   /**
    * Answer 'why' / 'what led to' questions with full provenance.
-   * Step 1: search chunks + graph relations from fullRecall.
-   * Step 2: retrieve user profile from recallPreferences.
+   * Step 1: search chunks + graph paths from /query.
+   * Step 2: retrieve user profile from /query.
    * Step 3: synthesize with citations via LLM.
    */
   // Step 1: Search with graph context
@@ -1202,20 +1251,17 @@ async function explainDecision(
     recencyBias: 0.4,
   });
   const chunks = data.data?.chunks ?? [];
-  const chunkRelations =
-    data.data?.graphContext?.chunkRelations ?? [];
+  const graph = data.data?.graph ?? [];
 
   // Build context with source attribution
   const ctxParts: string[] = [];
   for (const c of chunks) {
-    const fname =
-      (c.additional_metadata as any)?.filename ?? "unknown source";
-    const score = c.relevancy_score ?? 0;
-    ctxParts.push(`[${fname} | score:${score.toFixed(2)}]\n${c.chunk_content}`);
+    const score = c.score ?? 0;
+    ctxParts.push(`[${c.context_id} | score:${score.toFixed(2)}]\n${c.content}`);
   }
-  for (const rel of chunkRelations.slice(0, 6)) {
-    const combined = rel.combined_context ?? "";
-    if (combined) ctxParts.push(`[Entity relationship]: ${combined}`);
+  for (const path of graph.slice(0, 6)) {
+    const summary = path?.path_summary ?? "";
+    if (summary) ctxParts.push(`[Entity relationship]: ${summary}`);
   }
 
   // Step 2: Get user profile for answer calibration
@@ -1288,7 +1334,7 @@ def smart_search(question: str, user_id: str) -> dict:
 
 ## Step 6 - Search User Preferences
 
-To personalize any answer, retrieve the user's stored memory profile before calling the LLM. This is the same response structure as any [`/query`](/api-reference/v2/endpoint/query) call  -  an array of `chunks`.
+To personalize any answer, retrieve the user's stored profile before calling the LLM. This is the same response structure as any [`/query`](/api-reference/v2/endpoint/query) call - an array of `chunks`.
 
 ```bash
 curl -X POST 'https://api.hydradb.com/query' \
@@ -1305,21 +1351,25 @@ curl -X POST 'https://api.hydradb.com/query' \
 **Response**:
 ```json
 {
-  "chunks": [
-    {
-      "chunk_uuid": "0726e63e-e818-4515-88fc-ffbe3b1b523f_chunk_0",
-      "id":  "0726e63e-e818-4515-88fc-ffbe3b1b523f",
-      "chunk_content": "Alice is a senior engineer on the platform team. She owns the auth service and data pipeline. Prefers technical depth with references to PRs and ADRs.",
-      "relevancy_score": 0.634,
-      "additional_metadata": null
-    }
-  ],
-  "sources": [...],
-  "graph_context": {"query_paths": [], "chunk_relations": [], "chunk_id_to_group_ids": {}}
+  "data": {
+    "chunks": [
+      {
+        "chunk_id": "profile-alice_chunk_0",
+        "context_id": "profile-alice",
+        "score": 0.634,
+        "content": "Alice is a senior engineer on the platform team. She owns the auth service and data pipeline. Prefers technical depth with references to PRs and ADRs.",
+        "enrichment": null,
+        "temporal": null
+      }
+    ],
+    "graph": [],
+    "forceful_relations": [],
+    "llm_prompt": "[1] Alice is a senior engineer on the platform team. She owns the auth service and data pipeline. Prefers technical depth with references to PRs and ADRs."
+  }
 }
 ```
 
-> **Reading the response**: [`/query`](/api-reference/v2/endpoint/query) returns the same structure regardless of `type`  -  read the profile from `chunks[0].chunk_content`. `additional_metadata` will be `null` for memory entries; that's expected.
+> **Reading the response**: [`/query`](/api-reference/v2/endpoint/query) returns `data.chunks`, `data.graph`, `data.forceful_relations`, and `data.llm_prompt` - read the profile from `data.chunks[0].content`.
 
 ---
 
@@ -1381,7 +1431,7 @@ def handle_search_mention(event, client):
 
     result = smart_search(question, user_id)
     answer = result.get("answer") or "\n\n".join(
-        (c.chunk_content or "")[:300] for c in (result.get("chunks") or [])[:3]
+        (c.content or "")[:300] for c in (result.get("chunks") or [])[:3]
     )
 
     # Truncate for Slack (3000 char limit)
@@ -1394,7 +1444,7 @@ def handle_search_mention(event, client):
 
 ## Step 8 - Incremental Sync
 
-Run a nightly sync to keep all sources current. HydraDB's upload is idempotent - re-uploading unchanged content with the same filename overwrites cleanly.
+Run a nightly sync to keep all sources current. Ingest is idempotent - re-ingesting with the same `context_id` and `upsert: true` replaces the item cleanly.
 
 ```python
 # sync/nightly.py
@@ -1456,43 +1506,66 @@ All endpoints used in this cookbook. Base URL: `https://api.hydradb.com` · Head
 | Method | Endpoint | Purpose |
 |--------|----------|---------|
 | `POST` | `/databases` | Create the company-knowledge database |
-| `POST` | `/context/ingest` | Upload a source file (multipart form-data) |
+| `POST` | `/context/ingest` | Ingest source context items (JSON) |
 | `GET` | `/context/status?database=...&ids=...` | Check indexing status |
-| `POST` | `/context/ingest` | Store a user profile memory |
+| `POST` | `/context/ingest` | Store a user profile |
 | `POST` | `/query` | Retrieve user profile for personalization |
 | `POST` | `/query` | Query all indexed knowledge |
 
 ### Create Database
 ```json
-{ "database": "company-knowledge" }
+{
+  "database": "company-knowledge",
+  "database_metadata_schema": [
+    {"name": "source_type", "data_type": "VARCHAR"},
+    {"name": "doc_type", "data_type": "VARCHAR"},
+    {"name": "channel", "data_type": "VARCHAR"},
+    {"name": "space", "data_type": "VARCHAR"},
+    {"name": "repo", "data_type": "VARCHAR"}
+  ]
+}
 ```
 
-### Upload Knowledge (form-data)
+### Ingest Knowledge
 
-> Do not use `Content-Type: application/json`. This is a multipart upload.
+```json
+{
+  "database": "company-knowledge",
+  "collection": "slack",
+  "upsert": true,
+  "context": [
+    {
+      "context_id": "slack-engineering-1699430400.000001",
+      "title": "Slack #engineering thread 2024-11-08",
+      "happened_at": "2024-11-08T00:00:00Z",
+      "text": "Source: Slack #engineering\n\n<thread text>",
+      "attributes": {"source_type": "slack", "channel": "engineering"}
+    }
+  ]
+}
+```
 
-| Form field | Type | Value |
-|---|---|---|
-| `database` | Text | `company-knowledge` |
-| `collection` | Text | `slack` / `email` / `docs` / `github` |
-| `documents` | File | your `.txt` file |
+`collection` is `slack` / `email` / `docs` / `github` / `linear` depending on the source. Up to 100 items per request.
 
 ### Verify Processing (query params)
 ```
-GET /context/status?database=company-knowledge&ids=YOUR_ID
+GET /context/status?database=company-knowledge&ids=YOUR_CONTEXT_ID
 ```
 
-### Store User Memory
+### Store User Profile
 ```json
 {
-  "memories": [{
-    "text":      "Alice is a senior engineer...",
-    "infer":     true,
-    "user_name": "alice"
-  }],
-  "database":     "company-knowledge",
+  "database": "company-knowledge",
   "collection": "user-alice",
-  "upsert":        true
+  "upsert": true,
+  "context": [{
+    "context_id": "profile-alice",
+    "title": "Alice profile",
+    "text": "Alice is a senior engineer...",
+    "user_name": "alice",
+    "enrich": true,
+    "attributes": {"doc_type": "user_profile"}
+  }]
 }
 ```
 
@@ -1544,7 +1617,7 @@ Tested across a 2-year company knowledge base: 12 Slack channels, 3 Gmail accoun
 | Decision provenance ("why did we X?") | 18% | 29% | 82% | **+183%** |
 | Cross-source synthesis | 8% | 34% | 79% | **+132%** |
 | New hire onboarding questions | 31% | 48% | 88% | **+83%** |
-| Time saved per complex question | 45 min (manual) | ~8 min | under 30 sec | **−94%** |
+| Time saved per complex question | 45 min (manual) | ~8 min | under 30 sec | **-94%** |
 | P95 query latency | N/A (manual) | 220ms | under 200 ms | **Sub-second** |
 
 > The 183% improvement on decision provenance reflects HydraDB's context graph. Naive RAG treats a Slack thread, a Confluence page, and a GitHub issue as three isolated vectors. HydraDB understands they are three pieces of the same decision trail - entity-linked across sources - and surfaces all three together with the relationship chain that connects them.
@@ -1601,7 +1674,7 @@ atlassian-python-api
 
 1. Run `setup.py` to create your database.
 2. Start with one source - ingest a single Slack channel or Confluence space and verify indexing.
-3. Store profiles for 2–3 users via `memory/profiles.py`.
+3. Store profiles for 2-3 users via `memory/profiles.py`.
 4. Run `python search/qa.py` with a real question to confirm results.
 5. Wire `search/synthesis.py` into `interfaces/slack_search.py` and deploy the Slack bot.
 6. Schedule `sync/nightly.py` via cron once the initial ingest is complete.
@@ -1614,5 +1687,6 @@ The search quality improves as more sources are indexed - each new Slack channel
 
 | Version | Date | Notes |
 |---|---|---|
+| 1.2 | 2026-06-04 | Rewritten for the unified context API: file uploads replaced with `context` items, memory profiles stored as enriched context in per-user collections, and all responses read `data.chunks` / `data.graph` / `data.llm_prompt`. |
 | 1.1 | 2026-05-14 | Added TypeScript SDK tabs (CodeGroup) for all HydraDB API call blocks: database creation, all four connector uploads (Slack, Gmail, Confluence, GitHub), verify processing, add memory, full search (factual + provenance), and search preferences. |
 | 1.0 | 2026-05-09 | Initial release. Python SDK + curl examples for all six source connectors. |

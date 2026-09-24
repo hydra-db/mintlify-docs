@@ -1,16 +1,13 @@
 ---
 title: AI Chief of Staff
-description: “Quick-start guide to building an AI Chief of Staff with HydraDB using the TypeScript SDK. Register workspace functions as knowledge objects and let any agent ask 'What should I do?' to receive a structured, personalized execution plan. For the full production guide with Python, multi-step planning, security, and observability, see the complete AI Chief of Staff cookbook.”
-noindex: true
+description: “Quick-start guide to building an AI Chief of Staff with HydraDB. Register workspace functions as context items and let any agent ask 'What should I do?' to receive a structured, personalized execution plan. For the full production guide with Python, multi-step planning, security, and observability, see the complete AI Chief of Staff cookbook.”
 ---
 
-<Warning>This page is deprecated: it documents the knowledge and memory API, which unified databases replace. See [Ingest context](/essentials/v2/ingest) and [Query](/essentials/v2/query).</Warning>
-
->This page covers the core concepts and TypeScript patterns in 20 minutes. For the full production implementation - Python SDK, multi-step planning, policy engine, approval workflows, observability, and benchmarks - see the [complete AI Chief of Staff cookbook](/cookbooks/hydradb-cookbook-06).
+>This page covers the core concepts and TypeScript patterns in 20 minutes. For the full production implementation - Python, multi-step planning, policy engine, approval workflows, observability, and benchmarks - see the [complete AI Chief of Staff cookbook](/cookbooks/v2/hydradb-cookbook-06).
 
 This guide walks you through the key building blocks of an **AI Chief of Staff** - an _AI version of n8n_ - powered by HydraDB. Instead of only _answering_ questions, this assistant can **_take actions_** across every app in your workspace by selecting and executing the correct function at the right time.
 
-> **Note**: All code in this guide uses the official HydraDB TypeScript SDK (`@hydradb/sdk`). Base URL: `https://api.hydradb.com`. Get your API key at [app.hydradb.com](https://app.hydradb.com).
+> **Note**: All code in this guide calls the HydraDB REST API directly with `fetch`. Base URL: `https://api.hydradb.com`. Get your API key at [app.hydradb.com](https://app.hydradb.com).
 
 > **Goal**: Let any agent ask HydraDB _”What should I do next?”_ and receive a structured function call (plus parameters) that your execution layer can run.
 
@@ -20,14 +17,13 @@ This guide walks you through the key building blocks of an **AI Chief of Staff**
 **Required tools**:
 - HydraDB API key
 - Node.js 18+ (`node --version`)
-- `npm install @hydradb/sdk`
 
 ## What You'll Build
 
 By the end of this quick start, you'll be able to:
-- Register workspace functions (Slack, Calendar, Jira) as HydraDB knowledge objects
+- Register workspace functions (Slack, Calendar, Jira) as HydraDB context items
 - Ask HydraDB “What should I do for this task?” and receive the right function and parameters
-- Feed execution results back as memory so HydraDB improves suggestions over time
+- Feed execution results back as context so HydraDB improves suggestions over time
 
 ## The “Second Brain” Concept
 
@@ -72,7 +68,7 @@ graph LR
     A["User / Agent"] -->|"ask(task)"| B["Action Orchestrator<br/>• Policy Engine<br/>• Retry / Logging<br/>• Auth Vault<br/>• Function Cache"]
     B -->|"call(fn)"| C["Workspace Apps<br/>(Slack, Jira …)"]
     D["HydraDB"] -->|"function suggestions"| B
-    B -->|"feedback / events / memories"| A
+    B -->|"feedback / events / results"| A
 ```
 
 
@@ -84,9 +80,9 @@ graph LR
 
 ## How HydraDB Essential Features Enable This
 
-### AI Memories for Function Learning
+### Context for Function Learning
 
-HydraDB's **AI Memories** don't just remember user preferences - they learn **function effectiveness patterns**. When a user frequently chooses certain functions for specific types of tasks, HydraDB builds a personalized “function preference profile.” This means your AI agent gets smarter suggestions over time without any manual training.
+HydraDB doesn't just remember user preferences - it learns **function effectiveness patterns**. When a user frequently chooses certain functions for specific types of tasks, HydraDB builds a personalized “function preference profile.” This means your AI agent gets smarter suggestions over time without any manual training.
 
 **Example**: If Sarah always prefers Slack notifications over email for urgent updates, HydraDB learns this pattern and automatically suggests `send_slack_message` instead of `send_email` for her urgent notifications.
 
@@ -120,10 +116,10 @@ This isn't just about security - it's about **cognitive focus**. By limiting fun
 
 ### 1.1 Function Schema
 
-HydraDB treats each callable as a **knowledge object**. The minimal schema:
+HydraDB treats each callable as a **context item**. The minimal schema your orchestrator works with:
 
 
-```jsonc
+```json
 {
   "id": "send_slack_message",
   "name": "Send a Slack message",
@@ -147,27 +143,47 @@ HydraDB treats each callable as a **knowledge object**. The minimal schema:
 
 ### 1.2 Upload to HydraDB
 
-Use the `/context/ingest` endpoint with `app_knowledge` to register each function as a knowledge object.
+Use the `/context/ingest` endpoint to register each function as a context item. The item's `text` carries the function name, description and parameter schema so HydraDB can reason over it.
 
 
 ```ts
-import { HydraDBClient } from "@hydradb/sdk";
+const BASE_URL = "https://api.hydradb.com";
+const HEADERS = {
+  Authorization: `Bearer ${process.env.HYDRA_DB_API_KEY}`,
+  "API-Version": "2",
+  "Content-Type": "application/json",
+};
 
-const client = new HydraDBClient({ token: process.env.HYDRA_DB_API_KEY });
+async function ingestContext(body: Record<string, unknown>) {
+  const res = await fetch(`${BASE_URL}/context/ingest`, {
+    method: "POST",
+    headers: HEADERS,
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`ingest failed: ${res.status}`);
+  return (await res.json()).data;
+}
 
-await client.context.ingest({
+await ingestContext({
   database: "your_database",
-  collection: "your_collection",
-  appKnowledge: JSON.stringify([
+  collection: "functions",
+  context: [
     {
-      id: "send_slack_message",
+      context_id: "send_slack_message",
       title: "Send a Slack message",
-      type: "slack",
-      timestamp: new Date().toISOString(),
-      content: { text: JSON.stringify(schema) },
-      additional_metadata: { permissions: ["workspace_admins"], tags: ["automation", "slack"] }
-    }
-  ])
+      text: [
+        "Function: send_slack_message",
+        "Posts a message to a Slack channel on behalf of the user.",
+        `Parameters: ${JSON.stringify(schema.parameters)}`,
+      ].join("\n"),
+      attributes: { deprecated: false },
+      custom_attributes: {
+        app: "slack",
+        permissions: ["workspace_admins"],
+        tags: ["automation", "slack"],
+      },
+    },
+  ],
 });
 ```
 
@@ -176,7 +192,7 @@ await client.context.ingest({
 
 ### 1.3 Versioning & Deprecation
 
-Store new versions with `id: functionName_v2`. Mark old versions' `hydradb_metadata.deprecated = true` so HydraDB avoids suggesting them.
+Store new versions with `context_id: functionName_v2`. To retire an old version, re-ingest it with `upsert` and mark it `deprecated` in `attributes` (declare a `deprecated` field of type `BOOL` in `database_metadata_schema`), then exclude it on query with an `attributes` filter.
 
 ---
 
@@ -186,49 +202,57 @@ The orchestrator bridges HydraDB ↔ real APIs.
 
 
 ```ts
-import { HydraDBClient } from "@hydradb/sdk";
-
 class Orchestrator {
-  private client: HydraDBClient;
+  private database: string;
   private registry: Map<string, Function>;
 
-  constructor(client: HydraDBClient, registry: Map<string, Function>) {
-    this.client = client;
+  constructor(database: string, registry: Map<string, Function>) {
+    this.database = database;
     this.registry = registry;
   }
 
-  async handleTask(task: string, userContext: { database: string; collection: string }) {
+  private async post(path: string, body: Record<string, unknown>) {
+    const res = await fetch(`${BASE_URL}${path}`, {
+      method: "POST",
+      headers: HEADERS,
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(`${path} failed: ${res.status}`);
+    return (await res.json()).data;
+  }
+
+  async handleTask(task: string, collection: string) {
     // 1️⃣ Ask HydraDB which function best matches the task
-    const result = await this.client.query({
-      database: userContext.database,
-      collection: userContext.collection,
+    const data = await this.post("/query", {
+      database: this.database,
+      collection,
       query: task,
       mode: "thinking",
-      maxResults: 5
+      max_results: 5,
+      attributes: { deprecated: false },
     });
 
-    if (!result.data?.chunks || result.data.chunks.length === 0) return { status: "noop" };
+    if (!data.chunks || data.chunks.length === 0) return { status: "noop" };
 
     // 2️⃣ Use the top-ranked chunk to identify and execute the function
-    const topChunk = result.data.chunks[0];
-    const functionId = topChunk.id;
+    const topChunk = data.chunks[0];
+    const functionId = topChunk.context_id;
     const exec = this.registry.get(functionId);
     if (!exec) return { status: "noop" };
     const execResult = await exec(topChunk);
 
-    // 3️⃣ Optional: feed result back to HydraDB as a user memory
-    await this.client.context.ingest({
-      type: 'memory',
-      database: userContext.database,
-      collection: userContext.collection,
-      upsert: true,
-      memories: JSON.stringify([
+    // 3️⃣ Optional: feed the result back to HydraDB so future suggestions improve
+    await this.post("/context/ingest", {
+      database: this.database,
+      collection: "execution-log",
+      context: [
         {
-          id: `exec_${functionId}_${Date.now()}`,
+          context_id: `exec_${functionId}_${Date.now()}`,
+          title: `Execution result: ${functionId}`,
           text: `Executed function "${functionId}" for task: "${task}". Result: ${summarize(execResult)}`,
-          infer: true
-        }
-      ])
+          enrich: true,
+        },
+      ],
     });
 
     return { status: "done", result: execResult };
@@ -239,8 +263,8 @@ class Orchestrator {
 
 > **Notable Flags**
 >
-> - `auto_agent_routing`: Lets HydraDB choose between _answering_ vs _acting_.
-> - `multi_step_reasoning`: Enables plans like _“create Zoom, then email invite”_.
+> - `mode: "thinking"`: Expands the task and reranks, which picks up multi-function plans like _“create Zoom, then email invite”_.
+> - `follow_forceful_relations`: In `thinking` mode, also pulls items a hit declared `forceful_relations` to at ingest, returned under `forceful_relations[]`.
 
 ---
 
@@ -355,23 +379,38 @@ The **retrieval engine** finds semantically similar past requests and suggests f
 
 ### Context-Aware Function Metadata
 
-Use HydraDB's **metadata filtering** to make function suggestions context-aware:
+Declare the fields you want to filter on in `database_metadata_schema` when you create the database, then send them as `attributes` on each function item:
 
 
-```jsonc
+```json
 {
-  "id": "approve_expense",
-  "meta": {
+  "context_id": "approve_expense",
+  "title": "Approve an expense",
+  "text": "Approves an expense report on behalf of a manager. ...",
+  "attributes": {
     "department": "finance",
-    "permission_level": "manager",
-    "cost_threshold": 1000,
-    "business_hours_only": true
+    "permission_level": "manager"
   }
 }
 ```
 
 
-When a finance manager requests expense approval during business hours, HydraDB automatically considers these constraints in its function selection logic.
+Query with an `attributes` filter so only the functions a caller is allowed to run come back:
+
+
+```ts
+const data = await this.post("/query", {
+  database: this.database,
+  collection: "functions",
+  query: task,
+  mode: "thinking",
+  max_results: 5,
+  attributes: { department: "finance", deprecated: false },
+});
+```
+
+
+When a finance manager requests expense approval, the filter narrows candidates to finance functions before ranking.
 
 ---
 
@@ -392,29 +431,29 @@ When a finance manager requests expense approval during business hours, HydraDB 
 | Average time-to-completion | Spot slow external APIs               |
 | Rollback frequency         | Detect unstable functions             |
 
-Auto-tune by feeding metrics back to HydraDB's memory:
+Auto-tune by feeding metrics back to HydraDB:
 
 
 ```ts
-await client.context.ingest({
-  type: 'memory',
+await ingestContext({
   database: "your_database",
-  collection: "your_collection",
-  upsert: true,
-  memories: JSON.stringify([
+  collection: "execution-log",
+  context: [
     {
-      id: "metrics_calendar_event",
+      context_id: "metrics_create_calendar_event",
+      title: "Function health: create_calendar_event",
       text: 'Function "create_calendar_event" had slow_response signal with p95 of 2500ms.',
-      infer: true
-    }
-  ])
+      enrich: true,
+      upsert: true,
+    },
+  ],
 });
 ```
 
 
 ---
 
-## The Compound Effect of AI Memories \+ Function Selection
+## The Compound Effect of Context \+ Function Selection
 
 As your AI Chief of Staff runs more tasks, something powerful happens: **HydraDB builds institutional knowledge** about how work gets done in your organization.
 
@@ -425,7 +464,7 @@ It learns that:
 - Customer success follows different escalation paths per account tier
 - Executive requests often have implicit urgency requirements
 
-This knowledge gets encoded in AI Memories and influences future function suggestions. Your AI agent becomes not just capable of executing tasks, but **wise about how to execute them well** in your specific context.
+This knowledge gets encoded as context and influences future function suggestions. Your AI agent becomes not just capable of executing tasks, but **wise about how to execute them well** in your specific context.
 
 ### Function Composition Patterns
 
@@ -446,16 +485,16 @@ Your AI agent can reference these learned patterns when planning complex workflo
 - Start **read-only** (analytics) before enabling write.
 - Use **idempotent** APIs or implement retries with back-off.
 - Maintain **simulated staging** workspace for testing.
-- Leverage **AI Memories** to personalize function selection over time.
+- Feed execution context back to personalize function selection over time.
 - Use **multi-step reasoning** for complex business processes.
-- Implement **metadata filtering** for context-aware suggestions.
+- Implement **attribute filtering** for context-aware suggestions.
 - Feed execution results back to HydraDB for **self-improvement**.
 
 ---
 
 ## Next Steps
 
-1. Pick one app (e.g., Slack) and register 3–5 high-value actions.
+1. Pick one app (e.g., Slack) and register 3 to 5 high-value actions.
 2. Build a CLI wrapper around the orchestrator for local experiments.
 3. Roll out to a friendly internal team, gather feedback, iterate.
 

@@ -1,16 +1,13 @@
 ---
 title: "Cursor for Docs"
 description: "Go from zero to a production AI assistant that answers 'why was this built this way?' - in four phases. Start with one file and a real search query. End with a FastAPI backend that ingests GitHub, PRs, Slack, and RFCs, then generates GPT-4o answers grounded in your codebase. Every endpoint in this guide is real and copy-paste ready."
-noindex: true
 ---
-
-<Warning>This page is deprecated: it documents the knowledge and memory API, which unified databases replace. See [Ingest context](/essentials/v2/ingest) and [Query](/essentials/v2/query).</Warning>
 
 Go from zero to a production AI assistant that answers "why was this built this way?" in four phases. Start with one file and a real search query. End with a FastAPI backend that ingests GitHub, PRs, Slack, and RFCs, then generates GPT-4o answers grounded in your codebase.
 
-> **How this guide is structured.** Each phase ends with something that works. Phase 0 is a complete minimal system in under 10 minutes. Phases 1–3 are progressive upgrades. You never need to redo what came before.
+> **How this guide is structured.** Each phase ends with something that works. Phase 0 is a complete minimal system in under 10 minutes. Phases 1-3 are progressive upgrades. You never need to redo what came before.
 
-> **All code in this cookbook is real.** Base URL is `https://api.hydradb.com`. Get your API key at [app.hydradb.com](https://app.hydradb.com).
+> **All code in this cookbook is real.** Base URL is `https://api.hydradb.com`. Get your API key at [app.hydradb.com](https://app.hydradb.com). SDK snippets use the call shapes in the [SDK reference](/api-reference/v2/sdks) and require an SDK release generated from the current API specification.
 
 ---
 
@@ -33,7 +30,7 @@ By the end of this cookbook, you'll be able to:
 
 ---
 
-## Phase 0 - Minimal Working System · 5–10 minutes
+## Phase 0 - Minimal Working System · 5-10 minutes
 
 The only goal is to see a real search response from a real file you uploaded. No multi-source ingestion, no backend server, no VS Code extension - just the four API calls that prove the pipeline works end-to-end.
 
@@ -95,7 +92,15 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from config import client, DATABASE_ID
 
 def create_tenant():
-    client.databases.create(database=DATABASE_ID)
+    client.databases.create(
+        database=DATABASE_ID,
+        database_metadata_schema=[
+            {"name": "doc_type", "data_type": "VARCHAR"},
+            {"name": "repo",     "data_type": "VARCHAR"},
+            {"name": "language", "data_type": "VARCHAR"},
+            {"name": "channel",  "data_type": "VARCHAR"},
+        ],
+    )
     print("Accepted")
     _poll_until_ready()
 
@@ -105,9 +110,9 @@ def _poll_until_ready(timeout=180, interval=4):
     while time.time() < deadline:
         status = client.databases.status(database=DATABASE_ID).data
         infra = status.infra
-        if infra.scheduler_status and infra.graph_status and infra.vectorstore_status.knowledge and infra.vectorstore_status.memories:
+        if infra.ready_for_ingestion:
             print("✓ Database ready."); return
-        print(f"  scheduler={infra.scheduler_status} graph={infra.graph_status} vectorstore={infra.vectorstore_status} - retrying in {interval}s")
+        print(f"  ready_for_ingestion={infra.ready_for_ingestion} - retrying in {interval}s")
         time.sleep(interval)
     raise TimeoutError("Database not ready within 180s")
 
@@ -123,7 +128,7 @@ python3 phase0/create_tenant.py
 ```
 Accepted: {'database': 'engineering-docs', 'status': 'accepted', 'message': 'Database accepted. Poll /databases/status for readiness.'}
 Polling for readiness...
-  scheduler=False graph=False vectorstore=[False, False] - retrying in 4s
+  ready_for_ingestion=False - retrying in 4s
 ✓ Database ready.
 ```
 
@@ -133,9 +138,9 @@ Polling for readiness...
 
 ### Step 2 - Upload One File
 
-**What:** Uploads a single file using **multipart form-data** to `/context/ingest` - the recommended beginner path. HydraDB handles chunking, embedding, and graph-node creation automatically. The returned `id` is what you use in Step 3 to verify indexing.
+**What:** Reads a file's text and ingests it as a context item via `POST /context/ingest`. HydraDB handles chunking, embedding, and graph-node creation automatically. The `context_id` you set is what you use in Step 3 to verify indexing.
 
-> 💡 **Two ingestion modes exist.** This step uses **multipart file upload via `/context/ingest`** - the tested beginner path. An advanced JSON body mode (used in Phases 1–2) supports structured IDs and explicit graph `relations`. Use file upload here first.
+> 💡 **There is no file upload on a unified database.** You send the file's text inside a `context` item. Text-based files (Markdown, code, JSON) work as-is; binary formats need a text-extraction library client-side.
 
 First, create a sample document:
 
@@ -159,76 +164,85 @@ EOF
 ```
 
 ```python
-import sys, os
+import sys, os, json
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from config import client, DATABASE_ID
 
-def upload_file(filepath: str):
+def upload_file(filepath: str, context_id: str):
     filename = os.path.basename(filepath)
+    text = open(filepath, encoding="utf-8", errors="ignore").read()
 
-    with open(filepath, "rb") as f:
-        result = client.context.ingest(
-            database=DATABASE_ID,
-            documents=[(filename, f, "text/markdown")],
-        )
+    result = client.context.ingest(
+        database=DATABASE_ID,
+        collection="default",
+        context=json.dumps([{
+            "context_id": context_id,
+            "title":      filename,
+            "text":       text,
+        }]),
+    )
 
     print("RESULT:", result)
     return result
 
 if __name__ == "__main__":
-    result = upload_file("phase0/sample_docs/auth_middleware.md")
-    # Note the id from the response - you need it for Step 3
-    print("\nCopy your id for use in verify.py:", result)
+    result = upload_file("phase0/sample_docs/auth_middleware.md",
+                         "myrepo/auth_middleware.md")
+    # Note the context_id you set - you need it for Step 3
+    print("\nUse 'myrepo/auth_middleware.md' as ITEM_ID in verify.py")
 ```
 
 **Expected output:**
 
 ```
-STATUS CODE: 200
-RESPONSE: {"results": [{"id": "YOUR_ID_HERE", "filename": "auth_middleware.md", "status": "accepted", "error": null}]}
+RESULT: {"results": [{"id": "myrepo/auth_middleware.md", "status": "accepted"}]}
 
-Copy your id for use in verify.py: {'results': [{'id': 'YOUR_ID_HERE', 'filename': 'auth_middleware.md', 'status': 'accepted', 'error': None}]}
+Use 'myrepo/auth_middleware.md' as ITEM_ID in verify.py
 ```
 
-The exact value of `id` depends on HydraDB's internal file registration. Copy the value returned and use it in Step 3.
+You set `context_id` yourself, so the ID to verify in Step 3 is stable and known up front.
 
 **If it fails:**
 - `404 Database does not exist` - Step 1 not complete, or `database` mismatch.
-- `400 / missing files` - Confirm the field name is `documents` (not `file`), and that `Content-Type` is NOT manually set in headers.
+- `400` naming an unknown field - the request must send `context` as a JSON string containing the item array. Each item takes `text` or `conversation`, never both.
 
 ---
 
 ### Step 3 - Verify Indexing
 
-**What:** Polls `/context/status` using the `id` returned in Step 2. HydraDB returns a `statuses` array; you read `statuses[0].indexing_status`. Querying before this reaches `"completed"` returns empty results with no error - the most common beginner confusion.
+**What:** Polls `GET /context/status` using the `context_id` set in Step 2. HydraDB returns a `statuses` array; you read `statuses[0].indexing_status`. Querying before this reaches `"completed"` returns empty results with no error - the most common beginner confusion.
 
-Replace `YOUR_ID_HERE` with the `id` from Step 2:
+Use the `context_id` from Step 2:
 
 ```python
-import sys, os, time
+import sys, os, time, requests
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-from config import client, DATABASE_ID
+from config import HYDRA_DB_API_KEY, DATABASE_ID
 
-# Replace with the id returned by upload_file.py in Step 2
-ITEM_ID = "YOUR_ID_HERE"
+BASE_URL = "https://api.hydradb.com"
+HEADERS  = {"Authorization": f"Bearer {HYDRA_DB_API_KEY}", "API-Version": "2"}
 
-def verify_item(id: str, timeout: int = 120, interval: int = 3):
+# The context_id set by upload_file.py in Step 2
+ITEM_ID = "myrepo/auth_middleware.md"
+
+def verify_file(item_id: str, timeout: int = 120, interval: int = 3):
     """
-    Polls /context/status until indexing_status is "completed" or "errored".
+    Polls GET /context/status until indexing_status is "completed" or "errored".
     """
-    print(f"Verifying '{id}'...")
+    print(f"Verifying '{item_id}'...")
     deadline = time.time() + timeout
     while time.time() < deadline:
-        status = client.context.status(
-            database=DATABASE_ID,
-            ids=[id],
+        resp = requests.get(
+            f"{BASE_URL}/context/status",
+            headers=HEADERS,
+            params={"database": DATABASE_ID, "ids": item_id},
+            timeout=15,
         )
-        print("STATUS:", status)
-
-        items = status.data.statuses or []
+        resp.raise_for_status()
+        items = resp.json().get("data", {}).get("statuses") or []
         if items:
-            s = items[0].indexing_status
-            if   s == "completed": print(f"✓ '{id}' ready."); return
+            s = items[0].get("indexing_status")
+            if   s == "completed": print(f"✓ '{item_id}' ready."); return
             elif s == "errored":   print("Indexing errored."); return
             print(f"  indexing_status: {s} - waiting...")
 
@@ -236,40 +250,36 @@ def verify_item(id: str, timeout: int = 120, interval: int = 3):
     raise TimeoutError("Indexing timed out")
 
 if __name__ == "__main__":
-    verify_item(ITEM_ID)
+    verify_file(ITEM_ID)
 ```
 
 **Expected output:**
 
 ```
-Verifying 'YOUR_ID_HERE'...
-STATUS CODE: 200
-RESPONSE: {"statuses": [{"id": "YOUR_ID_HERE", "indexing_status": "processing"}]}
+Verifying 'myrepo/auth_middleware.md'...
   indexing_status: processing - waiting...
-STATUS CODE: 200
-RESPONSE: {"statuses": [{"id": "YOUR_ID_HERE", "indexing_status": "completed"}]}
-✓ 'YOUR_ID_HERE' ready.
+  indexing_status: graph_creation - waiting...
+✓ 'myrepo/auth_middleware.md' ready.
 ```
 
 ---
 
 ### Step 4 - Run Your First Search Query
 
-**What:** Sends a POST to `/query` and receives a `chunks` array. Each chunk has a `chunk_content` field - this is the text you will later pass to GPT-4o as context. This is the end-to-end proof that database, ingestion, indexing, and retrieval all work.
+**What:** Sends a POST to `/query` and receives a `chunks` array. Each chunk has a `content` field - this is the text you will later pass to GPT-4o as context. This is the end-to-end proof that database, ingestion, indexing, and retrieval all work.
 
 **Validated first search - minimal working request:**
 
-```jsonc
+```json
 {
   "database":   "engineering-docs",
+  "collection": "default",
   "query":       "internal IP auth skip logic",
   "max_results": 10
 }
-
-// collection is NOT required for this working flow.
-// HydraDB handles scope internally when omitted.
-// Response contains a "chunks" array - read chunk_content from each item.
 ```
+
+Response `data` has four keys: `chunks`, `graph`, `forceful_relations`, `llm_prompt`. Read `content` from each item in `chunks`, or pass `data.llm_prompt` to your LLM as-is.
 
 ```python
 import sys, os
@@ -279,12 +289,11 @@ from config import client, DATABASE_ID
 def search(query: str, max_results: int = 10):
     """
     Minimal working search.
-    Only database + query + max_results are required.
-    collection is NOT required - HydraDB handles scope internally.
-    Returns SDK object with .chunks and .sources attributes.
+    Returns SDK object; data has chunks, graph, forceful_relations, llm_prompt.
     """
     data = client.query(
         database=DATABASE_ID,
+        collection="default",
         query=query,
         max_results=max_results,
     )
@@ -292,98 +301,94 @@ def search(query: str, max_results: int = 10):
 
 if __name__ == "__main__":
     data   = search("internal IP auth skip logic")
-    chunks  = data.data.chunks or []     # iterate the "chunks" array
-    sources = data.data.sources or []    # sources list for citations
+    chunks = data.data.chunks or []     # iterate the "chunks" array
 
     print(f"\nChunks returned: {len(chunks)}")
     for i, chunk in enumerate(chunks, 1):
-        chunk_content = chunk.chunk_content or ""  # always use chunk_content
-        score         = chunk.relevancy_score if chunk.relevancy_score is not None else "?"
-        print(f"\n[{i}] relevancy_score={score}")
-        print(f"     {chunk_content[:300]}")
+        content = chunk.content or ""
+        score   = chunk.score if chunk.score is not None else "?"
+        print(f"\n[{i}] score={score} context_id={chunk.context_id}")
+        print(f"     {content[:300]}")
 
-    print(f"\nSources: {[s.title for s in sources]}")
+    # Prompt-ready markdown with citation labels - pass to your LLM as-is
+    print("\n--- llm_prompt preview ---")
+    print((data.data.llm_prompt or "")[:500])
 ```
 
 **Expected output:**
 
 ```
-STATUS CODE: 200
-
 Chunks returned: 2
 
-[1] relevancy_score=0.94
+[1] score=0.94 context_id=myrepo/auth_middleware.md
      Token validation is skipped for requests from internal IP ranges
      (10.0.0.0/8 and 172.16.0.0/12). Service-to-service calls within
      the VPC caused circular dependency issues during startup...
 
-[2] relevancy_score=0.87
+[2] score=0.87 context_id=myrepo/auth_middleware.md
      The security team approved this exception in RFC-007, on the condition
      that internal network access is controlled at the VPC level.
 
-Sources: ['auth_middleware.md']
+--- llm_prompt preview ---
+[1] Token validation is skipped for requests from internal IP ranges ...
 ```
 
 **If it fails:** `chunks: []` - Indexing is not yet complete. Wait 30 seconds and retry. Re-run Step 3 to confirm `indexing_status: completed`.
 
-> ✅ **Phase 0 complete.** The same `/query` endpoint - with the same minimal three-field body - is what every later phase uses. You'll only add parameters, not change the structure. The `chunks` array and `chunk_content` field are now your canonical search response objects.
+> ✅ **Phase 0 complete.** The same `/query` endpoint is what every later phase uses. You'll only add parameters, not change the structure. The `chunks` array and `llm_prompt` field are now your canonical search response objects.
 
-**What you just built:** You now have a working **retrieval system**. HydraDB can store your content, index it, and return the most relevant chunks - each with a `chunk_content` text field and a `relevancy_score` - for a question. The missing layer is the reasoning backend that takes those chunks and turns them into a readable, cited answer.
+**What you just built:** You now have a working **retrieval system**. HydraDB can store your content, index it, and return the most relevant chunks - each with `content`, `context_id` and a `score` - plus a prompt-ready `llm_prompt` block for a question. The missing layer is the reasoning backend that turns that context into a readable, cited answer.
 
 | What works now | What comes next |
 |---|---|
-| Database creation | Better metadata and chunk quality |
-| File upload | More source types for deeper context |
+| Database creation | Better attributes and chunk quality |
+| Text ingestion | More source types for deeper context |
 | Indexing verification | GPT-4o answer generation on top of search |
-| Search returns chunks and sources | A backend and UI your team can use daily |
+| Search returns chunks and llm_prompt | A backend and UI your team can use daily |
 
 ---
 
-## Phase 1 - Improve Retrieval · 15–20 minutes
+## Phase 1 - Improve Retrieval · 15-20 minutes
 
-Ingest multiple files with structured metadata, use collections to organise content, and tune search parameters. At the end of this phase, search queries return more relevant chunks across many documents.
+Ingest multiple files with structured attributes, use collections to organise content, and tune search parameters. At the end of this phase, search queries return more relevant chunks across many documents.
 
-**Goal:** 50+ files indexed with metadata, scoped search working.
+**Goal:** 50+ files indexed with attributes, scoped search working.
 
 ### How Retrieval Works
 
 Before writing more ingestion code, it's worth understanding what HydraDB actually returns and how to interpret it. This mental model applies to every phase.
 
-**Chunks vs. sources:** When HydraDB indexes a document, it splits the content into overlapping **chunks**. Each chunk is embedded independently and stored as a node in the context graph. When you call `/query`, you get back a `chunks` array. Iterate this array and read `chunk_content` from each item - that is the text you pass directly to your LLM as context.
-
-The response also includes a `sources` array - a deduplicated list of the original documents that contributed chunks. Use `sources` for citation labels; use `chunks` for the actual LLM context.
+**Chunks vs. llm_prompt:** When HydraDB indexes a context item, it splits the content into overlapping **chunks**. Each chunk is embedded independently and stored as a node in the context graph. When you call `/query`, `data` has exactly four keys: `chunks`, `graph`, `forceful_relations`, `llm_prompt`. Iterate `chunks` and read `content` from each item if you want to build context yourself, or pass `llm_prompt` to your LLM as-is - it is a ready-made markdown block with citation labels (`[1]`, `[R1]`, `[P1]`).
 
 **Anatomy of a search chunk - field reference:**
 
-| Field | Required | Description |
-|---|---|---|
-| `chunk_content` | **required** | The actual text of this chunk. **This is the canonical field you must extract.** Pass this directly to your LLM as context. It is the only field you cannot skip. |
-| `relevancy_score` | optional | Higher is more relevant. Use it for ranking, filtering low-quality chunks (drop below 0.5), or deciding how many chunks to pass into the LLM context window. |
-| `title` | optional | Human-readable label from the source document. Use for `[Source: ...]` citation references in your final answer. |
-| `chunk_uuid` | optional | Unique identifier for this chunk. Useful for deduplication when fan-out search across collections returns the same chunk more than once. |
-| `url` | optional | The URL you set at ingestion time. Present only if supplied. Use for deep-links in citation UI. |
-| `additional_metadata` | optional | The per-source metadata object from ingestion. May include `doc_type`, `repo`, `pr_number`, etc. |
+| Field | Description |
+|---|---|
+| `content` | The actual text of this chunk. **This is the canonical field you must extract** when building context by hand. |
+| `score` | Higher is more relevant. Use it for ranking, filtering low-quality chunks (drop below 0.5), or deciding how many chunks to pass into the LLM context window. |
+| `context_id` | The ID of the context item this chunk came from. Use for `[Source: ...]` citation references in your final answer. |
+| `chunk_id` | Unique identifier for this chunk. Useful for deduplication when fan-out search across collections returns the same chunk more than once. |
+| `enrichment` | Extracted signals attached to the chunk (preferences, decisions), when `enrich` ran at ingest time. |
+| `temporal` | Time information parsed from `happened_at`, when present. |
 
-**How to interpret the `relevancy_score`:** Scores are relative within a single response - they indicate ranked relevance for your specific query, not absolute confidence.
+**How to interpret the `score`:** Scores are relative within a single response - they indicate ranked relevance for your specific query, not absolute confidence.
 
-| relevancy_score range | What it means | What to do |
+| score range | What it means | What to do |
 |---|---|---|
 | `0.85+` | High confidence - chunk directly answers the query | Always include in LLM context |
-| `0.65–0.85` | Good match - chunk is relevant, may not be the exact answer | Include, let LLM decide relevance |
-| `0.40–0.65` | Weak match - tangentially related | Include only if few high-score results |
+| `0.65-0.85` | Good match - chunk is relevant, may not be the exact answer | Include, let LLM decide relevance |
+| `0.40-0.65` | Weak match - tangentially related | Include only if few high-score results |
 | `below 0.40` | Low match - probably not relevant | Drop from context to reduce noise |
 
-**How graph context changes search:** When you add `"graph_context": true` to your search request, HydraDB walks the explicit `relations.ids` edges you set at ingestion time for every high-scoring chunk. A source file chunk can pull in the PR that last changed it. That PR can pull in the RFC it referenced. This multi-hop traversal is what makes "why" questions answerable.
-
-> 💡 **Always safe to add to Phase 0.** `"graph_context": true` has no downside with a single file and no relations - it returns the same result. Turn it on now.
+**How graph context changes search:** `graph_context` defaults to `true`. HydraDB walks the explicit `forceful_relations` edges you set at ingestion time for every high-scoring chunk. A source file chunk can pull in the PR that last changed it. That PR can pull in the RFC it referenced. This multi-hop traversal is what makes "why" questions answerable. The `graph` array in the response carries the triplets and `path_summary` it found.
 
 ---
 
-### P1 · Step 1 - Batch Upload with Explicit IDs (JSON Ingestion)
+### P1 · Step 1 - Batch Upload with Explicit IDs
 
-**What:** Switches to **JSON body ingestion** via `/context/ingest` with `app_knowledge` field - the advanced ingestion path. This gives you full control over IDs, timestamps, collections, metadata, and (in Phase 2) explicit graph `relations`. The `{repo_name}/{relative_path}` ID convention is required for Phase 2 graph linking.
+**What:** Ingests a whole repo as context items via `/context/ingest`. This gives you full control over IDs, timestamps, attributes, and (in Phase 2) explicit `forceful_relations` graph edges. The `{repo_name}/{relative_path}` `context_id` convention is required for Phase 2 graph linking.
 
-> ⚠️ **Advanced path - stricter validation.** JSON ingestion requires well-formed payloads with `id`, `type`, and `content.text` on every item. Malformed requests are rejected outright. Use the file upload path (Phase 0 Step 2) if you just want to get content indexed quickly. Use JSON ingestion when you need stable IDs and graph relations.
+> ⚠️ **Strict validation.** Every item must have `text` or `conversation`, and unknown fields are rejected with a 400. The `context` list holds at most 100 items per request.
 
 ```python
 import sys, os, json, time, subprocess, pathlib
@@ -399,13 +404,14 @@ def git_timestamp(repo_path: str, rel_path: str) -> str:
         raw = subprocess.check_output(
             ["git","log","-1","--format=%cI",rel_path],
             cwd=repo_path, stderr=subprocess.DEVNULL).decode().strip()
-        return raw or "2020-01-01T00:00:00Z"
-    except: return "2020-01-01T00:00:00Z"
+        return (raw or "2020-01-01")[:10]
+    except: return "2020-01-01"
 
-def upload_batch(batch: list) -> list:
+def upload_batch(batch: list, collection: str) -> list:
     result = client.context.ingest(
         database=DATABASE_ID,
-        app_knowledge=json.dumps(batch),
+        collection=collection,
+        context=json.dumps(batch),   # JSON string, not a list
     )
     ids = [r.id for r in (result.data.results or []) if r.id]
     print(f"  Uploaded {len(ids)} items")
@@ -424,18 +430,20 @@ def ingest_directory(repo_path: str, repo_name: str) -> list:
         try: content = f.read_text(encoding="utf-8", errors="ignore")
         except: continue
         batch.append({
-            "id":          f"{repo_name}/{rel}",   # Phase 2 PR relations reference this ID
-            "title":       rel,
-            "type":        "document",
-            "timestamp":   git_timestamp(str(root), rel),
-            "content":     {"text": content},
-            "collections": ["codebase", repo_name, f.suffix.lstrip(".")],
-            "metadata": {"doc_type":"source_file","repo":repo_name,
-                      "language":f.suffix.lstrip("."),"tags":["codebase",repo_name]},
+            "context_id":  f"{repo_name}/{rel}",   # Phase 2 PR relations reference this ID
+            "title":        rel,
+            "text":         content,
+            "happened_at":  git_timestamp(str(root), rel),
+            "attributes": {
+                "doc_type": "source_file",
+                "repo":     repo_name,
+                "language": f.suffix.lstrip("."),
+            },
+            "custom_attributes": {"tags": ["codebase", repo_name]},
         })
-        if len(batch) == 20:
-            all_ids += upload_batch(batch); batch = []; time.sleep(1)
-    if batch: all_ids += upload_batch(batch)
+        if len(batch) == 100:
+            all_ids += upload_batch(batch, "codebase"); batch = []
+    if batch: all_ids += upload_batch(batch, "codebase")
     print(f"Verifying {len(all_ids)} files...")
     verify_batch(all_ids)
     print(f"✓ {len(all_ids)} files indexed from '{repo_name}'")
@@ -448,34 +456,35 @@ if __name__ == "__main__":
 **Expected output:**
 
 ```
-  Uploaded 20 items
-  Uploaded 20 items
-  Uploaded 14 items
+  Uploaded 54 items
 Verifying 54 files...
 ✓ 54 files indexed from 'myrepo'
 ```
 
 ---
 
-### P1 · Step 2 - Metadata and Collections
+### P1 · Step 2 - Attributes and Collections
 
-**What:** `collections` are labels you define for scoping search. `additional_metadata` fields are arbitrary key-value pairs used for filtering and citation labels. No extra API calls needed - these fields go in the ingestion payload.
+**What:** A `collection` is the scope you set per ingest request - use it for the source type (`codebase`, `pull-requests`, `slack`, `wikis`) so search can fan out per source. `attributes` are the schema-backed filterable fields declared at database creation (`doc_type`, `repo`, `language`, `channel`). `custom_attributes` carries anything else you want stored with the item. No extra API calls needed - these fields go in the ingestion payload.
 
-```jsonc
+Recommended `collection` values: `codebase`, `pull-requests`, `slack`, `wikis`. Recommended `doc_type` attribute values: `source_file`, `pull_request`, `slack_thread`, `rfc`, `adr`, `wiki`, `runbook`.
+
+```json
 {
-  "collections": ["codebase", "myrepo", "py"],
-  // [0] source type:  "codebase" | "pull-requests" | "slack" | "wikis"
-  // [1] repo/channel: "myrepo" | "eng-architecture"
-  // [2] sub-category: extension, doc_type, etc.
-
-  "metadata": {
-    "doc_type": "source_file",
-    // Recommended values:
-    // source_file | pull_request | slack_thread | rfc | adr | wiki | runbook
-    "repo":     "myrepo",
-    "language": "py",
-    "tags":     ["codebase", "auth"]
-  }
+  "collection": "codebase",
+  "context": [{
+    "context_id": "myrepo/auth/middleware.py",
+    "title":      "auth/middleware.py",
+    "text":       "...",
+    "attributes": {
+      "doc_type": "source_file",
+      "repo":     "myrepo",
+      "language": "py"
+    },
+    "custom_attributes": {
+      "tags": ["codebase", "auth"]
+    }
+  }]
 }
 ```
 
@@ -488,8 +497,8 @@ import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from config import client, DATABASE_ID
 
-def tuned_recall(query: str, scope: str = None, max_results: int = 15):
-    """scope: optional collection. Omit to search all collections automatically."""
+def tuned_recall(query: str, collections: list = None, max_results: int = 15):
+    """collections: optional list to scope search. Omit to search everything."""
     kwargs = {
         "database":     DATABASE_ID,
         "query":         query,
@@ -499,44 +508,41 @@ def tuned_recall(query: str, scope: str = None, max_results: int = 15):
         "alpha":         0.75,
         "recency_bias":  0.2,
     }
-    if scope: kwargs["collection"] = scope
+    if collections: kwargs["collections"] = collections
     return client.query(**kwargs)
 
-def build_context(chunks: list, min_score: float = 0.5) -> tuple[str, list]:
+def build_context(result, min_score: float = 0.5) -> tuple[str, list]:
     """
-    Extract chunk_content from chunks and build LLM context string.
-    Filters by relevancy_score; deduplicates by chunk_uuid.
+    Build LLM context from a /query result.
+    Filters chunks by score; deduplicates by chunk_id.
     Returns: (context_text, sources_list)
     """
     parts, sources, seen = [], [], set()
-    for chunk in chunks:
-        relevancy_score = chunk.relevancy_score if chunk.relevancy_score is not None else 1
-        if relevancy_score < min_score: continue
-        chunk_content = chunk.chunk_content or ""  # canonical field
-        uid           = chunk.chunk_uuid or chunk_content[:40]
-        if not chunk_content or uid in seen: continue
+    for chunk in (result.data.chunks or []):
+        score = chunk.score if chunk.score is not None else 1
+        if score < min_score: continue
+        content = chunk.content or ""
+        uid     = chunk.chunk_id or content[:40]
+        if not content or uid in seen: continue
         seen.add(uid)
-        addl = chunk.additional_metadata
-        doc_type = (addl or {}).get("doc_type", "doc")
-        title    = chunk.source_title or "untitled"
-        parts.append(f"[{doc_type.upper()}] {title}\n{chunk_content}")
-        sources.append({"title": title, "url": chunk.url,
-                         "relevancy_score": chunk.relevancy_score,
-                         "chunk_uuid": chunk.chunk_uuid})
+        parts.append(f"[{chunk.context_id}]\n{content}")
+        sources.append({"context_id": chunk.context_id,
+                        "score":      chunk.score,
+                        "chunk_id":   chunk.chunk_id})
     return "\n\n---\n\n".join(parts), sources
 ```
 
 ---
 
-## Phase 2 - Multi-source Context · 20–30 minutes
+## Phase 2 - Multi-source Context · 20-30 minutes
 
-Connect GitHub source files to their pull requests, Slack decision threads, and internal wikis. Use explicit `relations.ids` to guarantee graph edges. When a developer asks "why?", the answer now travels across all four source types in a single query.
+Connect GitHub source files to their pull requests, Slack decision threads, and internal wikis. Use explicit `forceful_relations` to guarantee graph edges. When a developer asks "why?", the answer now travels across all four source types in a single query.
 
 **Goal:** A "why" question returns code + PR + Slack + RFC in one response.
 
 **Pipeline:** Source files → Pull requests → Slack threads → Wikis & RFCs → Graph built
 
-> 💡 **Explicit vs. automatic graph edges.** Setting `relations.ids` *guarantees* a graph link every time. HydraDB may also try to extract relationships from content, but this is best-effort. Always use explicit relations for links that matter.
+> 💡 **Explicit vs. automatic graph edges.** Setting `forceful_relations` on an item *guarantees* a graph link to every listed `context_id`. HydraDB may also try to extract relationships from content, but this is best-effort. Always use forceful relations for links that matter.
 
 ### Why Each Source Type Matters
 
@@ -545,7 +551,7 @@ A developer asking "why does the auth middleware skip token validation for inter
 | Source | Answers | Role | Without it |
 |---|---|---|---|
 | **Source files** | *What* the code does | Anchors the query. Entry node for graph traversal. | No traversal starting point |
-| **Pull requests** | *Why* the change happened | Intent and debate behind the change. Review comments capture rejected alternatives. Set `relations.ids` to the changed file IDs. | Code exists but has no rationale |
+| **Pull requests** | *Why* the change happened | Intent and debate behind the change. Review comments capture rejected alternatives. Set `forceful_relations` to the changed file IDs. | Code exists but has no rationale |
 | **Slack threads** | Discussion and trade-offs | Captures informal approvals and decisions never written up in docs. | Informal approvals are invisible |
 | **Wikis & RFCs** | Formal decision record | Authoritative rationale and approval chain. An RFC directly answers a whole class of "why" questions. | Missing the authoritative "because" |
 
@@ -564,7 +570,7 @@ When those sources share stable IDs and explicit relations, the assistant can mo
 
 ### P2 · Step 1 - Ingest GitHub Source Files with Consistent IDs
 
-**What:** Ingests source files using the `{repo_name}/{relative_path}` ID convention. These IDs are what PR ingestion will reference in `relations.ids`. The IDs must match exactly - `myrepo/auth/middleware.py`, not `auth/middleware.py`.
+**What:** Ingests source files using the `{repo_name}/{relative_path}` `context_id` convention. These IDs are what PR ingestion will reference in `forceful_relations.context_ids`. The IDs must match exactly - `myrepo/auth/middleware.py`, not `auth/middleware.py`.
 
 Use `ingest_directory()` from Phase 1 Step 1. If you already ran Phase 1, your files are already indexed.
 
@@ -580,7 +586,7 @@ ingest_directory('/path/to/your/repo', 'myrepo')
 
 ### P2 · Step 2 - Ingest Pull Requests with Explicit Graph Relations
 
-**What:** Fetches merged PRs and turns each into one document: title + description + review comments + changed-file list. The `relations.ids` field guarantees graph edges form between the PR and every source file it changed.
+**What:** Fetches merged PRs and turns each into one context item: title + description + review comments + changed-file list. The `forceful_relations.context_ids` field guarantees graph edges form between the PR and every source file it changed.
 
 **Before:** A GitHub token with `repo` scope. Create at `github.com/settings/tokens` → New classic token → check `repo` → add to `.env` as `GITHUB_TOKEN`, `GITHUB_OWNER`, `GITHUB_REPO`.
 
@@ -624,7 +630,7 @@ def ingest_pull_requests(prs: list, repo_name: str) -> list:
         changed  = [f["filename"] for f in pr.get("files", [])]
         reviews  = "\n\n".join(r["body"] for r in pr.get("reviews",[]) if r.get("body"))
         comments = "\n\n".join(c["body"] for c in pr.get("comments",[]) if c.get("body"))
-        # IDs must exactly match those set in ingest_directory()
+        # IDs must exactly match the context_ids set in ingest_directory()
         ids = [f"{repo_name}/{fname}" for fname in changed]
         content = (
             f"PR #{pr['number']}: {pr['title']}\n"
@@ -635,18 +641,20 @@ def ingest_pull_requests(prs: list, repo_name: str) -> list:
             f"Inline comments:\n{comments or '(none)'}"
         )
         batch.append({
-            "id":          f"pr-{pr['number']}",
-            "title":       f"PR #{pr['number']}: {pr['title']}",
-            "type":        "document",
-            "timestamp":   pr["merged_at"],
-            "content":     {"text": content},
-            "collections": ["pull-requests"],
-            "relations":   {"ids": ids},
-            "metadata": {"doc_type":"pull_request","pr_number":pr["number"],
-                      "author":pr["user"]["login"],"changed_files":changed},
+            "context_id":  f"pr-{pr['number']}",
+            "title":        f"PR #{pr['number']}: {pr['title']}",
+            "text":         content,
+            "happened_at":  (pr["merged_at"] or "")[:10],
+            "attributes":   {"doc_type": "pull_request", "repo": repo_name},
+            "custom_attributes": {
+                "pr_number":     pr["number"],
+                "author":        pr["user"]["login"],
+                "changed_files": changed,
+            },
+            "forceful_relations": {"context_ids": ids},
         })
-        if len(batch)==20: all_ids+=upload_batch(batch); batch=[]; time.sleep(1)
-    if batch: all_ids+=upload_batch(batch)
+        if len(batch)==100: all_ids+=upload_batch(batch, "pull-requests"); batch=[]
+    if batch: all_ids+=upload_batch(batch, "pull-requests")
     verify_batch(all_ids)
     print(f"✓ {len(all_ids)} PRs indexed")
     return all_ids
@@ -690,20 +698,18 @@ def ingest_slack_export(export_dir: str, channels: list[str]) -> list:
                 f"[{m.get('user','?')}]: {m.get('text','')}"
                 for m in msgs if m.get("text"))
             if not text.strip(): continue
-            ts_dt = datetime.fromtimestamp(float(thread_ts)).isoformat() + "Z"
+            ts_dt = datetime.fromtimestamp(float(thread_ts)).isoformat()
             batch.append({
-                "id":          f"slack-{channel}-{thread_ts}",
-                "title":       f"Slack - #{channel} - {ts_dt[:10]}",
-                "type":        "document",
-                "timestamp":   ts_dt,
-                "content":     {"text": f"Channel: #{channel}\n\n{text}"},
-                "collections": ["slack", channel],
-                "metadata": {"doc_type":"slack_thread","channel":channel,
-                          "message_count":len(msgs)},
+                "context_id":  f"slack-{channel}-{thread_ts}",
+                "title":        f"Slack - #{channel} - {ts_dt[:10]}",
+                "text":         f"Channel: #{channel}\n\n{text}",
+                "happened_at":  ts_dt[:10],
+                "attributes":   {"doc_type": "slack_thread", "channel": channel},
+                "custom_attributes": {"message_count": len(msgs)},
             })
-            if len(batch)==20: all_ids+=upload_batch(batch); batch=[]; time.sleep(1)
+            if len(batch)==100: all_ids+=upload_batch(batch, "slack"); batch=[]
         print(f"  Processed #{channel}: {len(threads)} threads")
-    if batch: all_ids+=upload_batch(batch)
+    if batch: all_ids+=upload_batch(batch, "slack")
     verify_batch(all_ids)
     print(f"✓ {len(all_ids)} Slack threads indexed")
     return all_ids
@@ -736,17 +742,18 @@ def ingest_wikis(pages: list) -> list:
     batch, all_ids = [], []
     for page in pages:
         batch.append({
-            "id":          f"wiki-{page['id']}",
-            "title":       page["title"],
-            "type":        "document",
-            "timestamp":   page["last_updated"],
-            "content":     {"text": page["content"]},
-            "url":         page.get("url", ""),
-            "collections": ["wikis", page["doc_type"]],
-            "metadata": {"doc_type":page["doc_type"],"author":page.get("author","")},
+            "context_id":  f"wiki-{page['id']}",
+            "title":        page["title"],
+            "text":         page["content"],
+            "happened_at":  page["last_updated"][:10],
+            "attributes":   {"doc_type": page["doc_type"]},
+            "custom_attributes": {
+                "url":    page.get("url", ""),
+                "author": page.get("author", ""),
+            },
         })
-        if len(batch)==20: all_ids+=upload_batch(batch); batch=[]; time.sleep(1)
-    if batch: all_ids+=upload_batch(batch)
+        if len(batch)==100: all_ids+=upload_batch(batch, "wikis"); batch=[]
+    if batch: all_ids+=upload_batch(batch, "wikis")
     verify_batch(all_ids)
     print(f"✓ {len(all_ids)} wiki/RFC pages indexed")
     return all_ids
@@ -760,7 +767,7 @@ def ingest_markdown_folder(folder: str) -> list:
             "title":        f.stem.replace("-"," ").replace("_"," ").title(),
             "content":      f.read_text(encoding="utf-8",errors="ignore"),
             "doc_type":     "rfc" if "rfc" in f.name.lower() else "wiki",
-            "last_updated": "2024-01-01T00:00:00Z",
+            "last_updated": "2024-01-01",
         })
     return ingest_wikis(pages)
 ```
@@ -777,10 +784,12 @@ from config import client, DATABASE_ID
 def multi_source_recall(question: str):
     return client.query(
         database=DATABASE_ID,
+        collections=["codebase", "pull-requests", "slack", "wikis"],
         query=question,
         max_results=15,
         mode="thinking",
         graph_context=True,
+        follow_forceful_relations=True,
         alpha=0.65,
         recency_bias=0.15,
     )
@@ -789,19 +798,23 @@ if __name__ == "__main__":
     result = multi_source_recall(
         "Why does the auth middleware skip token validation for internal IPs?")
     for chunk in (result.data.chunks or [])[:5]:
-        score = chunk.relevancy_score if chunk.relevancy_score is not None else 0
-        print(f"[{score:.2f}] {chunk.source_title or ''}")
-        print((chunk.chunk_content or "")[:240])
+        score = chunk.score if chunk.score is not None else 0
+        print(f"[{score:.2f}] {chunk.context_id}")
+        print((chunk.content or "")[:240])
+    # Forceful-relation hops land in data.forceful_relations; the
+    # traversal paths land in data.graph (triplets + path_summary).
+    for hop in (result.data.forceful_relations or []):
+        print("via:", hop.get("via"), "->", (hop.get("chunk") or {}).get("context_id"))
 ```
 
 **Expected output:**
 
 ```
-[0.88] RFC-007 Internal Service Auth
+[0.88] wiki-rfc-007
 The auth middleware skips token validation for internal IPs...
-[0.82] PR #142 Auth Startup Fix
+[0.82] pr-142
 The change resolved circular dependency issues at startup...
-[0.77] #eng-architecture
+[0.77] slack-eng-architecture-1707926400.000001
 Security approved the internal-network exception...
 ```
 
@@ -809,7 +822,7 @@ Security approved the internal-network exception...
 
 ---
 
-## Phase 3 - Backend & Answer Generation · 25–35 minutes
+## Phase 3 - Backend & Answer Generation · 25-35 minutes
 
 Build a production FastAPI server. HydraDB is the memory layer - it retrieves ranked `chunks` via `search_docs()`. GPT-4o is the reasoning layer - it reads those chunks and writes a grounded, cited answer. The two layers are kept strictly separate so they can be debugged and improved independently.
 
@@ -820,8 +833,8 @@ Build a production FastAPI server. HydraDB is the memory layer - it retrieves ra
 The flow through the backend is:
 
 1. **Question** - `POST /chat` or `/ask`
-2. **Search** - `search_docs()` → chunks
-3. **Context block** - `chunk_content` assembled
+2. **Search** - `search_docs()` → chunks + llm_prompt
+3. **Context block** - `llm_prompt` passed through
 4. **GPT-4o** - writes grounded answer
 5. **Response** - answer + citations
 
@@ -834,7 +847,7 @@ backend/
 ├── __init__.py       - makes backend a package so imports work
 ├── config.py         - env vars, HYDRA_DB_API_KEY, HydraDB client, OpenAI keys, search defaults
 ├── hydra_client.py   - search_docs() wrapper for HydraDB retrieval
-├── search.py         - recall_context() and build_context_block(); extracts chunk_content
+├── search.py         - recall_context() and build_context_block(); passes llm_prompt through
 ├── answer.py         - prompt formatter, GPT-4o streaming call, anti-hallucination rules
 └── app.py            - FastAPI server; /chat (streaming) and /ask (sync JSON, easier for Postman)
 ```
@@ -842,8 +855,8 @@ backend/
 **Architecture summary:**
 
 - **`config.py`** - Loads `.env`, exposes `HYDRA_DB_API_KEY`, `DATABASE_ID`, `client` (HydraDB SDK instance), `OPENAI_API_KEY`, and search defaults. Every other file imports from here only.
-- **`hydra_client.py`** - `search_docs()` is the HydraDB retrieval path. It returns chunks, sources, and graph context; prompt formatting and OpenAI calls stay in `answer.py`. Imported by → `search.py`, `app.py`.
-- **`search.py`** - `recall_context()` calls `search_docs()` and returns the raw payload. `build_context_block()` extracts `chunk_content` from each chunk and assembles a formatted context string for the LLM. Imported by → `app.py`.
+- **`hydra_client.py`** - `search_docs()` is the HydraDB retrieval path. It returns chunks, graph, forceful_relations and llm_prompt; prompt formatting and OpenAI calls stay in `answer.py`. Imported by → `search.py`, `app.py`.
+- **`search.py`** - `recall_context()` calls `search_docs()` and returns the raw payload. `build_context_block()` takes the prompt-ready `llm_prompt` from the response and falls back to assembling `content` from chunks when it is empty. Imported by → `app.py`.
 - **`answer.py`** - Takes the context block from `search.py`, formats the system + user prompt, and calls the OpenAI streaming API. Contains all anti-hallucination rules. Never calls HydraDB. Imported by → `app.py`.
 - **`app.py`** - Two endpoints: `POST /chat` streams NDJSON token-by-token - ideal for a web or IDE frontend. `POST /ask` returns a complete JSON response with `answer`, `sources`, and `chunks` - easier for Postman testing. Both use the same `recall_context` → `build_context_block` → `stream_answer` pipeline.
 
@@ -904,23 +917,27 @@ RECALL_ALPHA       = 0.75  # semantic vs keyword balance
 from backend.config import client, DATABASE_ID, RECALL_MAX_RESULTS, RECALL_ALPHA
 
 
+ALL_COLLECTIONS = ["codebase", "pull-requests", "slack", "wikis", "default"]
+
+
 def search_docs(
     query: str,
     max_results: int = RECALL_MAX_RESULTS,
-    scope: str = None,
+    collections: list = None,
     graph_context: bool = True,
     recency_bias: float = 0.2,
 ):
     """
     PRIMARY VERIFIED PATH - build and test your backend on this function first.
 
-    Calls /query. scope (collection) is optional - omit to
-    search all collections automatically. Response contains:
-      "chunks"  - iterate this array; read chunk_content from each item for LLM context
-      "sources" - deduplicated source list; use for citations
+    Calls /query. collections scopes the search; omit to pass
+    ALL_COLLECTIONS. Response data contains:
+      "chunks"     - iterate this array; read content from each item
+      "llm_prompt" - prompt-ready markdown block; pass to the LLM as-is
     """
     kwargs = {
         "database":     DATABASE_ID,
+        "collections":   collections or ALL_COLLECTIONS,
         "query":         query,
         "max_results":   max_results,
         "mode":          "thinking",
@@ -928,8 +945,6 @@ def search_docs(
         "alpha":         RECALL_ALPHA,
         "recency_bias":  recency_bias,
     }
-    if scope:
-        kwargs["collection"] = scope
     return client.query(**kwargs)
 
 ```
@@ -938,7 +953,7 @@ def search_docs(
 
 ### backend/search.py
 
-`recall_context()` calls `search_docs()` and returns the raw HydraDB payload. `build_context_block()` reads the `chunks` array, extracts each `chunk_content` field, and assembles them into a single formatted string that is passed to the LLM. The `sources` array from the payload is used separately by `app.py` for citation output.
+`recall_context()` calls `search_docs()` and returns the raw HydraDB payload. `build_context_block()` prefers the prompt-ready `llm_prompt` from the response - a markdown block with citation labels - and falls back to joining `content` from each chunk when it is empty. The `context_id` values from `chunks` are used separately by `app.py` for citation output.
 
 ```python
 from backend.hydra_client import search_docs
@@ -947,13 +962,12 @@ from backend.hydra_client import search_docs
 def recall_context(query: str, max_results: int = 10):
     """
     Call search_docs() with sensible defaults for the first backend.
-    scope=None means HydraDB searches all collections automatically.
-    Returns SDK object with .chunks and .sources attributes.
+    Returns SDK object; data has chunks, graph, forceful_relations, llm_prompt.
     """
     return search_docs(
         query=query,
         max_results=max_results,
-        scope=None,            # no collection needed - HydraDB handles scope
+        collections=None,      # defaults to ALL_COLLECTIONS
         graph_context=True,
         recency_bias=0.2,
     )
@@ -961,37 +975,35 @@ def recall_context(query: str, max_results: int = 10):
 
 def build_context_block(recall_payload) -> str:
     """
-    Extract chunk_content from each chunk and assemble the LLM context string.
+    Assemble the LLM context string from a /query result.
 
-    chunks  - the main array; iterate this and read chunk_content from each item.
-    sources - the deduplicated source list; used for citations in app.py.
-
-    chunk_content is the canonical field to pass into the LLM.
-    Always iterate chunks[], never a "results" key - the correct key is "chunks".
+    data.llm_prompt is the recommended path: a prompt-ready markdown
+    block with citation labels ([1], [R1], [P1]). Fall back to joining
+    chunk.content when llm_prompt is empty. Iterate chunks[], never a
+    "results" key - the correct key is "chunks".
     """
-    chunks  = recall_payload.data.chunks or []
-    sources = recall_payload.data.sources or []
+    data = recall_payload.data
 
-    context_parts = []
-    for chunk in chunks:
-        text = (chunk.chunk_content or "").strip()
-        if text:
-            context_parts.append(text)
+    if data.llm_prompt:
+        context_text = data.llm_prompt
+    else:
+        context_text = "\n\n".join(
+            (c.content or "").strip()
+            for c in (data.chunks or [])
+            if c.content
+        )
 
-    context_text = "\n\n".join(context_parts)
+    # Citation labels: unique context_ids in score order
+    seen, source_lines = set(), []
+    for c in (data.chunks or []):
+        if c.context_id and c.context_id not in seen:
+            seen.add(c.context_id)
+            source_lines.append(f"- {c.context_id}")
 
-    source_lines = []
-    for source in sources:
-        title     = context.title or "Untitled"
-        id = context.id or ""
-        source_lines.append(f"- {title} ({id})")
-
-    sources_text = "\n".join(source_lines)
-
-    return f"Context:\n{context_text}\n\nSources:\n{sources_text}"
+    return f"Context:\n{context_text}\n\nSources:\n{chr(10).join(source_lines)}"
 ```
 
-> 💡 **Production upgrade: score filtering.** `build_context_block` is intentionally simple for the first backend. For production, add a `relevancy_score` filter to drop low-quality chunks before building the context string - the same pattern used in Phase 1's `build_context()` helper.
+> 💡 **Production upgrade: score filtering.** `build_context_block` is intentionally simple for the first backend. For production, add a `score` filter to drop low-quality chunks before building the context string - the same pattern used in Phase 1's `build_context()` helper.
 
 ---
 
@@ -1118,7 +1130,11 @@ async def chat(body: dict):
 
     async def stream():
         # Emit sources first so the client can render citations immediately
-        sources_list = [{"title": s.title, "id": s.id} for s in (recall_payload.data.sources or [])]
+        seen, sources_list = set(), []
+        for c in (recall_payload.data.chunks or []):
+            if c.context_id and c.context_id not in seen:
+                seen.add(c.context_id)
+                sources_list.append(c.context_id)
         yield json.dumps({"sources": sources_list}) + "\n"
         for token in stream_answer(question, context_block):
             yield json.dumps({"text": token}) + "\n"
@@ -1131,7 +1147,7 @@ def ask(body: dict):
     """
     Synchronous JSON endpoint - easier for Postman testing and API consumers
     that don't stream. Returns a complete response object in one round-trip.
-    Returns answer, sources, chunks, and graph_context.
+    Returns answer, sources, chunks, and graph.
     """
     question = body.get("question", "").strip()
     if not question:
@@ -1141,12 +1157,18 @@ def ask(body: dict):
     context_block  = build_context_block(recall_payload)
     full_answer    = "".join(stream_answer(question, context_block))
 
+    seen, sources_list = set(), []
+    for c in (recall_payload.data.chunks or []):
+        if c.context_id and c.context_id not in seen:
+            seen.add(c.context_id)
+            sources_list.append(c.context_id)
+
     return {
-        "answer":        full_answer,
-        "sources":       [{"title": s.title, "id": s.id} for s in (recall_payload.data.sources or [])],
-        "chunks":        [{"chunk_content": c.chunk_content, "relevancy_score": c.relevancy_score,
-                           "source_title": c.source_title} for c in (recall_payload.data.chunks or [])],
-        "graph_context": None,
+        "answer":  full_answer,
+        "sources": sources_list,
+        "chunks":  [{"content": c.content, "score": c.score,
+                     "context_id": c.context_id} for c in (recall_payload.data.chunks or [])],
+        "graph":   recall_payload.data.graph,
     }
 ```
 
@@ -1156,10 +1178,10 @@ def ask(body: dict):
 
 Understanding the exact data path prevents debugging confusion. `build_context_block()` does the following in order:
 
-1. **Read the `chunks` array** from the search payload. `/query` returns `{"chunks": [...], "sources": [...]}` - always iterate `chunks`, never `results`.
-2. **Extract `chunk_content`** from each chunk object. This is the raw text of the chunk - a few hundred tokens of the original document. It is the only required field. Skip any chunk where `chunk_content` is absent or empty.
-3. **Join all `chunk_content` values** with double newlines to form the context body.
-4. **Append the sources list** from `recall_payload.sources` in `- title (id)` format so the model can cite them.
+1. **Read `data.llm_prompt`** from the search payload. `/query` returns `data` with `chunks`, `graph`, `forceful_relations` and `llm_prompt`. The prompt is a markdown block with citation labels.
+2. **Fall back to the `chunks` array** when `llm_prompt` is empty. Always iterate `chunks`, never `results`. Each chunk's `content` is the raw text - a few hundred tokens of the original item.
+3. **Join the text** into the context body.
+4. **Append the sources list** built from unique `context_id` values in `chunks`, in `- context_id` format so the model can cite them.
 5. **Return the assembled string** to `stream_answer()`. This becomes the user message body inside the OpenAI prompt.
 
 The assembled context block that GPT-4o receives looks like this:
@@ -1257,10 +1279,10 @@ Detailed implementation coming in the next revision. Everything in Phase 4 is pa
 
 ### If Your Retrieval Quality Is Weak
 
-- **Fix your IDs and metadata.** Weak retrieval often starts upstream. Use stable IDs, clear titles, accurate timestamps, and useful metadata like `doc_type`, `repo`, and `channel`.
-- **Add explicit relations.** If "why" answers feel shallow, it usually means the assistant sees the code but not the documents around it. Add `relations.ids` between code, PRs, Slack, and RFCs.
-- **Improve source formatting.** A PR with only a title is weak. A PR with title, description, changed files, reviews, and inline comments is strong. Rich documents produce better chunks.
-- **Add relevancy_score filtering.** The production upgrade to `build_context_block` is to drop chunks where `relevancy_score` is below your threshold before assembling the context string.
+- **Fix your IDs and attributes.** Weak retrieval often starts upstream. Use stable `context_id`s, clear titles, accurate `happened_at` dates, and useful attributes like `doc_type`, `repo`, and `channel`.
+- **Add explicit relations.** If "why" answers feel shallow, it usually means the assistant sees the code but not the documents around it. Add `forceful_relations.context_ids` between code, PRs, Slack, and RFCs.
+- **Improve source formatting.** A PR with only a title is weak. A PR with title, description, changed files, reviews, and inline comments is strong. Rich items produce better chunks.
+- **Add score filtering.** The production upgrade to `build_context_block` is to drop chunks where `score` is below your threshold before assembling the context string.
 
 ### How to Extend Beyond the First Version
 
@@ -1286,19 +1308,19 @@ A good progression: Phase 0 search in the terminal → FastAPI `/ask` in Postman
 
 **Cause:** The endpoint path has a typo, extra slash, or missing segment. Also occurs when querying a `collection` that has never had data written to it.
 
-**Fix:** Correct paths: `/context/ingest` (file upload or JSON batch with `app_knowledge`), `/query`, `/context/status`. If using `collection`, confirm at least one batch was successfully uploaded to that collection first.
+**Fix:** Correct paths: `/context/ingest` (JSON body with a `context` array, or multipart form with `context` as a JSON string), `/query`, `/context/status`. If using `collection`, confirm at least one batch was successfully uploaded to that collection first.
 
-### 400 - Provide at least one of: documents or app_knowledge
+### 400 - context is required / unknown field
 
-**Cause:** For file upload: the field name is wrong (`file` instead of `documents`), or `Content-Type: application/json` was manually set (which breaks multipart). For JSON batch: the array is empty or objects are missing required fields.
+**Cause:** The `context` array is missing or empty, an item has neither `text` nor `conversation` (or has both), or the payload includes a field the API does not know - decoding is strict.
 
-**Fix:** For file upload: use `files={"documents": (filename, f, "text/markdown")}` and `data={"database": DATABASE_ID}`. Do NOT set `Content-Type` manually. For JSON batch: confirm each item has `id`, `type`, and `content.text`.
+**Fix:** Send `{"database", "collection", "context": [{...}]}`. Each item needs `text` or `conversation`. Valid optional fields: `context_id`, `title`, `attributes`, `custom_attributes`, `happened_at`, `user_name`, `enrich`, `instructions`, `upsert`, `forceful_relations`, `acl`. There are no `documents`, `app_knowledge`, `memories`, `relations`, or `type` fields.
 
 ### Empty Search - chunks: []
 
-**Cause:** Indexing is still in progress, or `relevancy_score` filtering in `build_context_block` is too aggressive, or the query does not semantically match any ingested content.
+**Cause:** Indexing is still in progress, or `score` filtering in `build_context_block` is too aggressive, or the query does not semantically match any ingested content.
 
-**Fix:** Step 1 - Run `verify_file()` and confirm `"indexing_status": "completed"` in the `statuses` array. Step 2 - Run `phase0/search.py` directly and print the raw response - check that the `chunks` key is present and non-empty before any filtering. Step 3 - Check the `relevancy_score` values on returned chunks.
+**Fix:** Step 1 - Run `verify_file()` and confirm `"indexing_status": "completed"` in the `statuses` array. Step 2 - Run `phase0/search.py` directly and print the raw response - check that the `chunks` key is present and non-empty before any filtering. Step 3 - Check the `score` values on returned chunks.
 
 ### 429 - OpenAI insufficient_quota
 
@@ -1321,14 +1343,14 @@ def stream_answer(question: str, context: str):
 
 ## Production Notes
 
-- **Batch size and rate limits.** The JSON batch upload endpoint accepts a maximum of **20 source objects per request**. Always sleep 1 second between batches. For large repos (1,000+ files), expect ingestion to take 10–30 minutes total.
+- **Batch size and limits.** `/context/ingest` accepts a maximum of **100 items per request**, 1 MiB of text per item and 8 MiB per request. For large repos (1,000+ files), expect ingestion to take 10-30 minutes total.
 - **Indexing delays.** Indexing is async. Never rely on a fixed sleep; always poll [`/context/status`](/api-reference/v2/endpoint/source-status) until the `statuses` array shows `"indexing_status": "completed"`.
-- **Consistency and upserts.** HydraDB upserts by `id` - re-uploading replaces the existing document. There is a brief window where search may return stale chunks. Run verify on new IDs before marking a deployment complete.
-- **LLM context window.** The basic `build_context_block` assembles all chunk text. For production, add a `relevancy_score` filter and a character cap (e.g. 12,000 chars) to prevent exceeding GPT-4o's context window.
-- **Graph edge consistency.** Graph edges only form if both sides exist and are indexed. Always ingest source files first, then PRs. Re-ingest affected PRs if you add new files after initial ingestion.
+- **Consistency and upserts.** Set `upsert: true` and a stable `context_id` - re-ingesting replaces the existing item. There is a brief window where search may return stale chunks. Run verify on new IDs before marking a deployment complete.
+- **LLM context window.** The basic `build_context_block` passes `llm_prompt` through as-is. For production, add a `score` filter and a character cap (e.g. 12,000 chars) to prevent exceeding GPT-4o's context window.
+- **Graph edge consistency.** Forceful edges only form if both sides exist and are indexed. Always ingest source files first, then PRs. Re-ingest affected PRs if you add new files after initial ingestion.
 - **API key security.** The HydraDB API key grants full access to all database data. Never commit it to git. Use environment secrets in production. Rotate immediately if you suspect exposure.
-- **OpenAI token costs.** Each question sends context + system prompt + question to GPT-4o. For a 50-engineer team asking 200 questions/day, budget $2–4/day. Use `gpt-4o-mini` for factual lookups to reduce cost.
-- **Search quality monitoring.** Log the `relevancy_score` value of each chunk included in a response. If median scores are falling over time, new content may be diluting the index - re-ingest with better metadata and collections tagging. Also confirm the `chunks` array is non-empty before sending context to GPT-4o.
+- **OpenAI token costs.** Each question sends context + system prompt + question to GPT-4o. For a 50-engineer team asking 200 questions/day, budget $2-4/day. Use `gpt-4o-mini` for factual lookups to reduce cost.
+- **Search quality monitoring.** Log the `score` value of each chunk included in a response. If median scores are falling over time, new content may be diluting the index - re-ingest with better attributes and collections tagging. Also confirm the `chunks` array is non-empty before sending context to GPT-4o.
 
 ---
 
@@ -1340,100 +1362,78 @@ All endpoints used in this cookbook. Base URL: `https://api.hydradb.com`. Header
 
 **POST** `/databases` - Async, poll `/databases/status` before ingesting
 
+Request:
+
 ```json
-Request:  { "database": "engineering-docs" }
+{ "database": "engineering-docs" }
+```
 
 Response:
+
+```json
 {
   "database": "engineering-docs",
   "status":    "accepted",
   "message":   "Database accepted. Poll /databases/status for readiness."
 }
-
-GET /databases/status?database=engineering-docs
-→ { "status": "ready" }
 ```
 
-### Upload File - Beginner Path
+`GET /databases/status?database=engineering-docs` → `{ "status": "ready" }`
 
-**POST** `/context/ingest` - Multipart form-data · field name `"files"` · database as form field
+### Ingest Context
 
-```python
-# Correct multipart file upload
-client.context.ingest(
-    database=DATABASE_ID,
-    documents=[(filename, f, "text/markdown")],
-)
-
-# Response:
-{
-  "results": [
-    {
-      "id": "<id>",
-      "filename":  "auth_middleware.md",
-      "status":    "accepted",
-      "error":     null
-    }
-  ]
-}
-```
-
-### Upload Sources - JSON Body (Advanced)
-
-**POST** `/context/ingest` - Max 20 items · body field `app_knowledge` (JSON string) · supports relations
+**POST** `/context/ingest` - Up to 100 items · `context` is the item array (JSON string via the SDK) · `forceful_relations` for explicit edges
 
 ```python
 import json
 
 client.context.ingest(
     database="engineering-docs",
-    app_knowledge=json.dumps([{
-        "id":          "myrepo/auth/middleware.py",
-        "title":       "auth/middleware.py",
-        "type":        "document",
-        "timestamp":   "2025-11-14T10:22:00Z",
-        "content":     {"text": "full content here"},
-        "collections": ["codebase", "myrepo"],
-        "relations":   {"ids": ["pr-42"]},
-        "metadata":   {"doc_type": "source_file", "repo": "myrepo"},
+    collection="codebase",
+    upsert=True,
+    context=json.dumps([{
+        "context_id":  "myrepo/auth/middleware.py",
+        "title":        "auth/middleware.py",
+        "text":         "full content here",
+        "happened_at":  "2025-11-14",
+        "attributes":   {"doc_type": "source_file", "repo": "myrepo"},
+        "forceful_relations": {"context_ids": ["pr-42"]},
     }]),
 )
 
-# Response: { "ids": ["myrepo/auth/middleware.py"] }
+# Response: { "results": [{ "id": "myrepo/auth/middleware.py", "status": "accepted" }] }
 ```
 
 ### Verify Indexing
 
 **GET** `/context/status` - Returns `statuses[]` array · poll until `"completed"`
 
-```jsonc
-// Required: ?ids=<id>&database=engineering-docs
+Required query params: `?ids=<id>&database=engineering-docs`
 
-// Response:
+```json
 {
   "statuses": [
     { "id": "<id>", "indexing_status": "completed" }
   ]
 }
-// indexingStatus: "processing" | "completed" | "errored"
 ```
+
+`indexing_status` is one of `processing`, `completed`, `errored`.
 
 ### Search - Validated Minimal Request
 
-**POST** `/query` - Primary verified path · `collection` optional · returns `chunks[]` and `sources[]`
+**POST** `/query` - Primary verified path · `data` returns `chunks`, `graph`, `forceful_relations`, `llm_prompt`
 
-```jsonc
+```json
 {
   "database":   "engineering-docs",
+  "collection": "codebase",
   "query":       "internal IP auth skip logic",
   "max_results": 10
 }
-
-// collection is NOT required. HydraDB handles scope internally.
-// Response: {"chunks": [...], "sources": [...]}
-// Read chunk_content from each item in chunks[] for LLM context.
-// relevancy_score on each chunk indicates ranked relevance.
 ```
+
+Read `content` from each item in `chunks[]` for LLM context, or pass `data.llm_prompt` to your LLM as-is. `score` on each chunk indicates ranked relevance.
 
 ### Multi-hop Search
 
@@ -1442,10 +1442,12 @@ client.context.ingest(
 ```json
 {
   "database":     "engineering-docs",
+  "collections": ["codebase", "pull-requests", "slack", "wikis"],
   "query":         "Why does auth middleware skip token validation for internal IPs?",
   "max_results":   15,
   "mode":          "thinking",
   "graph_context": true,
+  "follow_forceful_relations": true,
   "alpha":         0.65,
   "recency_bias":  0.15
 }
@@ -1455,7 +1457,7 @@ client.context.ingest(
 
 ## Benchmarks
 
-1,200 developer questions across three engineering teams (18–80 engineers, codebases 150k–2.2M lines) compared against naive vector search using identical ingested content.
+1,200 developer questions across three engineering teams (18-80 engineers, codebases 150k-2.2M lines) compared against naive vector search using identical ingested content.
 
 | Query type | Naive vector search | HydraDB with graph_context | Δ |
 |---|---|---|---|
