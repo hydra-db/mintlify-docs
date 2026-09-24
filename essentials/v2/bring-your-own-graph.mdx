@@ -183,62 +183,199 @@ Dialect notes:
 
 ### Common queries
 
-```cypher Upsert a node on your own key
-MERGE (p:Person {ext_id: $id})
-SET p += $props
-RETURN p.ext_id AS id
+Every example below runs against the same small sample graph, in order. Load
+it into a fresh collection first to follow along - send each query as the
+`query` of [`POST /byog/query`](#endpoints), with the
+`params` shown in its first comment. The **Response** tab is the `data` the
+query returns.
+
+**Load the sample graph**
+
+<CodeGroup>
+```cypher Query
+CREATE (alice:Person {ext_id: "u1", name: "Alice", role: "admin"}),
+       (bob:Person   {ext_id: "u2", name: "Bob",   role: "analyst"}),
+       (carol:Person {ext_id: "u3", name: "Carol", role: "engineer"}),
+       (dan:Person   {ext_id: "u4", name: "Dan",   role: "engineer"}),
+       (eve:Person   {ext_id: "u5", name: "Eve",   role: "designer"}),
+       (acme:Company   {ext_id: "c1", name: "Acme",   sector: "fintech"}),
+       (globex:Company {ext_id: "c2", name: "Globex", sector: "retail"}),
+       (alice)-[:KNOWS {since: 2020}]->(bob),
+       (bob)-[:KNOWS {since: 2021}]->(carol),
+       (carol)-[:KNOWS {since: 2022}]->(dan),
+       (alice)-[:KNOWS {since: 2023}]->(eve),
+       (bob)-[:WORKS_AT]->(acme),
+       (carol)-[:WORKS_AT]->(acme),
+       (dan)-[:WORKS_AT]->(globex)
+RETURN count(*) AS created
 ```
 
-```cypher Connect two existing nodes
+```json Response
+[{ "created": 1 }]
+```
+</CodeGroup>
+
+**Upsert a node on your own key**
+
+<CodeGroup>
+```cypher Query
+// params: {"id": "u1", "props": {"role": "owner"}}
+MERGE (p:Person {ext_id: $id})
+SET p += $props
+RETURN p.ext_id AS id, p.name AS name, p.role AS role
+```
+
+```json Response
+[{ "id": "u1", "name": "Alice", "role": "owner" }]
+```
+</CodeGroup>
+
+**Connect two existing nodes**
+
+<CodeGroup>
+```cypher Query
+// params: {"from": "u5", "to": "c1", "since": 2024}
 MATCH (a:Person {ext_id: $from}), (b:Company {ext_id: $to})
 MERGE (a)-[w:WORKS_AT]->(b)
 SET w.since = $since
+RETURN a.name AS person, type(w) AS rel, b.name AS company, w.since AS since
 ```
 
-```cypher Expand a node's neighborhood
--- Every relationship on Alice and the node on the other end, in any direction.
+```json Response
+[{ "person": "Eve", "rel": "WORKS_AT", "company": "Acme", "since": 2024 }]
+```
+</CodeGroup>
+
+**Expand a node's neighborhood**
+
+<CodeGroup>
+```cypher Query
+// params: {"name": "Bob"}
+// Every relationship on Bob and the node on the other end, in any direction.
 MATCH (p:Person {name: $name})-[r]-(nbr)
 RETURN type(r) AS rel, labels(nbr) AS kind, nbr.name AS neighbor
 ORDER BY rel, neighbor
 ```
 
-```cypher Multi-hop relationship expansion
--- Friends-of-friends up to 3 hops away, following only outgoing KNOWS edges.
+```json Response
+[
+  { "rel": "KNOWS",    "kind": ["Person"],  "neighbor": "Alice" },
+  { "rel": "KNOWS",    "kind": ["Person"],  "neighbor": "Carol" },
+  { "rel": "WORKS_AT", "kind": ["Company"], "neighbor": "Acme" }
+]
+```
+</CodeGroup>
+
+**Multi-hop relationship expansion**
+
+<CodeGroup>
+```cypher Query
+// params: {"name": "Alice"}
+// Everyone up to 3 hops away, following only outgoing KNOWS edges.
 MATCH (a:Person {name: $name})-[:KNOWS*1..3]->(reach:Person)
 WHERE reach.name <> $name
 RETURN DISTINCT reach.name AS name
 ORDER BY name
 ```
 
-```cypher Shortest path between two nodes
--- The actual path (nodes + edges in order), not just the endpoints.
+```json Response
+[{ "name": "Bob" }, { "name": "Carol" }, { "name": "Dan" }, { "name": "Eve" }]
+```
+</CodeGroup>
+
+**Shortest path between two nodes**
+
+<CodeGroup>
+```cypher Query
+// params: {"from": "Alice", "to": "Carol"}
+// The actual path (nodes + edges in order), not just the endpoints.
 MATCH (a:Person {name: $from}), (b:Person {name: $to})
 RETURN shortestPath((a)-[:KNOWS*..8]->(b)) AS path
 ```
 
-```cypher Filtered, typed traversal
--- Who does Alice know that works at a company in "fintech"?
+```json Response
+[
+  {
+    "path": {
+      "nodes": [
+        { "id": 0, "labels": ["Person"], "ext_id": "u1", "name": "Alice", "role": "owner" },
+        { "id": 1, "labels": ["Person"], "ext_id": "u2", "name": "Bob",   "role": "analyst" },
+        { "id": 2, "labels": ["Person"], "ext_id": "u3", "name": "Carol", "role": "engineer" }
+      ],
+      "edges": [
+        { "id": 0, "relation": "KNOWS", "source_node_id": 0, "target_node_id": 1, "since": 2020 },
+        { "id": 1, "relation": "KNOWS", "source_node_id": 1, "target_node_id": 2, "since": 2021 }
+      ]
+    }
+  }
+]
+```
+</CodeGroup>
+
+**Filtered, typed traversal**
+
+<CodeGroup>
+```cypher Query
+// params: {"name": "Alice"}
+// Who does Alice know that works at a fintech company?
 MATCH (a:Person {name: $name})-[:KNOWS]->(f:Person)-[:WORKS_AT]->(c:Company)
 WHERE c.sector = "fintech"
 RETURN f.name AS person, c.name AS company
+ORDER BY person
 ```
 
-```cypher Aggregate
--- Headcount per company, largest first.
+```json Response
+[
+  { "person": "Bob", "company": "Acme" },
+  { "person": "Eve", "company": "Acme" }
+]
+```
+</CodeGroup>
+
+**Aggregate**
+
+<CodeGroup>
+```cypher Query
+// Headcount per company, largest first.
 MATCH (p:Person)-[:WORKS_AT]->(c:Company)
 RETURN c.name AS company, count(p) AS headcount
 ORDER BY headcount DESC
-LIMIT 10
 ```
 
-```cypher Index a property you filter on
+```json Response
+[
+  { "company": "Acme",   "headcount": 3 },
+  { "company": "Globex", "headcount": 1 }
+]
+```
+</CodeGroup>
+
+**Index a property you filter on**
+
+<CodeGroup>
+```cypher Query
 CREATE INDEX FOR (n:Person) ON (n.ext_id)
 ```
 
-```cypher Delete a node and its edges
+```json Response
+[]
+```
+</CodeGroup>
+
+**Delete a node and its edges**
+
+<CodeGroup>
+```cypher Query
+// params: {"id": "u5"}
 MATCH (p:Person {ext_id: $id})
 DETACH DELETE p
+RETURN count(*) AS deleted
 ```
+
+```json Response
+[{ "deleted": 1 }]
+```
+</CodeGroup>
 
 ### Response format
 
