@@ -918,7 +918,7 @@ Three `POST /query` patterns cover internal search, routed by simple keyword det
 
 - `recency_bias: 0.5`: old and recent context matter equally.
 - `alpha: 0.5`: weighs keyword and semantic matching equally.
-- `collection`: set it only when the user clearly asks about one tool. Otherwise list every source collection in `collections` (for example `["slack", "email", "docs", "github"]`). Without either, the query reads only the default collection.
+- `collection`: set it only when the user clearly asks about one tool. Otherwise list the source collections in `collections`. Without either, the query reads only the default collection. A collection exists only after its first write, and listing one that does not exist returns `400`, so `source_collections()` asks HydraDB which ones exist before each search.
 
 <CodeGroup>
 ```python Python SDK
@@ -929,6 +929,19 @@ from hydra_db import HydraDB
 TENANT_ID = "company-knowledge"
 SOURCE_COLLECTIONS = ["slack", "email", "docs", "github"]
 client    = HydraDB(token=os.environ["HYDRA_DB_API_KEY"])
+
+
+def source_collections() -> list[str]:
+    """
+    The source collections that exist so far. A collection is created on its
+    first write, and /query rejects a listed collection that does not exist,
+    so this lets you search after wiring up only some sources.
+    """
+    existing = client.databases.collections(database=TENANT_ID).data.collections or []
+    found = [c for c in SOURCE_COLLECTIONS if c in existing]
+    if not found:
+        raise RuntimeError("Ingest at least one source before searching.")
+    return found
 
 
 def search(
@@ -951,8 +964,8 @@ def search(
         mode="thinking",
         alpha=0.5,
         recency_bias=recency_bias,
-        # One source, or fan out across every source collection.
-        **({"collection": sub_tenant} if sub_tenant else {"collections": SOURCE_COLLECTIONS}),
+        # One source, or fan out across every source collection that exists.
+        **({"collection": sub_tenant} if sub_tenant else {"collections": source_collections()}),
     )
 
 
@@ -983,6 +996,16 @@ const client = new HydraDBClient({ token: process.env.HYDRA_DB_API_KEY! });
 const TENANT_ID = "company-knowledge";
 const SOURCE_COLLECTIONS = ["slack", "email", "docs", "github"];
 
+// The source collections that exist so far. A collection is created on its
+// first write, and /query rejects a listed collection that does not exist.
+export async function sourceCollections(): Promise<string[]> {
+  const resp = await client.databases.collections({ database: TENANT_ID });
+  const existing = resp.data?.collections ?? [];
+  const found = SOURCE_COLLECTIONS.filter((c) => existing.includes(c));
+  if (found.length === 0) throw new Error("Ingest at least one source before searching.");
+  return found;
+}
+
 async function search(
   question: string,
   userId: string,
@@ -1004,9 +1027,9 @@ async function search(
     alpha: 0.5,
     recencyBias: recencyBias,
   };
-  // One source, or fan out across every source collection.
+  // One source, or fan out across every source collection that exists.
   if (subTenant) payload["collection"] = subTenant;
-  else payload["collections"] = SOURCE_COLLECTIONS;
+  else payload["collections"] = await sourceCollections();
 
   return await client.query(payload);
 }
@@ -1045,9 +1068,9 @@ Pass the chunks and relation chains to an LLM to write a cited answer.
 import os
 from openai import OpenAI
 from hydra_db import HydraDB
+from search.qa import source_collections
 
 TENANT_ID     = "company-knowledge"
-SOURCE_COLLECTIONS = ["slack", "email", "docs", "github"]
 client        = HydraDB(token=os.environ["HYDRA_DB_API_KEY"])
 openai_client = OpenAI()
 
@@ -1077,7 +1100,7 @@ def explain_decision(question: str, user_id: str) -> str:
     # Step 1: Search with graph context
     data            = client.query(
         database=TENANT_ID,
-        collections=SOURCE_COLLECTIONS,
+        collections=source_collections(),
         query=question,
         max_results=18,
         graph_context=True,
@@ -1146,10 +1169,10 @@ print(answer)
 // search/provenance.ts
 import { HydraDBClient } from "@hydradb/sdk";
 import OpenAI from "openai";
+import { sourceCollections } from "./qa";
 
 const client = new HydraDBClient({ token: process.env.HYDRA_DB_API_KEY! });
 const TENANT_ID = "company-knowledge";
-const SOURCE_COLLECTIONS = ["slack", "email", "docs", "github"];
 const openai = new OpenAI();
 
 async function getUserProfile(userId: string): Promise<string> {
@@ -1178,7 +1201,7 @@ async function explainDecision(
   // Step 1: Search with graph context
   const data = await client.query({
     database: TENANT_ID,
-    collections: SOURCE_COLLECTIONS,
+    collections: await sourceCollections(),
     query: question,
     maxResults: 18,
     graphContext: true,
@@ -1451,7 +1474,7 @@ The `POST /context/ingest` form fields are `database` (text, `company-knowledge`
 
 Raw `POST /query` bodies for the two knowledge searches:
 
-**All sources** (`collections` fans the query out to each source collection and merges the results):
+**All sources** (`collections` fans the query out to each source collection and merges the results; list only collections you have ingested into, or the request returns `400`):
 
 ```json
 {
