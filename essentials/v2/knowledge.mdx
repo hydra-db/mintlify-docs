@@ -9,12 +9,12 @@ import { Field } from "/snippets/field.jsx";
 
 Knowledge stores reusable context: product documents, internal wikis, policy PDFs, Slack threads, Notion pages, CSVs, and emails.
 
-Knowledge is the counterpart to [Memories](/essentials/v2/memories), which holds per-user context. Both are retrievable through the same [`POST /query`](/api-reference/v2/endpoint/query) endpoint, but they live in separate stores; you pick which one to query via the `type` parameter (see [Query](/essentials/v2/query)).
+Knowledge is the shared counterpart to [Memories](/essentials/v2/memories), which hold per-user context.
 
 | | Knowledge | Memories |
 |---|---|---|
 | **Content** | Documents, files, app-generated content | User preferences, conversations, inferred traits |
-| **Scope** | Shared across all users in a database | Per-user, scoped by `collection` (formerly `sub_tenant_id`) |
+| **Scope** | Shared: anyone who queries its `collection` can read it | One user: stored in that user's `collection` (formerly `sub_tenant_id`) |
 | **Mutability** | Versioned: replaced or deleted explicitly | Dynamic: evolves with every interaction |
 | **Query via** | [`POST /query`](/api-reference/v2/endpoint/query) with `type: "knowledge"` | [`POST /query`](/api-reference/v2/endpoint/query) with `type: "memory"` |
 | **`vectorstore_status`** | `vectorstore_status.knowledge` | `vectorstore_status.memories` |
@@ -35,7 +35,7 @@ When you call [`POST /context/ingest`](/api-reference/v2/endpoint/ingest-context
 4. **Embeds** every chunk into the dense and sparse vector stores.
 5. **Indexes** the result so it becomes queryable via [`POST /query`](/api-reference/v2/endpoint/query).
 
-The pipeline runs **asynchronously**. The ingest call returns `202 Accepted` with `id`s; the content isn't queryable until `indexing_status` reaches at least `graph_creation`. Poll [`GET /context/status`](/api-reference/v2/endpoint/source-status) to track progress. See the full status table at [Ingestion Status](/api-reference/v2/endpoint/source-status).
+The pipeline runs **asynchronously**: ingest returns `202 Accepted` with `id`s, and the content becomes queryable once `indexing_status` reaches `graph_creation`. [Section 5](#5-verifying-processing) shows how to poll.
 
 ---
 
@@ -53,12 +53,11 @@ Reach for [Memories](/essentials/v2/memories) instead when the content is:
 - Per-user conversation history that should shape future answers for that user.
 - Anything that should personalize a single user's experience.
 
-
 ---
 
 ## 4. Two ingestion paths
 
-[`POST /context/ingest`](/api-reference/v2/endpoint/ingest-context) with `type=knowledge` accepts two content formats in the same request: you can send either, or both at once. Send the fields as `multipart/form-data`; a body that is neither form data nor JSON returns `415`. Pick the path that matches what you have on hand:
+[`POST /context/ingest`](/api-reference/v2/endpoint/ingest-context) with `type=knowledge` accepts two content formats, and you can send either or both in one `multipart/form-data` request. Pick the path that matches what you have:
 
 - **Path A** when you have **binary files** HydraDB should parse for you.
 - **Path B** when you have **pre-extracted text** from an app or connector and want to skip parsing.
@@ -205,7 +204,6 @@ curl -X POST 'https://api.hydradb.com/context/ingest' \
 ```
 </CodeGroup>
 
-
 **Response (both paths):**
 
 ```json
@@ -292,6 +290,8 @@ done
 ```
 </CodeGroup>
 
+Each status in the `data` payload looks like this:
+
 ```json
 {
   "statuses": [
@@ -338,7 +338,7 @@ Any other key, including `title`, `type`, `url`, and `timestamp`, returns `400`.
 | <Field name="collection" type="string" recommended /> | Logical partition. Must match form-level `collection` when present. |
 | <Field name="title" type="string" recommended /> | Short title, subject, ticket title, or page name. |
 | <Field name="type" type="string" recommended /> | Source category for display/analytics, such as `slack`, `notion`, `gmail`, or `jira`. |
-| <Field name="kind" type="email, message, ticket, knowledge_base, comment, custom" recommended /> | App object kind. Selects the app parser for `fields`. |
+| <Field name="kind" type="email, message, ticket, knowledge_base, comment, meeting, custom" recommended /> | App object kind. Selects the app parser for `fields`. |
 | <Field name="provider" type="string" recommended /> | App namespace such as `slack`, `gmail`, `jira`, `notion`, `salesforce`, or `linear`. |
 | <Field name="external_id" type="string" recommended /> | Stable provider ID for this exact item. Enables exact lookup and relation resolution. |
 | <Field name="fields" type="object" required /> | App-native content and structure. Put primary text here (`body`, `description`, `title`, or `data` depending on `kind`). |
@@ -467,6 +467,8 @@ At query time, linked sources are returned in the `additional_context` field of 
 **`thinking` mode only.** Forceful-relation context is fetched only when `mode: "thinking"` is set on the query request (or when `mode: "auto"` routes to thinking). In `fast` mode, `query_forceful_relations` is ignored even if set to `true`.
 </Warning>
 
+---
+
 ## 8. Metadata on knowledge
 
 [Metadata](/essentials/v2/metadata) is how you bridge structured filters and semantic search. Attach `metadata` at ingestion to enable deterministic narrowing at query time:
@@ -486,7 +488,7 @@ Then at query time:
 }
 ```
 
-For hot, supported top-level filters, declare `metadata` keys in the database metadata schema. In a database with a schema, ingest rejects undeclared keys, so a filter on an undeclared key returns no results. `additional_metadata` is stored alongside the source for display and bookkeeping; to filter on it, nest the keys under `additional_metadata` in `metadata_filters` (e.g. `{"metadata_filters": {"additional_metadata": {"author": "Alice"}}}`). `document_metadata` is accepted only as a legacy alias for that nested filter namespace.
+Declare the `metadata` keys you filter on in the database metadata schema. In a database with a schema, ingest rejects undeclared keys, so filtering on one returns nothing. `additional_metadata` is stored alongside the source for display and bookkeeping; to filter on it, nest the keys under `additional_metadata` in `metadata_filters` (e.g. `{"metadata_filters": {"additional_metadata": {"author": "Alice"}}}`). `document_metadata` is accepted only as a legacy alias for that nested filter namespace.
 
 See [Metadata](/essentials/v2/metadata) for schema design, filter examples, and the `metadata` vs `additional_metadata` decision rule. See [Create Database](/api-reference/v2/endpoint/create-tenant) for the schema field configuration (`enable_dense_embedding`, `enable_sparse_embedding`).
 
@@ -501,7 +503,6 @@ See [Metadata](/essentials/v2/metadata) for schema design, filter examples, and 
 | Not polling [`/context/status`](/api-reference/v2/endpoint/source-status) before querying | Chunks aren't indexed yet, so query results are empty | Wait for `indexing_status: completed` (or `graph_creation` for partial availability). |
 | Sending `document_metadata` as a JSON object instead of a JSON string | `multipart/form-data` validation fails | Stringify `document_metadata` before sending in the `-F` field. |
 | Omitting `database` | `400` error (`database is required`) | Required on every call. |
-| Pointing forceful relations at memory IDs from a knowledge source | Silently returns nothing at query | Forceful relations work **within the knowledge store**: knowledge to knowledge. |
 
 ---
 

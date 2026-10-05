@@ -9,7 +9,7 @@ import { Field } from "/snippets/field.jsx";
 
 Most applications start every conversation from scratch. Memories let your agent carry useful user-specific context from one session to the next, so responses become more personal over time.
 
-A memory is one unit of context: a stated preference, an inferred trait, a past conversation, a decision, feedback, or a fact your agent should be able to retrieve later. HydraDB stores every memory in a structural [context graph](/essentials/v2/context-graphs), so related preferences surface together at retrieval time.
+A memory is one unit of context: a stated preference, an inferred trait, a past conversation, a decision, feedback, or a fact your agent should be able to retrieve later. HydraDB links memories in a [context graph](/essentials/v2/context-graphs), so related preferences surface together at retrieval time.
 
 See [Knowledge vs Memories](/essentials/v2/knowledge#1-what-it-is) for a side-by-side comparison.
 
@@ -24,10 +24,7 @@ If the answer is yes, store it as [Knowledge](/essentials/v2/knowledge). If the 
 | If the content is… | Store it as… |
 |---|---|
 | About a specific user or session | Memory |
-| Shared across all users in your database | [Knowledge](/essentials/v2/knowledge) |
-
-HydraDB can [infer memories from raw input](#use-infer-true-when-the-input-is-raw-signal).
-
+| Meant for other users too | [Knowledge](/essentials/v2/knowledge) |
 
 Good candidates for [Knowledge ingestion](/essentials/v2/knowledge) include product docs, policy PDFs, internal wikis, Slack exports, and other shared material that should be reusable across users.
 
@@ -41,8 +38,7 @@ The pipeline works like this:
 
 1. **Parse the input**: raw text, markdown, or user-assistant pairs.
 2. **Optionally infer meaning**: if `infer: true`, HydraDB extracts the underlying preference, trait, or fact.
-3. **Process and index the result**: the memory is prepared for retrieval.
-4. **Make it queryable**: later, [`POST /query`](/api-reference/v2/endpoint/query) can retrieve it with `type: "memory"` or `type: "all"`.
+3. **Index it**: once indexed, [`POST /query`](/api-reference/v2/endpoint/query) can retrieve it with `type: "memory"` or `type: "all"`.
 
 The most important choice is [`infer`](#choose-whether-hydradb-should-infer-the-memory). It decides whether HydraDB should extract the useful memory from raw signal, or store exactly what you send.
 
@@ -52,7 +48,7 @@ Ingestion is asynchronous, so memories are not queryable immediately. Poll [`GET
 
 ## Choose the right input shape
 
-Each memory item should usually provide either `text` or `user_assistant_pairs`, **not both**. Choose the shape based on the content you already have.
+Each memory item takes either `text` or `user_assistant_pairs`, **not both** (sending both returns `400`). Choose the shape that matches the content you already have.
 
 ### Text
 
@@ -117,7 +113,6 @@ The full schema lives on [`POST /context/ingest`](/api-reference/v2/endpoint/ing
 | <Field name="metadata" type="object" /> | Database-schema fields for filtering and query. Send this as an object inside each `memories[]` item, for example `"metadata": { "department": "support" }`. Up to 16 KiB as compact JSON. |
 | <Field name="additional_metadata" type="object" /> | Canonical free-form per-memory fields for display or bookkeeping. Send this as an object. Up to 1 KiB as compact JSON. |
 
-
 <Warning>
   **Memory metadata encoding:** `memories` is itself a JSON-stringified multipart field. Within each memory item, `metadata` and `additional_metadata` are plain objects. Do not stringify them again.
 </Warning>
@@ -134,17 +129,16 @@ The full schema lives on [`POST /context/ingest`](/api-reference/v2/endpoint/ing
 
 ---
 
-## Scope memories to the right user or workspace
+## Query memories
 
-Memories live in their own store, separate from [Knowledge](/essentials/v2/knowledge). The [`POST /query`](/api-reference/v2/endpoint/query) endpoint reaches each store through the `type` parameter:
+Memories live in their own store, separate from [Knowledge](/essentials/v2/knowledge). [`POST /query`](/api-reference/v2/endpoint/query) reaches each store through the `type` parameter:
 
 - `type: "memory"` queries the Memories store (`vectorstore_status.memories`).
 - `type: "knowledge"` queries the [Knowledge](/essentials/v2/knowledge) store (`vectorstore_status.knowledge`).
 - `type: "all"` runs both in parallel and returns a single merged, re-ranked result set.
 
 <Info>
-  <strong>One endpoint, two stores.</strong>
-  <p>Both stores are read from the same collection. If shared documents live in their own collection, list it next to the user's in <code>collections</code>. See <a href="/essentials/v2/query">Query</a>.</p>
+  **One endpoint, two stores.** Both stores are read from the same collection. If shared documents live in their own collection, list it next to the user's in `collections`. See [Query](/essentials/v2/query).
 </Info>
 
 ---
@@ -240,20 +234,19 @@ The response returns an `id` for each memory and an initial `status` of `queued`
 }
 ```
 
-Poll [`GET /context/status`](/api-reference/v2/endpoint/source-status) with the returned `id` until `indexing_status` is `completed`. You can also use webhooks when available. After indexing, the memory can surface in [`POST /query`](/api-reference/v2/endpoint/query-overview) when called with `type: "memory"` or `type: "all"`.
+Poll [`GET /context/status`](/api-reference/v2/endpoint/source-status) with the returned `id`, or register a [webhook](/essentials/v2/webhooks), until the memory is indexed.
 
 ---
 
-
 ## Choose whether HydraDB should infer the memory
 
-The `infer` flag is the key design decision. It controls how much extraction work your application does before sending content to HydraDB.
+`infer` controls how much extraction work your application does before sending content to HydraDB.
 
 ### Use `infer: true` when the input is raw signal
 
 With `infer: true`, you give HydraDB messy or indirect evidence (dialogue, logs, behavior, feedback, or observations), and HydraDB extracts the useful preference, trait, or fact.
 
-For example, instead of writing custom logic to decide whether a user prefers dark mode, you can send a stream of UI events. If the user switched to dark mode, kept it for a month, briefly toggled back to light mode, then reverted, HydraDB can infer the useful memory: `"user prefers dark mode"`.
+For example, instead of writing your own logic to decide whether a user prefers dark mode, send the raw stream of UI events and let HydraDB infer it. The [example below](#example-infer-a-preference-from-behavior) shows exactly this.
 
 Use `infer: true` for:
 
@@ -359,15 +352,12 @@ If you sent the same input with `infer: false`, HydraDB would index the event lo
 | Mistake | What goes wrong | Fix |
 |---|---|---|
 | Sending `"memory": "..."` instead of `"memories": [...]` | Validation fails | Use `"memories": [ { "text": "..." } ]`, always an array of objects |
-| Omitting `database` | Request validation error | Include `database` on every call |
+| Omitting `database` | `400` (`database is required`) | Include `database` on every call |
 | Omitting `collection` for per-user data | The memory lands in the default collection and may surface in the wrong scope | Use the user's ID as `collection` for B2C separation |
-| Setting `custom_instructions` with `infer: false` | Instructions are ignored | Set `infer: true` if you need instructions to affect extraction |
 | Extracting preferences yourself before sending raw logs | You duplicate work HydraDB can do for you | Send the raw signal with `infer: true` |
 | Sending pre-extracted facts with `infer: true` | HydraDB may re-derive the memory and change the original phrasing | Use `infer: false` for already-structured facts |
 | Treating `user_name` as cosmetic | It can influence inference, so the wrong name can bias extraction | Pass the actual user's name |
 | Storing shared docs as memories | They will not surface when querying `type: "knowledge"` | Use [knowledge ingestion](/essentials/v2/knowledge) with `type=knowledge` on [`POST /context/ingest`](/api-reference/v2/endpoint/ingest-context) |
-| Expecting immediate searchability | Ingestion is asynchronous | Poll [`GET /context/status`](/api-reference/v2/endpoint/source-status) until indexing is complete |
-| Forgetting `infer` for conversational input | Raw dialogue is stored without preference extraction | Set `infer: true` for conversations |
 
 ---
 
