@@ -4,38 +4,29 @@ description: "How HydraDB scopes data using databases and collections, and how s
 ---
 
 <Note>
-  The request fields are now named **`database`** (formerly `tenant_id`) and **`collection`** (formerly `sub_tenant_id`). The old names and the old `/tenants` routes remain fully supported as deprecated aliases, so existing integrations keep working without any changes -- however, we recommend using the latest conventions. See [Migrating from `tenant_id` and `sub_tenant_id`](#7-migrating-from-the-legacy-tenant-and-sub-tenant-fields) for the full compatibility contract.
+  Request fields are `database` (formerly `tenant_id`) and `collection` (formerly `sub_tenant_id`). The old names and the old `/tenants` routes still work. New code should use the new names. The full contract is [Migrating from `tenant_id` and `sub_tenant_id`](#7-migrating-from-the-legacy-tenant-and-sub-tenant-fields).
 </Note>
 
 ## 1. What it is
 
-HydraDB scopes data using two identifiers:
+HydraDB scopes data with two identifiers:
 
-- **`database`** - the top-level scoping identifier. Use it for customers, environments, or other primary data boundaries.
-- **`collection`** - an optional scoping identifier within a database. Use it for users, workspaces, teams, or other logical partitions.
+- **`database`:** the top-level scope and isolation boundary. Use it for customers, environments, or other primary data boundaries.
+- **`collection`:** an optional scope inside a database. Use it for users, workspaces, teams, projects, or other logical partitions.
 
-HydraDB write and query operations are scoped by `database`. When `collection` is provided, it further narrows the scope for that operation. If you omit `collection`, HydraDB uses the database's default collection.
-
-Use the same scoping values consistently across writes and reads. If you write data with one `collection` and later query with a different one, that data may not appear in the query results.
+Every write and query is scoped by `database`. When you send `collection`, it narrows the scope further. If you omit `collection`, HydraDB uses the database's default collection, which is created on the first write.
 
 ---
 
 ## 2. When to use each
 
-| Goal | Use |
-|---|---|
-| Separate customers on your platform | A different `database` per customer |
-| Separate environments (`prod` vs `staging`) | A different `database` per environment |
-| Separate per-user state within one customer | One `database`, `collection = user_id` |
-| Separate per-workspace data within one customer | One `database`, `collection = workspace_id` |
-| Store broadly shared Knowledge | Omit `collection` to use the database's default collection |
+- **Separate customers on your platform:** a different `database` per customer.
+- **Separate environments (`prod` and `staging`):** a different `database` per environment. Do not use `collection` for this.
+- **Separate per-user state within one customer:** one `database`, with `collection = user_id`.
+- **Separate per-workspace data within one customer:** one `database`, with `collection = workspace_id`.
+- **Broadly shared Knowledge:** omit `collection` to use the database's default collection.
 
-Two practical rules:
-
-- Use a separate **database** whenever data must not mix across customers or environments.
-- Use a **collection** for logical partitions inside a database, such as users, workspaces, teams, or projects.
-
-Do not use `collection` as a substitute for separate production and staging databases. Environments should usually be separated at the `database` level.
+Use a separate database whenever data must not mix across customers or environments.
 
 ---
 
@@ -43,7 +34,7 @@ Do not use `collection` as a substitute for separate production and staging data
 
 ### B2C application
 
-Use one database for the application or customer account, and use each end-user as a collection.
+Use one database for the application or customer account, and use each end user as a collection.
 
 ```text
 database      = "acme_app"
@@ -73,15 +64,18 @@ Typical flow:
 - Workspace-specific data uses a workspace `collection`.
 - User-specific Memories use a user-level `collection`.
 
-### Shared Knowledge + user personalization
+### Shared Knowledge plus user personalization
 
-For personalized answers grounded in shared Knowledge, use the `type` parameter on `POST /query`:
+Memories and Knowledge live in separate stores. Both are reached through `POST /query`, selected by `type`:
 
-- `type: "knowledge"` retrieves shared Knowledge (Knowledge vector store, `vectorstore_status.knowledge`).
-- `type: "memory"` retrieves user-specific Memories (Memories vector store, `vectorstore_status.memories`).
-- `type: "all"` runs both in parallel and returns one merged, re-ranked result set  -  usually what you want for personalized answers.
+- `type: "knowledge"` retrieves shared Knowledge: documents and app sources (Knowledge vector store, `vectorstore_status.knowledge`).
+- `type: "memory"` retrieves the user's Memories (Memories vector store, `vectorstore_status.memories`).
+- `type: "all"` runs both in parallel and returns one merged, re-ranked result set.
 
-When you need different formatting for shared vs personal context in the LLM prompt, call `POST /query` twice (once with `type: "knowledge"`, once with `type: "memory"`) and combine in your application.
+`type: "all"` reads both stores from the **same** scope. Send one `POST /query` with `type: "all"` and the user's `collection` when that user's knowledge and memories share the collection. When shared knowledge and the user's memories live in different collections, either:
+
+- **One call:** keep shared knowledge in a named collection (for example `company_docs`) and send `collections: ["company_docs", "user_123"]` with `type: "all"`. HydraDB runs the query in each collection and merges the results. Every listed collection must already exist.
+- **Two calls:** query `type: "knowledge"` in the shared scope and `type: "memory"` with the user's `collection`, then combine them in your application. This also helps when you want to format shared and personal context differently in the prompt.
 
 ---
 
@@ -89,35 +83,17 @@ When you need different formatting for shared vs personal context in the LLM pro
 
 ### Writes
 
-Writes include `database`, and may include `collection`.
+Writes include `database`, and may include `collection`. Send `collection` when the data belongs to a specific user, workspace, team, or other partition. Omit it when you want the data in the database's default collection.
 
-Use `collection` when the data belongs to a specific user, workspace, team, or other logical partition. Omit it when you intentionally want the data written to the database's default collection.
-
-Examples:
-
-- A memory about John's preferences should be written with John's `collection`.
-- Workspace-specific runbooks should be written with that workspace's `collection`.
-- Broadly shared Knowledge should use the same scope you plan to use when querying it.
+- A memory about John's preferences goes under John's `collection`.
+- Workspace-specific runbooks go under that workspace's `collection`.
+- Broadly shared Knowledge should use the same scope you plan to query it with.
 
 ### Reads
 
-Query requests include `database`, and may include `collection`. If `collection` is omitted, query uses the database's default collection.
+Query requests include `database`, and may include `collection`. A query only searches the scope you send. A query that names a `collection` does not also read the default collection. To combine data from several collections, prefer one query with `collections` (a list, or a weighted object), unless you need separate response formatting or client-side treatment per scope.
 
-Use the same scoping values on query that you used when writing the data. A query request with one `collection` should not be expected to retrieve data written under a different `collection`.
-
-If your application needs to combine data from multiple scopes, prefer one query call with `collections` unless you need separate response formatting or client-side treatment per scope.
-
-Use `collection` for partitioning data. Use `metadata_filters` for narrowing results within that scope.
-
-### Memories and Knowledge
-
-Memories and Knowledge live in separate stores, both reached through `POST /query`:
-
-- `type: "memory"` retrieves **Memories** (user-scoped, personal).
-- `type: "knowledge"` retrieves **Knowledge** (shared documents and app sources).
-- `type: "all"` retrieves both in one call.
-
-For a personalized answer, the common pattern is one `POST /query` with `type: "all"` and the user's `collection`. HydraDB runs both stores in parallel and merges results. Use two separate calls only when you need to format the two streams differently in your LLM prompt.
+Use `collection` to partition data. Use `metadata_filters` to narrow results inside that scope. Metadata filters are not a replacement for the right `database` and `collection`.
 
 <Warning>
   <strong>Use the same <code>collection</code> on writes and reads for the same logical scope.</strong>
@@ -128,7 +104,7 @@ For a personalized answer, the common pattern is one `POST /query` with `type: "
 
 ## 5. Minimal working example
 
-The example below shows a common personalized-answer flow: write a user Memory with a single `collection`, then query Knowledge and Memories together with `collections`.
+A common personalized-answer flow: write a user Memory under the user's `collection`, then query Knowledge and Memories together with `type: "all"`. The query reads only `user_123`. If shared knowledge lives in another collection, send `collections` instead, as in [Shared Knowledge plus user personalization](#shared-knowledge-plus-user-personalization).
 
 <CodeGroup>
 
@@ -236,37 +212,17 @@ result = client.query(
 
 ## 6. Common mistakes
 
-**Mismatched `collection` between write and read.**
-Data written under one collection should not be expected to surface when queried under another. Use the same `collection` consistently for the same logical scope.
-
-**Sharing a `database` across environments.**
-Do not use one database for both production and staging. Create separate databases for separate environments.
-
-**Confusing `database` with `collection`.**
-Use `database` for primary boundaries such as customers or environments. Use `collection` for partitions inside a database, such as users or workspaces.
-
-**Assuming query automatically searches every collection.**
-A query call uses the scope you provide. If your application needs data from multiple scopes, pass `collections` as a list or weighted object.
-
-**Writing shared Knowledge under a user scope by accident.**
-If broadly shared Knowledge is written with a user-specific `collection`, it may not appear where other users expect it. Choose the write scope based on where the content should be queried later.
-
-**Using metadata filters as a substitute for collections.**
-Metadata filters narrow results inside a scope. They are not a replacement for choosing the right `database` and `collection`.
-
-**Using unstable identifiers.**
-Avoid display names, emails that may change, or user-provided labels as long-term scope identifiers. Prefer stable internal IDs such as `user_123`, `workspace_42`, or `org_acme`.
-
-**Deleting a collection.**
-`DELETE /databases/collections` permanently removes one collection and all of its data. The parent database stays. Use [List Collections](/api-reference/v2/endpoint/list-sub-tenants) to confirm the name first. On the dashboard, click a database to expand its collections, then delete from the inline list.
+- **Writing shared Knowledge under a user scope by accident:** if broadly shared Knowledge is written with a user-specific `collection`, it may not appear where other users expect it. Choose the write scope based on where the content will be queried.
+- **Using unstable identifiers:** avoid display names, emails that may change, or user-provided labels as long-term scope identifiers. Prefer stable internal IDs such as `user_123`, `workspace_42`, or `org_acme`.
+- **Deleting a collection:** `DELETE /databases/collections` permanently removes one collection and all of its data. The parent database stays. Use [List Collections](/api-reference/v2/endpoint/list-sub-tenants) to confirm the name first. On the dashboard, click a database to expand its collections, then delete from the inline list.
 
 ---
 
 ## 7. Migrating from the legacy tenant and sub-tenant fields
 
-`database`/`collection` are the canonical v2 names for what were historically called `tenant_id`/`sub_tenant_id`. The rename is **user-facing only**: internally HydraDB still uses the historical names, so nothing about your data changes. **The old names remain accepted forever; migration is optional and non-breaking.**
+`database` and `collection` are the canonical v2 names for what were called `tenant_id` and `sub_tenant_id`. The rename is **user-facing only**. Internally HydraDB still uses the old names, so nothing about your data changes. **The old names remain accepted forever. Migration is optional and non-breaking.**
 
-Backward compatibility is total across every surface:
+The old names work on every surface:
 
 | Surface | Legacy (still works) | Canonical (preferred) |
 |---|---|---|
@@ -275,16 +231,16 @@ Backward compatibility is total across every surface:
 | `/query` multi-scope selector | `sub_tenant_ids` | `collections` |
 | Query params | `?tenant_id=…&sub_tenant_id=…` | `?database=…&collection=…` |
 
-Both prefixes dispatch to the same handlers, and the legacy fields are accepted in the query string, JSON body, and multipart form. An existing integration that uses only the old names is a pure no-op and behaves exactly as before.
+Both route prefixes dispatch to the same handlers. The legacy fields are accepted in the query string, JSON body, and multipart form, so an integration that uses only the old names behaves exactly as before.
 
-On `/query`, `collections` is the canonical way to scope to one or more collections (send a list, or an object mapping collection ID to a relative ranking weight). `sub_tenant_ids` remains accepted as its deprecated alias, and the singular `sub_tenant_id` still works too. See [Query](/api-reference/v2/endpoint/query).
+On `/query`, `collections` is the canonical way to scope to one or more collections. Send a list, or an object mapping collection ID to a relative ranking weight. `sub_tenant_ids` remains accepted as its deprecated alias, and the singular `sub_tenant_id` still works too. See [Query](/api-reference/v2/endpoint/query).
 
 ### Deprecation signals
 
-When a request uses a legacy route **or** a legacy field, HydraDB adds a non-breaking migration nudge (never an error, and the status code is unchanged):
+When a request uses a legacy route **or** a legacy field, HydraDB adds a migration notice. It is never an error, and the status code is unchanged:
 
-- **`Deprecation: true`** response header, plus a `Warning` header carrying the migration message.
-- **`meta.deprecation`**: a list of structured notices in the response envelope's `meta` object (for endpoints that return the envelope). Each entry carries `deprecated`, a human-readable `message`, and `deprecated_since` (e.g. `"2.0.1"`); field-level notices (such as `sub_tenant_ids` → `collections`) also include `deprecated_field` and `preferred_field`, while route-level notices omit them. Fully-migrated requests omit the list entirely.
+- **Headers:** a `Deprecation: true` response header, plus a `Warning` header carrying the migration message.
+- **`meta.deprecation`:** a list of structured notices in the response envelope's `meta` object, on endpoints that return the envelope. Each entry carries `deprecated`, a human-readable `message`, and `deprecated_since` (for example `"2.0.1"`). Field-level notices (such as `sub_tenant_ids` replaced by `collections`) also include `deprecated_field` and `preferred_field`. Route-level notices omit them. Fully migrated requests omit the list entirely.
 
 ```json
 {
@@ -305,21 +261,21 @@ When a request uses a legacy route **or** a legacy field, HydraDB adds a non-bre
 }
 ```
 
-Use these signals to find and retire legacy usage; once you send only the canonical names on the `/databases` routes, the header and `meta.deprecation` disappear.
+Use these signals to find and retire legacy usage. Once you send only the canonical names on the `/databases` routes, the header and `meta.deprecation` disappear.
 
 ### Sending both names
 
 If you send **both** a canonical field and its deprecated alias:
 
 - **Same value** (for example `database` and `tenant_id` both `"acme"`): accepted. HydraDB uses the canonical value.
-- **Different values** (for example `database: "acme"` and `tenant_id: "other"`): rejected with `400`, since the two names refer to the same thing and must agree. Send only one. The same rule applies to `collection`/`sub_tenant_id` and to `collections`/`sub_tenant_ids` on `/query`.
+- **Different values** (for example `database: "acme"` and `tenant_id: "other"`): rejected with `400`, because the two names refer to the same thing and must agree. Send only one. The same rule applies to `collection` and `sub_tenant_id`, and to `collections` and `sub_tenant_ids` on `/query`.
 
 ---
 
 ## Related
 
-- [Memories](/essentials/v2/memories) - user-scoped context
-- [Knowledge](/essentials/v2/knowledge) - shared document context
-- [Query](/essentials/v2/query) - how scoping is applied at query time
-- [How to Use API Results](/essentials/v2/api-results) - merging query results into a prompt
-- [Create Database](/api-reference/v2/endpoint/tenants-overview) - defining databases and their metadata schema
+- [Memories](/essentials/v2/memories): user-scoped context
+- [Knowledge](/essentials/v2/knowledge): shared document context
+- [Query](/essentials/v2/query): how scoping is applied at query time
+- [How to Use API Results](/essentials/v2/api-results): merging query results into a prompt
+- [Create Database](/api-reference/v2/endpoint/tenants-overview): defining databases and their metadata schema

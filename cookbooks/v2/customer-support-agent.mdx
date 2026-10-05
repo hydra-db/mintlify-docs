@@ -1,80 +1,36 @@
 ---
 title: "AI Customer Support Agent with Memory"
-description: "A support agent that never forgets. Ingest help docs, past ticket resolutions, and every conversation turn into HydraDB. Every response is personalized using per-user memory - the agent knows the customer's plan, their past issues, their preferences, and what already failed before it starts typing."
+description: "On each ticket, query the help docs and that customer's memory, then reply."
 ---
 
-This guide walks you through building a **customer support agent with persistent memory** powered by HydraDB. Unlike generic chatbots that answer the same way for every customer, this agent knows who it's talking to - their plan, their history, their preferences, and what already didn't work - before it types a single word.
-
-> **Note**: All code in this guide is production-ready and uses real HydraDB endpoints. Base URL: `https://api.hydradb.com`. Get your API key at [app.hydradb.com](https://app.hydradb.com).
-
-> **Goal**: Build a support agent that makes two fast HydraDB calls on every ticket - one to retrieve knowledge base context, one to retrieve customer memory - merges both, and passes the result to an LLM for a personalized response. Full round-trip under 400ms.
-
----
+Build a support agent that remembers each customer. On every ticket it makes two HydraDB queries, merges the results, passes them to your model for the reply, and stores the turn back in HydraDB. Target: the two HydraDB calls finish in under 400 ms round trip.
 
 ## Prerequisites
 
-**Required knowledge**: Python basics, REST APIs, environment variables  
-**Required tools**:
-- HydraDB API key
+- Base URL: `https://api.hydradb.com`
+- A HydraDB API key from [app.hydradb.com](https://app.hydradb.com), exported as `HYDRA_DB_API_KEY`
+- An OpenAI API key, only for the final reply
 - Python 3.11 or 3.12 (`python --version`)
-- OpenAI API key (for generating the final support response)
 - `pip install hydradb-sdk openai`
 
-## What You'll Build
+You will:
 
-By the end of this cookbook, you'll be able to:
-- Ingest help docs and past ticket resolutions into a shared HydraDB knowledge base
-- Store per-customer memory so the agent knows their plan, history, and preferences before responding
-- Make the two-call search pattern - knowledge base + customer memory - on every incoming ticket
-- Generate personalized support responses that reference the customer's specific context
-- Store every conversation turn back into HydraDB to continuously improve future responses
+- Ingest help docs and past ticket resolutions once, as shared knowledge. HydraDB builds a context graph that links related articles and resolutions.
+- Give each customer their own memory, keyed by the customer: a collection named `customer-{id}`, and `user_name` set to the customer id on every memory.
+- Store each turn verbatim with `infer: false`, and store preference signals with `infer: true` so HydraDB extracts them for you.
 
----
+The two queries, both with `mode: "thinking"`:
 
-## The Problem with Generic Support Bots
-
-Standard AI support chatbots answer the same way for every customer. Ask about a billing issue and you get the generic billing FAQ. The agent has no idea you've asked this three times, that you're on the Enterprise plan, or that the last agent told you it was a known bug being fixed this sprint.
-
-HydraDB fixes this. Every interaction is stored as a memory. Every help doc and past ticket resolution is ingested as knowledge. When a customer opens a new conversation, the agent makes two fast calls to HydraDB:
-
-1. `POST /query` - retrieves knowledge base context: help articles, past ticket resolutions, and linked documents relevant to the customer's message.
-2. `POST /query` - retrieves the customer's personal memory: their plan, past issues, inferred preferences, and conversation history.
-
-Both results are merged and passed to the LLM. The result is a support agent that feels like it knows the customer personally. Because it does.
+1. `POST /query` on the shared knowledge base: help articles, past ticket resolutions, and linked documents.
+2. `POST /query` with `type: "memory"` on the customer's collection: their plan, past issues, inferred preferences, and conversation history.
 
 ---
 
-## How HydraDB Enables This
+## Step 1: Create the database
 
-Three HydraDB primitives power this use case:
+Create one database for support. Each customer gets their own collection, created automatically on their first write. Help docs and resolved tickets go in one shared `knowledge-base` collection. This is the [B2C pattern](/essentials/v2/multi-tenant#b2c-application).
 
-- **Knowledge memories** - help docs, FAQs, past ticket resolutions. Uploaded once via `client.context.ingest()` and continuously available to every agent handling any customer. HydraDB automatically builds a context graph linking related articles and resolutions.
-- **User memories** - per-customer context stored via `POST /context/ingest` with the customer's `user_name`. Each conversation turn, product feedback signal, and inferred preference is stored here. HydraDB's `infer: true` mode automatically extracts implicit preferences from conversation text - "I'd prefer email updates" becomes a stored preference without you parsing it.
-- **Two-call search pattern** - when a customer opens a ticket, the agent calls `POST /query` to search the knowledge base and `POST /query` to retrieve personal memory. Results are merged before the LLM call. Use `mode: "thinking"` on both calls to enable personalised ranking.
-
----
-
-## Architecture Overview
-
-```mermaid
-graph LR
-    A["Customer Message"] -->|"new ticket"| B["Support Agent"]
-    B -->|"POST /query"| C["HydraDB\nKnowledge Base"]
-    B -->|"POST /query"| D["HydraDB\nCustomer Memory"]
-    C -->|"ranked help docs + resolved tickets"| E["Merge Context"]
-    D -->|"preferences + history + plan"| E
-    E -->|"full context"| F["LLM (GPT-4o)"]
-    F -->|"personalized reply"| B
-    B -->|"POST /context/ingest"| D
-```
-
----
-
-## Step 1 - Create Database
-
-One database for your support system. Use collections to isolate customer data - each customer gets their own collection, automatically created on their first interaction. This is the B2C pattern from HydraDB's docs.
-
-> **SDK required**: Install the official Python SDK - `pip install hydradb-sdk`. The ingestion endpoint (`upload_knowledge`) requires the SDK; raw `requests` with `json=` will return a 422. Note: the import name differs from the package name.
+> **Use the SDK:** `/context/ingest` takes multipart form data, so raw `requests` with `json=` does not work. Use the SDK (`pip install hydradb-sdk`), or send multipart form fields yourself. The import name (`hydra_db`) differs from the package name.
 
 <CodeGroup>
 ```python Python SDK
@@ -129,17 +85,17 @@ Output:
 
 ---
 
-## Step 2 - Ingest Knowledge Base
+## Step 2: Ingest the knowledge base
 
-Upload your help docs, FAQs, and past ticket resolutions into a shared `knowledge-base` collection. HydraDB builds a context graph connecting related articles automatically - a question about "billing" will surface linked articles about "invoices", "payment methods", and "plan upgrades" even if the customer didn't mention those words.
+Upload your help docs, FAQs, and past ticket resolutions into the shared `knowledge-base` collection. HydraDB builds a context graph that connects related articles. A question about "billing" then surfaces linked articles about "invoices", "payment methods", and "plan upgrades", even if the customer never used those words.
 
-> **Batch limit**: Max 20 sources per request. Wait 1 second between batches.
+> **Batch limit:** Max 20 sources per request. Wait 1 second between batches.
 
-> **Important - database placement**: `database` and `collection` must appear in **two places**: as top-level SDK parameters AND inside each item in `app_knowledge`. The `AppKnowledgeModel` validates both independently. Omitting either location returns a 400 error.
+> **Database placement:** `database` is a required top-level form field. Items in `app_knowledge` may also carry `database` and `collection`. An item's `database` must match the top-level one, or the request returns 400.
 
-> **app_knowledge format**: The SDK parameter `app_knowledge` takes a **JSON string** - use `json.dumps(batch)`, not a Python list directly.
+> **app_knowledge format:** The SDK parameter `app_knowledge` takes a **JSON string**. Use `json.dumps(batch)`, not a Python list.
 
-### Help Docs & FAQs
+### Help docs and FAQs
 
 <CodeGroup>
 ```python Python SDK
@@ -255,9 +211,9 @@ async function ingestHelpDocs(articles: any[]): Promise<string[]> {
 ```
 </CodeGroup>
 
-### Past Ticket Resolutions
+### Past ticket resolutions
 
-Past resolved tickets are gold - they contain the exact diagnosis path, the solution that worked, and the customer context. Include resolution steps and root cause so HydraDB can build graph links between symptoms and solutions.
+Resolved tickets hold the diagnosis path, the fix that worked, and the customer context. Include the resolution steps and root cause, so HydraDB can link symptoms to solutions in the graph.
 
 <CodeGroup>
 ```python Python SDK
@@ -363,13 +319,13 @@ async function ingestResolvedTickets(tickets: any[]): Promise<string[]> {
 
 ---
 
-## Step 3 - Build Per-Customer Memory
+## Step 3: Build per-customer memory
 
-Every customer gets their own persistent memory in HydraDB. This is what makes the agent feel personal. The memory contains every conversation turn, every preference signal, every product feedback item - and HydraDB continuously re-ranks which memories are most useful for the current interaction.
+Each customer has their own memory in HydraDB: conversation turns, preference signals, and product feedback. On each query, HydraDB ranks which of those memories fit the current message.
 
-### Store Conversation Turns
+### Store conversation turns
 
-After every message exchange, write both the customer message and agent response to HydraDB. Use `infer: false` for verbatim storage - you want the exact words so future search can surface the precise prior exchange.
+After every exchange, write the customer message and the agent reply to HydraDB. Use `infer: false` to store the exact words, so a later search can surface that exchange.
 
 <CodeGroup>
 ```python Python SDK
@@ -439,9 +395,9 @@ async function storeConversationTurn(
 ```
 </CodeGroup>
 
-### Infer User Preferences
+### Infer user preferences
 
-Store inferred preferences separately using `infer: true`. HydraDB extracts implicit signals from the text - preferred contact method, technical expertise level, frustration signals - and connects them to related context in the graph.
+Store preferences separately with `infer: true`. HydraDB extracts the signals from the text (preferred contact method, technical level, frustration) and links them to related context in the graph. For example, "I'd prefer email updates" becomes a stored preference without you parsing it.
 
 <CodeGroup>
 ```python Python SDK
@@ -524,15 +480,23 @@ await storeCustomerPreference(
 ```
 </CodeGroup>
 
-> **When to call this**: After ticket resolution ("customer confirmed this fix works"), when a customer expresses a preference explicitly ("can you just send me a link instead of steps?"), or when your system detects a pattern (third ticket about the same feature). Also call it at account creation time with CRM data - plan type, company size, primary use case.
+> **When to call this:** After a ticket is resolved ("customer confirmed this fix works"), when a customer states a preference ("can you just send me a link instead of steps?"), or when your system detects a pattern (third ticket about the same feature). Also call it at account creation with CRM data: plan type, company size, primary use case.
 
 ---
 
-## Step 4 - Handle a Support Request
+## Step 4: Handle a support request
 
-When a customer opens a ticket, the agent makes two search calls to HydraDB, merges the results, then generates a response. `/query` searches the knowledge base; `/query` searches the customer's personal memory. Both are needed - neither alone returns the full picture.
+Run both queries, then merge them. You need both: the knowledge base holds the fix, and the memory holds who the customer is and what they already tried.
 
-### Search Customer Context
+Why the parameters are set this way:
+
+- `mode: "thinking"` on both calls, which expands each query into several and reranks the results.
+- `graph_context: true` on the knowledge base call, to link entities across documents. Thinking mode returns a deeper graph slice than fast mode.
+- `alpha: 0.8`, the recommended starting point. It leans toward semantic matching. Lower it when messages carry literal tokens such as error codes.
+- `type: "memory"` and the customer's collection on the second call, so it reads only that customer's memories.
+- Memory chunks go first in the merged list, so the model weighs them more.
+
+### Search customer context
 
 <CodeGroup>
 ```python Python SDK
@@ -637,9 +601,9 @@ async function recallCustomerContext(
 ```
 </CodeGroup>
 
-### Generate a Personalized Response
+### Generate a personalized response
 
-Pass the merged context to an LLM. The personal memory chunks surface what the customer's plan is, what they've already tried, and their communication preferences. The knowledge base chunks provide the actual solution. The LLM just needs to write the reply.
+Pass the merged context to an LLM. The memory chunks give the customer's plan, what they already tried, and how they like to be addressed. The knowledge base chunks give the solution. The LLM writes the reply.
 
 <CodeGroup>
 ```python Python SDK
@@ -771,13 +735,11 @@ async function handleTicket(
 ```
 </CodeGroup>
 
-> **Alternative - skip the LLM**: Use `POST /query` with `mode: "thinking"` and `collection: customer_id` to have HydraDB generate the answer directly. Faster, but less control over the system prompt and tone.
-
 ---
 
-## Step 5 - Escalation & Human Handoff
+## Step 5: Escalation and human handoff
 
-When the agent can't resolve an issue, it escalates to a human - but critically, it sends the full HydraDB context with it. The human agent sees everything: the customer's account history, what the AI already tried, similar past tickets, and the customer's preferences. No "hi, can you describe your issue again?"
+When the agent cannot resolve an issue, hand it to a human with the full HydraDB context: account history, what the AI already tried, similar past tickets, and the customer's preferences. The human does not need to ask the customer to describe the issue again.
 
 <CodeGroup>
 ```python Python SDK
@@ -902,9 +864,9 @@ async function escalateToHuman(
 
 ---
 
-## Step 6 - Slack & Email Interface
+## Step 6: Slack and email interface
 
-Expose the support agent on Slack for internal teams and via email webhook for customer-facing support. Both use the same `handle_ticket` function - HydraDB's memory layer works identically across channels. A customer who emailed last week and now opens a Slack thread gets the same personalized context because both are stored under their `customer_id`.
+Expose the agent on Slack for internal teams and through an email webhook for customers. Both call the same `handle_ticket`, and memory works the same on every channel. Map each channel's user to the same `customer_id` (for example, with a CRM lookup). A customer who emailed last week then gets the same context when they open a Slack thread.
 
 ### Slack
 
@@ -975,7 +937,7 @@ app.event("app_mention", async ({ event, client }) => {
 ```
 </CodeGroup>
 
-### Email Webhook
+### Email webhook
 
 ```python
 # interfaces/email_webhook.py
@@ -1015,7 +977,7 @@ You should see the credit reflected within 24 hours. Is there anything else I ca
 
 ---
 
-## API Reference
+## API reference
 
 All endpoints used in this cookbook. Base URL: `https://api.hydradb.com` · Header: `Authorization: Bearer YOUR_API_KEY`
 
@@ -1028,13 +990,13 @@ All endpoints used in this cookbook. Base URL: `https://api.hydradb.com` · Head
 | `POST` | `/query` | Search knowledge base |
 | `POST` | `/query` | Retrieve customer personal memory |
 
-### Create Database
+### Create database
 
 ```json
 { "database": "customer-support" }
 ```
 
-### Upload Knowledge (via SDK)
+### Upload knowledge (via SDK)
 
 ```python
 client.context.ingest(
@@ -1043,8 +1005,8 @@ client.context.ingest(
     upsert=True,
     app_knowledge=json.dumps([{
         "id":            "kb-article-001",
-        "database":     "customer-support",    # also required inside each item
-        "collection": "knowledge-base",      # also required inside each item
+        "database":     "customer-support",    # optional; must match the top-level database
+        "collection": "knowledge-base",      # optional per-item collection
         "title":         "How to reset your SSO configuration",
         "type":          "confluence",
         "timestamp":     "2024-10-01T00:00:00Z",
@@ -1054,7 +1016,9 @@ client.context.ingest(
 )
 ```
 
-### Store Customer Memory (Conversation Turn)
+### Store customer memory (conversation turn)
+
+The two memory examples list the fields of a multipart form request. `memories` is sent as a JSON string, which the SDK builds from `json.dumps([...])`.
 
 ```json
 {
@@ -1069,7 +1033,7 @@ client.context.ingest(
 }
 ```
 
-### Store Customer Preference
+### Store customer preference
 
 ```json
 {
@@ -1084,7 +1048,7 @@ client.context.ingest(
 }
 ```
 
-### Search Knowledge Base
+### Search knowledge base
 
 ```json
 {
@@ -1098,7 +1062,7 @@ client.context.ingest(
 }
 ```
 
-### Search Customer Memory
+### Search customer memory
 
 ```json
 {
@@ -1113,23 +1077,21 @@ client.context.ingest(
 
 ## Benchmarks
 
-Tested across 2,400 real support tickets (mix of billing, technical, onboarding, account issues) with and without HydraDB memory. Human raters evaluated response quality and relevance.
+Tested on 2,400 real support tickets (billing, technical, onboarding, and account issues), with and without HydraDB memory. Human raters scored response quality and relevance. Each line gives the generic support bot first, then the HydraDB agent.
 
-| Metric | Generic Support Bot | HydraDB Support Agent | Delta |
-|--------|--------------------|-----------------------|-------|
-| First-contact resolution rate | 38% | 71% | +87% |
-| "Agent knew my history" (CSAT signal) | 12% of sessions | 84% of sessions | +600% |
-| Unnecessary escalation rate | 41% | 9% | −78% |
-| Repeated troubleshooting steps (already tried) | 67% of tickets | 4% of tickets | −94% |
-| P95 search latency (HydraDB step) | N/A | under 200 ms | Sub-second |
+- **First-contact resolution rate:** 38% vs 71% (+87%).
+- **"Agent knew my history" (CSAT signal):** 12% vs 84% of sessions (+600%).
+- **Unnecessary escalation rate:** 41% vs 9% (down 78%).
+- **Repeated troubleshooting steps (already tried):** 67% vs 4% of tickets (down 94%).
+- **P95 search latency (HydraDB step):** under 200 ms for the HydraDB agent (sub-second). Not applicable to the generic bot.
 
-> The 94% drop in repeated troubleshooting steps is the most direct result of persistent memory. Without HydraDB, a customer who reports the same SSO issue for the third time gets the same "try clearing your browser cache" suggestion. With HydraDB, the agent knows that was already tried - and tried twice - and goes straight to the next level of diagnosis.
+> The drop in repeated troubleshooting steps comes straight from memory. A customer reporting the same SSO issue for the third time no longer gets "try clearing your browser cache" again. The agent sees it was already tried twice and moves to the next diagnosis.
 
-> **Benchmark methodology**: Figures are based on internal HydraDB testing. See [research.hydradb.com/hydradb.pdf](https://research.hydradb.com/hydradb.pdf) for the full paper. Results will vary by corpus size, content quality, and query distribution.
+> **Benchmark methodology:** Figures are based on internal HydraDB testing. See [research.hydradb.com/hydradb.pdf](https://research.hydradb.com/hydradb.pdf) for the full paper. Results will vary by corpus size, content quality, and query distribution.
 
 ---
 
-## File Structure
+## File structure
 
 ```
 customer_support_agent/
@@ -1164,11 +1126,11 @@ slack-bolt          # only if using Slack interface
 
 ---
 
-## Next Steps
+## Run it
 
 1. Run `setup.py` to create your database and verify the connection.
 2. Run the ingestion scripts with your real help docs and past tickets.
 3. Seed a few customer memories from your CRM at account creation time.
 4. Wire `handle_ticket` into your existing support channel (email, Slack, or web chat).
 
-The agent improves automatically - every conversation stored via `context.ingest(type="memory")` makes the next response for that customer more personalized. There is no retraining step. HydraDB re-ranks memories continuously as new interactions come in.
+There is no retraining step. Each turn you store with `context.ingest(type="memory")` is ranked into the next query for that customer.

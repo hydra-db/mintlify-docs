@@ -1,11 +1,11 @@
 ---
 title: "Custom Ingestion Instructions"
-description: "Steer how a connector's data is interpreted and indexed with free-text instructions, per connector or per resource."
+description: "Free text, per connector or per resource, that tells HydraDB what synced content means before it is indexed."
 ---
 
-Custom ingestion instructions are free text attached to a connector that guides how its synced documents are interpreted and indexed. The text is injected into the ingestion pipeline's extraction and inference stages for every document the connector syncs, so you can tell HydraDB what the content means before it is indexed, rather than after a query comes back wrong.
+Custom ingestion instructions are free text on a connector or on one of its resources. HydraDB adds the text to the extraction and inference stages of its ingestion pipeline for every document the connector syncs. Use it to tell HydraDB what the content means before it is indexed, including facts the documents never state.
 
-The canonical use case is taxonomy. Suppose your product was rebranded from *Aurora* to *Nimbus*: years of documents mention only the old name, nothing in the corpus states the rename, and a search for "Nimbus" misses all of the pre-rebrand context. One instruction fixes the interpretation at ingestion time:
+Example: the product was renamed from Aurora to Nimbus. Old documents only say Aurora, and nothing in them states the rename, so a search for Nimbus misses them. One instruction fixes that:
 
 ```text
 Aurora was renamed to Nimbus in January 2025; they are the same product.
@@ -15,13 +15,17 @@ Aurora as a former name.
 
 From the next sync onward, documents that mention only Aurora are extracted under the Nimbus entity, with alias links to the old name, so new-name queries reach old-name content through the knowledge graph.
 
-Instructions are equally useful for focus ("prioritize decisions, owners, and deadlines; ignore social chatter"), interpretation ("threads in this workspace are incident retros; extract root cause and remediation"), and domain vocabulary ("SEV1/SEV2 are incident severities, not product names").
+Other uses:
+
+- **Focus:** "prioritize decisions, owners, and deadlines; ignore social chatter".
+- **Interpretation:** "threads in this workspace are incident retros; extract root cause and remediation".
+- **Domain vocabulary:** "SEV1/SEV2 are incident severities, not product names".
 
 ---
 
 ## Works with every existing connector
 
-Instructions are purely additive. Every connector you already have supports them today with a single `PATCH`. There is no reconnection, reconfiguration or migration, and nothing changes until you set one:
+Every connector you already have supports instructions with a single `PATCH`. There is no reconnection, reconfiguration or migration:
 
 ```bash
 curl -X PATCH 'https://api.hydradb.com/connectors/CONNECTOR_ID' \
@@ -31,7 +35,7 @@ curl -X PATCH 'https://api.hydradb.com/connectors/CONNECTOR_ID' \
   -d '{ "custom_instructions": "Aurora was renamed to Nimbus in January 2025; they are the same product." }'
 ```
 
-The connector's configuration is re-read at the start of every sync cycle, so the instruction applies from the next sync automatically. A connector with no instructions behaves exactly as before.
+The connector's configuration is re-read at the start of every sync cycle, so the instruction applies from the next sync. A connector with no instructions behaves exactly as before.
 
 ---
 
@@ -40,11 +44,9 @@ The connector's configuration is re-read at the start of every sync cycle, so th
 - **Connector level:** applies to every resource that has no instructions of its own. Set it with `custom_instructions` on `POST /connectors` or `PATCH /connectors/{id}`.
 - **Resource level:** applies to documents synced from that one resource. Set it with `PATCH /connectors/{id}/resources/{resource_id}`, or with `custom_instructions` on a resource in configure.
 
-A resource-level value **replaces** the connector default for that resource's documents. It does not add to it. An empty or absent resource value inherits the connector default. This mirrors how per-resource database and collection overrides already resolve.
+A resource uses its own instructions when it has them, otherwise the connector's, otherwise none. A resource-level value **replaces** the connector default for that resource's documents. It does not add to it. An empty or absent resource value inherits the connector default. Per-resource database and collection overrides resolve the same way.
 
-So a resource uses its own instructions when it has them, otherwise the connector's, otherwise none.
-
-Use a resource override when one connector spans materially different content: a channel of incident retros and a channel of release notes want different guidance, and a connector-wide value can only describe both badly.
+Use a resource override when one connector spans different kinds of content. A channel of incident retros and a channel of release notes need different guidance, and one connector-wide value describes both badly.
 
 ### Set the connector default at creation
 
@@ -102,28 +104,28 @@ curl -X PATCH 'https://api.hydradb.com/connectors/CONNECTOR_ID/resources/RESOURC
   -d '{ "custom_instructions": "" }'
 ```
 
-Clearing a resource override returns that resource to the connector default. Re-sending a configure request without the field preserves an existing override, so routine reconfiguration never silently strips a tuned resource.
+Clearing a resource override returns that resource to the connector default. Re-sending a configure request without the field keeps an existing override, so reconfiguring never silently strips one.
 
 ### Read them back
 
-`GET /connectors/{id}` returns the connector's `custom_instructions`; `GET /connectors/{id}/resources` returns each resource's, absent when the resource inherits.
+`GET /connectors/{id}` returns the connector's `custom_instructions`. `GET /connectors/{id}/resources` returns each resource's, and omits it when the resource inherits.
 
 ---
 
 ## From the dashboard
 
-- **At connect time**: the connect wizard has a dedicated *Instructions* step between resource selection and review. Set the connector default there, and click any selected resource to give it its own instructions before ingestion starts.
-- **After connecting**: open the connector and click **Instructions**, or click the instructions icon on any resource row. The dialog lists the connector default and every resource with its override-or-inherits state, so you can see and edit the whole hierarchy in one place. Resources with their own instructions are badged in the resource table.
+- **At connect time:** the connect wizard has an *Instructions* step between resource selection and review. Set the connector default there, and click any selected resource to give it its own instructions before ingestion starts.
+- **After connecting:** open the connector and click **Instructions**, or click the instructions icon on any resource row. The dialog lists the connector default and every resource, showing whether each overrides or inherits, so you can edit them all in one place. Resources with their own instructions are badged in the resource table.
 
 ---
 
 ## Semantics and limits
 
-- **Applies to future syncs only.** Instructions are read at sync time and stamped onto each document as it is ingested. Already-indexed documents are not re-processed; each document keeps the instructions it was ingested under, recorded in its stored metadata.
-- **Length limit: 4,000 characters**, counted in characters rather than bytes, so multi-byte scripts get the same budget. Longer values are rejected with a 400 and the stored value is left unchanged.
-- **Cost.** The text rides the extraction and inference prompts for every synced document, so a long value on a high-volume connector is a recurring processing cost. Say what matters and stop.
-- **Steering, not string rewriting.** Instructions guide the language models that build the knowledge graph. Explicit, unambiguous instructions ("X was renamed to Y; they are the same product; index under Y") get the strongest adherence; vague guidance gets vague results. State each rule directly, name the exact terms involved, and keep unrelated rules as separate sentences.
-- **No filtering or routing.** Instructions do not change which documents sync, where they are stored, or who can access them. Use resource selection, [multi-tenant routing](/essentials/v2/multi-tenant), and ACLs for those.
+- **Applies to future syncs only:** instructions are read at sync time and stamped onto each document as it is ingested. Already-indexed documents are not re-processed. Each document keeps the instructions it was ingested under, recorded in its stored metadata.
+- **Length limit:** 4,000 characters, counted in characters rather than bytes, so multi-byte scripts get the same budget. Longer values are rejected with a `400` and the stored value is left unchanged.
+- **Cost:** the text rides the extraction and inference prompts for every synced document, so a long value on a high-volume connector is a recurring processing cost. Say what matters and stop.
+- **Steering, not string rewriting:** instructions guide the language models that build the knowledge graph. Explicit, unambiguous instructions ("X was renamed to Y; they are the same product; index under Y") get the strongest adherence. Vague guidance gets vague results. State each rule directly, name the exact terms involved, and keep unrelated rules as separate sentences.
+- **No filtering or routing:** instructions do not change which documents sync, where they are stored, or who can access them. Use resource selection, [multi-tenant routing](/essentials/v2/multi-tenant), and [ACLs](/essentials/v2/access-control) for those.
 
 ---
 

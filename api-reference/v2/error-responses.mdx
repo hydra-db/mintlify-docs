@@ -3,9 +3,9 @@ title: "Error Responses"
 description: "Response envelope, HTTP status codes, error codes, and retry patterns."
 ---
 
-### Response envelope
+## Response envelope
 
-HydraDB core endpoints (`/databases`, `/context/*`, and `/query`) use the same top-level envelope for successful and failed requests. Webhook management endpoints (`/webhooks/indexing*`) return their documented response object directly and do not include this envelope.
+`/databases`, `/context/*`, `/query`, `/feedback`, and `/webhooks/indexing*` use the same top-level envelope for successful and failed requests. Connector endpoints and `PATCH /databases/{database}/metadata-schema` return their documented success object directly, without the envelope; their errors still use it.
 
 ```json
 {
@@ -22,16 +22,13 @@ HydraDB core endpoints (`/databases`, `/context/*`, and `/query`) use the same t
 }
 ```
 
-
-
-Field | Description |
-|---|---|
-| `success` | `false` for errors. |
-| `data` | Always `null` for error responses. |
-| `error.code` | Machine-readable code for programmatic handling. |
-| `error.message` | Human-readable explanation of what failed. |
-| `meta.request_id` | Request identifier. Include it when contacting support. |
-| `meta.latency_ms` | Server-side processing time in milliseconds. 
+- `success`: `false` for errors.
+- `data`: `null` for errors. One exception: a failed `DELETE /context` keeps its per-ID results under `data`.
+- `error.code`: machine-readable code for programmatic handling.
+- `error.message`: human-readable explanation of what failed.
+- `meta.request_id`: request identifier. Include it when you contact support.
+- `meta.latency_ms`: server-side processing time in milliseconds.
+- `detail`: deprecated copy of the error (`detail.error_code`, `detail.message`) kept for older clients. Read `error` instead.
 
 <Info>
 Use `error.code` for branching and log `meta.request_id` for every failed request. The HTTP status tells you the class of failure; the error code tells you what to do.
@@ -43,10 +40,13 @@ Use `error.code` for branching and log `meta.request_id` for every failed reques
 |---|---|---|
 | `400` | Invalid parameters or malformed request | No |
 | `401` | Missing, expired, or invalid API key | No |
-| `403` | Authenticated, but not permitted for the resource | No |
+| `402` | Your plan does not allow the request, for example one connector too many | No. Upgrade the plan |
+| `403` | Authenticated, but not permitted for the resource, or the plan's database limit is reached | No |
 | `404` | Database, source, memory, or related resource was not found | No |
-| `409` | Conflict, usually an existing database or context item ID | Usually no |
-| `422` | Well-formed request that failed validation | No |
+| `409` | Conflict: the database already exists, a source is still indexing when you delete it, or a schema field conflicts | Only `SOURCE_PROCESSING`, after `Retry-After` |
+| `413` | Request body or upload too large | No |
+| `415` | Wrong `Content-Type`, such as a JSON body sent to the multipart-only `POST /context/ingest` | No |
+| `422` | Well-formed request that failed validation, or a query sent before the database finished provisioning | Only `TENANT_INFRA_NOT_READY`, after the database is ready |
 | `429` | Rate limit exceeded | Yes, with backoff |
 | `500` | Internal server error | Yes, with backoff |
 | `503` | Temporary service unavailability | Yes, with backoff |
@@ -55,30 +55,35 @@ Use `error.code` for branching and log `meta.request_id` for every failed reques
 
 | Code | Typical status | Meaning |
 |---|---|---|
-| `INVALID_PARAMETERS` | `400` | A required parameter is missing, malformed, or mutually incompatible with another parameter. |
+| `INVALID_INPUT` | `400` | The default for a bad request: a required parameter is missing, malformed, or conflicts with another parameter. Also used for `413` and `415`. |
 | `UNAUTHORIZED` | `401` | The `Authorization: Bearer <your_api_key>` header is missing or invalid. |
-| `FORBIDDEN` | `403` | The API key is valid but does not have access to the requested resource, or the account/plan limit prevents the operation. |
-| `DATABASE_ALREADY_EXISTS` | `409` | `POST /databases` received a `database` (formerly `tenant_id`) that is already in use. |
+| `PAYMENT_REQUIRED` | `402` | A plan limit refused the write, for example the connector count on your plan. |
+| `FREE_PLAN_DEPRECATED` | `402` | The workspace is on the deprecated Free plan. The message and `detail.upgrade_url` carry the upgrade link. |
+| `FORBIDDEN` | `403` | The API key is valid but cannot call this route or reach this resource, or the plan's database limit is reached. |
+| `NOT_FOUND` | `404` | The requested resource does not exist, for example a source ID in `DELETE /context`. |
 | `DATABASE_NOT_FOUND` | `404` | The requested database does not exist or is not visible to the current API key. |
-| `SOURCE_NOT_FOUND` | `404` | The requested source or memory ID does not exist in the selected database/collection. |
-| `VALIDATION_ERROR` | `422` | The request shape was valid JSON/form data, but one or more fields failed semantic validation. |
+| `DATABASE_ALREADY_EXISTS` | `409` | `POST /databases` received a `database` (formerly `tenant_id`) that is already in use. |
+| `SOURCE_PROCESSING` | `409` | `DELETE /context` hit a source that is still indexing. Retry after the `Retry-After` header. |
+| `VALIDATION_ERROR` | `400` or `422` | A field failed semantic validation. On `POST /query` it is a `400` for a metadata filter that does not fit the field's type. On connectors it is a `422` for credentials that fail validation. |
+| `TENANT_INFRA_NOT_READY` | `422` | `POST /query` reached a database that is still provisioning. Poll [Database Status](/api-reference/v2/endpoint/tenant-status) until `ready_for_ingestion` is `true`, then retry. |
+| `CORPUS_TYPE_UNSUPPORTED` | `400` | The `type` value does not fit this endpoint or database, for example `type: "all"` on ingest. |
 | `RATE_LIMITED` | `429` | The API key exceeded its current rate limit. |
-| `INTERNAL_ERROR` | `500` | HydraDB hit an unexpected server-side error. |
+| `INTERNAL_ERROR` | `500` | HydraDB hit an unexpected server-side error. A rare failure in the auth layer reports `INTERNAL_SERVER_ERROR` instead. |
 | `SERVICE_UNAVAILABLE` | `503` | A dependency is temporarily unavailable or the service is under load. |
 
 <Note>
-Endpoint pages list the most common codes for that operation. New codes may be added over time, so clients should handle unknown `error.code` values gracefully.
+Endpoint pages list the most common codes for that operation. New codes may be added over time, so clients should handle unknown `error.code` values gracefully. `PATCH /databases/{database}/metadata-schema` currently returns `INTERNAL_ERROR` for its `400` and `409` errors too, so branch on the HTTP status there.
 </Note>
 
 <Note>
-**Missing database returns `DATABASE_NOT_FOUND`.** A request for a database that does not exist returns `DATABASE_NOT_FOUND` on both the canonical `/databases` routes and the deprecated `/tenants` routes. The deprecated `/tenants` routes otherwise keep their pre-rename error contract for backward compatibility: a duplicate on `POST /tenants` returns `INVALID_INPUT` (not `DATABASE_ALREADY_EXISTS`), whereas the canonical `POST /databases` returns `DATABASE_ALREADY_EXISTS` as shown above. The HTTP status is identical on both. See [Migrating from `tenant_id` and `sub_tenant_id`](/essentials/v2/multi-tenant#7-migrating-from-the-legacy-tenant-and-sub-tenant-fields).
+**The deprecated `/tenants` routes keep their pre-rename error codes.** A missing database returns `NOT_FOUND` instead of `DATABASE_NOT_FOUND`, and a duplicate `POST /tenants` returns `INVALID_INPUT` instead of `DATABASE_ALREADY_EXISTS`. The HTTP status is the same. The route decides the code: sending the old `tenant_id` field to a `/databases` route still gets the new codes. See [Migrating from `tenant_id` and `sub_tenant_id`](/essentials/v2/multi-tenant#7-migrating-from-the-legacy-tenant-and-sub-tenant-fields).
 </Note>
 
 ## Ingestion error codes
 
-Asynchronous ingestion failures surface a numeric `E####` code in the `error_code` field of [`GET /context/status`](/api-reference/v2/endpoint/source-status) responses and `indexing.status_changed` [webhook](/essentials/v2/webhooks) payloads. Unlike the HTTP `error.code` values above (which describe why a *request* was rejected), these describe why a specific *item* failed to index.
+Asynchronous ingestion failures surface a numeric `E####` code in the `error_code` field of [`GET /context/status`](/api-reference/v2/endpoint/source-status) responses and `indexing.status_changed` [webhook](/essentials/v2/webhooks) payloads. The HTTP `error.code` values above say why a *request* was rejected. These say why a specific *item* failed to index.
 
-Many storage- and capacity-related ingestion errors are **transient**: the pipeline retries them automatically with backoff, and they typically self-resolve within minutes. A code appearing in `error_code` does not by itself mean the item has failed permanently  -  only treat an item as a real failure once it reaches the terminal `errored` status.
+Many storage and capacity ingestion errors are **transient**: the pipeline retries them automatically with backoff, and they usually clear within minutes. A code in `error_code` does not by itself mean the item failed permanently. Treat an item as a real failure only once it reaches the terminal `errored` status.
 
 | Code | Meaning | Severity |
 |---|---|---|
@@ -90,12 +95,14 @@ Many storage- and capacity-related ingestion errors are **transient**: the pipel
 </Note>
 
 <Note>
-`E6001` is **transient**, not terminal. If you observe it on an in-flight item, keep polling [`/context/status`](/api-reference/v2/endpoint/source-status)  -  the item normally advances to `graph_creation` / `completed` on a subsequent retry with no action on your part. Only contact support if the item is still reported as `errored` after retries are exhausted.
+`E6001` is **transient**, not terminal. If you see it on an in-flight item, keep polling [`/context/status`](/api-reference/v2/endpoint/source-status). The item normally advances to `graph_creation` or `completed` on a later retry with no action from you. Contact support only if the item is still `errored` after retries are exhausted.
 </Note>
 
 ## Retry pattern
 
 Retry only transient failures: `429`, `500`, and `503`. Use exponential backoff with jitter and keep retries bounded.
+
+Two other codes clear on their own, so retry them after waiting rather than with blind backoff: `409 SOURCE_PROCESSING` (wait for `Retry-After`) and `422 TENANT_INFRA_NOT_READY` (wait until the database is ready).
 
 <CodeGroup>
 ```typescript TypeScript SDK
@@ -188,8 +195,12 @@ try {
   });
 } catch (error) {
   if (error instanceof HydraDBError) {
-    const code = error.body?.error?.code;
-    const requestId = error.body?.meta?.request_id;
+    // error.body is typed `unknown`; it holds the raw snake_case error envelope.
+    const body = error.body as
+      | { error?: { code?: string }; meta?: { request_id?: string } }
+      | undefined;
+    const code = body?.error?.code;
+    const requestId = body?.meta?.request_id;
 
     if (code === "DATABASE_NOT_FOUND") {
       // Create or select a valid database before ingesting.
@@ -243,7 +254,7 @@ Also send `API-Version: 2` on raw HTTP requests. The official SDKs set the versi
 
 ### Database not found after creation
 
-Database creation is asynchronous. After `POST /databases`, poll [`GET /databases/status`](/api-reference/v2/endpoint/tenant-status) until `infra.scheduler_status`, `infra.graph_status`, `infra.vectorstore_status.knowledge`, and `infra.vectorstore_status.memories` are all `true`.
+Database creation is asynchronous. After `POST /databases`, poll [`GET /databases/status`](/api-reference/v2/endpoint/tenant-status) until `infra.ready_for_ingestion` is `true`. It turns `true` once `scheduler_status`, `graph_status`, and both `vectorstore_status` flags are `true`. A query sent earlier returns `422 TENANT_INFRA_NOT_READY`.
 
 ### Ingestion validation errors
 
@@ -260,11 +271,11 @@ Empty results are not always errors. Check these first:
 
 - Context status may still be `queued` or `processing`; poll [`GET /context/status`](/api-reference/v2/endpoint/source-status).
 - `metadata_filters` may be too restrictive or may target the wrong metadata namespace.
-- The query may be scoped to the wrong `database` or `collection` (formerly `tenant_id` / `sub_tenant_id`).
+- The query may be scoped to the wrong `database` or `collection` (formerly `tenant_id` and `sub_tenant_id`).
 - The `type` value may exclude the collection you need. Use `type: "all"` when combining knowledge and memories in `POST /query`.
 
 ## Related sections
 
-- [API Reference](/api-reference/v2) - endpoint inventory and conventions
-- [Ingestion Status](/api-reference/v2/endpoint/source-status) - async ingestion state
-- [Query](/api-reference/v2/endpoint/query) - retrieval parameters and response shape
+- [API Reference](/api-reference/v2): endpoint inventory and conventions.
+- [Ingestion Status](/api-reference/v2/endpoint/source-status): async ingestion state.
+- [Query](/api-reference/v2/endpoint/query): retrieval parameters and response shape.

@@ -1,68 +1,39 @@
 ---
 title: "Build your own Glean with HydraDB"
-description: "Learn how to build a comprehensive workplace search and AI assistant platform using HydraDB APIs. This guide covers data ingestion, retrieval, and app-layer answer generation across multiple data sources."
+description: "Ingest Slack, email, Drive, and Jira, then query them together."
 ---
 
-This guide will walk you through building an extremely powerful workplace search and AI assistant platform that rivals Glean using HydraDB APIs. You'll learn how to create a unified retrieval experience across multiple data sources and generate answers in your application layer.
-
-> **Note**: All code in this guide uses the official HydraDB Python SDK. Base URL: `https://api.hydradb.com`. Get your API key at [app.hydradb.com](https://app.hydradb.com).
+Build workplace search like Glean: ingest Slack, email, Drive, and Jira into HydraDB, query them all with one call, and write the answer in your app.
 
 ## Prerequisites
 
-**Required knowledge**: Python basics, REST APIs, environment variables  
-**Required tools**:
-- HydraDB API key
+- Base URL: `https://api.hydradb.com`
+- A HydraDB API key from [app.hydradb.com](https://app.hydradb.com), exported as `HYDRA_DB_API_KEY`
 - Python 3.11 or 3.12 (`python --version`)
 - `pip install hydradb-sdk`
+- For the TypeScript tabs: `npm install @hydradb/sdk`
 
-## What You'll Build
+By the end you can:
 
-By the end of this cookbook, you'll be able to:
-- Ingest documents from multiple data sources (Slack, email, Google Drive, Jira) into a unified HydraDB knowledge base
-- Run natural language workplace search across all sources with a single [`/query`](/api-reference/v2/endpoint/query) call
-- Personalize search results per user by storing and retrieving AI memories
-- Generate grounded AI answers from retrieved context using any LLM
+- Fetch data from each app with Composio, the app's own API, webhooks, or scheduled jobs
+- Ingest Slack, email, Drive, and Jira into one database
+- Query them with one [`POST /query`](/api-reference/v2/endpoint/query), tuned with `mode`, `alpha`, `recency_bias`, and metadata filters
+- Personalize each user's search with a profile and a per-user `collection`
+- Show the knowledge graph paths that connect the results
+- Isolate data per tenant and check permissions before a query
+- Pass the returned chunks to your model
 
-## Overview
+## Step 1: Data ingestion strategy
 
-A Glean-like application typically includes these core features:
+### 1.1 App connector setup
 
-- **Universal Search**: Search across multiple data sources (documents, emails, chats, etc.)
-- **Retrieval-Assisted Answers**: Generate intelligent answers from retrieved company knowledge
-- **AI Memories for User Preferences**: Remember and adapt to individual user preferences, search patterns, and behavioral patterns
-- **Data Ingestion**: Connect to various apps and services
-- **Knowledge Graph**: Build connections between information
-- **Security & Access Control**: Role-based permissions and data isolation
+Fetch the data from each app. Two ways are shown below.
 
-## Architecture Overview
+To skip writing fetchers, use HydraDB's native [connectors](/essentials/v2/connectors) instead. You connect an account once, and HydraDB syncs Slack, GitHub, Notion, and other apps on a schedule (every hour by default).
 
-```mermaid
-graph TD
-    A["Frontend UI<br/>• Search UI<br/>• Chat Interface<br/>• Results View"] 
-    B["Backend API<br/>• Data Sync<br/>• Auth/ACL<br/>• App Connectors"]
-    C["HydraDB APIs<br/>• Retrieval Engine<br/>• Document Index<br/>• Memory Store"]
-    
-    D["Data Sources<br/>• Google apps<br/>• Slack<br/>• Notion<br/>• Jira"]
-    E["App Connectors for Fetching Data<br/><br/>• Composio<br/>• Vanilla APIs<br/>• Webhooks<br/>• Scheduled Jobs"]
-    F["Retrieval Layer<br/>• HydraDB Memory<br/>• User Sessions<br/>• Metadata Store"]
-    
-    A <--> B
-    B <--> C
-    A --> D
-    B <--> E
-    C --> F
-```
+#### Option A: Composio
 
-
-## Step 1: Data Ingestion Strategy
-
-### 1.1 App Connectors Setup
-
-You'll need to connect to various data sources. Here are recommended approaches:
-
-#### Option A: Using Composio
-
-[Composio](https://composio.dev/) provides pre-built connectors for popular apps:
+[Composio](https://composio.dev/) has pre-built connectors for popular apps:
 
 
 ```javascript
@@ -95,9 +66,9 @@ const composioConfig = {
 ```
 
 
-#### Option B: Vanilla API Integration
+#### Option B: Each app's own API
 
-For custom integrations, use the native APIs:
+Call each app's own API:
 
 
 ```javascript
@@ -166,11 +137,11 @@ class GmailConnector {
 ```
 
 
-### 1.2 Data Normalization
+### 1.2 Data normalization
 
-Create a unified data format for all sources:
+Map every source to one format:
 
-> **Important**: For optimal performance, limit each batch to a maximum of **20 app sources** per request. Send multiple batch requests with an interval of **1 second** between each request.
+> **Important:** Send at most **20 app sources** per request. Wait **1 second** between requests.
 
 
 ```javascript
@@ -200,11 +171,9 @@ const normalizedData = {
 ```
 
 
-### 1.3 Batch Upload to HydraDB
+### 1.3 Batch upload to HydraDB
 
-Use HydraDB's batch upload capabilities for efficient data ingestion:
-
-> **Best Practice**: Always verify processing after upload using the `/context/status` endpoint to ensure your data is properly indexed.
+Send the normalized items as `app_knowledge`. Then check `/context/status` for each item, so you know it is indexed before you query it.
 
 
 <CodeGroup>
@@ -289,13 +258,11 @@ const uploadWithVerification = async (sources: any[], database: string, collecti
 </CodeGroup>
 
 
-## Step 2: Search and Answer Generation
+## Step 2: Search and answer generation
 
-### 2.1 Universal Search Interface
+### 2.1 Universal search
 
-Create a search interface that queries across all data sources:
-
-> **Note**: HydraDB supports filtering by `source_title` and `source_type` using the `metadata` parameter. Use these for targeted searches across specific data sources.
+One query searches every source in the collection you name. A query without `collection` reads the database's default collection. To search only some sources, pass `metadata_filters`. Filters match fields in each source's `metadata`, so set a field such as `source_type` at ingest and declare it in the database metadata schema.
 
 
 <CodeGroup>
@@ -316,7 +283,7 @@ def search(query: str, database: str, collection: str = None,
         mode=mode,
         alpha=0.5,        # Balance semantic vs keyword search (0.0 to 1.0)
         recency_bias=0.3, # Recency preference (0.0 to 1.0)
-        **({"metadata": metadata} if metadata else {}),
+        **({"metadata_filters": metadata} if metadata else {}),
     )
 
 # Filter search by source type
@@ -355,7 +322,7 @@ const search = async (query: string, database: string, options: SearchOptions = 
     mode,
     alpha: 0.5,         // Balance semantic vs keyword search (0.0 to 1.0)
     recencyBias: 0.3,  // Recency preference (0.0 to 1.0)
-    ...(metadata && { metadata }),
+    ...(metadata && { metadataFilters: metadata }),
   });
 };
 
@@ -370,15 +337,15 @@ const searchBySourceTitle = (query: string, database: string, sourceTitle: strin
 </CodeGroup>
 
 
-### 2.2 Advanced Search Features
+### 2.2 Advanced search features
 
-Implement advanced search capabilities:
+The parameters that shape ranking:
 
-> **Advanced Features**:
->
-> - `mode`: Use `"thinking"` for multi-query retrieval with reranking, or `"fast"` for single-query retrieval
-> - `alpha`: Controls semantic vs keyword matching (0.0-1.0, or `"auto"`)
-> - `recency_bias`: Prioritizes recent content (0.0-1.0)
+- `mode`: `"fast"` runs one query. `"thinking"` runs several queries and reranks, so use it for complex questions. Omitted means `"auto"`, which picks one of the two per query.
+- `alpha`: balance of semantic and keyword matching, from 0.0 (all keyword) to 1.0 (all semantic), or `"auto"`. Default `0.8`.
+- `recency_bias`: how much to favor recent content, from 0.0 to 1.0. Omitted means a mild `0.4` tilt. Send `0` to turn it off.
+
+The helpers below add metadata filters, prepend extra context to the query, and fold earlier conversation turns into the query.
 
 
 <CodeGroup>
@@ -404,7 +371,7 @@ def search_with_filters(query: str, database: str, source_types: str = None, sou
         mode="fast",
         alpha=0.5,
         recency_bias=0.3,
-        **({"metadata": metadata} if metadata else {})
+        **({"metadata_filters": metadata} if metadata else {})
     )
 
 # Guide retrieval with additional context — prepend context to the query string
@@ -456,7 +423,7 @@ const searchWithFilters = async (
     mode: "fast",
     alpha: 0.5,
     recencyBias: 0.3,
-    ...(Object.keys(metadata).length > 0 && { metadata })
+    ...(Object.keys(metadata).length > 0 && { metadataFilters: metadata })
   });
 };
 
@@ -491,20 +458,13 @@ const conversationalSearch = async (
 </CodeGroup>
 
 
-### 2.3 AI Memories and User Preferences
+### 2.3 User preferences
 
-One of the most powerful features of building a Glean-like application with HydraDB is leveraging **AI Memories** to create truly personalized experiences. HydraDB automatically manages AI memories using `collection` for user-level isolation. This allows your application to remember user preferences, past interactions, and behavioral patterns, making every search and interaction more relevant and efficient.
+Keep a profile for each user: preferred formats and sources, response style, and recent queries. Use it on every search.
 
-#### Understanding AI Memories
+HydraDB uses `collection` to isolate each user's data, so the query below sets `collection` to the user's id. The code keeps the profile in a local store and folds the preferences into the query text. To keep preferences in HydraDB instead, store them as [memories](/essentials/v2/memories).
 
-HydraDB's AI memories are dynamic, user-specific profiles that evolve over time. They capture not just what users say, but their intentions, preferences, and unique behaviors. HydraDB automatically manages these memories using `collection` for user-level isolation. This enables your Glean clone to:
-
-- **Remember User Preferences**: Format preferences, source preferences, search patterns
-- **Understand Intent**: Learn what types of information users typically seek
-- **Adapt Responses**: Tailor answers based on past interactions
-- **Anticipate Needs**: Suggest relevant information before users ask
-
-#### Implementing AI Memories in Your Search
+#### Personalized search
 
 
 <CodeGroup>
@@ -565,7 +525,7 @@ def search_with_memory(query: str, database: str, user_id: str):
         recency_bias=0.3,
     )
     if profile["preferred_source_types"]:
-        kwargs["metadata"] = {"source_type": profile["preferred_source_types"]}
+        kwargs["metadata_filters"] = {"source_type": profile["preferred_source_types"]}
 
     search_results = client.query(**kwargs)
 
@@ -644,7 +604,7 @@ const searchWithMemory = async (query: string, database: string, userId: string)
     alpha: 0.5,
     recencyBias: 0.3,
     ...(userProfile.preferredSourceTypes?.length > 0 && {
-      metadata: { source_type: userProfile.preferredSourceTypes }
+      metadataFilters: { source_type: userProfile.preferredSourceTypes }
     })
   });
 
@@ -675,8 +635,9 @@ const searchWithMemory = async (query: string, database: string, userId: string)
 </CodeGroup>
 
 
-#### User Preference Learning
+#### Preference learning
 
+Count the queries, formats, sources, and filters each user picks, so the profile improves over time.
 
 ```javascript
 class PreferenceLearner {
@@ -779,8 +740,9 @@ class PreferenceLearner {
 ```
 
 
-#### Memory-Enhanced Search Interface
+#### Search interface with preferences
 
+This component loads the profile, suggests past searches, and marks a source as preferred when the user clicks a result from it.
 
 ```javascript
 const MemoryEnhancedSearch = ({ userId }) => {
@@ -928,27 +890,18 @@ const MemoryEnhancedSearch = ({ userId }) => {
 ```
 
 
-#### Benefits of AI Memories in Your Glean Clone
+#### Best practices for user preferences
 
-1. **Personalized Search Results**: Users get results tailored to their preferences and past behavior
-2. **Faster Information Discovery**: The system learns what sources and formats users prefer
-3. **Improved User Experience**: Every interaction feels more personal and relevant
-4. **Reduced Cognitive Load**: Users don't need to repeat their preferences or search patterns
-5. **Adaptive Learning**: The system continuously improves based on user interactions
-6. **Automatic Management**: HydraDB handles memory updates automatically - no manual implementation required
-
-#### Best Practices for AI Memories
-
-- **Respect Privacy**: Always give users control over their data and preferences
-- **Transparency**: Show users what preferences are being used and allow them to modify them
-- **Graceful Degradation**: Ensure the system works well even without user history
-- **Collection Isolation**: Use `collection` to isolate user data for personalized experiences
-- **Performance**: Cache user profiles to avoid repeated API calls
+- **Privacy:** give users control over their data and preferences.
+- **Transparency:** show users which preferences are in use, and let them change them.
+- **No history:** make sure search still works well for a new user.
+- **Collection isolation:** use `collection` to keep each user's data separate.
+- **Performance:** cache user profiles to avoid repeated API calls.
 
 
-## Step 3: Frontend Implementation
+## Step 3: Frontend
 
-### 3.1 Search Interface
+### 3.1 Search interface
 
 
 ```javascript
@@ -1014,8 +967,9 @@ const GleanSearchInterface = () => {
 ```
 
 
-### 3.2 Results Display
+### 3.2 Results display
 
+Show the ranked chunks. When the response includes `graph_context`, show the knowledge graph paths too, so users see how the results connect.
 
 ```javascript
 const SearchResults = ({ results }) => {
@@ -1065,10 +1019,13 @@ const ChunkCard = ({ chunk }) => {
 ```
 
 
-## Step 4: Data Synchronization
+## Step 4: Data synchronization
 
-### 4.1 Scheduled Sync Jobs
+If you fetch data yourself, keep it fresh with scheduled jobs, webhooks, or both. [Connectors](/essentials/v2/connectors) do this for you.
 
+### 4.1 Scheduled sync jobs
+
+Poll each app on its own interval. Retry failures with exponential backoff.
 
 ```javascript
 class DataSyncManager {
@@ -1154,8 +1111,9 @@ class DataSyncManager {
 ```
 
 
-### 4.2 Webhook Integration
+### 4.2 Webhooks
 
+Ingest each new Slack message as it arrives.
 
 <CodeGroup>
 ```python Python SDK
@@ -1234,10 +1192,13 @@ app.post("/webhooks/slack", async (req, res) => {
 </CodeGroup>
 
 
-## Step 5: Security and Access Control
+## Step 5: Security and access control
 
-### 5.1 Multi-Tenant Architecture
+### 5.1 Multi-tenant architecture
 
+Give each tenant its own `database` and each team or user its own `collection`. Check the user's role before you run a query.
+
+To filter inside HydraDB as well, store an allow-list on each document and send `acl` on `POST /query`. HydraDB then returns only documents that user may see. See [Access control](/essentials/v2/access-control).
 
 ```javascript
 class TenantManager {
@@ -1304,8 +1265,9 @@ class TenantManager {
 ```
 
 
-### 5.2 Data Privacy and Compliance
+### 5.2 Data privacy and compliance
 
+Delete memories past a retention window, and anonymize sensitive fields.
 
 ```javascript
 class DataPrivacyManager {
@@ -1407,9 +1369,9 @@ class DataPrivacyManager {
 ```
 
 
-## Step 6: Performance Optimization
+## Step 6: Performance
 
-### 6.1 Caching Strategy
+### 6.1 Caching
 
 
 ```javascript
@@ -1454,7 +1416,7 @@ class SearchCache {
 ```
 
 
-### 6.2 Rate Limiting
+### 6.2 Rate limiting
 
 
 ```javascript
@@ -1488,9 +1450,9 @@ class RateLimiter {
 ```
 
 
-## Step 7: Monitoring and Analytics
+## Step 7: Monitoring and analytics
 
-### 7.1 Search Analytics
+### 7.1 Search analytics
 
 
 ```javascript
@@ -1559,49 +1521,41 @@ class SearchAnalytics {
 ```
 
 
-## Best Practices and Recommendations
+## Best practices
 
-### 1. Data Ingestion Best Practices
+### Data ingestion
 
-- **Batch Processing**: Use HydraDB's batch upload endpoints for efficiency
-- **Batch Limits**: Limit to 20 app sources per request with 1-second intervals between batches
-- **Incremental Sync**: Only sync new/changed data to minimize API calls
-- **Error Handling**: Implement retry logic with exponential backoff
-- **Processing Verification**: Always verify upload processing using `/context/status`
-- **Rate Limiting**: Respect API rate limits and implement queuing
+- **Incremental sync:** sync only new or changed data.
+- **Error handling:** retry with exponential backoff.
+- **Rate limiting:** respect API rate limits and queue requests.
 
-### 2. Search Optimization
+### Search
 
-- **Query Preprocessing**: Clean and normalize user queries
-- **Result Ranking**: Use `alpha` and `recency_bias` for fine-tuning
-- **Metadata Filtering**: Use `source_title` and `source_type` for targeted searches
-- **Thinking Mode**: Use `mode: "thinking"` for complex queries that benefit from multi-query retrieval with reranking
-- **Caching**: Cache frequent queries and results
+- **Query preprocessing:** clean and normalize user queries.
+- **Caching:** cache frequent queries and their results.
 
-### 3. Security Considerations
+### Security
 
-- **Data Encryption**: Encrypt sensitive data at rest and in transit
-- **Access Control**: Implement role-based access control (RBAC)
-- **Audit Logging**: Log all search queries and data access
-- **Data Retention**: Implement automatic data deletion policies
+- **Encryption:** encrypt sensitive data at rest and in transit.
+- **Access control:** use role-based access control (RBAC).
+- **Audit logging:** log every search query and data access.
+- **Data retention:** delete data automatically after a set period.
 
-### 4. Performance Tips
+### Performance
 
-- **Connection Pooling**: Reuse HTTP connections
-- **Async Processing**: Use async/await for non-blocking operations
-- **Memory Management**: Implement proper cleanup for large datasets
-- **Batch Optimization**: Respect 20-source batch limits and 1-second intervals
-- **Processing Verification**: Verify uploads to ensure data is properly indexed
-- **Monitoring**: Track response times and error rates
+- **Connection pooling:** reuse HTTP connections.
+- **Async processing:** use async/await so calls do not block.
+- **Memory management:** clean up large datasets when you are done with them.
+- **Monitoring:** track response times and error rates.
 
-### 5. User Experience
+### User experience
 
-- **Autocomplete**: Implement search suggestions
-- **Faceted Search**: Allow filtering by source type, date, author
-- **Saved Searches**: Let users save and share search queries
-- **Export Results**: Allow users to export search results
+- **Autocomplete:** suggest searches as the user types.
+- **Faceted search:** filter by source type, date, and author.
+- **Saved searches:** let users save and share queries.
+- **Export results:** let users export search results.
 
-## Deployment Checklist
+## Deployment checklist
 
 - Set up authentication and authorization
 - Configure data connectors and sync schedules
@@ -1612,22 +1566,9 @@ class SearchAnalytics {
 - Set up analytics and reporting
 - Document API usage and troubleshooting
 
-## Conclusion
+## Next steps
 
-Building a Glean-like application with HydraDB APIs provides you with a powerful, scalable foundation for workplace search and AI assistance. By following this guide and implementing the best practices outlined, you can create a comprehensive solution that rivals commercial offerings while maintaining full control over your data and user experience.
-
-The key to success is starting with a solid architecture, implementing proper data synchronization, and gradually adding advanced features like multi-step reasoning, conversation memory, and personalized responses. HydraDB's APIs provide the AI capabilities you need, while your application handles the data ingestion, user interface, and business logic.
-
-Remember to monitor performance, gather user feedback, and continuously iterate on your implementation to create the best possible user experience.
-
-## Change Log
-
-| Date | Change |
-|------|--------|
-| 2026-05-14 | Replaced raw `fetch()`-based `HydraDBDataIngestion` class with official SDK calls (`client.context.ingest`, `client.context.status`) |
-| 2026-05-14 | Replaced raw `fetch()`-based `GleanSearch` class with `client.query` SDK call |
-| 2026-05-14 | Replaced `AdvancedSearch` class with standalone SDK helper functions (`searchWithFilters`, `searchWithContext`, `conversationalSearch`) |
-| 2026-05-14 | Replaced `PersonalizedSearch` class with flat SDK-based `searchWithMemory` function |
-| 2026-05-14 | Replaced webhook `cortexIngestion.uploadBatch()` call with `client.context.ingest()` SDK call |
-| 2026-05-14 | Added Python SDK equivalents in `<CodeGroup>` tabs for all replaced code blocks |
-| 2026-05-14 | Removed "Status: In progress" notice |
+- [Query](/essentials/v2/query): the `POST /query` parameters and modes
+- [Connectors](/essentials/v2/connectors): let HydraDB sync your apps
+- [Access control](/essentials/v2/access-control): filter results per user with `acl`
+- [Memories](/essentials/v2/memories): store user preferences in HydraDB

@@ -5,8 +5,6 @@ description: "LLM-facing reference for building against the current HydraDB docs
 
 # HydraDB Agent Integration Guide
 
-This document is a self-contained reference designed for AI coding agents. It covers everything needed to understand, install, configure, and integrate HydraDB into any project -- from zero prior knowledge to production-ready usage.
-
 ### TL;DR: Critical endpoints
 
 1. **`POST /databases`** (`client.databases.create()`): Provision an isolated database workspace.
@@ -49,8 +47,9 @@ Core raw HTTP responses (`/databases`, `/context/*`, and `/query`) are wrapped:
 - Parse core raw HTTP payloads from `data`.
 - The SDKs return the full envelope object; read the payload from its `data` field (e.g. `response.data`). On failure they raise a typed exception rather than returning an envelope with `error` set.
 - Log `meta.request_id` for failed requests.
-- `meta` may also carry an optional `deprecation` list (with a `Deprecation: true` response header) when a request uses a legacy `/tenants` route or a deprecated field (`tenant_id`/`sub_tenant_id`, or `sub_tenant_ids` on `/query`). Every entry has `deprecated`, `message`, and `deprecated_since`. `deprecated_field` and `preferred_field` are **optional**: the `sub_tenant_ids` notice on `/query` carries them, the `tenant_id`/`sub_tenant_id` notice does not. Read `message` for the migration, and do not key logic off the two optional fields. It is a non-breaking nudge. The status code is unchanged. Prefer the `/databases` routes and `database`/`collection`/`collections` fields to avoid it. Treat `meta` as an open object: ignore keys you do not recognize.
-- Exception: webhook management endpoints (`/webhooks/indexing*`) return their documented response object directly, without the `{ success, data, error, meta }` envelope.
+- `meta` may also carry an optional `deprecation` list (with a `Deprecation: true` response header) when a request uses a legacy tenants route (any path under /tenants) or a deprecated field (`tenant_id`/`sub_tenant_id`, or `sub_tenant_ids` on `/query`). Every entry has `deprecated`, `message`, and `deprecated_since`. `deprecated_field` and `preferred_field` are **optional**: the `sub_tenant_ids` notice on `/query` carries them, the `tenant_id`/`sub_tenant_id` notice does not. Read `message` for the migration, and do not key logic off the two optional fields. It is a non-breaking nudge. The status code is unchanged. Prefer the `/databases` routes and `database`/`collection`/`collections` fields to avoid it. Treat `meta` as an open object: ignore keys you do not recognize.
+- Webhook management endpoints (`/webhooks/indexing*`) and `/feedback` use the same envelope. Read their documented response object from `data`.
+- Exceptions: connector endpoints (`/connectors*`) and `PATCH /databases/{database}/metadata-schema` return their success body directly, without the envelope. Their errors still use the envelope.
 
 ### Core endpoints
 
@@ -99,21 +98,21 @@ Use the same `type` enum across context lifecycle APIs and search. Search additi
 
 ### Metadata naming
 
-- `metadata`: schema-aligned, declared at database creation, fast filter path. Sent as a top-level request field on `/context/ingest`.
-- `additional_metadata`: canonical free-form metadata; anything not present in the `metadata` schema. Also a top-level request field.
-- `document_metadata`: on file uploads only, binds a source `id` to each uploaded file. It is not a metadata envelope  -  do not nest `metadata` or `additional_metadata` inside it.
+- `metadata`: schema-aligned, declared at database creation, fast filter path. Set it per source on `/context/ingest`: on each `document_metadata[]` item (file uploads), each `app_knowledge[]` item, or each memory item. There is no top-level `metadata` form field.
+- `additional_metadata`: canonical free-form metadata; anything not present in the `metadata` schema. Set it in the same places as `metadata`.
+- `document_metadata`: file uploads only. A JSON array with one entry per file in `documents`, in the same order. Each entry carries the source `id` and that file's `metadata` and `additional_metadata`.
 - `metadata_filters` top-level keys match the `metadata` schema.
 - `metadata_filters.additional_metadata` scopes free-form metadata.
 
 ### Sending feedback
 
-**If a query did not give you what you needed  -  nothing relevant came back, the top result was wrong, or you had to fall back to another source  -  please tell us with `POST /feedback`.** You are the only party that knows whether the retrieved context actually answered the question, and that judgement is what tunes retrieval.
+**If a query did not give you what you needed (nothing relevant came back, the top result was wrong, or you had to fall back to another source), please tell us with `POST /feedback`.** You are the only party that knows whether the retrieved context actually answered the question, and that judgement is what tunes retrieval.
 
-It is entirely optional, and there is no penalty for skipping it. Send it when you have something specific to report; a report on a query that disappointed you is worth far more than a stream of routine ones. If a query worked well and you want to say so, `rating: "positive"` is welcome too  -  it tells us what to preserve.
+It is entirely optional, and there is no penalty for skipping it. Send it when you have something specific to report; a report on a query that disappointed you is worth far more than a stream of routine ones. If a query worked well and you want to say so, `rating: "positive"` is welcome too. It tells us what to preserve.
 
 **Once you have finished the task, a short report on how the context actually performed is recommended.** The end of the task is when you know something you could not know at retrieval time: whether a chunk that looked plausible turned out to be stale, contradicted by another source, or never used at all. A single report then is worth more than one per query.
 
-Give it context. We see only a `request_id` and whatever prose you send  -  nothing about what you were doing  -  so a report that stands on its own is far more useful than one that assumes the session can be reconstructed. Worth a sentence each:
+Give it context. We see only a `request_id` and whatever prose you send, nothing about what you were doing. A report that stands on its own is far more useful than one that assumes the session can be reconstructed. Worth a sentence each:
 
 - What the user was actually trying to do.
 - Which chunks carried the answer, and which you discarded and why.
@@ -136,14 +135,14 @@ except Exception:
     pass  # fire-and-forget, exactly as above
 ```
 
-At the end of a task `rating: "positive"` is as valuable as a negative one, because by then you know which part of the context did the work  -  and that is what tells us what to keep.
+At the end of a task `rating: "positive"` is as valuable as a negative one, because by then you know which part of the context did the work, and that is what tells us what to keep.
 
 Rules, when you do send it:
 
-- **Take `request_id` from the query's own response  -  never invent one.** It is in `meta.request_id`, and in the `X-Request-ID` response header. Send it back **verbatim**: an id you made up, or one from another query, correlates to nothing.
+- **Take `request_id` from the query's own response. Never invent one.** It is in `meta.request_id`, and in the `X-Request-ID` response header. Send it back **verbatim**: an id you made up, or one from another query, correlates to nothing.
 - Set `source: "agent"`. It separates your reports from human ones, which fail in different ways.
 - Say **what** was wrong, not that something was wrong. "Returned the 2023 policy, current one is in the Q3 handbook" is actionable; "bad results" is not.
-- Do not block the user on it. Feedback is fire-and-forget: if the **feedback call itself** fails, drop it and carry on  -  never retry in a loop, and never surface that error to the user.
+- Do not block the user on it. Feedback is fire-and-forget: if the **feedback call itself** fails, drop it and carry on. Never retry in a loop, and never surface that error to the user.
 - Feedback never changes the query's result. It is a signal, not a correction, and reading it back is not possible.
 
 ```python
@@ -163,11 +162,11 @@ except Exception:
     pass  # fire-and-forget: a failed report must never reach the user
 ```
 
-Catch broadly. The point is that **nothing** escapes  -  narrowing to the SDK error type would still let a timeout or a DNS failure surface an error the user cannot act on, from a call they did not ask for.
+Catch broadly. The point is that **nothing** escapes. Narrowing to the SDK error type would still let a timeout or a DNS failure surface an error the user cannot act on, from a call they did not ask for.
 
-**"Did not give me what I needed" is not the same as "errored".** A query that returned `200` with unhelpful results is exactly what this endpoint is for. A query that never returned  -  `4xx`/`5xx`, or the SDK raised  -  is not: handle the error and move on rather than reporting it. Feedback is a judgement about retrieval quality, and a query that produced no results has no retrieval to judge. Fix the request instead: a `404` means the database name is wrong, a `429` means back off, a `400` means the body was malformed.
+**"Did not give me what I needed" is not the same as "errored".** A query that returned `200` with unhelpful results is exactly what this endpoint is for. A query that never returned (`4xx`/`5xx`, or the SDK raised) is not: handle the error and move on rather than reporting it. Feedback is a judgement about retrieval quality, and a query that produced no results has no retrieval to judge. Fix the request instead: a `404` means the database name is wrong, a `429` means back off, a `400` means the body was malformed.
 
-**If you know the right answer, send it as `ground_truth`.** When you are running against a labelled set, or you know which document should have been returned, that is a far stronger signal than a comment  -  it can be scored without a human reading it. With `ground_truth` present, `feedback` prose is optional:
+**If you know the right answer, send it as `ground_truth`.** When you are running against a labelled set, or you know which document should have been returned, that is a far stronger signal than a comment. It can be scored without a human reading it. With `ground_truth` present, `feedback` prose is optional:
 
 ```python
 try:
@@ -185,7 +184,7 @@ except Exception:
 
 Send `answer`, `source_ids`, or both. Do **not** guess: only send ground truth you actually have. A fabricated answer key is worse than none, because it is scored as if it were true.
 
-Limit: 100 submissions per minute per organization  -  far above what reporting only the queries that fell short will ever reach. If you do hit `429`, honour `Retry-After` or simply skip that report  -  never spin.
+Limit: 100 submissions per minute per organization, far above what reporting only the queries that fell short will ever reach. If you do hit `429`, honour `Retry-After` or simply skip that report. Never spin.
 
 ### Do not mix scopes accidentally
 
@@ -219,7 +218,7 @@ Knowledge is shared context: documents, PDFs, Markdown, CSVs, Slack threads, Not
 - Ingest with `POST /context/ingest`, `type=knowledge`.
 - Search with `POST /query`, `type: "knowledge"`.
 - Use for content that should be reusable across users.
-- Mutability is explicit: re-ingest with the same ID and `upsert: true`, or delete.
+- Mutability is explicit: re-ingest with the same ID and `upsert: true`, edit metadata in place with `PATCH /context/{id}/metadata`, or delete.
 
 ### Memories
 
@@ -250,19 +249,19 @@ It supports:
 
 ### Feedback
 
-`POST /feedback` records how a query performed. It is the loop that closes retrieval quality, and it is open to agents whenever a query falls short  -  and, once a task is finished, for a short report on how the context held up  -  see [Sending feedback](#sending-feedback).
+`POST /feedback` records how a query performed. It is the loop that closes retrieval quality, and it is open to agents whenever a query falls short. Once a task is finished, it also takes a short report on how the context held up. See [Sending feedback](#sending-feedback).
 
 | Field | Required | Notes |
 |---|---|---|
 | `request_id` | yes | The UUID from that query's `meta.request_id`, verbatim |
 | `feedback` | yes* | What was right or wrong, up to 8000 chars. *Optional if `ground_truth` is sent |
-| `rating` | no | `positive`, `negative`, `neutral`. Omitting it ≠ `neutral` |
-| `source` | no | `user` (default) or `agent`  -  agents set `"agent"` |
+| `rating` | no | `positive`, `negative`, `neutral`. Omitting it is not the same as `neutral` |
+| `source` | no | `user` (default) or `agent`. Agents set `"agent"` |
 | `database` / `collection` | no | Optional scoping; `collection` requires `database` |
-| `ground_truth` | no | `{ answer, source_ids }`  -  what the right answer was, when you know it. Makes `feedback` optional |
+| `ground_truth` | no | `{ answer, source_ids }`: what the right answer was, when you know it. Makes `feedback` optional |
 | `metadata` | no | Up to 20 string pairs of your own context (agent name, conversation id) |
 
-Each submission is its own record  -  sending a second report about the same query adds to it rather than replacing it, so refine as you learn more.
+Each submission is its own record. A second report about the same query adds to it rather than replacing it, so refine as you learn more.
 
 ### Context graph
 
@@ -547,13 +546,11 @@ Use SDK autocomplete/returned object shape for the exact field spelling.
 | `collection` | optional logical partition; default collection if omitted |
 | `upsert` | default `true`; replaces existing sources with same ID |
 | `documents` | binary uploads for knowledge |
-| `metadata` | schema-aligned filterable fields; top-level `metadata_filters` match these |
-| `additional_metadata` | free-form fields; anything you want as metadata that is not in the `metadata` schema |
-| `document_metadata` | JSON-stringified array, one item per uploaded file; assigns a source `id` to that file |
+| `document_metadata` | JSON-stringified array, one item per uploaded file, same order as `documents`; carries each file's `id`, `metadata`, `additional_metadata`, and `relations` |
 | `app_knowledge` | JSON-stringified object/array of pre-extracted app sources |
 | `memories` | JSON-stringified array of memory items |
 
-`metadata` and `additional_metadata` are top-level request fields. They are not nested inside `document_metadata`.
+There is no top-level `metadata` or `additional_metadata` form field. Set them per source: inside each `document_metadata[]` item for files, each `app_knowledge[]` item, or each memory item.
 
 ### Knowledge from files
 
@@ -567,22 +564,28 @@ with open("policy.pdf", "rb") as f:
         type="knowledge",
         database="acme_corp",
         documents=[("policy.pdf", f, "application/pdf")],
-        metadata={"department": "support", "status": "approved"},
-        additional_metadata={"author": "Alice", "version": 2},
-        document_metadata=json.dumps([{"id": "policy_v2"}]),
+        document_metadata=json.dumps([
+            {
+                "id": "policy_v2",
+                "metadata": {"department": "support", "status": "approved"},
+                "additional_metadata": {"author": "Alice", "version": 2},
+            }
+        ]),
     )
 ```
 
 `metadata` carries the schema-aligned fields declared on the database; top-level `metadata_filters` match these. Anything you want as metadata that is not present in the `metadata` schema goes in `additional_metadata`.
 
-`document_metadata` exists for one reason: when you upload a file there is otherwise no way to assign it a specific source ID. Use it to bind an `id` to each uploaded file.
+`document_metadata` is how you attach anything to an uploaded file: its source `id` (otherwise HydraDB assigns one), its metadata, and its relations. Send one item per file, in the same order as `documents`. The item count must match the file count, and an unrecognized key returns `400`.
 
 `document_metadata` item fields:
 
 | Field | Purpose |
 |---|---|
 | `id` | stable source ID / upsert key for the uploaded file |
-| `relations` | explicit forceful relations, e.g. `{ "ids": [...] }` |
+| `metadata` | schema-aligned fields for this file (max 16 KiB compact JSON) |
+| `additional_metadata` | free-form fields for this file (max 1 KiB compact JSON) |
+| `relations` | relations you declare to other sources, e.g. `{ "ids": [...] }` |
 
 ### Knowledge from app sources
 
@@ -663,7 +666,7 @@ client.context.ingest(
             "text": "User prefers dark mode and concise answers.",
             "infer": True,
             "user_name": "Alex",
-            "tenant_metadata": json.dumps({"team": "engineering"}),
+            "metadata": {"team": "engineering"},
             "additional_metadata": {"source": "onboarding"},
             "relations": {"ids": ["pref_concise"]}
         }
@@ -684,7 +687,7 @@ Memory item fields:
 | `custom_instructions` | guide inference when `infer: true` |
 | `user_name` | helps inference |
 | `expiry_time` | TTL in seconds |
-| `tenant_metadata` | schema-aligned fields; for memory items, encode as a JSON string inside the JSON-stringified `memories` field |
+| `metadata` | schema-aligned fields, as an object (do not stringify it again inside `memories`). `tenant_metadata` is not read on memory items. |
 | `additional_metadata` | free-form fields; keep as objects |
 | `relations` | explicit memory-to-memory links |
 
@@ -700,7 +703,7 @@ Parameters:
 
 - `database` required
 - `ids` required array
-- `collection`  -  **required if you ingested into one.** The lookup is scoped: omitting `collection`, or sending the wrong one, returns `indexing_status: "errored"` with `error_code: "FILE_NOT_FOUND"` and `message: "ID not found"` for a source that exists and is fully searchable. That is a scope miss, not an indexing failure, and it is indistinguishable from one unless you read `error_code`.
+- `collection`: **required if you ingested into one.** The lookup is scoped: omitting `collection`, or sending the wrong one, returns `indexing_status: "errored"` with `error_code: "FILE_NOT_FOUND"` and `message: "ID not found"` for a source that exists and is fully searchable. That is a scope miss, not an indexing failure, and it is indistinguishable from one unless you read `error_code`.
 
 Status meanings from docs:
 
@@ -818,15 +821,15 @@ Rules:
 | `type` | `knowledge`, `memory`, `all` | store selector for knowledge, memories, or both |
 | `query_by` | `hybrid`, `text` | default hybrid |
 | `operator` | `or`, `and`, `phrase` | only for `query_by: "text"` |
-| `mode` | `fast`, `thinking` | applies to hybrid; thinking improves quality but adds latency |
-| `max_results` | integer/null | default around 10; max documented as 50 |
-| `alpha` | `0.0`–`1.0` or `auto` | hybrid weight; `1.0` semantic, `0.0` BM25 |
-| `recency_bias` | `0.0`–`1.0` | boost newer content |
-| `graph_context` | boolean | default true; include graph slice |
+| `mode` | `fast`, `thinking`, `auto` | applies to hybrid; omitted means `auto`, which picks fast or thinking per query (thinking when unsure); thinking improves quality but adds latency |
+| `max_results` | integer/null | default 10; max 250 |
+| `alpha` | `0.0` to `1.0`, or `auto` | hybrid weight; `1.0` semantic, `0.0` BM25 |
+| `recency_bias` | `0.0` to `1.0` | boost newer content; omitted means `0.4`, send `0` to disable |
+| `graph_context` | boolean | default true; include graph slice; `false` only takes effect in fast mode, thinking always includes it |
 | `query_forceful_relations` | boolean | only effective in `thinking` mode |
 | `additional_context` | string | short factual hint; not a hard filter |
 | `metadata_filters` | object | deterministic filters before/around ranking |
-| `query_apps` | boolean | app-aware retrieval lane for app sources; still searches the full selected knowledge scope |
+| `query_apps` | boolean | app-aware retrieval lane for app sources; still searches the full selected knowledge scope; defaults to `true` on `/query`, send `false` to disable |
 
 ### Recommended configurations
 
@@ -1092,9 +1095,9 @@ Field options:
 
 Rules:
 
-- Plan hot filter fields before first ingest; undeclared scope keys can be ignored.
-- Use exact equality filters; range/contains/fuzzy matching should be in the query or downstream reranker.
-- To change metadata on an indexed context item, re-ingest with the same `id` and `upsert: true`.
+- Plan hot filter fields before first ingest. `PATCH /databases/{database}/metadata-schema` can add fields later, but cannot rename, retype, or reflag existing ones.
+- Top-level `metadata` filters support `equals`, `contains`, and `contains_any`. Range and fuzzy matching belong in the query or a downstream reranker.
+- To change metadata on an indexed context item, call `PATCH /context/{id}/metadata` (merges keys), or re-ingest with the same `id` and `upsert: true`.
 - Do not rename metadata keys without re-ingesting affected sources.
 
 ---
@@ -1125,7 +1128,7 @@ Parameters:
 - `collection`
 - `type: "knowledge" | "memory"`
 - `ids`
-- `page`, `page_size` (1–100)
+- `page`, `page_size` (1 to 100)
 - `filters.tenant_metadata`
 - `filters.additional_metadata`
 - `filters.source_fields`
@@ -1205,33 +1208,33 @@ Use `type: "memory"` to delete memory IDs.
 
 | Code | Meaning |
 |---|---|
-| `INVALID_INPUT` | required, malformed, or conflicting parameter. This is the code for essentially every `400`  -  branch on it, not on a generic name |
+| `INVALID_INPUT` | required, malformed, or conflicting parameter. This is the code for essentially every `400`. Branch on it, not on a generic name |
 | `VALIDATION_ERROR` | request shape valid but failed validation |
 | `UNAUTHORIZED` | missing/invalid bearer token |
 | `FORBIDDEN` | key lacks access |
 | `DATABASE_ALREADY_EXISTS` | duplicate database ID |
 | `DATABASE_NOT_FOUND` | database missing/not visible |
-| `TENANT_INFRA_NOT_READY` | `422`  -  the database exists but its infrastructure is still provisioning. This is what querying before polling readiness returns |
-| `FILE_NOT_FOUND` | id not found **in the selected scope**  -  usually a `collection` mismatch rather than a missing source |
+| `TENANT_INFRA_NOT_READY` | `422`: the database exists but its infrastructure is still provisioning. This is what querying before polling readiness returns |
+| `FILE_NOT_FOUND` | id not found **in the selected scope**, usually a `collection` mismatch rather than a missing source |
 | `SOURCE_PROCESSING` | the source is still indexing and cannot serve this request yet |
 | `NOT_FOUND` | requested resource does not exist |
 | `PARSE_ERROR` | a document could not be parsed |
 | `PROCESSING_FAILED` | indexing failed for a source |
 | `RATE_LIMITED` | rate limit exceeded |
 | `INTERNAL_ERROR` | unexpected server error |
-| `BACKEND_ERROR` | `502`  -  an upstream dependency returned an error |
+| `BACKEND_ERROR` | `502`: an upstream dependency returned an error |
 | `SERVICE_UNAVAILABLE` | dependency unavailable / under load |
 
-There is no `INVALID_PARAMETERS` and no `SOURCE_NOT_FOUND`  -  earlier revisions of this guide listed both, and no HydraDB response has ever carried either. Match on `INVALID_INPUT` and `FILE_NOT_FOUND` instead.
+There is no `INVALID_PARAMETERS` and no `SOURCE_NOT_FOUND`. Earlier revisions of this guide listed both, and no HydraDB response has ever carried either. Match on `INVALID_INPUT` and `FILE_NOT_FOUND` instead.
 
-Retry only `429`, `500`, `503`; use bounded exponential backoff with jitter.
+Retry only `429`, `500`, `502`, and `503`, with bounded exponential backoff and jitter.
 
 SDK errors:
 
 ```python
 from hydra_db.core.api_error import ApiError
 
-RETRYABLE = (429, 500, 503)
+RETRYABLE = (429, 500, 502, 503)
 
 try:
     result = client.query(
@@ -1270,7 +1273,7 @@ try {
 
 ## 13. Cookbook patterns
 
-The cookbooks show production patterns. Click the links below to read the raw Markdown guides with complete setup code and schemas:
+The cookbooks show production patterns. Each link opens the raw Markdown guide, with complete setup code and schemas:
 
 | Cookbook Guide | Purpose & Retrieval Patterns | Link to Guide |
 |---|---|---|

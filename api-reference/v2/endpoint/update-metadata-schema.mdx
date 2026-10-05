@@ -6,10 +6,10 @@ openapi: "api-reference/v2/openapi.json PATCH /databases/{database}/metadata-sch
 
 import { Field } from "/snippets/field.jsx";
 
-Use this endpoint to add new fields to a database's `database_metadata_schema`.
+Call this when an existing database needs a new field in its `database_metadata_schema`. The SDK methods are `client.databases.update_metadata_schema()` (Python) and `client.databases.updateMetadataSchema()` (TypeScript). To read the current schema, call `GET /databases/{database}/metadata-schema`. It returns the same field shape, so you can feed it back into `add_fields`.
 
 <Warning>
-  This endpoint is additive only. It cannot delete fields, rename fields, or change the type/flags of existing fields.
+  This endpoint is additive only. It cannot delete fields, rename fields, or change the type or flags of existing fields. It also cannot add dense or sparse search lanes.
 </Warning>
 
 <RequestExample>
@@ -27,10 +27,9 @@ curl -X PATCH 'https://api.hydradb.com/databases/acme_corp/metadata-schema' \
         "enable_match": true
       },
       {
-        "name": "summary_label",
-        "data_type": "VARCHAR",
-        "enable_dense_embedding": true,
-        "enable_sparse_embedding": true
+        "name": "priority",
+        "data_type": "INT64",
+        "enable_match": true
       }
     ]
   }'
@@ -49,12 +48,7 @@ response = requests.patch(
     json={
         "add_fields": [
             {"name": "region", "data_type": "VARCHAR", "enable_match": True},
-            {
-                "name": "summary_label",
-                "data_type": "VARCHAR",
-                "enable_dense_embedding": True,
-                "enable_sparse_embedding": True,
-            },
+            {"name": "priority", "data_type": "INT64", "enable_match": True},
         ]
     },
 )
@@ -71,12 +65,7 @@ const response = await fetch("https://api.hydradb.com/databases/acme_corp/metada
   body: JSON.stringify({
     add_fields: [
       { name: "region", data_type: "VARCHAR", enable_match: true },
-      {
-        name: "summary_label",
-        data_type: "VARCHAR",
-        enable_dense_embedding: true,
-        enable_sparse_embedding: true,
-      },
+      { name: "priority", data_type: "INT64", enable_match: true },
     ],
   }),
 });
@@ -90,48 +79,49 @@ const response = await fetch("https://api.hydradb.com/databases/acme_corp/metada
 
 | Name | Description |
 | --- | --- |
-| <Field name="database" type="string" required /> | Database whose metadata schema should be extended. Formerly `tenant_id`; the `tenant_id` alias is still accepted (deprecated). |
+| <Field name="database" type="string" required /> | Database whose metadata schema you are extending. Formerly `tenant_id`, which is still accepted as a deprecated alias. |
 
 ### Body
 
 | Name | Description |
 | --- | --- |
-| <Field name="add_fields" type="array" required /> | New metadata schema fields to append. Must contain at least one field. |
+| <Field name="add_fields" type="array" required /> | Metadata schema fields to append. Must contain at least one field. A field that already exists with an identical definition is skipped, so you can resend your full field list. |
 
 Each `add_fields[]` item uses the same field shape as `database_metadata_schema` on [Create Database](/api-reference/v2/endpoint/create-tenant):
 
 | Field | Description |
 | --- | --- |
-| <Field name="name" type="string" required /> | New metadata key. Must start with a letter or `_`, contain only letters/numbers/underscores, and not be a reserved system name. |
+| <Field name="name" type="string" required /> | New metadata key. Must start with a letter, contain only letters, numbers, and underscores (up to 255 characters), and not be a reserved system name. |
 | <Field name="data_type" type="string" /> | `VARCHAR`, `BOOL`, `INT8`, `INT16`, `INT32`, `INT64`, `FLOAT`, `DOUBLE`, `JSON`, or friendly aliases such as `string`, `integer`, `float`, `boolean`, `object`. Defaults to `VARCHAR`. `ARRAY` is not supported and is rejected with `400`; for multi-value fields declare `VARCHAR` and store the values comma-joined. |
 | <Field name="max_length" type="integer" /> | Max length for `VARCHAR`. Default `1024`; maximum `65535`. |
-| <Field name="enable_match" type="boolean" /> | Enables the intended exact-match metadata filtering path for this field. |
-| <Field name="enable_dense_embedding" type="boolean" /> | Adds a dense semantic-search lane for a `VARCHAR` metadata field. |
-| <Field name="enable_sparse_embedding" type="boolean" /> | Adds a sparse/BM25 search lane for a `VARCHAR` metadata field. |
+| <Field name="enable_match" type="boolean" /> | Enables exact-match metadata filtering on this field. |
+| <Field name="enable_dense_embedding" type="boolean" /> | Not accepted on a new field here: it returns `400`. Dense lanes can only be declared at [database creation](/api-reference/v2/endpoint/create-tenant). |
+| <Field name="enable_sparse_embedding" type="boolean" /> | Not accepted on a new field here: it returns `400`. Sparse (BM25) lanes can only be declared at database creation. |
 | <Field name="filterable" type="boolean" /> | Backward-compatible shorthand for `enable_match: true`. Prefer `enable_match`. |
 
 ## Rules
 
-- Additions only.
-- Existing field names cannot be reused, case-insensitively.
-- Existing fields cannot be deleted or changed.
-- Total custom database metadata fields cannot exceed 32.
+- Names are compared case-insensitively. Resending an existing field with an identical definition is a no-op. Any other difference (type, `max_length`, or flags) returns `409`, and so does declaring the same name twice in one request with different definitions.
+- A database can have at most 32 custom metadata fields in total. Skipped fields do not count toward the new total.
 - Reserved names such as `source_id`, `chunk_id`, `metadata`, and `document_metadata` are rejected.
-- Dense/sparse embedding flags are only valid on `VARCHAR` fields.
-- MongoDB indexes for `enable_match` fields are created before the merged schema is persisted.
+- The embedding-flag rejection applies to new fields only. Resending an existing field that already has those flags is still a no-op.
+- MongoDB indexes for `enable_match` fields are created before the merged schema is saved.
 
 <Warning>
-  This endpoint persists the updated schema and MongoDB filter indexes. It does not yet alter/backfill existing Milvus collections for newly added dense/sparse metadata fields. Create the desired semantic metadata fields before ingesting, or migrate/re-ingest into a database with the final schema if those fields must participate in semantic/BM25 metadata search.
+  This endpoint saves the schema and the MongoDB filter indexes. It does not alter the existing vector collections, which is why it rejects new dense and sparse lanes. If a field must take part in semantic or BM25 metadata search, create a database with the final schema and re-ingest into it.
 </Warning>
 
 ## Response
+
+A successful response returns `database`, the deprecated `tenant_id`, and `added_fields` directly, without the `success` and `data` envelope. `added_fields` lists only the fields this call actually added; skipped duplicates are left out, so an empty list means the database already had everything you sent. Errors use the standard [error envelope](/api-reference/v2/error-responses).
 
 <ResponseExample>
 
 ```json Success
 {
   "database": "acme_corp",
-  "added_fields": ["region", "summary_label"]
+  "tenant_id": "acme_corp",
+  "added_fields": ["region", "priority"]
 }
 ```
 
@@ -140,8 +130,8 @@ Each `add_fields[]` item uses the same field shape as `database_metadata_schema`
   "success": false,
   "data": null,
   "error": {
-    "code": "CONFLICT",
-    "message": "field \"region\" already exists in the schema"
+    "code": "INTERNAL_ERROR",
+    "message": "Schema conflict: field \"region\" already exists in the schema with a different definition. Resubmitting a field with its existing definition is accepted as a no-op, but an existing field cannot be modified. See https://docs.hydradb.com/api-reference/v2/endpoint/patch-metadata-schema for usage details. Re-send the field with its existing definition to make this a no-op, or use a different field name."
   },
   "meta": {
     "request_id": "9d13aef4-02f4-4e73-8c62-4c2601d04f9d",
@@ -154,12 +144,14 @@ Each `add_fields[]` item uses the same field shape as `database_metadata_schema`
 
 ## Errors
 
-| Status | When it happens |
-| --- | --- |
-| `400` | Invalid request body, empty `add_fields`, invalid field name/type, too many fields, embedding enabled on a non-`VARCHAR` field. |
-| `404` | Database not found. |
-| `409` | Field already exists or the update conflicts with stored database mapping/schema state. |
-| `500` | Backend persistence or index creation failed. |
+- `400`: an invalid request body (`INVALID_INPUT`), or a field the rules reject: empty `add_fields`, an invalid name or type, `ARRAY`, more than 32 fields, or an embedding flag.
+- `404 DATABASE_NOT_FOUND`: the database does not exist.
+- `409`: a field conflicts with an existing field or with another entry in the same request, or the database changed during the request. Retry the last case.
+- `500`: saving the schema or creating the index failed. Retry.
+
+<Note>
+  Apart from a malformed body and a missing database, this endpoint currently returns `error.code: "INTERNAL_ERROR"` for its `400`, `409`, and `500` errors alike. Branch on the HTTP status and read `error.message`, which names the field and the rule it broke.
+</Note>
 
 ## Related
 
