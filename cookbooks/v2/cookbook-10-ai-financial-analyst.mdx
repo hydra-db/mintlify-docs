@@ -27,7 +27,7 @@ The problem is **temporal ambiguity**. Q2 and Q4 earnings calls share vocabulary
 
 HydraDB handles this with three properties:
 
-- **Timestamp-aware indexing:** every document's ISO 8601 `timestamp` is indexed next to the vector. `recency_bias` uses it to weight results toward recent documents or spread them across time.
+- **Event-time-aware ranking:** each document carries an ISO 8601 event date (`event_time` in `additional_metadata`). `recency_bias` uses it to weight results toward recent periods or spread them across time.
 - **Temporal knowledge graph:** entities (companies, executives, metrics, products) are nodes. Each mention of a metric adds a time-ordered edge on that entity, a versioned history that a "revenue trend" query walks in order instead of returning a flat ranked list.
 - **Multi-query expansion:** in `mode: "thinking"`, HydraDB runs varied reformulations in parallel. "How did guidance change between Q2 and Q4?" becomes "Q2 guidance outlook", "Q4 forward guidance revised", and "guidance comparison quarterly", each aimed at a different point on the timeline.
 
@@ -98,7 +98,11 @@ print(result)
 
 ### 2.1 Earnings call transcripts and SEC filings (PDF)
 
-Tag each earnings PDF with `ticker`, `period`, `doc_type`, `fiscal_year`, and `fiscal_quarter` so you can filter to one company or period before semantic search runs. Declare the fields you filter on in the database metadata schema. For an uploaded file, per-file metadata goes in the `document_metadata` form field: a JSON array with one item per file, in the same order as `documents`.
+Tag each earnings PDF so you can filter to one company or period before semantic search runs. For an uploaded file, per-file metadata goes in the `document_metadata` form field: a JSON array with one item per file, in the same order as `documents`.
+
+- **`metadata`:** the fields you filter on (`ticker`, `doc_type`, `fiscal_year`, `fiscal_quarter`). Declare them in the database metadata schema. In a database with a schema, an undeclared `metadata` key is rejected.
+- **`additional_metadata`:** labels you read back (`period_label`, `period_end_date`) and `event_time`. Recency ranking reads the event time from `additional_metadata` (`event_time`, `timestamp`, or `date`), never the upload time, so set it to the period end.
+- **Title:** `document_metadata` takes no `title`. The source title comes from the filename, so name files clearly (for example `NVDA-Q2-2023-earnings.pdf`).
 
 ```python
 # ingest/earnings_pdfs.py
@@ -117,37 +121,33 @@ def ingest_earnings_pdf(
     period_label: str,    # e.g. "Q2 2023" - human-readable label for UI
     period_end_date: str, # ISO 8601, e.g. "2023-06-30T00:00:00Z"
 ) -> str:
-    """
-    Upload a single earnings PDF. Returns the id for verification.
-
-    IMPORTANT: database and collection must appear both as top-level
-    SDK params AND inside the app_knowledge JSON - AppKnowledgeModel validates both.
-    """
+    """Upload a single earnings PDF. Returns the id for verification."""
     collection = f"earnings-{ticker.lower()}"
 
-    app_knowledge = json.dumps([{
-        "id":           f"{ticker}-{doc_type}-{fiscal_year}-Q{fiscal_quarter}",
-        "title":        f"{ticker} {period_label} {doc_type.replace('_', ' ').title()}",
-        "type":         "pdf",
-        "timestamp":    period_end_date,   # drives recency ranking - must be accurate
-        "database":    TENANT_ID,
-        "collection": collection,
+    # One item per file in `documents`, in the same order.
+    document_metadata = json.dumps([{
+        "id": f"{ticker}-{doc_type}-{fiscal_year}-Q{fiscal_quarter}",
+        # Schema fields you filter on.
         "metadata": {
-            "ticker":          ticker,
-            "doc_type":        doc_type,
-            "fiscal_year":     fiscal_year,
-            "fiscal_quarter":  fiscal_quarter,
+            "ticker":         ticker,
+            "doc_type":       doc_type,
+            "fiscal_year":    fiscal_year,
+            "fiscal_quarter": fiscal_quarter,
+        },
+        # Free-form fields. event_time drives recency ranking, so it must be
+        # the period end, not the upload date.
+        "additional_metadata": {
             "period_label":    period_label,
             "period_end_date": period_end_date,
-        }
+            "event_time":      period_end_date,
+        },
     }])
 
     with open(file_path, "rb") as f:
-        # FIX: SDK expects a tuple of (filename, file_obj, mime_type), not a raw file handle.
         result = client.context.ingest(
             database=TENANT_ID,
             collection=collection,
-            app_knowledge=app_knowledge,
+            document_metadata=document_metadata,
             documents=[(os.path.basename(file_path), f, "application/pdf")],
         )
 
@@ -214,13 +214,13 @@ filings = [
 ]
 ids = ingest_earnings_batch(filings)
 # Output:
-# Uploaded ACME Q1 2023 earnings_transcript → id: 988293fa-e29
-# Uploaded ACME Q2 2023 earnings_transcript → id: 9d7951c8-160
-# Uploaded ACME Q3 2023 earnings_transcript → id: 2cf6ea6e-5fe
-# Uploaded ACME Q4 2023 earnings_transcript → id: edff67d5-237
+# Uploaded ACME Q1 2023 earnings_transcript → id: ACME-earnings_transcript-2023-Q1
+# Uploaded ACME Q2 2023 earnings_transcript → id: ACME-earnings_transcript-2023-Q2
+# Uploaded ACME Q3 2023 earnings_transcript → id: ACME-earnings_transcript-2023-Q3
+# Uploaded ACME Q4 2023 earnings_transcript → id: ACME-earnings_transcript-2023-Q4
 ```
 
-> **The `timestamp` field is load-bearing:** `recency_bias` sorts and weights by it. A blank value or the upload date makes every Q2 and Q4 call look equally "recent", and temporal queries fail. Always use the fiscal period end date.
+> **The event time is load-bearing:** `recency_bias` weights by `additional_metadata.event_time`. Without it, every Q2 and Q4 call looks equally "recent" and temporal queries fail. Always use the fiscal period end date, never the upload date.
 
 ### 2.2 Internal metrics (CSV or JSON)
 
@@ -395,27 +395,24 @@ def ingest_board_memo(
 ) -> str:
     collection = "board-memos"
 
-    app_knowledge = json.dumps([{
-        "id":           f"{ticker}-{memo_type}-{meeting_date[:10]}",
-        "title":        f"{ticker} {period_label} - {memo_type.replace('_', ' ').title()}",
-        "type":         "pdf",
-        "timestamp":    meeting_date,
-        "database":    TENANT_ID,
-        "collection": collection,
+    document_metadata = json.dumps([{
+        "id": f"{ticker}-{memo_type}-{meeting_date[:10]}",
         "metadata": {
-            "ticker":       ticker,
-            "doc_type":     memo_type,
+            "ticker":   ticker,
+            "doc_type": memo_type,
+        },
+        "additional_metadata": {
             "period_label": period_label,
             "meeting_date": meeting_date,
-        }
+            "event_time":   meeting_date,   # drives recency ranking
+        },
     }])
 
     with open(file_path, "rb") as f:
-        # FIX: SDK expects a tuple of (filename, file_obj, mime_type), not a raw file handle.
         result = client.context.ingest(
             database=TENANT_ID,
             collection=collection,
-            app_knowledge=app_knowledge,
+            document_metadata=document_metadata,
             documents=[(os.path.basename(file_path), f, "application/pdf")],
         )
 
@@ -675,10 +672,10 @@ def query_trend(
     if not chunks:
         return "No relevant context found - verify documents are uploaded and indexed."
 
-    # Sort chunks by timestamp so LLM sees them in chronological order
+    # Sort chunks by fiscal period (event_time, ISO 8601) so the LLM sees them in order
     chunks_sorted = sorted(
         chunks,
-        key=lambda c: c.source_upload_time or "",
+        key=lambda c: (c.additional_metadata or {}).get("event_time", ""),
     )
 
     # Build context with explicit period labels and source attribution
