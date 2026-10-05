@@ -5,8 +5,6 @@ description: "Turn a query response into an LLM prompt."
 
 `POST /query` returns structured JSON. Before you can pass it to an LLM, you need to convert the retrieval payload into a plain string. This page shows how.
 
-The same pattern works regardless of whether you set `type: "knowledge"`, `type: "memory"`, or `type: "all"` - the response shape is identical.
-
 ---
 
 ## 1. What the response looks like
@@ -75,12 +73,12 @@ The retrieval payload has the same core shape regardless of `type` or `query_by`
 
 Four things matter for prompt construction:
 
-- **`chunks`** - the primary retrieval output. Ranked by relevance; preserve the order HydraDB returns.
-- **`graph_context.query_paths`** - entity traversal paths derived from your query. Useful for relational reasoning. See [Context Graphs](/essentials/v2/context-graphs).
-- **`graph_context.chunk_relations`** + **`chunk_id_to_group_ids`** - per-chunk graph relations grouped by `group_id`, so you can attach the right triplets to each chunk.
-- **`additional_context`** - a map keyed by `chunk_uuid`. When a chunk includes `extra_context_ids`, use those IDs to look up related chunks here.
+- **`chunks`**: the primary retrieval output. Ranked by relevance; preserve the order HydraDB returns.
+- **`graph_context.query_paths`**: entity traversal paths derived from your query. Useful for relational reasoning. See [Context Graphs](/essentials/v2/context-graphs).
+- **`graph_context.chunk_relations`** + **`chunk_id_to_group_ids`**: per-chunk graph relations grouped by `group_id`, so you can attach the right triplets to each chunk.
+- **`additional_context`**: a map keyed by `chunk_uuid`. When a chunk includes `extra_context_ids`, use those IDs to look up related chunks here.
 
-The raw object has too much noise for an LLM - IDs, timestamps, metadata. Section 2 shows how to convert it into a clean string.
+The raw object has too much noise for an LLM: IDs, timestamps, metadata. Section 2 shows how to convert it into a clean string.
 
 ---
 
@@ -285,7 +283,9 @@ asyncio.run(main())
 
 ## 4. Combining Knowledge and Memories
 
-The simplest path is one `POST /query` with `type: "all"` - HydraDB queries both stores in parallel and returns one merged, ranked result set.
+The simplest path is one `POST /query` with `type: "all"`. HydraDB queries both stores in parallel and returns one merged, ranked result set.
+
+`type: "all"` reads both stores from the same scope, so this example assumes the shared documents are in `user_123` too. If they live in their own collection, send `collections: ["company_docs", "user_123"]` instead of `collection`.
 
 <CodeGroup>
 ```python Python SDK
@@ -399,12 +399,13 @@ from hydra_db import AsyncHydraDB
 from hydra_db.helpers import build_string
 
 hydra = AsyncHydraDB(token="YOUR_HYDRA_DB_API_KEY")
+question = "What is our refund policy?"
 
 async def main():
     knowledge_result, memory_result = await asyncio.gather(
         hydra.query(
             database="acme_corp",
-            query="refund policy",
+            query=question,
             type="knowledge",
             query_by="hybrid",
             mode="thinking",
@@ -433,11 +434,12 @@ import { HydraDBClient } from "@hydradb/sdk";
 import { buildString } from "@hydradb/sdk/helpers";
 
 const hydra = new HydraDBClient({ token: process.env.HYDRA_DB_API_KEY });
+const question = "What is our refund policy?";
 
 const [knowledgeResult, memoryResult] = await Promise.all([
   hydra.query({
     database: "acme_corp",
-    query: "refund policy",
+    query: question,
     type: "knowledge",
     queryBy: "hybrid",
     mode: "thinking",
@@ -458,7 +460,7 @@ const prompt =
 ```
 </CodeGroup>
 
-If memory query fails or times out, fall back to the knowledge-only prompt.
+If the memory query fails or times out, fall back to the knowledge-only prompt.
 
 ---
 
@@ -467,9 +469,8 @@ If memory query fails or times out, fall back to the knowledge-only prompt.
 - **Preserve server order.** Don't re-sort chunks client-side.
 - **Start small on chunks.** `max_results: 10` is a reasonable default. Drop to 5 if you hit token limits, raise to 20 if you rerank downstream.
 - **Use graph context selectively.** It improves relational queries and bloats simple lookups. See [Context Graphs](/essentials/v2/context-graphs).
-- **Always give the model a grounding instruction.** A system prompt like "answer only from the provided context" prevents the model from inventing answers when retrieval is thin.
+- **Give the model a grounding instruction:** Use a system prompt like "answer only from the provided context" to reduce unsupported answers when retrieval is thin.
 - **Format consistently.** Whatever section delimiters you choose (`=== CONTEXT ===`, `Chunk N`, `Source:`), keep them stable across calls so the model learns the structure.
-- **`type: "all"` is the simplest path when you need both knowledge and memories.** One call, one result set, one `build_string` call.
 
 ---
 
@@ -482,18 +483,18 @@ If memory query fails or times out, fall back to the knowledge-only prompt.
 | Including too many chunks | Token overflow or answer quality drops | Start at `max_results: 10`; reduce if needed. |
 | Re-sorting chunks client-side | Overrides HydraDB's ranking | Preserve the server-returned order. |
 | Missing a grounding instruction | The model invents answers when retrieval is thin | System prompt: answer only from the provided context. |
-| Setting `graph_context: false` and expecting graph fields | Graph context will be omitted | `graph_context` is on by default; only set it to `false` when you explicitly don't want graph data. |
-| Using `query_forceful_relations` with `mode: "fast"` | Flag is silently ignored | `query_forceful_relations` only takes effect when `mode: "thinking"`. |
+| Setting `graph_context: false` and expecting graph fields | Graph context will be omitted (in fast mode; thinking always returns it) | `graph_context` is on by default; only set it to `false` when you explicitly don't want graph data. |
+| Using `query_forceful_relations` with `mode: "fast"` | Flag is ignored | `query_forceful_relations` only takes effect when `mode: "thinking"` (or `"auto"` routed to thinking). |
 | Looking up `chunk_relations` without `chunk_id_to_group_ids` | The right relations don't attach to the right chunk | Use `chunk_id_to_group_ids[chunk_uuid]` to find the `group_id`s, then filter `chunk_relations` by them. |
 
 ---
 
 ## Related
 
-- [Query](/essentials/v2/query) - request parameters and response shape
-- [Memories](/essentials/v2/memories) - what `POST /query` with `type: "memory"` queries
-- [Knowledge](/essentials/v2/knowledge) - what `POST /query` with `type: "knowledge"` queries
-- [Context Graphs](/essentials/v2/context-graphs) - what `graph_context` fields contain
+- [Query](/essentials/v2/query): request parameters and response shape
+- [Memories](/essentials/v2/memories): what `POST /query` with `type: "memory"` queries
+- [Knowledge](/essentials/v2/knowledge): what `POST /query` with `type: "knowledge"` queries
+- [Context Graphs](/essentials/v2/context-graphs): what `graph_context` fields contain
 
 ---
 
