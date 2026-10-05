@@ -3,12 +3,12 @@ title: "Scoping using metadata"
 description: "How HydraDB uses metadata to scope query results with schema-backed fields, free-form additional metadata, source metadata edits, and exact metadata filters."
 ---
 
-Metadata is structured data attached to [Knowledge](/essentials/v2/knowledge) and [Memories](/essentials/v2/memories). Use it when you already know a hard constraint before retrieval runs, such as `department=legal`, `region=us`, `status=published`, or `author=alice`.
+Metadata is structured data attached to [Knowledge](/essentials/v2/knowledge) and [Memories](/essentials/v2/memories). Use it for a hard constraint you know before retrieval runs, such as `department=legal`, `region=us`, `status=published`, or `author=alice`.
 
 HydraDB has two metadata layers:
 
-- **Database metadata (`metadata`):** fields declared in the database's `database_metadata_schema`. Filter on them with top-level keys in `metadata_filters`. This is the fast scoping path. Older docs and the `tenant_metadata` alias call it tenant metadata.
-- **Additional metadata (`additional_metadata`):** free-form fields on one source or memory. No schema. Filter on them under `metadata_filters.additional_metadata`. This is the flexible, slower path.
+- **Database metadata (`metadata`):** fields declared in the database's `database_metadata_schema`. Filter on them with top-level keys in `metadata_filters`. This is the fast path. Older docs and the `tenant_metadata` alias call it tenant metadata.
+- **Additional metadata (`additional_metadata`):** free-form fields on one source or memory, with no schema. Filter on them under `metadata_filters.additional_metadata`. This is the flexible, slower path.
 
 ```json
 {
@@ -25,51 +25,49 @@ HydraDB has two metadata layers:
 
 ## 1. Choose the right metadata layer
 
-- **Fields you scope on every query or most queries:** stable, high-cardinality fields such as department, region, plan, customer, or status. Put them in `metadata` and the [database schema](/api-reference/v2/endpoint/create-tenant), with `enable_match: true`. Filter with `metadata_filters: { "department": "legal" }`.
-- **Ad hoc or source-specific fields:** author, Slack timestamp, external ID, document version, or anything unique to one document. Put them in `additional_metadata`. No schema is required. Filter with `metadata_filters: { "additional_metadata": { "author": "alice" } }`. Best for display, citations, debugging, and occasional filters.
-- **Hard scoping plus semantic search:** send `metadata_filters` and a natural-language `query`. Filters narrow the candidates. Ranking still uses the query.
-- **Semantic search over a metadata text field:** declare the field in `metadata` with `enable_dense_embedding: true` and put the concept in `query`, not in `metadata_filters`. `VARCHAR` fields only.
-- **Keyword search over a metadata text field:** declare the field in `metadata` with `enable_sparse_embedding: true`. Normal `/query` text (BM25) search then covers it. `VARCHAR` fields only.
+- **Fields you scope on in most queries:** stable fields such as department, region, plan, customer, or status. Put them in `metadata` and the [database schema](/api-reference/v2/endpoint/create-tenant) with `enable_match: true`. Filter with `metadata_filters: { "department": "legal" }`.
+- **Ad hoc or source-specific fields:** author, Slack timestamp, external ID, document version, or anything unique to one document. Put them in `additional_metadata`. Filter with `metadata_filters: { "additional_metadata": { "author": "alice" } }`. Best for display, citations, debugging, and occasional filters.
+- **Hard scoping plus semantic search:** send `metadata_filters` with a natural-language `query`. Filters narrow the candidates. The query still drives ranking.
+- **Semantic search over a metadata text field:** declare it in `metadata` with `enable_dense_embedding: true` (`VARCHAR` only). Put the concept in `query`, not in `metadata_filters`.
+- **Keyword search over a metadata text field:** declare it in `metadata` with `enable_sparse_embedding: true` (`VARCHAR` only). Normal `/query` text (BM25) search then covers it.
 - **Partition by user, workspace, or team:** send `collection` on every request. Metadata filters narrow results inside that partition. They do not replace it. See [Multi-Tenant](/essentials/v2/multi-tenant).
 
-The `database` field was formerly `tenant_id` and `collection` was formerly `sub_tenant_id`. The old names still work as deprecated aliases. [Follow this for when to use `database` and `collection`](./multi-tenant#2-when-to-use-each).
+`database` was formerly `tenant_id` and `collection` was formerly `sub_tenant_id`. The old names still work as deprecated aliases. See [when to use `database` and `collection`](./multi-tenant#2-when-to-use-each).
 
 ---
 
 ## 2. How metadata filters run
 
-HydraDB runs user `metadata_filters` correctness-first:
+HydraDB applies `metadata_filters` correctness-first:
 
-1. **MongoDB source-id prefilter:** safe scalar database and additional metadata filters are resolved to matching `source_id`s in MongoDB.
+1. **MongoDB source-id prefilter:** safe scalar database and additional metadata filters resolve to matching `source_id`s in MongoDB.
 2. **Scoped retrieval:** vector and BM25 retrieval search only those source IDs.
-3. **Post-filter correctness net:** hydrated chunks are checked again against the requested metadata. This also keeps graph expansion and fallback or retry paths from leaking excluded sources.
+3. **Post-filter correctness net:** hydrated chunks are checked again against the filter, so graph expansion and fallback or retry paths cannot leak excluded sources.
 
-A valid filter with no matching sources returns an empty result set. HydraDB does not silently widen it into an unfiltered search.
+A valid filter that matches no sources returns an empty result. HydraDB never widens it into an unfiltered search.
 
 ### Filter semantics
 
-- **Multiple keys:** AND. Every key and value you send must match.
-- **Database and additional metadata together:** AND across both layers.
+- **Multiple keys:** AND. Every key must match, across both layers.
 - **Operators:** each top-level `metadata` key takes `{"equals": value}`, `{"contains": value}`, or `{"contains_any": [values]}`. See [Filter operators](#filter-operators).
-- **Values:** `equals` is exact equality against the **whole** stored value.
-- **Lists:** **ANY, not ALL.** A list matches a source holding **any one** of the listed values (OR/IN), so `tags: ["alpha", "beta"]` matches a source tagged `"alpha"` and a source tagged `"beta"`. Write it as `{"contains_any": [...]}` on a top-level `metadata` key, or as a bare list in `additional_metadata`. Adding values widens the result set. There is no ALL (AND) operator inside a single key. Lists work on `VARCHAR` fields only. A list passed for a declared field of another type is rejected with `400 VALIDATION_ERROR`.
+- **Lists:** **ANY, not ALL.** `tags: ["alpha", "beta"]` matches a source tagged `"alpha"` and a source tagged `"beta"`. Use `{"contains_any": [...]}` on a top-level `metadata` key, or a bare list in `additional_metadata`. More values widen the results, and there is no ALL operator within one key. Lists work on `VARCHAR` fields only. A list for a declared field of another type returns `400 VALIDATION_ERROR`.
 - **Null values:** rejected with `400` (`metadata_filters values cannot be null`).
-- **Range and fuzzy:** not supported in user `metadata_filters`. Put fuzzy concepts in `query`, use semantic metadata fields, or post-process client-side.
-- **OR:** within one key, use `contains_any`. Across different keys, run several queries and union the results client-side.
-- **Graph context:** respects metadata filters. Graph paths from excluded sources are removed.
-- **Size:** each list holds at most **500** values, and the whole `metadata_filters` object is capped at **64 KiB**. See [Filter size limits](#filter-size-limits).
+- **Range and fuzzy:** not supported. Put fuzzy concepts in `query`, use semantic metadata fields, or post-process client-side.
+- **OR:** within one key, use `contains_any`. Across keys, run several queries and union the results client-side.
+- **Graph context:** paths from excluded sources are removed.
+- **Size:** at most **500** values per list and **64 KiB** for the whole object. See [Filter size limits](#filter-size-limits).
 
 <Warning>
-  `metadata_filters` are hard constraints, not semantic hints. A filter like `{ "mood": "happy" }` requires an exact stored value. It does not expand to related values like "joyful" or "cheerful". To search metadata text semantically, declare a `VARCHAR` field with `enable_dense_embedding` and include the concept in the main `query`.
+  `metadata_filters` are hard constraints, not semantic hints. `{ "mood": "happy" }` requires that exact stored value, not "joyful" or "cheerful". For semantic matching, use `enable_dense_embedding` and put the concept in `query`.
 </Warning>
 
 ### Filter operators
 
-Each top-level `metadata` key in `metadata_filters` takes an operator object naming the comparison you want.
+Each top-level `metadata` key in `metadata_filters` takes an operator object.
 
 | Operator | Value | Matches |
 | --- | --- | --- |
-| `equals` | a single value | sources whose field is **exactly** that value |
+| `equals` | a single value | sources whose **whole** field value is exactly that value |
 | `contains` | a single value | sources whose field **holds** that value, at any position in a multi-value field |
 | `contains_any` | an array | sources holding **any one** of the listed values (OR/IN) |
 
@@ -98,33 +96,24 @@ The filters return:
 - `{"contains": "a@company.com"}` returns A, B, D.
 - `{"contains_any": ["a@company.com", "c@company.com"]}` returns A, B, C, D.
 
-`contains` is position-independent: it matches whether the value is the only one, the first, or in the middle.
-
 Operators apply to top-level `metadata` keys only. Inside `additional_metadata`, use a bare scalar for an exact match or a bare array to match any listed value.
 
 <Warning>
-  An operator used inside `additional_metadata` is **not** rejected. It is read as an exact-match filter against a stored object, so on a normal field it matches nothing and the request returns `200` with an empty result rather than an error.
-</Warning>
+  How operator objects are parsed:
 
-A known operator given the wrong operand type, or several operators in one object, is rejected with `400 VALIDATION_ERROR` rather than silently returning no results. A **misspelled** operator is not: `{"contian": "x"}` is indistinguishable from a filter for a stored object with that key, so it is left alone and matches nothing.
-
-<Warning>
-  **`contains`, `contains_any` and `equals` are reserved key names.** An object built only from them is read as an operator, so it can no longer be used to exact-match a stored object:
-
-  - `{"contains": "x"}` is read as the `contains` operator.
-  - `{"contains": "a", "equals": "b"}` is rejected with `400`, because every key is an operator name.
-  - `{"contains": "a", "other": 1}` is an exact-match object filter, unchanged.
-
-  This only affects a `JSON`-typed field storing an object whose keys all come from those three words. To match such an object, rename the nested key or the field.
+  - **Operator inside `additional_metadata`:** not rejected. It is read as an exact match against a stored object, so it matches nothing and returns `200` with an empty result.
+  - **Wrong operand type, or several operators in one object:** rejected with `400 VALIDATION_ERROR`.
+  - **Misspelled operator:** `{"contian": "x"}` reads as a stored-object filter and matches nothing.
+  - **Reserved key names:** an object built only from `contains`, `contains_any` and `equals` is read as an operator. `{"contains": "x"}` is the `contains` operator, `{"contains": "a", "equals": "b"}` is rejected with `400`, and `{"contains": "a", "other": 1}` is still an exact-match object filter. This only matters for a `JSON`-typed field storing an object whose keys all come from those three words. Rename the nested key or the field.
 </Warning>
 
 <Note>
-  The bare forms still work and are unchanged, but are **deprecated** in favour of the operators, because they infer the comparison from the JSON shape instead of stating it. A bare scalar behaves as `equals`, a bare array as `contains_any`, and a bare single-element array as `contains`. So `{"emails": "a@x"}` and `{"emails": ["a@x"]}` differ by one character and return different results.
+  Bare forms still work but are **deprecated**, because they infer the comparison from the JSON shape. A bare scalar acts as `equals`, a bare array as `contains_any`, and a bare single-element array as `contains`. So `{"emails": "a@x"}` and `{"emails": ["a@x"]}` differ by one character and return different results.
 </Note>
 
 ### Storing multiple values in one field
 
-A declared schema field holds a single value. To store several values in one field, declare it as `VARCHAR` and join the values with commas:
+A declared field holds one value. To store several, declare it as `VARCHAR` and join the values with commas:
 
 ```json
 {
@@ -144,32 +133,28 @@ Then filter for one member with `contains`:
 }
 ```
 
-Points to know:
-
-- `data_type: "array"` is **not** accepted on a declared field. Declaring one is rejected with `400`.
-- Sending an array **value** for a declared `VARCHAR` field is also rejected: `metadata field "attendee_emails" must be of type string, got array`. Join the values yourself.
-- The comma is the separator, so a value that itself contains a comma will not match as expected. If your values can contain commas, use a field per value or a different value format.
-- Size the field for the whole joined string. `max_length` defaults to `1024` and its maximum is `65535`. It **cannot be raised after the field is created**, so declare it large enough up front.
-- `equals` compares the entire joined string, so it is rarely what you want on a multi-value field. Use `contains`.
+- `data_type: "array"` is **not** accepted on a declared field (`400`). An array **value** for a declared `VARCHAR` field is also rejected: `metadata field "attendee_emails" must be of type string, got array`. Join the values yourself.
+- The comma is the separator, so a value that contains a comma will not match as expected. Use a field per value or another format.
+- Size the field for the whole joined string. `max_length` defaults to `1024`, has a maximum of `65535`, and **cannot be raised after the field is created**.
+- `equals` compares the entire joined string, so use `contains` on a multi-value field.
 
 ---
 
 ## 3. Plan your schema
 
-- **Plan scoping fields before first ingest:** you can add fields later with [`PATCH /databases/{database}/metadata-schema`](/api-reference/v2/endpoint/update-metadata-schema), but you cannot rename, retype, or change the flags of a field once it exists. If you will scope on a field more than once, declare it with `enable_match: true`. A top-level filter key is never ignored: it is matched against each source's stored `metadata`. In a database with a schema, ingest and metadata edits reject undeclared keys, so a filter on a key you never declared returns an empty result. The exception is `connector_id` and `provider`, which [connectors](/essentials/v2/connectors#metadata-on-synced-objects) write on every synced object.
-- **Use `metadata` for hot paths, `additional_metadata` for cold ones:** Database-level scopes are pre-applied in the vector store. Document-level scopes can need a post-retrieval pass with over-fetch.
-- **Keep keys stable:** Renaming a metadata key requires re-ingesting affected sources. So does changing `enable_match` flags.
-- **Edit metadata in place:** [`PATCH /context/{id}/metadata`](/api-reference/v2/endpoint/update-source-metadata) merges new `metadata` and `additional_metadata` values into an indexed source. See [section 7](#7-update-metadata-without-re-ingesting). Re-ingesting with `upsert: true` and the same `id` also works.
+- **Declare scoping fields before first ingest:** [`PATCH /databases/{database}/metadata-schema`](/api-reference/v2/endpoint/update-metadata-schema) can add fields later, but you cannot rename, retype, or change the flags of an existing field. Declare any field you will scope on with `enable_match: true`.
+- **Undeclared keys match nothing:** a top-level filter key is never ignored. It is matched against each source's stored `metadata`, and a database with a schema rejects undeclared keys on ingest and edit, so no source holds one. The exception is `connector_id` and `provider`, which [connectors](/essentials/v2/connectors#metadata-on-synced-objects) write on every synced object. To fix it, add the field with `enable_match: true`, then ingest or edit sources with a value.
+- **Use `metadata` for hot paths, `additional_metadata` for cold ones:** database-level scopes are pre-applied in the vector store. An `additional_metadata` filter that cannot run before retrieval makes HydraDB over-fetch about 3x and match afterwards.
+- **Keep keys stable:** renaming a key or changing `enable_match` flags requires re-ingesting affected sources.
+- **Edit in place:** [`PATCH /context/{id}/metadata`](/api-reference/v2/endpoint/update-source-metadata) merges new values into an indexed source. See [section 7](#7-update-metadata-without-re-ingesting).
 
 ---
 
 ## 4. Minimal working example
 
-Two phases: **set up metadata** (declare the schema below, then [attach values at ingest](#5-attach-metadata-at-ingest)), then [**scope at query**](#6-query-with-metadata-filters).
+Declare the schema on the database, [attach values at ingest](#5-attach-metadata-at-ingest), then [**scope at query**](#6-query-with-metadata-filters).
 
 ### Step 1: Create metadata
-
-The schema lives at the database level. Values land on each source at ingest time. Both happen before any query.
 
 #### Step 1a: Declare the schema at database creation
 
@@ -237,54 +222,51 @@ await client.databases.create({
 
 | Field | Type / values | Purpose |
 | --- | --- | --- |
-| `name` | string | Metadata key. Must start with a letter or `_`, contain only letters, numbers, and underscores, and not use reserved system names such as `source_id`, `chunk_id`, or `metadata`. |
-| `data_type` | `VARCHAR`, `BOOL`, `INT8`, `INT16`, `INT32`, `INT64`, `FLOAT`, `DOUBLE`, `JSON` or friendly aliases `string`, `boolean`, `integer`, `float`, `object` | Defaults to `VARCHAR`. `ARRAY` is **not** supported and is rejected with `400`. For multi-value fields see [Storing multiple values in one field](#storing-multiple-values-in-one-field). |
-| `max_length` | integer | Max length for `VARCHAR`. Default `1024`, maximum `65535`. This sizes one declared schema field. It is **not** the limit on how much metadata you can send per request. For that, see [Size limits](#size-limits). |
-| `enable_match` | boolean | Creates the fast exact-match filtering path for this field. Use it for top-level `metadata_filters` keys. |
-| `enable_dense_embedding` | boolean | Adds a dense semantic-search lane for a `VARCHAR` metadata field. |
-| `enable_sparse_embedding` | boolean | Adds a sparse (BM25) keyword-search lane for a `VARCHAR` metadata field. |
-| `filterable` | boolean | Backward-compatible shorthand for `enable_match: true`. Prefer `enable_match` in new code. |
-| `searchable` | boolean | Backward-compatible input accepted by the API, but do not rely on it to replace explicit `enable_dense_embedding` / `enable_sparse_embedding`. Set those flags directly. |
+| `name` | string | Starts with a letter or `_`. Letters, numbers, and underscores only. Not a reserved system name such as `source_id`, `chunk_id`, or `metadata`. |
+| `data_type` | `VARCHAR`, `BOOL`, `INT8`, `INT16`, `INT32`, `INT64`, `FLOAT`, `DOUBLE`, `JSON` or friendly aliases `string`, `boolean`, `integer`, `float`, `object` | Defaults to `VARCHAR`. `ARRAY` is **not** supported and is rejected with `400`. See [Storing multiple values in one field](#storing-multiple-values-in-one-field). |
+| `max_length` | integer | `VARCHAR` length. Default `1024`, maximum `65535`. Sizes one field, **not** the per-request budget ([Size limits](#size-limits)). |
+| `enable_match` | boolean | Fast exact-match filtering path. Use it for top-level `metadata_filters` keys. |
+| `enable_dense_embedding` | boolean | Dense semantic-search lane. `VARCHAR` fields only. |
+| `enable_sparse_embedding` | boolean | Sparse (BM25) keyword-search lane. `VARCHAR` fields only. |
+| `filterable` | boolean | Backward-compatible shorthand for `enable_match: true`. Prefer `enable_match`. |
+| `searchable` | boolean | Accepted for backward compatibility. Do not rely on it. Set `enable_dense_embedding` / `enable_sparse_embedding` directly. |
 
 Limits and guardrails:
 
 - Up to 32 custom database metadata fields.
-- Up to **6 embedding-enabled** fields per database. `enable_dense_embedding` and `enable_sparse_embedding` each count as one, so a field with both set counts as two. `enable_match` does not count against this limit. Exceeding it fails database creation with `400` before anything is provisioned.
+- Up to **6 embedding-enabled** fields per database. `enable_dense_embedding` and `enable_sparse_embedding` each count as one, so a field with both counts as two. `enable_match` does not count. Exceeding the limit fails database creation with `400` before anything is provisioned.
 - Field names are unique case-insensitively.
-- Dense and sparse embedding flags are only valid on `VARCHAR` fields.
-- Runtime `metadata` values must match the declared type when the database has a schema.
-- Unknown `metadata` keys are rejected on ingest and on edit when the database has a non-empty schema.
-- Each metadata layer has a byte budget per request. See [Size limits](#size-limits).
+- In a database with a schema, runtime `metadata` values must match the declared type, and unknown keys are rejected on ingest and on edit.
 
 ### Size limits
 
-Every request that attaches metadata is checked against two caps, on ingest and on metadata edit alike:
+Ingest and metadata edits check two caps:
 
 | Layer | Send as | Cap |
 | --- | --- | --- |
 | Database (tenant) metadata | `metadata` at ingest, `database_metadata` on edit | **16 KiB** (16,384 bytes) |
 | Document metadata | `additional_metadata` | **1 KiB** (1,024 bytes) |
 
-Older spellings are still accepted, but **not uniformly**. Which one works depends on the endpoint:
+Older spellings are accepted, but **not on every endpoint**:
 
 | Alias | On `/context/ingest` | On `PATCH /context/{id}/metadata` |
 | --- | --- | --- |
 | `tenant_metadata` | accepted | accepted (`database_metadata` wins if both are sent) |
 | `document_metadata` | accepted | **rejected with `400`**: send `additional_metadata` |
 
-Where an alias is accepted, it is held to the same cap as the canonical field.
+An accepted alias has the same cap as the canonical field.
 
-The cap applies to the **whole map**, not to any one value. It is measured on the map's compact JSON encoding in UTF-8 bytes:
+Each cap covers the **whole map**, measured as compact JSON in UTF-8 bytes:
 
-- **Keys and punctuation count:** quotes, colons, commas and braces all count toward the cap.
+- **Keys and punctuation count:** quotes, colons, commas and braces.
 - **Bytes, not characters:** accented Latin characters cost 2 bytes, most CJK characters 3, and emoji 4.
-- **Budget in bytes from the start:** a 950-character summary with two small sibling keys serializes to 1,015 bytes, and 65 bytes of that is structure. Push the summary to 1,000 characters and the request is rejected at 1,065 bytes.
+- **Budget in bytes from the start:** a 950-character summary with two small sibling keys serializes to 1,015 bytes, 65 of them structure. At 1,000 characters the request is rejected at 1,065 bytes.
 
 ```json Document metadata: 1,015 bytes, just inside the 1 KiB cap
 {"title":"Q3 Board Deck","author":"ada@example.com","summary":"<950 characters>"}
 ```
 
-Exceeding either cap fails the whole request with `400` before anything is ingested. The message names the offending field and reports both numbers:
+Exceeding either cap fails the whole request with `400` before anything is ingested:
 
 ```json
 {
@@ -300,21 +282,21 @@ Exceeding either cap fails the whole request with `400` before anything is inges
 On [`PATCH /context/{id}/metadata`](/api-reference/v2/endpoint/update-source-metadata) the same message is prefixed with `invalid metadata edit:`.
 
 <Tip>
-  If a document needs more than 1 KiB of descriptive metadata, put the long text in the document body, where it gets chunked and embedded. Keep `additional_metadata` for the short values you filter on.
+  For more than 1 KiB of descriptive metadata, put the long text in the document body, where it is chunked and embedded. Keep `additional_metadata` for short values you filter on.
 </Tip>
 
 ### Filter size limits
 
-The caps above bound the metadata you **store**. `metadata_filters` on [`/query`](/api-reference/v2/endpoint/query) has its own, separate pair. These bound what you **send at query time** and are unrelated to how much metadata a source carries:
+`metadata_filters` on [`/query`](/api-reference/v2/endpoint/query) has separate caps on what you send at query time:
 
 - **Values in any one list:** **500**.
 - **Whole `metadata_filters` object:** **64 KiB** (65,536 bytes).
 
-The object size is measured the same way (compact JSON, UTF-8 bytes, field names and punctuation counted) and includes the nested `additional_metadata` object. It is measured **after** operator objects are reduced to their values, so `{"contains": "x"}` counts as `["x"]` and the operator keyword costs nothing. Both spellings of the same filter cost the same, because the cap bounds the expression sent to the vector store, and the spelling does not change it.
+The object is measured the same way, including the nested `additional_metadata` object, **after** operator objects are reduced to their values. So `{"contains": "x"}` counts as `["x"]`: the cap bounds the expression sent to the vector store, and spelling does not change it.
 
-Every value in a list is expanded into that expression. The per-list cap catches one runaway list. The object cap catches many legal lists adding up: twenty lists of 500 values each pass the list cap but total roughly 127 KiB, so the object cap rejects them.
+The list cap catches one runaway list. The object cap catches many legal lists adding up: twenty lists of 500 values pass the list cap but total roughly 127 KiB, so the object cap rejects them.
 
-Over either limit returns `400` before the query runs, naming the offending key or the actual byte count:
+Over either limit returns `400` before the query runs:
 
 ```
 metadata_filters.customer_id (got 743) must contain at most 500 values
@@ -324,26 +306,22 @@ Reduce the number or size of filter values.
 ```
 
 <Tip>
-  Needing far more than 500 values in one filter usually means the constraint belongs in the data. Add a metadata field that groups those values (a segment, tier, or cohort key) and filter on that instead.
+  Needing far more than 500 values usually means the constraint belongs in the data. Add a field that groups those values (a segment, tier, or cohort key) and filter on that.
 </Tip>
 
 ### Add schema fields later
 
-You can add database metadata fields after database creation with [`PATCH /databases/{database}/metadata-schema`](/api-reference/v2/endpoint/update-metadata-schema). This is additive only:
-
-- Add new fields: yes.
-- Delete fields: no.
-- Change the type or flags of existing fields: no.
+[`PATCH /databases/{database}/metadata-schema`](/api-reference/v2/endpoint/update-metadata-schema) adds fields after database creation. It cannot delete fields or change the type or flags of existing ones. To change a field, create a new database with the corrected schema.
 
 <Warning>
-  Adding fields updates the stored database schema. Existing Milvus collections are not yet altered or backfilled for newly added dense or sparse metadata lanes. If a new metadata field must take part in semantic or BM25 metadata search over existing data, create a new database with that schema and re-ingest, or confirm the current migration path with support.
+  Adding fields updates the stored schema only. Existing Milvus collections are not yet altered or backfilled for new dense or sparse metadata lanes. If a new field must take part in semantic or BM25 metadata search over existing data, create a new database with that schema and re-ingest, or confirm the current migration path with support.
 </Warning>
 
 ---
 
 ## 5. Attach metadata at ingest
 
-For knowledge ingestion, send `metadata` and `additional_metadata` on each `document_metadata[]` item or `app_knowledge[]` item.
+For knowledge, send `metadata` and `additional_metadata` on each `document_metadata[]` or `app_knowledge[]` item.
 
 <CodeGroup>
 ```bash cURL
@@ -427,14 +405,14 @@ await client.context.ingest({
 </CodeGroup>
 
 <Warning>
-  For `type=memory`, the `memories` multipart field is JSON-stringified, but each memory item's `metadata` and `additional_metadata` are plain objects, the same as on `document_metadata` and `app_knowledge` items. Do not stringify them a second time.
+  For `type=memory`, the `memories` multipart field is JSON-stringified, but each item's `metadata` and `additional_metadata` are plain objects, as on `document_metadata` and `app_knowledge` items. Do not stringify them a second time.
 </Warning>
 
 ---
 
 ## 6. Query with metadata filters
 
-Mix database-level (top-level) and document-level (nested) scopes in the same `metadata_filters` object:
+Mix database-level (top-level) and document-level (nested) scopes in one `metadata_filters` object:
 
 <CodeGroup>
 ```bash cURL
@@ -487,7 +465,7 @@ const result = await client.query({
 ```
 </CodeGroup>
 
-Use the legacy alias only when maintaining older clients:
+Use the legacy alias only for older clients:
 
 ```json
 {
@@ -497,13 +475,13 @@ Use the legacy alias only when maintaining older clients:
 }
 ```
 
-If both aliases are present and both are objects, `additional_metadata` wins on conflicts.
+If both aliases are objects, `additional_metadata` wins on conflicts.
 
 ---
 
 ## 7. Update metadata without re-ingesting
 
-Use [`PATCH /context/{id}/metadata`](/api-reference/v2/endpoint/update-source-metadata) when you know the source ID and need to update metadata in place.
+Use [`PATCH /context/{id}/metadata`](/api-reference/v2/endpoint/update-source-metadata) to update an existing source's metadata in place.
 
 ```json
 {
@@ -518,24 +496,21 @@ Use [`PATCH /context/{id}/metadata`](/api-reference/v2/endpoint/update-source-me
 }
 ```
 
-Behavior:
+- The source must already exist, and `collection` is required.
+- Send at least one of `database_metadata` (deprecated alias `tenant_metadata`), `additional_metadata`, or `acl`. `document_metadata` is not accepted.
+- Metadata is merged (upsert): sent keys are inserted or overwritten, and omitted keys are kept.
+- `acl` changes who may retrieve the source. It **replaces** rather than merges, and an `acl`-only body is a valid edit. See [Access Control](/essentials/v2/access-control).
+- Fields with only `enable_match` are MongoDB-only edits, effective for filters and listing.
+- Fields with `enable_dense_embedding` or `enable_sparse_embedding` sync their vector store lane synchronously. The response reports `vector_sync_required` / `vector_synced` (deprecated aliases `milvus_sync_required` / `milvus_synced` are still emitted). These fields reject `null`, which would leave stale vectors.
+- A `400` means an unknown key, a wrong type, an over-size payload ([Size limits](#size-limits)), too-deep nesting, a reserved key, or a missing `collection`.
 
-- The source must already exist.
-- `collection` is required.
-- Send at least one of `database_metadata`, `additional_metadata`, or `acl`. `tenant_metadata` is the deprecated alias for `database_metadata`.
-- The update is a merge (upsert): sent keys are inserted or overwritten, and omitted keys are preserved.
-- `document_metadata` is not accepted on this endpoint. Use `additional_metadata`.
-- The same endpoint accepts `acl` to change who may retrieve the source. Unlike metadata, `acl` **replaces** rather than merges, and an `acl`-only body is a valid edit. See [Access Control](/essentials/v2/access-control).
-- Edits to database metadata fields that only have `enable_match` are MongoDB-only and take effect for filters and listing.
-- If an edited database metadata field has `enable_dense_embedding` or `enable_sparse_embedding`, HydraDB synchronously syncs the matching vector store lane and reports `vector_sync_required` / `vector_synced` in the response. The deprecated `milvus_sync_required` / `milvus_synced` aliases are still emitted.
-
-To replace the whole document and its content, re-ingest with `upsert: true` and the same source `id`. Upsert replaces the source payload and the metadata supplied at ingestion.
+To replace the whole document, re-ingest with `upsert: true` and the same `id`. That replaces the payload and its ingest-time metadata.
 
 ---
 
 ## 8. Listing with metadata filters
 
-Use [`POST /context/list`](/api-reference/v2/endpoint/list-documents) when you want to browse or page sources rather than run semantic retrieval:
+Use [`POST /context/list`](/api-reference/v2/endpoint/list-documents) to browse or page sources instead of running semantic retrieval:
 
 ```json
 {
@@ -550,30 +525,21 @@ Use [`POST /context/list`](/api-reference/v2/endpoint/list-documents) when you w
 }
 ```
 
-`/context/list` also accepts legacy aliases `tenant_metadata` for `metadata` and `document_metadata` for `additional_metadata`.
+`/context/list` also accepts the legacy aliases `tenant_metadata` for `metadata` and `document_metadata` for `additional_metadata`.
 
 ---
 
 ## 9. Common mistakes
 
-| Symptom | Cause | Fix |
-| --- | --- | --- |
-| A top-level filter returns no results | The key isn't declared in `database_metadata_schema`, so no source stores it under `metadata` | Add the field with [`PATCH /databases/{database}/metadata-schema`](/api-reference/v2/endpoint/update-metadata-schema) and `enable_match: true`, then ingest or edit sources with a value for it. |
-| A filter on an `additional_metadata` key returns no results | Scope passed as a top-level key, so it is matched against `metadata` instead | Nest it: `metadata_filters: { additional_metadata: { author: "alice" } }`. |
-| Renaming, retyping, or reflagging a schema field fails | Existing schema fields cannot change. The schema endpoint only adds fields. | Create a new database with the corrected schema. To add a new field, use [`PATCH /databases/{database}/metadata-schema`](/api-reference/v2/endpoint/update-metadata-schema). |
-| Query returns 0 results after adding a scope | Over-scoping: combined constraints exclude everything | Start with the minimum hard constraints. Add scopes one at a time and re-check counts. |
-| Range or fuzzy scope doesn't work | `metadata_filters` supports only `equals`, `contains`, and `contains_any` | Move that constraint into the `query` text, use a different `query_by`, or apply it in your own post-scoping. |
-| `additional_metadata` scope feels slow | When the filter cannot be applied before retrieval, HydraDB over-fetches about 3x and matches afterwards | Move the hot field into `metadata` and declare it in the schema. |
-| Metadata edit returns 400 | Unknown key, wrong type, over-size payload (16 KiB database metadata, 1 KiB document metadata), too-deep nesting, reserved key, or missing `collection` | Check the schema and [size limits](#size-limits). Send only `database_metadata` (or `tenant_metadata`) and `additional_metadata`. |
-| Dense or sparse metadata edit rejects `null` | Null would leave stale semantic metadata vectors | Set a non-null value, or re-ingest with the desired metadata. |
-| New schema field does not take part in semantic metadata search | An additive schema update does not yet alter or backfill existing Milvus fields | Create the final schema before ingesting, or re-ingest into a database that has it. |
+- **An `additional_metadata` filter returns nothing:** the key was sent top-level, so it was matched against `metadata`. Nest it: `metadata_filters: { additional_metadata: { author: "alice" } }`.
+- **0 results after adding a scope:** the combined constraints exclude everything. Start with the minimum, then add scopes one at a time.
 
 ---
 
 ## 10. Advanced patterns
 
-- **Published vs draft:** add a `status` field with `enable_match: true` to your schema. Tag every source with `metadata.status` set to `"draft"` or `"published"`. Pass `metadata_filters: { status: "published" }` on user-facing queries to keep work in progress out of customer answers.
-- **Multi-language corpora:** add a `language` field with `enable_match: true`. Route each query to the right language by passing `metadata_filters: { language: detect_language(query) }`.
+- **Published vs draft:** declare `status` with `enable_match: true`, set `metadata.status` to `"draft"` or `"published"`, and pass `metadata_filters: { status: "published" }` on user-facing queries.
+- **Multi-language corpora:** declare `language` with `enable_match: true` and pass `metadata_filters: { language: detect_language(query) }`.
 
 ---
 

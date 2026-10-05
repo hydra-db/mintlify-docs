@@ -3,7 +3,7 @@ title: "AI Customer Support Agent with Memory"
 description: "On each ticket, query the help docs and that customer's memory, then reply."
 ---
 
-Build a support agent that remembers each customer. On every ticket it makes two HydraDB queries, merges the results, passes them to your model for the reply, and stores the turn back in HydraDB. Target: the two HydraDB calls finish in under 400 ms round trip.
+Build a support agent that remembers each customer. On every ticket it makes two HydraDB queries, passes the merged results to your model for the reply, and stores the turn back in HydraDB. Target: the two HydraDB calls finish in under 400 ms round trip.
 
 ## Prerequisites
 
@@ -12,12 +12,6 @@ Build a support agent that remembers each customer. On every ticket it makes two
 - An OpenAI API key, only for the final reply
 - Python 3.11 or 3.12 (`python --version`)
 - `pip install hydradb-sdk openai`
-
-You will:
-
-- Ingest help docs and past ticket resolutions once, as shared knowledge. HydraDB builds a context graph that links related articles and resolutions.
-- Give each customer their own memory, keyed by the customer: a collection named `customer-{id}`, and `user_name` set to the customer id on every memory.
-- Store each turn verbatim with `infer: false`, and store preference signals with `infer: true` so HydraDB extracts them for you.
 
 The two queries, both with `mode: "thinking"`:
 
@@ -28,9 +22,9 @@ The two queries, both with `mode: "thinking"`:
 
 ## Step 1: Create the database
 
-Create one database for support. Each customer gets their own collection, created automatically on their first write. Help docs and resolved tickets go in one shared `knowledge-base` collection. This is the [B2C pattern](/essentials/v2/multi-tenant#b2c-application).
+One support database holds a shared `knowledge-base` collection for help docs and resolved tickets, plus one `customer-{id}` collection per customer, created on first write. Every memory also sets `user_name` to the customer id. This is the [B2C pattern](/essentials/v2/multi-tenant#b2c-application).
 
-> **Use the SDK:** `/context/ingest` takes multipart form data, so raw `requests` with `json=` does not work. Use the SDK (`pip install hydradb-sdk`), or send multipart form fields yourself. The import name (`hydra_db`) differs from the package name.
+> **Use the SDK:** `/context/ingest` takes multipart form data, so raw `requests` with `json=` does not work. Use the SDK (`pip install hydradb-sdk`, imported as `hydra_db`), or send multipart form fields yourself.
 
 <CodeGroup>
 ```python Python SDK
@@ -87,13 +81,9 @@ Output:
 
 ## Step 2: Ingest the knowledge base
 
-Upload your help docs, FAQs, and past ticket resolutions into the shared `knowledge-base` collection. HydraDB builds a context graph that connects related articles. A question about "billing" then surfaces linked articles about "invoices", "payment methods", and "plan upgrades", even if the customer never used those words.
+Upload help docs, FAQs, and past ticket resolutions into `knowledge-base`. HydraDB's context graph connects related articles, so a question about "billing" also surfaces "invoices", "payment methods", and "plan upgrades", even if the customer never used those words.
 
-> **Batch limit:** Max 20 sources per request. Wait 1 second between batches.
-
-> **Database placement:** `database` is a required top-level form field. Items in `app_knowledge` may also carry `database` and `collection`. An item's `database` must match the top-level one, or the request returns 400.
-
-> **app_knowledge format:** The SDK parameter `app_knowledge` takes a **JSON string**. Use `json.dumps(batch)`, not a Python list.
+> **Ingest rules:** max 20 sources per request, 1 second between batches. `database` is a required top-level form field. Items in `app_knowledge` may also carry `database` and `collection`, but an item's `database` must match the top-level one, or the request returns 400. The SDK's `app_knowledge` takes a **JSON string**: use `json.dumps(batch)`, not a Python list.
 
 ### Help docs and FAQs
 
@@ -213,7 +203,7 @@ async function ingestHelpDocs(articles: any[]): Promise<string[]> {
 
 ### Past ticket resolutions
 
-Resolved tickets hold the diagnosis path, the fix that worked, and the customer context. Include the resolution steps and root cause, so HydraDB can link symptoms to solutions in the graph.
+Include the resolution steps and root cause so the graph links symptoms to solutions.
 
 <CodeGroup>
 ```python Python SDK
@@ -321,11 +311,11 @@ async function ingestResolvedTickets(tickets: any[]): Promise<string[]> {
 
 ## Step 3: Build per-customer memory
 
-Each customer has their own memory in HydraDB: conversation turns, preference signals, and product feedback. On each query, HydraDB ranks which of those memories fit the current message.
+Each customer's memory holds conversation turns, preference signals, and product feedback, and each query ranks which of them fit the current message.
 
 ### Store conversation turns
 
-After every exchange, write the customer message and the agent reply to HydraDB. Use `infer: false` to store the exact words, so a later search can surface that exchange.
+After every exchange, store the customer message and agent reply with `infer: false`, so the exact words come back in later searches.
 
 <CodeGroup>
 ```python Python SDK
@@ -397,7 +387,7 @@ async function storeConversationTurn(
 
 ### Infer user preferences
 
-Store preferences separately with `infer: true`. HydraDB extracts the signals from the text (preferred contact method, technical level, frustration) and links them to related context in the graph. For example, "I'd prefer email updates" becomes a stored preference without you parsing it.
+Store preferences separately with `infer: true`. HydraDB extracts signals (preferred contact method, technical level, frustration) and links them in the graph, so "I'd prefer email updates" becomes a stored preference without parsing.
 
 <CodeGroup>
 ```python Python SDK
@@ -480,21 +470,19 @@ await storeCustomerPreference(
 ```
 </CodeGroup>
 
-> **When to call this:** After a ticket is resolved ("customer confirmed this fix works"), when a customer states a preference ("can you just send me a link instead of steps?"), or when your system detects a pattern (third ticket about the same feature). Also call it at account creation with CRM data: plan type, company size, primary use case.
+> **When to call this:** after a ticket is resolved, when a customer states a preference ("can you just send me a link instead of steps?"), when your system detects a pattern (third ticket about the same feature), and at account creation with CRM data (plan type, company size, primary use case).
 
 ---
 
 ## Step 4: Handle a support request
 
-Run both queries, then merge them. You need both: the knowledge base holds the fix, and the memory holds who the customer is and what they already tried.
+Run both queries and merge them: the knowledge base holds the fix, and the memory holds who the customer is and what they already tried.
 
-Why the parameters are set this way:
-
-- `mode: "thinking"` on both calls, which expands each query into several and reranks the results.
-- `graph_context: true` on the knowledge base call, to link entities across documents. Thinking mode returns a deeper graph slice than fast mode.
-- `alpha: 0.8`, the recommended starting point. It leans toward semantic matching. Lower it when messages carry literal tokens such as error codes.
-- `type: "memory"` and the customer's collection on the second call, so it reads only that customer's memories.
-- Memory chunks go first in the merged list, so the model weighs them more.
+- `mode: "thinking"`: expands each query into several and reranks the results.
+- `graph_context: true` on the knowledge base call: links entities across documents, with a deeper graph slice than fast mode.
+- `alpha: 0.8`: the recommended starting point, leaning semantic. Lower it when messages carry literal tokens such as error codes.
+- `type: "memory"` with the customer's collection: reads only that customer's memories.
+- Memory chunks first in the merged list: the model weighs them more.
 
 ### Search customer context
 
@@ -603,7 +591,7 @@ async function recallCustomerContext(
 
 ### Generate a personalized response
 
-Pass the merged context to an LLM. The memory chunks give the customer's plan, what they already tried, and how they like to be addressed. The knowledge base chunks give the solution. The LLM writes the reply.
+The memory chunks give the customer's plan, what they already tried, and how they like to be addressed; the knowledge base chunks give the solution.
 
 <CodeGroup>
 ```python Python SDK
@@ -739,7 +727,7 @@ async function handleTicket(
 
 ## Step 5: Escalation and human handoff
 
-When the agent cannot resolve an issue, hand it to a human with the full HydraDB context: account history, what the AI already tried, similar past tickets, and the customer's preferences. The human does not need to ask the customer to describe the issue again.
+Hand unresolved issues to a human with the account history, what the AI already tried, similar past tickets, and the customer's preferences, so nobody asks the customer to repeat the issue.
 
 <CodeGroup>
 ```python Python SDK
@@ -866,7 +854,7 @@ async function escalateToHuman(
 
 ## Step 6: Slack and email interface
 
-Expose the agent on Slack for internal teams and through an email webhook for customers. Both call the same `handle_ticket`, and memory works the same on every channel. Map each channel's user to the same `customer_id` (for example, with a CRM lookup). A customer who emailed last week then gets the same context when they open a Slack thread.
+Slack (for internal teams) and an email webhook (for customers) both call `handle_ticket`. Map each channel's user to the same `customer_id`, for example with a CRM lookup, so a customer who emailed last week gets the same context in a Slack thread.
 
 ### Slack
 
@@ -979,7 +967,7 @@ You should see the credit reflected within 24 hours. Is there anything else I ca
 
 ## API reference
 
-All endpoints used in this cookbook. Base URL: `https://api.hydradb.com` · Header: `Authorization: Bearer YOUR_API_KEY`
+Base URL: `https://api.hydradb.com`. Header: `Authorization: Bearer YOUR_API_KEY`.
 
 | Method | Endpoint | Purpose |
 |--------|----------|---------|
@@ -1077,7 +1065,7 @@ The two memory examples list the fields of a multipart form request. `memories` 
 
 ## Benchmarks
 
-Tested on 2,400 real support tickets (billing, technical, onboarding, and account issues), with and without HydraDB memory. Human raters scored response quality and relevance. Each line gives the generic support bot first, then the HydraDB agent.
+2,400 real support tickets (billing, technical, onboarding, and account), with and without HydraDB memory, scored by human raters for quality and relevance. Each line gives the generic support bot first, then HydraDB.
 
 - **First-contact resolution rate:** 38% vs 71% (+87%).
 - **"Agent knew my history" (CSAT signal):** 12% vs 84% of sessions (+600%).
@@ -1085,9 +1073,7 @@ Tested on 2,400 real support tickets (billing, technical, onboarding, and accoun
 - **Repeated troubleshooting steps (already tried):** 67% vs 4% of tickets (down 94%).
 - **P95 search latency (HydraDB step):** under 200 ms for the HydraDB agent (sub-second). Not applicable to the generic bot.
 
-> The drop in repeated troubleshooting steps comes straight from memory. A customer reporting the same SSO issue for the third time no longer gets "try clearing your browser cache" again. The agent sees it was already tried twice and moves to the next diagnosis.
-
-> **Benchmark methodology:** Figures are based on internal HydraDB testing. See [research.hydradb.com/hydradb.pdf](https://research.hydradb.com/hydradb.pdf) for the full paper. Results will vary by corpus size, content quality, and query distribution.
+> **Benchmark methodology:** the drop in repeated steps comes from memory: a third SSO report no longer gets "try clearing your browser cache" again. Figures come from internal HydraDB testing; see the [full paper](https://research.hydradb.com/hydradb.pdf). Results vary by corpus size, content quality, and query distribution.
 
 ---
 
@@ -1130,7 +1116,7 @@ slack-bolt          # only if using Slack interface
 
 1. Run `setup.py` to create your database and verify the connection.
 2. Run the ingestion scripts with your real help docs and past tickets.
-3. Seed a few customer memories from your CRM at account creation time.
-4. Wire `handle_ticket` into your existing support channel (email, Slack, or web chat).
+3. Seed a few customer memories from your CRM.
+4. Wire `handle_ticket` into your support channel (email, Slack, or web chat).
 
-There is no retraining step. Each turn you store with `context.ingest(type="memory")` is ranked into the next query for that customer.
+There is no retraining step: each turn stored with `context.ingest(type="memory")` is ranked into that customer's next query.

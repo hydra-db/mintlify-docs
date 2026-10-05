@@ -13,7 +13,7 @@ Build an internal knowledge agent that ingests Notion, Confluence, and Slack int
 - `pip install hydradb-sdk`
 - Python basics, REST APIs, environment variables
 
-Each connector below needs its own client library and credentials. Install and export only the ones you wire up. The snippets read them directly, so a missing one fails at once.
+Install and export only the connectors you wire up; a missing variable fails at once.
 
 | Source | Install | Environment |
 | --- | --- | --- |
@@ -21,26 +21,17 @@ Each connector below needs its own client library and credentials. Install and e
 | Confluence | `pip install atlassian-python-api beautifulsoup4` | `CONFLUENCE_URL`, `CONFLUENCE_USER`, `CONFLUENCE_TOKEN` |
 | Slack | `pip install slack_sdk slack_bolt` | `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN` |
 
-By the end you can:
-
-- Ingest Notion pages, Confluence docs, and Slack threads into one HydraDB database
-- Verify indexing before you query
-- Answer "why did we decide X?" from decision context across linked documents
-- Serve the answers from a Slack bot
-
 ## How HydraDB works
 
-Notion's built-in AI returns the document you asked about and stops. It can't tell you **why** a decision was made, who influenced it, or whether something newer replaced it. HydraDB parses, enriches, and links every memory into a **context graph**. When your agent calls `POST /query`, it gets the context that fits that query, weighted by recency, relevance, relationships, and past usage.
+Notion's built-in AI returns the document you asked about and stops. It can't tell you **why** a decision was made, who influenced it, or whether something newer replaced it. HydraDB parses, enriches, and links every memory into a **context graph**, so `POST /query` returns the context that fits the query, weighted by recency, relevance, relationships, and past usage.
 
 You use three primitives:
 
-- **Database:** your workspace. Data is isolated per database. Create one per application.
-- **Memory:** any unit of context, such as a Notion page, a Confluence doc, a Slack thread, or a user preference. HydraDB chunks, embeds, and links memories into the context graph.
+- **Database:** your workspace. Data is isolated per database, and it supports multiple tenants. Create one per application.
+- **Memory:** any unit of context, such as a Notion page, a Confluence doc, a Slack thread, or a user preference. HydraDB chunks, embeds, and links memories into the context graph, so you don't manage embeddings or vector indexes.
 - **Search:** the call your agent makes before it acts. It runs metadata filtering, then graph traversal, then semantic retrieval, then personalized ranking.
 
 ## Step 1: Create a database
-
-A database isolates your data and supports multiple tenants.
 
 **Endpoint:** `POST /databases`
 
@@ -69,19 +60,17 @@ resp = client.databases.create(database=DATABASE_ID)
 print("Database:", resp)
 ```
 
-> **Collections for teams:** Use `collection` to isolate data by department. Engineering, Sales, and HR each get their own namespace in your database. There is nothing to configure. Pass the ID on upload.
+> **Collections for teams:** use `collection` to give Engineering, Sales, and HR their own namespace in your database. There is nothing to configure; pass the ID on upload.
 
 ---
 
 ## Step 2: Upload knowledge
 
-HydraDB parses, chunks, embeds, and links your content into the context graph. You don't manage embeddings or vector indexes.
-
 ### Notion connector
 
-Fetch pages from Notion, format each one as an app source, and upload in batches. HydraDB creates the graph edges for you.
+Format each Notion page as an app source and upload in batches. HydraDB creates the graph edges.
 
-> **Batch limit:** Max **20 sources per request**. Wait **1 second between batches** to respect rate limits.
+> **Batch limit:** max **20 sources per request**, with **1 second between batches** to respect rate limits.
 
 ```python
 import json, time
@@ -151,7 +140,7 @@ def ingest_notion_database(database_id: str, collection: str = None) -> list:
 
 ### Confluence connector
 
-Confluence pages use the same upload format, with `type: "confluence"` to label the source type.
+Confluence pages use the same format, with `type: "confluence"`.
 
 ```python
 from atlassian import Confluence
@@ -199,7 +188,7 @@ def ingest_space(space_key: str, collection: str = None) -> list:
 
 ### Verify indexing
 
-Wait until HydraDB finishes indexing before you run a query. A source is searchable from `graph_creation`. The code below waits for `completed` and stops on `errored`.
+Wait for indexing before you query. A source is searchable from `graph_creation`; the code waits for `completed` and stops on `errored`.
 
 **Endpoint:** `GET /context/status?ids=ID&database=DATABASE`
 
@@ -230,7 +219,7 @@ def verify_all(ids: list):
 
 ## Step 3: Add user memories
 
-HydraDB also stores **user memories**: preferences, habits, and patterns that personalize search per user.
+**User memories** store preferences, habits, and patterns that personalize search per user.
 
 - `infer: true`: HydraDB extracts implicit signals from the text.
 - `infer: false`: HydraDB stores the fact as written.
@@ -293,13 +282,13 @@ add_user_memory(
 )
 ```
 
-To use these memories, query the user's collection with `type: "memory"` (see [More calls](#more-calls)) and pass the results to your LLM next to the knowledge context. A knowledge query on another collection does not read them.
+To use these memories, query the user's collection with `type: "memory"` (see [More calls](#more-calls)) and pass the results to your LLM with the knowledge context. A knowledge query on another collection does not read them.
 
 ---
 
 ## Step 4: Search context
 
-Your agent makes this call before it answers. `POST /query` runs the multi-stage pipeline and returns ranked chunks, plus `graph_context` that shows how entities relate.
+Before it answers, your agent calls `POST /query`, which returns ranked chunks plus `graph_context` showing how entities relate.
 
 **Endpoint:** `POST /query`
 
@@ -351,12 +340,12 @@ for chunk in (context.data.chunks or []):
 
 ## Step 5: Search and generate an answer
 
-Retrieve context with `POST /query`, then pass the returned `chunks` and `sources` into your LLM prompt. The parameters that matter:
+Pass the returned `chunks` and `sources` into your LLM prompt.
 
-- `alpha`: 0 to 1. Balances semantic against keyword (BM25) retrieval. Higher leans semantic. This step uses `0.5` for an even blend; Step 4 uses `0.8`.
-- `recency_bias`: 0 to 1. Higher prefers newer content. Omitting it applies a mild `0.4` tilt. Send `0` to turn it off.
+- `alpha`: 0 to 1, semantic against keyword (BM25) retrieval; higher leans semantic. This step uses `0.5` for an even blend; Step 4 uses `0.8`.
+- `recency_bias`: 0 to 1; higher prefers newer content. Omitting it applies a mild `0.4` tilt; send `0` to turn it off.
 - `graph_context`: returns entity paths across documents. Default `true`.
-- `metadata_filters`: exact-match filters on declared metadata fields. The example filters on `source_type`, which works only if you declare that field in the database metadata schema and set it in each item's `metadata` at upload.
+- `metadata_filters`: exact-match filters on declared metadata fields. The `source_type` filter works only if you declare that field in the database metadata schema and set it in each item's `metadata` at upload.
 
 **Endpoint:** `POST /query`
 
@@ -412,13 +401,13 @@ notion_result = ask_workspace(
 )
 ```
 
-> **Maintaining conversation context:** Store chat history in your application and include relevant prior turns in your LLM prompt. HydraDB returns retrieval context; your app owns the final answer and conversation state.
+> **Maintaining conversation context:** HydraDB returns retrieval context; your app owns the final answer and conversation state. Store chat history in your app and include relevant prior turns in the LLM prompt.
 
 ---
 
 ## Step 6: Slack interface
 
-Expose the knowledge base as a Slack bot. When a user mentions `@wiki`, the bot calls `ask_workspace()` for context. Your app can pass that context to an LLM to write the reply.
+When a user mentions `@wiki`, the bot calls `ask_workspace()` for context, which your app can pass to an LLM to write the reply.
 
 ```python
 from slack_bolt import App
@@ -498,20 +487,20 @@ curl -X POST 'https://api.hydradb.com/context/ingest' \
 
 ### Delete a memory
 
-`DELETE /context` removes stale or incorrect memory data. Send `type: "memory"`, the `ids` to delete, and the `collection` the memories live in. Omitting `collection` targets the default collection.
+`DELETE /context` removes stale or incorrect memories. Send `type: "memory"`, the `ids` to delete, and the `collection` they live in; omitting `collection` targets the default collection.
 
 ---
 
 ## Benchmarks
 
-HydraDB scores 90% search accuracy on LongMemEvals and runs at petabyte scale with sub-second latency. Compared with a naive RAG pipeline over the same 12,400-document corpus (naive RAG first, then HydraDB):
+HydraDB scores 90% search accuracy on LongMemEvals and runs at petabyte scale with sub-second latency. Against naive RAG over the same 12,400-document corpus (naive RAG first, then HydraDB):
 
 - **Factual lookup queries:** 81% vs 90% search accuracy (+11%).
 - **"Why did we..." decision queries:** 34% vs 79% search accuracy (+132%).
 - **Stale doc surface rate:** 41% vs 7% of results (83% lower).
 - **P95 query latency:** 220 ms vs under 200 ms (sub-second).
 
-> **Benchmark methodology:** Figures are based on internal HydraDB testing. For the formal benchmark paper see [research.hydradb.com/hydradb.pdf](https://research.hydradb.com/hydradb.pdf). Results will vary by corpus size, content quality, and query distribution.
+> **Benchmark methodology:** figures come from internal HydraDB testing; see the [formal benchmark paper](https://research.hydradb.com/hydradb.pdf). Results vary by corpus size, content quality, and query distribution.
 
 ## Next steps
 
