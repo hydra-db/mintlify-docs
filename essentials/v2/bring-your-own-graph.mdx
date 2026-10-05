@@ -1,36 +1,39 @@
 ---
 title: "Bring Your Own Graph: per source"
-description: "Send your own entities and relations for a source at ingest, and skip LLM graph extraction for it."
+description: "Supply your own entities and relations for a document and skip LLM graph extraction."
 ---
 
 This is Bring Your Own Graph (BYOG) for a single source: you attach your own entities and relations to a document, app source, or memory when you ingest it. For a separate graph database that you model and query with Cypher, see [Bring Your Own Graph: Cypher collections](/essentials/v2/graph-collections-byog).
 
 ## 1. What it is
 
-Attach a `graph_payload` to a source on [`POST /context/ingest`](/api-reference/v2/endpoint/ingest-context). The source can be a document, an `app_knowledge` item, or a memory. For that source, HydraDB **uses your graph instead of running LLM extraction**.
+Bring Your Own Graph (BYOG) lets you attach a `graph_payload` (your own entities and relations) to a **source** (a document, an `app_knowledge` source, or a memory) on [`POST /context/ingest`](/api-reference/v2/endpoint/ingest-context). For that source, HydraDB **uses your graph instead of running LLM extraction**.
 
-Your graph is stored in the same `source`, `relation`, `target` triplet shape that extraction produces, so it answers queries the same way. It shows up in the `graph_context` slice, and its relations point back at the source's chunks. Your queries do not change.
+Your graph is stored in exactly the same shape extraction produces (`source` to `relation` to `target` triplets), so it answers queries identically: it shows up in the `graph_context` slice and its relations point back at the source's chunks. No query-side changes are needed.
+
+---
 
 ## 2. When to use it
 
-Use it when you already know the relationships and want them used exactly as written:
+Use BYOG when you already know the relationships and want them used verbatim:
 
-- You maintain a curated knowledge graph, an ontology, or a database export.
-- You need deterministic, reproducible relations, not model-extracted ones.
-- You want faster ingestion. A BYOG source skips the extraction LLM call entirely.
+- You maintain a curated knowledge graph, an ontology, or a database export and want those exact facts in HydraDB.
+- You need deterministic, reproducible relations rather than model-extracted ones.
+- You want faster ingestion: a BYOG document skips the extraction LLM call entirely.
 
-Which tool:
+Pick the right tool:
 
-- **HydraDB finds the relationships:** [Context Graphs](/essentials/v2/context-graphs). Auto-extraction is the default.
-- **Link whole sources to each other:** [forceful relations](/essentials/v2/knowledge) (`relations` on a document or app source).
-- **Supply the full entity and relation graph for one source:** this page.
-- **Model and query your own graph with Cypher:** [Bring Your Own Graph: Cypher collections](/essentials/v2/graph-collections-byog).
+| You want… | Use |
+| --- | --- |
+| HydraDB to discover relationships for you | [Context Graphs](/essentials/v2/context-graphs) (auto-extraction, the default) |
+| To declare links **between whole sources** | [Forceful relations](/essentials/v2/knowledge) (`relations` on a document/app source) |
+| To supply the **full entity/relation graph for one source** | **Bring Your Own Graph** (this page) |
 
 ---
 
 ## 3. The `graph_payload` shape
 
-`graph_payload` is a JSON string: a **map keyed by source id** (a document's `document_metadata` `id`, an `app_knowledge` item's `id`, or a memory's `id`). Each value is that source's graph, an `entities` map and a `relations` list. Add keys to attach graphs to several sources in one request.
+`graph_payload` is a JSON string: a **map keyed by source id** (a document's `document_metadata` `id`, an `app_knowledge` item's `id`, or a memory's `id`), where each value is that source's graph (an `entities` map + a `relations` list). Attach graphs to several sources in one request by adding more keys.
 
 ```json
 {
@@ -52,39 +55,44 @@ Which tool:
 }
 ```
 
-- **Top-level key:** the id of a source in the same request. A key that matches no source in the request is rejected with `400`. A source must carry an explicit `id` to be targeted.
-- **Knowledge or memory:** `graph_payload` works for both `type=knowledge` and `type=memory`. A request is one or the other, so its keys target only that type's sources.
-- **`entities`:** a map keyed by a caller-local id. Each entity has a `name` (required), `type`, `namespace`, and optional `identifier` (an external id, display-only). The key is only a handle for relations and is not stored.
-- **`relations`:** a list of edges. `source` and `target` are entity-map keys. `predicate` is any plain string. `context` and `temporal_details` are optional.
-- **No `chunk_id`:** you never send or see chunk ids. HydraDB resolves them server-side when it links your relations to the source's chunks.
-- **Normalized names:** entity names are **normalized (lowercased)** so they match at query time, like extracted entities. Entities that no relation references are dropped.
+- **Top-level key**: the id of the source this graph belongs to (a document's `document_metadata` `id`, an `app_knowledge` item's `id`, or a memory's `id`). A key matching no source in the request is rejected with `400`.
+- **`entities`**: a map keyed by a caller-local id. Each entity has a `name` (required), `type`, `namespace`, and optional `identifier` (an external id, display-only). The entity key is just a handle for relations to reference; it is not stored.
+- **`relations`**: a list of edges. `source` and `target` are entity-map keys; `predicate` is any plain string; `context` and `temporal_details` are optional per relation.
+- **No `chunk_id`**: you never supply or see chunk ids; HydraDB resolves them server-side when it links your relations to the source's chunks.
+- Entity names are **normalized (lowercased)** so they match at query time, just like extracted entities. Entities that no relation references are dropped.
 
 ---
 
 ## 4. How it behaves
 
-- **Replace mode:** a BYOG source's graph is your `graph_payload`, and LLM extraction is skipped. The source is still chunked and embedded, so it stays fully vector-searchable.
-- **Chunk linking:** each relation is linked to the source's most relevant chunk or chunks, so `graph_context` results hydrate the right passages. Linking is permissive (see [Limitations](#8-limitations)).
-- **Queryable like any graph:** your relations appear in the `/query` `graph_context` slice, tagged `origin: "byog"` in metadata, and traverse like extracted ones. See [Context Graphs](/essentials/v2/context-graphs).
-- **Durable across re-ingest:** HydraDB stores your graph server-side. If you re-ingest the same source **without** a `graph_payload` (a connector re-sync, or a content edit), HydraDB re-applies the stored graph. It does **not** fall back to LLM extraction and does **not** error. To change the graph, re-ingest **with** a new `graph_payload`, which replaces the stored copy.
+- **Replace mode:** A BYOG document's graph is your `graph_payload`; LLM extraction is skipped for it. The document is still chunked and embedded, so it stays fully vector-searchable.
+- **Chunk linking:** Each relation is linked to the source's most relevant chunk(s), so `graph_context` results hydrate the right passages. Linking is permissive (see [Limitations](#8-limitations)).
+- **Queryable like any graph:** Your relations appear in the `/query` `graph_context` slice (tagged `origin: "byog"` in metadata) and traverse exactly like extracted ones (see [Context Graphs](/essentials/v2/context-graphs)).
+- **Durable across re-ingest:** Your graph is persisted server-side, so it outlives a single upload. Re-ingesting the same source **without** a `graph_payload` (a connector re-sync, or just iterating on the document's content) re-applies your stored graph: HydraDB does **not** fall back to LLM extraction and does **not** error. Your facts are never silently lost. To change the graph, re-ingest **with** a new `graph_payload`; it replaces the stored copy (replace mode).
 
 ---
 
 ## 5. Limits
 
-`graph_payload` is validated up front. Payloads over these limits are rejected with `400`:
+`graph_payload` is validated up front; oversized payloads are rejected with `400`.
 
-- Entities: at most 5,000.
-- Relations: at most 10,000.
-- Relations per entity (degree): at most 500.
-- `context` length: at most 2,000 characters.
-- `name` and `predicate` length: at most 256 characters each.
+| Limit | Value |
+| --- | --- |
+| Entities | ≤ 5,000 |
+| Relations | ≤ 10,000 |
+| Relations per entity (degree) | ≤ 500 |
+| `context` length | ≤ 2,000 chars |
+| `name` / `predicate` length | ≤ 256 chars |
+
+<Note>
+`graph_payload` is **per-source**: each top-level key must match the `id` of a source in the same request (a document's `document_metadata` `id`, an `app_knowledge` item's `id`, or, when `type=memory`, a memory's `id`). Attach graphs to multiple sources at once. A source must carry an explicit `id` to be targeted (that `id` is the map key). Works for both `type=knowledge` and `type=memory`: a single request is one or the other, so its `graph_payload` keys target only that type's sources.
+</Note>
 
 ---
 
 ## 6. Example: multiple sources in one request
 
-This request carries graphs for **two documents and one `app_knowledge` source**, each keyed by its own id.
+`graph_payload` is a map, so one request can carry graphs for several sources at once: here **two documents and one app_knowledge source**, each keyed by its own id. Then query, and each source's triples surface.
 
 <CodeGroup>
 
@@ -238,7 +246,7 @@ await client.context.ingest({
 
 </CodeGroup>
 
-Poll [Ingestion Status](/api-reference/v2/endpoint/source-status) until the source is ready. Then query with `graph_context: true`:
+Poll [Ingestion Status](/api-reference/v2/endpoint/source-status) until the source is ready, then query with `graph_context: true`:
 
 ```bash cURL
 curl -X POST 'https://api.hydradb.com/query' \
@@ -255,7 +263,7 @@ curl -X POST 'https://api.hydradb.com/query' \
   }'
 ```
 
-Your triplet comes back in `graph_context`, tagged `origin: "byog"`:
+Your triplet comes back in `graph_context` and traverses just like an extracted one. The `origin: "byog"` tag on the relation marks it as yours:
 
 ```json
 {
@@ -279,7 +287,7 @@ Your triplet comes back in `graph_context`, tagged `origin: "byog"`:
 
 ## 7. Memories
 
-For memories, send `type=memory`, give each memory an `id`, and key the graph by that `id`. Relations link to the memory's chunks and surface in `/query` with `type=memory` and `graph_context: true`.
+Memories accept a `graph_payload` too: send `type=memory`, give each memory an `id`, and key the graph by that `id`. The graph shape is identical; relations link to the memory's chunks and surface in `/query` with `type=memory` and `graph_context: true`.
 
 ```bash cURL
 curl -X POST 'https://api.hydradb.com/context/ingest' \
@@ -302,22 +310,21 @@ curl -X POST 'https://api.hydradb.com/context/ingest' \
   }'
 ```
 
-A memory without an `id` gets a server-generated one and cannot be targeted. The `memories` form field stays plural even though `type` is the singular `memory`.
+A memory must carry an explicit `id` to receive a graph (an id-less memory gets a server-generated id and can't be targeted). The `memories` form field stays plural even though `type` is the singular `memory`.
 
 ---
 
 ## 8. Limitations
 
-- **Replace, not augment:** a BYOG source has no LLM-extracted facts, only the graph you supply (plus normal chunk search). Augment mode is a future enhancement.
-- **Permissive linking can cause false positives:** every relation links to its best-matching chunk, even if the match is weak. There is no reject floor yet. A linked relation is **sourced** (similar to a chunk), not necessarily **supported** (stated by the source).
-- **Bulk, one-shot:** you supply the whole graph with the source. Per-triple add, update, and delete are not available yet.
+- **Replace, not augment:** A BYOG source has no LLM-extracted facts, only the graph you supply (plus normal chunk search). Augment mode is a future enhancement.
+- **Permissive linking leads to possible false positives:** Every relation links to its best-matching chunk even if the match is weak; there is no reject floor yet. A linked relation is **sourced** (similar to a chunk), not necessarily **supported** (stated by the source).
+- **Bulk, one-shot:** You supply the whole graph with the source. Per-triple add/update/delete is not yet available.
 
 ---
 
 ## Related
 
-- [Context Graphs](/essentials/v2/context-graphs): the auto-extracted graph that BYOG replaces for a source
-- [Bring Your Own Graph: Cypher collections](/essentials/v2/graph-collections-byog): a separate graph you model and query with Cypher
+- [Context Graphs](/essentials/v2/context-graphs): the auto-extracted graph BYOG replaces; HydraDB builds it for you, BYOG lets you supply it
 - [Knowledge](/essentials/v2/knowledge): documents, and forceful relations between sources
 - [Ingest Context](/api-reference/v2/endpoint/ingest-context): the `graph_payload` form field reference
 - [Query](/essentials/v2/query): how chunks and graph context are retrieved together

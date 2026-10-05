@@ -1,17 +1,21 @@
 ---
 title: "Architecture"
-description: "What happens after you call the API: provisioning, indexing, and query."
+description: "How HydraDB moves content from ingestion to indexed query, and where databases, metadata, graph context, and retrieval fit together."
 ---
 
-You call a small HTTP API. HydraDB provisions an isolated database, indexes content in the background, and answers `POST /query` from what is already indexed.
+HydraDB is context infrastructure for AI applications. From the outside, you call a small set of HTTP APIs. Inside, HydraDB orchestrates database isolation, asynchronous ingestion, indexing, graph construction, and hybrid retrieval, so your application can store context once and query the right pieces later. This page walks through what happens behind the scenes, and points at the endpoints and concepts you'll touch along the way.
 
 ---
 
-## Three planes
+## The big picture
 
-- **Control:** authentication, database lifecycle, provisioning, and status. The [`/databases`](/api-reference/v2/endpoint/tenants-overview) routes.
-- **Ingestion (async):** file, app-source, and memory writes, then parsing, chunking, embedding, and graph construction. [`POST /context/ingest`](/api-reference/v2/endpoint/ingest-context) writes to the [knowledge](/essentials/v2/knowledge) store with `type=knowledge` and the [memories](/essentials/v2/memories) store with `type=memory`. [`GET /context/status`](/api-reference/v2/endpoint/source-status) tracks progress.
-- **Retrieval (sync):** hybrid query, metadata filtering, BM25 keyword search, graph context, and response shaping. [`POST /query`](/api-reference/v2/endpoint/query) is the only query endpoint. [`GET /context/relations`](/api-reference/v2/endpoint/source-relations) lists the extracted entity relations.
+HydraDB organizes its work into three logical planes. You interact only with the API; everything else stays behind the service boundary.
+
+| Plane | What it handles | Endpoints |
+|---|---|---|
+| **Control** | API authentication, database lifecycle, provisioning, and status | [`/databases`](/api-reference/v2/endpoint/tenants-overview) family |
+| **Ingestion** | File and app-source uploads, memory writes, parsing, chunking, embedding, and graph construction | [`POST /context/ingest`](/api-reference/v2/endpoint/ingest-context), [`GET /context/status`](/api-reference/v2/endpoint/source-status) |
+| **Retrieval** | Hybrid query, metadata filtering, graph context, keyword bm25 search, and response shaping | [`POST /query`](/api-reference/v2/endpoint/query), [`GET /context/relations`](/api-reference/v2/endpoint/source-relations) |
 
 ```mermaid
 flowchart LR
@@ -28,7 +32,7 @@ flowchart LR
     style Status fill:#1e293b,stroke:#334155,stroke-width:2px,color:#f8fafc,stroke-linecap:round
   end
 
-  subgraph Ingestion[Ingestion Plane - async]
+  subgraph Ingestion["Ingestion Plane (async)"]
     direction LR
     Queue([Ingestion Queue])
     Parser([Parse and Chunk])
@@ -40,7 +44,7 @@ flowchart LR
     style Graph fill:#FF571A,stroke:#FF571A,stroke-width:2px,color:#f8fafc,stroke-linecap:round
   end
 
-  subgraph Retrieval[Retrieval Plane - sync]
+  subgraph Retrieval["Retrieval Plane (sync)"]
     direction LR
     Query([Query Orchestrator])
     MemVec([Memories Vector Store])
@@ -78,78 +82,131 @@ flowchart LR
   Query --> Sources
 ```
 
+Two details to notice in the diagram:
+
+- **Two vector stores, one ingest endpoint.** [`POST /context/ingest`](/api-reference/v2/endpoint/ingest-context) routes to the [Knowledge](/essentials/v2/knowledge) store when `type=knowledge` and to the [Memories](/essentials/v2/memories) store when `type=memory`. Same endpoint, different bucket.
+- **One query endpoint, every retrieval method.** [`POST /query`](/api-reference/v2/endpoint/query) is the only retrieval entry point. The `type` and `query_by` parameters decide what gets queried and how. See [Query](/essentials/v2/query) for the full picture.
+
 ---
 
 ## Ingestion lifecycle
 
-A successful upload means HydraDB queued the work, not that the content is queryable. Each source moves from `queued` to `processing` to `graph_creation` to `completed`. A failure during `processing` or `graph_creation` ends in `errored`. Poll [`GET /context/status`](/api-reference/v2/endpoint/source-status) with the returned `id`.
+Ingestion is asynchronous. A successful upload means HydraDB accepted the work and queued it; it does not mean the content is immediately queryable. Each source moves through a status pipeline before it becomes fully queryable:
 
-- **`graph_creation` is already queryable:** chunks are retrievable once embedding finishes. Wait for `completed` only when you need full graph context (`graph_context: true` on query).
-- **Failures carry detail:** an `errored` item has an `error_code` and `error_message`, so you can tell a parse failure from a validation or infrastructure problem.
+```mermaid
+flowchart LR
+  Upload([Upload Knowledge or Memory])
+  Queued([Queued])
+  Processing([Processing])
+  Graph([Graph Creation])
+  Completed([Completed])
+  Errored([Errored])
 
-Status table and polling pattern: [Ingestion Status](/api-reference/v2/endpoint/source-status).
+  Upload --> Queued
+  Queued --> Processing
+  Processing --> Graph
+  Graph --> Completed
+  Processing -.failure.-> Errored
+  Graph -.failure.-> Errored
+
+  style Upload fill:#1e293b,stroke:#334155,stroke-width:2px,color:#f8fafc,stroke-linecap:round
+  style Queued fill:#0f172a,stroke:#334155,stroke-width:2px,color:#f8fafc,stroke-linecap:round
+  style Processing fill:#0f172a,stroke:#334155,stroke-width:2px,color:#f8fafc,stroke-linecap:round
+  style Graph fill:#FF571A,stroke:#FF571A,stroke-width:2.5px,color:#f8fafc,stroke-linecap:round
+  style Completed fill:#22c55e,stroke:#166534,stroke-width:2px,color:#f8fafc,stroke-linecap:round
+  style Errored fill:#ef4444,stroke:#b91c1c,stroke-width:2px,color:#f8fafc,stroke-linecap:round
+```
+
+Poll [`GET /context/status`](/api-reference/v2/endpoint/source-status) with the returned `id` to follow each item through the pipeline. Two practical notes:
+
+- **`graph_creation` is already queryable.** Chunks become retrievable as soon as embedding finishes; you only need to wait for `completed` when you specifically need full graph context (`graph_context: true` on query).
+- **Failures surface with detail.** An `errored` status comes back with an `error_code` and `error_message` so you can distinguish parse failures from validation problems from infrastructure issues.
+
+The full status table and polling pattern lives at [Ingestion Status](/api-reference/v2/endpoint/source-status).
 
 ---
 
 ## From upload to query
 
-1. **Create a database** with [`POST /databases`](/api-reference/v2/endpoint/create-tenant), optionally with a [metadata schema](/essentials/v2/metadata).
-2. **Wait** until [`GET /databases/status`](/api-reference/v2/endpoint/tenant-status) reports `infra.ready_for_ingestion: true`, which means the scheduler, the graph, and both vector stores are ready.
-3. **Ingest** with [`POST /context/ingest`](/api-reference/v2/endpoint/ingest-context): `type=knowledge` for shared documents, `type=memory` for one user.
-4. **Wait again** until each `id` reaches `completed` (or `graph_creation`, as above).
-5. **Query** with [`POST /query`](/api-reference/v2/endpoint/query). `type` is `"knowledge"`, `"memory"`, or `"all"`. `query_by` is `"hybrid"` (default) or `"text"` (BM25, with `operator`). Details: [Query](/essentials/v2/query).
+Here's the canonical end-to-end flow. Each step links to the endpoint that owns it:
+
+1. **Create a database** with [`POST /databases`](/api-reference/v2/endpoint/create-tenant) (your isolated workspace, optionally with a [metadata schema](/essentials/v2/metadata) declared up front).
+2. **Wait for provisioning** by polling [`GET /databases/status`](/api-reference/v2/endpoint/tenant-status) until `infra.ready_for_ingestion` is `true`, which means `scheduler_status`, `graph_status`, `vectorstore_status.knowledge`, and `vectorstore_status.memories` are all `true`.
+3. **Ingest content** with [`POST /context/ingest`](/api-reference/v2/endpoint/ingest-context): pick `type=knowledge` for shared documents or `type=memory` for per-user context. See [Knowledge](/essentials/v2/knowledge) and [Memories](/essentials/v2/memories) for the content models.
+4. **Watch indexing finish** by polling [`GET /context/status`](/api-reference/v2/endpoint/source-status) until each `id` reaches `completed` (or `graph_creation` if you don't need graph traversal).
+5. **Query** with [`POST /query`](/api-reference/v2/endpoint/query). Pick `type: "knowledge"` for Knowledge, `type: "memory"` for Memories, or `type: "all"` for both. Pair with `query_by: "hybrid"` (default) or `"text"` (BM25, with `operator`). The mechanics live in [Query](/essentials/v2/query).
+
+That's the whole loop. Most of what changes between integrations is *what* you put in the metadata, *what* you query with, and *which* `type` and `query_by` combination fits the task.
 
 ---
 
 ## Database isolation
 
-- **`database`:** the isolation boundary. One database cannot read another. Required on every request. Deprecated alias: `tenant_id`.
-- **`collection`:** partitions a database into users, teams, or projects, for writes and single-scope queries. Deprecated alias: `sub_tenant_id`. If you omit it, HydraDB uses the default collection, created on the first write.
-- **`collections`:** the preferred scope selector on `POST /query`. Send a list to weight scopes equally, or an object of weights.
+A `database` (formerly `tenant_id`, still accepted as a deprecated alias) is the top-level isolation boundary: no database can read another database's data. Within a database, `collection` (formerly `sub_tenant_id`) carves out logical partitions: users, teams, workspaces, or projects. Omitting `collection` on any call resolves to the database's default collection, which is created on the first write; no collection exists until then.
 
-Choosing boundaries for your product: [Multi-tenant](/essentials/v2/multi-tenant).
+The right mapping depends on your product shape:
 
----
+| Product shape | Database pattern | Collection pattern |
+|---|---|---|
+| **B2B SaaS** | One database per customer organization | One collection per team, workspace, or end user |
+| **B2C app** | One database for your application | One collection per end user |
+| **Internal tools** | One database per company or environment | One collection per department or project |
 
-## Metadata fields
-
-- `metadata`: fields set at [ingest](/api-reference/v2/endpoint/ingest-context) whose keys match the database's [metadata schema](/essentials/v2/metadata). You declare the schema when you create the database and can add fields later.
-- `additional_metadata`: free-form fields per document.
-- `metadata_filters`: narrows results before ranking. Top-level keys match `metadata`. Free-form keys go under `additional_metadata`. For filters you use often, declare the field in `database_metadata_schema`.
+The deeper trade-offs (when to spin up a new database vs. a new collection, how scoping interacts with [metadata filters](/essentials/v2/metadata), and how this affects [Memories](/essentials/v2/memories)) are covered in [Multi-Tenant Support](/essentials/v2/multi-tenant).
 
 ---
 
 ## Retrieval pipeline
 
-`type` picks the store and `query_by` picks the method. Every call then runs the same steps:
+[`POST /query`](/api-reference/v2/endpoint/query) is the single retrieval endpoint. Two parameters describe the request: `type` picks the store, `query_by` picks the method. From there, every call goes through the same pipeline:
 
-1. **Authenticate and scope:** validate `database`, then apply `collection` or `collections` (the default collection when neither is sent).
-2. **Filter:** `metadata_filters` narrow the candidates before ranking.
-3. **Retrieve:** hybrid retrieval over the vector store and the BM25 keyword index, or BM25 only when `query_by: "text"`.
-4. **Blend:** `alpha` weights semantic against keyword scores (`1.0` is pure semantic, `0.0` is pure BM25).
-5. **Enrich:** `mode: "fast"` is a single low-latency pass. `mode: "thinking"` expands the query, reranks, and pulls in the relations you declared at ingest. `mode: "auto"` (the default) picks one per query. With `graph_context` on (the default), HydraDB attaches related paths from the [context graph](/essentials/v2/context-graphs). Thinking always does. `graph_context: false` takes effect only in fast mode.
-6. **Shape the response:** ranked `chunks`, deduplicated `sources`, optional `graph_context`, and any `additional_context`.
+1. **Authenticate and scope.** Validate `database`, resolve the database, and apply the requested `collection` or `collections` (the default collection when neither is sent).
+2. **Filter before ranking.** Apply `metadata_filters` to narrow the candidate set (see [Metadata](/essentials/v2/metadata)).
+3. **Retrieve.** Run hybrid retrieval over the semantic vector store and the keyword bm25 index, or BM25-only retrieval when `query_by: "text"`.
+4. **Blend.** Use `alpha` to weight semantic vs. keyword bm25 contributions (`1.0` = pure semantic, `0.0` = pure BM25).
+5. **Enrich.** When `graph_context: true` (the default), traverse the [context graph](/essentials/v2/context-graphs) and attach related paths; thinking mode always does, so `graph_context: false` takes effect only in fast mode. When `mode: "thinking"`, expand the query, rerank, and pull in author-declared forceful relations. `mode: "auto"` (the default) picks fast or thinking per query.
+6. **Shape the response.** Return ranked `chunks`, deduplicated `sources`, optional `graph_context`, and any `additional_context`.
 
-The response is retrieved context, not an LLM answer. Pass it to your own model with the helper in [How to Use API Results](/essentials/v2/api-results). Tuning: [Query](/essentials/v2/query).
+The response is *retrieved context*, not a final LLM answer. You pass the chunks (and any graph context) into your own agent or model prompt. See [How to Use API Results](/essentials/v2/api-results) for the helper that formats it.
 
 ---
 
-## When a query returns nothing
+## Key controls
 
-Check in this order:
+A short cheat sheet for the parameters you'll touch most often, and where each one lives:
 
-1. **Status:** did every `id` reach at least `graph_creation`?
-2. **Scope:** is the `database` correct? Did you write under one `collection` and read under another?
-3. **Filters:** is each key in the right namespace, as in [Metadata fields](#metadata-fields)?
+| Field | Used in | What it does |
+|---|---|---|
+| `database` | Every call | Selects the isolated workspace. Required on every request. |
+| `collection` | Ingest + query | Narrows data to a user, team, or workspace inside the database. Use a single collection for writes and single-scope queries. |
+| `collections` | Query | Preferred query-time collection selector. Use a single-item list, a multi-scope list with equal weights, or a weighted object for fanout ranking. |
+| `metadata` | [Ingest](/api-reference/v2/endpoint/ingest-context) | Schema-aligned metadata indexed at ingest. Must match the [database metadata schema](/essentials/v2/metadata) declared at database creation (fields can be added later). |
+| `additional_metadata` | [Ingest](/api-reference/v2/endpoint/ingest-context) | Free-form per-document metadata. Stored alongside the source; filterable at query via `metadata_filters.additional_metadata`. |
+| `metadata_filters` | [Query](/api-reference/v2/endpoint/query) | Deterministic narrowing before ranking. Top-level keys match `metadata`; nested `additional_metadata` filters free-form fields. |
+| `alpha` | [Query](/api-reference/v2/endpoint/query) | Blends semantic vs. keyword bm25 scores in `query_by: "hybrid"`. |
+| `graph_context` | [Query](/api-reference/v2/endpoint/query) | When `true` (the default), attaches the relevant slice of the [context graph](/essentials/v2/context-graphs) to the response. `false` takes effect only in fast mode. |
+| `mode` | [Query](/api-reference/v2/endpoint/query) | `"fast"` for low-latency single-pass retrieval; `"thinking"` for multi-query expansion and reranking; `"auto"` (the default) picks one per query. |
+
+---
+
+## Operational mental model
+
+HydraDB separates **write-time** work from **query-time** work. Uploads return quickly and run in the background; query stays synchronous and reads only indexed content. When results look incomplete, walk the chain in order:
+
+1. **Status first.** Did every `id` reach `completed` (or at least `graph_creation`)? Check [Ingestion Status](/api-reference/v2/endpoint/source-status).
+2. **Scope second.** Is the `database` correct? Did you write under one `collection` and read under another? See [Multi-Tenant](/essentials/v2/multi-tenant).
+3. **Filters third.** Are you using the right namespace? Top-level `metadata_filters` keys match `metadata`; free-form fields belong under `additional_metadata`. For hot top-level filters, declare the field in `database_metadata_schema`. See [Metadata](/essentials/v2/metadata).
+
+This order catches almost every "I uploaded but query returns nothing" debugging session.
 
 ---
 
 ## Related
 
-- [Core Concepts](/get-started/v2/core-concepts)
-- [Quickstart](/get-started/v2/quickstart)
-- [Knowledge](/essentials/v2/knowledge) and [Memories](/essentials/v2/memories)
-- [Query](/essentials/v2/query)
-- [Multi-tenant](/essentials/v2/multi-tenant)
-- [Context Graphs](/essentials/v2/context-graphs)
-- [Metadata](/essentials/v2/metadata)
+- [Core Concepts](/get-started/v2/core-concepts): the five primitives (Memories, Knowledge, Query, Databases, Metadata)
+- [Quickstart](/get-started/v2/quickstart): build your first integration in five minutes
+- [Knowledge](/essentials/v2/knowledge) and [Memories](/essentials/v2/memories): the two content models
+- [Query](/essentials/v2/query): deep dive on `POST /query`
+- [Multi-Tenant Support](/essentials/v2/multi-tenant): scoping patterns and pitfalls
+- [Context Graphs](/essentials/v2/context-graphs): how the graph layer enriches retrieval
+- [Metadata](/essentials/v2/metadata): designing filterable fields

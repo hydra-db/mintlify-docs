@@ -3,15 +3,48 @@ title: "Webhooks"
 description: "Receive indexing status events when ingested content finishes processing."
 ---
 
-Webhooks send your application an HTTP callback when HydraDB finishes processing a document or memory. Use them to update your own database when content is ready for query, notify users that an upload finished, trigger downstream jobs, or track indexing failures without polling.
+Webhooks let your application receive an HTTP callback when HydraDB finishes processing a document or memory.
+
+Use them when you want to:
+
+- Update your own database when content is ready for query
+- Notify users that an upload has finished
+- Trigger downstream jobs after indexing completes
+- Track indexing failures without polling
+
+<Info>
+Webhooks are sent for terminal indexing states. For progress updates before completion, use [Ingestion Status](/api-reference/v2/endpoint/source-status).
+</Info>
 
 ---
 
 ## 1. How it works
 
-When an ingested item reaches a terminal indexing state, HydraDB creates a delivery record and sends a `POST` to your URL. For progress updates before that, use [Ingestion Status](/api-reference/v2/endpoint/source-status). A failed delivery is retried in the background, and you can also retry it yourself. See [Delivery and retries](#7-delivery-and-retries).
+When an ingested item reaches a terminal state, HydraDB creates a delivery record and sends a `POST` request to your webhook URL.
 
-The only event today is `indexing.status_changed`. It fires when an item reaches `completed`, `errored`, or `success` (a legacy alias for `completed`).
+```mermaid
+flowchart LR
+  A([Upload content]) --> B([HydraDB indexes it])
+  B --> C{Terminal status}
+  C --> D([Create delivery record])
+  D --> E([POST to your webhook URL])
+  E --> F([Mark delivered or retry])
+
+  style A fill:#0f172a,stroke:#334155,stroke-width:2px,color:#f8fafc
+  style B fill:#0f172a,stroke:#334155,stroke-width:2px,color:#f8fafc
+  style C fill:#CC4515,stroke:#FF571A,stroke-width:2px,color:#ffffff
+  style D fill:#0f172a,stroke:#334155,stroke-width:2px,color:#f8fafc
+  style E fill:#0f172a,stroke:#334155,stroke-width:2px,color:#f8fafc
+  style F fill:#0f172a,stroke:#10b981,stroke-width:2px,color:#f8fafc
+```
+
+The supported event today is:
+
+| Event | When it fires |
+|---|---|
+| `indexing.status_changed` | When an item reaches `completed`, `errored`, or `success` |
+
+`success` is a legacy alias for `completed`.
 
 ---
 
@@ -26,17 +59,19 @@ Open the HydraDB dashboard and go to **Webhooks**.
 5. Enable signing and copy the generated secret. It is shown once and cannot be retrieved later.
 6. Use **Send Test** to confirm your endpoint receives a request.
 
-Signing is optional, but turn it on. Without it, your endpoint cannot tell a real HydraDB delivery from any other request. See [Verifying signatures](#5-verifying-signatures).
+Signing is optional but strongly recommended: without it, your endpoint cannot tell a real HydraDB delivery from anything else that can reach the URL. See [Verifying signatures](#5-verifying-signatures).
 
 <Warning>
 Your webhook URL must be reachable from the public internet. Localhost and private network addresses are blocked.
 </Warning>
 
 <Info>
-Management endpoints (`/webhooks/indexing` and the routes under it) return the standard v2 `{ success, data, error, meta }` envelope, like `/databases`, `/context/*`, and `/query`. The examples below show only `data`. The event sent to your URL is not wrapped. See [Request format](#3-request-format).
+Webhook management endpoints return the standard v2 `{ success, data, error, meta }` envelope used by `/databases`, `/context/*`, and `/query`. The response examples below show only `data`. The event sent to your webhook URL is not wrapped.
 </Info>
 
 ### Register with cURL
+
+Use your HydraDB API key to register a webhook from your backend or terminal.
 
 ```bash cURL
 curl -X POST 'https://api.hydradb.com/webhooks/indexing' \
@@ -62,9 +97,9 @@ curl -X POST 'https://api.hydradb.com/webhooks/indexing' \
 }
 ```
 
-`signing_secret` is optional. If you send one, it must be at least 16 characters.
+`signing_secret` is optional here and must be at least 16 characters if you supply one.
 
-Or send `generate_signing_secret` to register and enable signing in one call. The generated secret comes back once, in this response:
+To have HydraDB generate a strong secret instead, send `generate_signing_secret` and register in a single call. The secret comes back once on the response, so registering and enabling signing are one atomic step:
 
 ```bash cURL
 curl -X POST 'https://api.hydradb.com/webhooks/indexing' \
@@ -91,7 +126,7 @@ curl -X POST 'https://api.hydradb.com/webhooks/indexing' \
 }
 ```
 
-Send `generate_signing_secret` or `signing_secret`, not both. Sending both returns `422`.
+`generate_signing_secret` and `signing_secret` are mutually exclusive; sending both returns `422`. Whichever you choose, your receiver should verify `X-HydraDB-Signature` on every delivery.
 
 ### Check the current registration
 
@@ -114,7 +149,7 @@ curl 'https://api.hydradb.com/webhooks/indexing' \
 
 ### Edit a webhook
 
-`POST /webhooks/indexing` also replaces an existing registration.
+Use the same `POST /webhooks/indexing` endpoint to replace the existing registration.
 
 ```bash cURL
 curl -X POST 'https://api.hydradb.com/webhooks/indexing' \
@@ -128,13 +163,15 @@ curl -X POST 'https://api.hydradb.com/webhooks/indexing' \
   }'
 ```
 
-Omitting `signing_secret` while editing **preserves** your current secret. Editing the URL or the event list never changes your signing configuration. To turn signing off, call `DELETE /webhooks/indexing/signing-secret`.
+Omitting `signing_secret` while editing **preserves** the secret you already have. Editing the URL or the event list never changes your signing configuration.
+
+To turn signing off, call `DELETE /webhooks/indexing/signing-secret` explicitly.
 
 ### Manage the signing secret
 
-You can enable signing when you register, with `generate_signing_secret` or `signing_secret`. To enable, rotate, or disable it later, use `/webhooks/indexing/signing-secret`.
+You can enable signing at registration with `generate_signing_secret` or `signing_secret`. The signing secret also has its own endpoint, so enabling it later, rotating, and disabling are always deliberate actions rather than side effects of editing a registration.
 
-**Generate a secret:** send no body. HydraDB returns a strong secret once, in plain text.
+**Generate a secret:** Send no body and HydraDB creates a strong one for you. The secret is returned exactly once, in plain text.
 
 ```bash cURL
 curl -X POST 'https://api.hydradb.com/webhooks/indexing/signing-secret' \
@@ -152,7 +189,7 @@ curl -X POST 'https://api.hydradb.com/webhooks/indexing/signing-secret' \
 }
 ```
 
-**Supply your own:** deploy the secret to your receiver first, then give it to HydraDB, so no delivery is signed with a secret your endpoint lacks.
+**Supply your own:** Useful when you want to deploy the secret to your receiver first and hand it to HydraDB afterwards, so there is no window where deliveries are signed with a secret your endpoint does not yet know.
 
 ```bash cURL
 curl -X POST 'https://api.hydradb.com/webhooks/indexing/signing-secret' \
@@ -162,7 +199,7 @@ curl -X POST 'https://api.hydradb.com/webhooks/indexing/signing-secret' \
   -d '{ "signing_secret": "at-least-16-characters" }'
 ```
 
-**Disable signing:** removes the stored secret. Deliveries stop carrying `X-HydraDB-Signature`.
+**Disable signing:** This removes the stored secret, and deliveries stop carrying `X-HydraDB-Signature`.
 
 ```bash cURL
 curl -X DELETE 'https://api.hydradb.com/webhooks/indexing/signing-secret' \
@@ -171,7 +208,7 @@ curl -X DELETE 'https://api.hydradb.com/webhooks/indexing/signing-secret' \
 ```
 
 <Warning>
-Rotating takes effect immediately, with no overlap period. Deliveries in flight are signed with the new secret, so a receiver that only knows the old one rejects them. See [Zero-downtime key rotation](#zero-downtime-key-rotation).
+Rotating takes effect immediately, with no overlap period. Deliveries in flight during a rotation are signed with the new secret, so a receiver that only knows the old one will reject them. See [Zero-downtime key rotation](#zero-downtime-key-rotation) for how to rotate without a gap.
 </Warning>
 
 ### Send a test delivery
@@ -217,10 +254,12 @@ HydraDB sends a `POST` request with a JSON body.
 
 ### Headers
 
-- `Content-Type`: always `application/json`.
-- `X-HydraDB-Delivery-ID`: stable delivery ID for this event.
-- `X-HydraDB-Event`: event name, such as `indexing.status_changed`.
-- `X-HydraDB-Signature`: `sha256=<hex>`, the HMAC-SHA256 of the raw request body keyed by your signing secret. Present only when signing is configured.
+| Header | Description |
+|---|---|
+| `Content-Type` | Always `application/json` |
+| `X-HydraDB-Delivery-ID` | Stable delivery ID for this event |
+| `X-HydraDB-Event` | Event name, such as `indexing.status_changed` |
+| `X-HydraDB-Signature` | `sha256=<hex>`, the HMAC-SHA256 of the raw request body keyed by your signing secret. Present only when signing is configured. See [Verifying signatures](#5-verifying-signatures) |
 
 The signature scheme in full:
 
@@ -232,9 +271,9 @@ digest = HMAC-SHA256(key = signing_secret, message = raw request body bytes)
 
 Three details decide whether your verifier works:
 
-- The `sha256=` prefix is **part of the header value**. Compare against the whole string.
+- The `sha256=` prefix is **part of the header value**, not a separate field. Compare against the whole string.
 - The digest is **lowercase hex**, not base64.
-- The HMAC covers the **raw body bytes exactly as received**. Parsing and re-serialising the JSON produces different bytes, and the signature will not match.
+- The HMAC is computed over the **raw body bytes exactly as received**. Parsing the JSON and re-serialising it produces different bytes and the signature will not match.
 
 ### Payload
 
@@ -270,29 +309,51 @@ For failed indexing, the payload can include `error_code` and `error_message`:
 }
 ```
 
-- `event`: event type, currently `indexing.status_changed`.
-- `delivery_id`: stable ID for this event. Store it to deduplicate retries.
-- `id`: the document, memory, or app item ID you supplied at ingestion. Older examples call it `doc_id`. New payloads use `id`.
-- `database`: the database name you ingested into, the value you sent as `database` (or `tenant_id`). Empty only for items ingested before this field existed.
-- `collection`: collection scope for the indexed item.
-- `status`: terminal indexing status, usually `completed` or `errored`.
-- `timestamp`: time the payload was created.
-- `error_code`, `error_message`: present, when available, for failed processing.
-- `tenant_id`: deprecated. An identifier for the database, not its name. Always present.
-- `sub_tenant_id`: deprecated exact alias for `collection`.
+| Field | Description |
+|---|---|
+| `event` | Event type. Currently `indexing.status_changed`. |
+| `delivery_id` | Stable ID for this event. Store it to deduplicate retries. |
+| `id` | The document, memory, or app item ID you supplied during ingestion. |
+| `database` | The name of the database you ingested into: the value you sent as `database` (or `tenant_id`) on the ingest request. Empty only for items ingested before this field existed. |
+| `collection` | Collection scope for the indexed item. |
+| `status` | Terminal indexing status. Usually `completed` or `errored`. |
+| `timestamp` | Time the webhook payload was created. |
+| `error_code` | Present when available for failed processing. |
+| `error_message` | Present when available for failed processing. |
+| `tenant_id` | Deprecated. An identifier for the database, not the name you ingested into. Always present. |
+| `sub_tenant_id` | Deprecated alias for `collection`, carrying the same value. |
 
 <Note>
-**`tenant_id` and `database` do not carry the same value.** `database` is the name you ingested into (`marketing-docs`), the only field that matches what you sent, so route and filter on **`database`**. `tenant_id` is an identifier for it (`kv3qz7mabx`), unchanged so existing integrations keep working. Read it only if you need a scope that is always set.
+Older examples may refer to this document identifier as `doc_id`. New webhook payloads use `id`.
+</Note>
+
+<Note>
+**`tenant_id` and `database` do not carry the same value.** `database` is the name
+you ingested into (`marketing-docs`); `tenant_id` is an identifier for it
+(`kv3qz7mabx`). Route and filter on **`database`**: it is the only field that
+matches what you sent.
+
+`tenant_id` still carries the same identifier it always has, so integrations
+matching on it keep working unchanged. `sub_tenant_id` remains an exact alias for
+`collection`. Read `database` and `collection` in new integrations.
+</Note>
+
+<Note>
+`database` is empty only for items ingested before this field existed. Read
+`tenant_id` if you need a scope that is always set.
 </Note>
 
 ---
 
 ## 4. Test delivery payload
 
-The dashboard **Send Test** button sends a synthetic event, not a real indexing delivery.
+The dashboard **Send Test** button sends a synthetic event. It does not create a real indexing delivery.
 
 <Note>
-Nothing was ingested, so there is no database name to report. The test payload sets every scope field, including `database`, to your organisation ID.
+Nothing was ingested, so there is no database name to report: the test payload sets
+every scope field (including `database`) to your organisation ID. A real delivery
+reports the database you ingested into. Match on `test: true` (or the `test_` prefix
+on `delivery_id`) to tell the two apart.
 </Note>
 
 ```json
@@ -310,13 +371,15 @@ Nothing was ingested, so there is no database name to report. The test payload s
 }
 ```
 
-Match on `test: true` (or the `test_` prefix on `delivery_id`) to ignore test events in production workflows.
+Use `test: true` to ignore test events in production workflows.
 
 ---
 
 ## 5. Verifying signatures
 
-Verification is one function of your signing secret, the raw request body, and the `X-HydraDB-Signature` header. The official SDKs include it:
+Verification is one function. It takes your signing secret, the raw request body, and the `X-HydraDB-Signature` header, and returns whether the delivery genuinely came from HydraDB.
+
+If you use an official SDK, it is already there and you can skip the rest of this section:
 
 <CodeGroup>
 
@@ -337,17 +400,61 @@ if (!verifyWebhookSignature(secret, rawBody, signature)) {
 
 </CodeGroup>
 
-Without an SDK, copy `verify_webhook_signature` (Python) or `verifyWebhookSignature` (TypeScript) from the [receiver examples](#6-receiver-examples). Both compare in constant time: a plain `==` leaks timing information that can be used to forge a signature byte by byte. In Node, compare lengths first, because `timingSafeEqual` throws on a mismatch.
+Otherwise, implement it directly. Both use a constant-time comparison, which matters: a naive `==` leaks timing information that can be used to forge a signature byte by byte.
+
+<CodeGroup>
+
+```python Python
+import hashlib
+import hmac
+
+
+def verify_webhook_signature(secret: str, raw_body: bytes, signature: str) -> bool:
+    """Return True when signature is valid for raw_body."""
+    if not secret or not signature:
+        return False
+    digest = hmac.new(secret.encode(), raw_body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(signature, f"sha256={digest}")
+```
+
+```typescript TypeScript
+import crypto from "node:crypto";
+
+export function verifyWebhookSignature(
+  secret: string,
+  rawBody: Buffer,
+  signature: string | undefined,
+): boolean {
+  if (!secret || !signature) {
+    return false;
+  }
+  const expected =
+    "sha256=" + crypto.createHmac("sha256", secret).update(rawBody).digest("hex");
+
+  const expectedBuffer = Buffer.from(expected);
+  const signatureBuffer = Buffer.from(signature);
+
+  // timingSafeEqual throws on a length mismatch, so guard before comparing.
+  if (signatureBuffer.length !== expectedBuffer.length) {
+    return false;
+  }
+  return crypto.timingSafeEqual(signatureBuffer, expectedBuffer);
+}
+```
+
+</CodeGroup>
 
 <Warning>
-Fail closed. If the signing secret is missing from your environment, reject the request instead of skipping verification. A verifier that accepts everything when a variable is unset gives no protection.
+Fail closed. If the signing secret is missing from your environment, reject the request rather than skipping verification. A verifier that silently accepts everything when a variable is unset is worse than no verifier, because it looks like it is protecting you.
 </Warning>
 
 ---
 
 ## 6. Receiver examples
 
-Return a `2xx` quickly and do slow work after you acknowledge the request. Both handlers read the **raw** body before parsing.
+Your endpoint should return a `2xx` response quickly. Do any slow work after you acknowledge the request.
+
+These wire the verifier above into a real handler. Note that both read the **raw** body before parsing.
 
 <CodeGroup>
 
@@ -457,19 +564,25 @@ app.listen(3000);
 
 ## 7. Delivery and retries
 
-HydraDB records every delivery attempt. See the history on the dashboard Webhooks page or with the API below.
+HydraDB records every delivery attempt. You can inspect delivery history from the dashboard Webhooks page.
 
 Delivery states:
 
-- `pending`: the event was recorded and is waiting to be sent.
-- `sweeping`: HydraDB has claimed the event for delivery or retry.
-- `delivered`: your endpoint returned a successful status code.
-- `failed`: the current send attempt failed and will be retried.
-- `permanently_failed`: HydraDB stopped retrying this event. On HydraDB Cloud this happens after 16 attempts.
+| State | Meaning |
+|---|---|
+| `pending` | The event was recorded and is waiting to be sent. |
+| `sweeping` | HydraDB has claimed the event for delivery or retry. |
+| `delivered` | Your endpoint returned a successful status code. |
+| `failed` | The current send attempt failed and will be retried. |
+| `permanently_failed` | HydraDB stopped retrying this event. On HydraDB Cloud this happens after 16 attempts. |
 
-Failed deliveries retry in the background, and the sweep process recovers events from a worker that shut down mid-delivery. To resend a `failed` or `permanently_failed` delivery yourself, see [Retry a failed delivery](#retry-a-failed-delivery).
+HydraDB retries failed deliveries in the background. If a worker shuts down during delivery, the sweep process recovers the event later.
 
-Make your receiver idempotent: store `delivery_id`, return `2xx` without repeating side effects on a repeat, and do not depend on exactly-once delivery.
+Your receiver should be idempotent:
+
+- Store `delivery_id`.
+- If the same `delivery_id` arrives again, return `2xx` without repeating side effects.
+- Do not depend on receiving events exactly once.
 
 ### List deliveries with cURL
 
@@ -512,11 +625,17 @@ curl 'https://api.hydradb.com/webhooks/indexing/deliveries?limit=20&status=faile
   -H "API-Version: 2"
 ```
 
-`status` accepts any delivery state above: `pending`, `sweeping`, `delivered`, `failed`, or `permanently_failed`.
+Valid filters are:
+
+- `pending`
+- `sweeping`
+- `delivered`
+- `failed`
+- `permanently_failed`
 
 ### Paginate deliveries
 
-When `next_cursor` is not `null`, pass it back as `cursor`. `limit` can be between `1` and `100`.
+When `next_cursor` is not `null`, pass it back as `cursor`.
 
 ```bash cURL
 curl 'https://api.hydradb.com/webhooks/indexing/deliveries?limit=20&cursor=<next_cursor>' \
@@ -524,9 +643,11 @@ curl 'https://api.hydradb.com/webhooks/indexing/deliveries?limit=20&cursor=<next
   -H "API-Version: 2"
 ```
 
+`limit` can be between `1` and `100`.
+
 ### Get one delivery
 
-Replace `<delivery_id>` with a value from a webhook payload or the delivery list.
+Replace `<delivery_id>` with a value from a webhook payload or from the delivery list response.
 
 ```bash cURL
 curl 'https://api.hydradb.com/webhooks/indexing/deliveries/<delivery_id>' \
@@ -560,20 +681,22 @@ curl -X POST 'https://api.hydradb.com/webhooks/indexing/deliveries/<delivery_id>
 
 ### Zero-downtime key rotation
 
-HydraDB signs each delivery with exactly one secret, so a plain rotation leaves a window where your receiver rejects deliveries signed with a secret it does not have yet. The overlap has to live in your receiver, which accepts both secrets during the changeover. So you need the new secret before HydraDB uses it: supply it yourself instead of generating one.
+Rotating takes effect immediately and HydraDB signs each delivery with exactly one secret, so a naive rotation leaves a window where deliveries are signed with a secret your receiver does not have yet. Every delivery in that window fails verification, and a correct receiver rejects them.
+
+The fix is to make the change on your side first, and overlap the two secrets in your own receiver. That requires knowing the new secret before HydraDB starts using it, which is why you supply it yourself rather than having one generated.
 
 <Steps>
   <Step title="Choose the new secret yourself">
-    Generate a high-entropy value with your own tooling, for example `openssl rand -base64 32`. Do not use the generate option: a generated secret is only revealed after it is already in effect.
+    Generate a high-entropy value with your own tooling, for example `openssl rand -base64 32`. Do not use the generate option here: a generated secret is only revealed after it is already in effect, which is exactly the window you are trying to avoid.
   </Step>
   <Step title="Teach your receiver both secrets">
-    Deploy your receiver so it accepts either secret, reading both from your environment. Deliveries still verify against the old one.
+    Deploy your receiver so it accepts either the current secret or the new one, reading both from your environment. At this point nothing has changed on the HydraDB side, so every delivery still verifies against the old secret.
   </Step>
   <Step title="Rotate in HydraDB, supplying that secret">
-    In the dashboard, open **Rotate**, tick **I'll use my own secret**, and paste the value. Over the API, `POST /webhooks/indexing/signing-secret` with a `signing_secret` body. Deliveries switch immediately, and your receiver already accepts the new secret.
+    In the dashboard, open **Rotate**, tick **I'll use my own secret**, and paste the value. Over the API, `POST /webhooks/indexing/signing-secret` with a `signing_secret` body. Deliveries switch to the new secret immediately, and your receiver already accepts it.
   </Step>
   <Step title="Retire the old secret">
-    Once deliveries verify against the new secret, remove the old one from your receiver and redeploy. Keep this window short.
+    Once you have confirmed deliveries are verifying against the new secret, remove the old one from your receiver and redeploy. You are back to a single active secret.
   </Step>
 </Steps>
 
@@ -633,25 +756,33 @@ export function verifyWebhookSignature(rawBody: Buffer, signature: string | unde
 
 </CodeGroup>
 
+<Note>
+The overlap lives in your receiver, not in HydraDB. Each delivery carries a single `X-HydraDB-Signature` value, so accepting two secrets is something your code does during the changeover. Keep the window short and remove the old secret once the rotation is confirmed.
+</Note>
+
 ---
 
 ## 9. Security checklist
 
 - Use HTTPS for your webhook URL.
-- Enable signing and let HydraDB generate the secret. An invented secret is usually far weaker than one from a CSPRNG.
-- Verify `X-HydraDB-Signature` over the raw body with a constant-time comparison, and fail closed.
-- Keep the secret in your secret manager, not in source control.
-- Return `2xx` only after you accept the event, and queue slow work.
+- Enable signing and let HydraDB generate the secret. A secret you invent yourself is usually far weaker than one from a CSPRNG, and a weak secret makes the signature decorative.
+- Verify `X-HydraDB-Signature` using the raw request body, with a constant-time comparison.
+- Fail closed. Reject the request when the secret is missing from your environment, rather than skipping verification.
+- Store the secret as a secret. It belongs in your secret manager, not in source control.
+- Return `2xx` only after you accept the event.
 - Deduplicate using `delivery_id`.
+- Keep the endpoint fast. Put slow work in a queue or background job.
 
 ---
 
 ## 10. Common issues
 
-- **Test delivery fails:** confirm your endpoint is public and returns a `2xx` status.
-- **Signature check fails:** check the [three signature details](#3-request-format): raw body, the whole header value including `sha256=`, and lowercase hex.
-- **Signature header is missing:** signing is not configured. Call `POST /webhooks/indexing/signing-secret` to enable it.
-- **Signatures started failing after a rotation:** rotation applies immediately. Deploy the new secret to your receiver. See [Zero-downtime key rotation](#zero-downtime-key-rotation).
-- **Event arrives more than once:** expected during retries. Deduplicate with `delivery_id`.
-- **Event never arrives:** check the delivery history for `failed` or `permanently_failed`.
-- **`id` is unexpected:** it is the ID you supplied at ingestion: a document ID, memory ID, or app item ID.
+| Issue | What to check |
+|---|---|
+| Test delivery fails | Confirm your endpoint is public and returns a `2xx` status. |
+| Signature check fails | Verify the HMAC is computed over the raw request body, not parsed JSON. Check you are comparing against the whole header value including the `sha256=` prefix, and that the digest is lowercase hex rather than base64. |
+| Signature header is missing | Signing is not configured. Call `POST /webhooks/indexing/signing-secret` to enable it. |
+| Signatures started failing after a rotation | Rotation applies immediately. Confirm your receiver has the new secret deployed, and see [Zero-downtime key rotation](#zero-downtime-key-rotation) to avoid the gap next time. |
+| Event arrives more than once | This is expected during retries. Deduplicate with `delivery_id`. |
+| Event never arrives | Check the dashboard delivery history for `failed` or `permanently_failed`. |
+| `id` is unexpected | It is the ID you supplied at ingestion, such as document ID, memory ID, or app item ID. |

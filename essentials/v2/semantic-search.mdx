@@ -1,53 +1,58 @@
 ---
 title: "Semantic Search & Retrieval"
-description: "How meaning, keywords, the graph, and metadata filters combine in one query."
+description: "How semantic, keyword bm25, graph, and metadata signals work together in HydraDB query."
 ---
 
-Semantic search matches by meaning, so a paraphrase still finds the right text. `POST /query` combines it with keyword matching, the graph, and scope (database isolation and metadata filters) in one call. There is no separate vector-only endpoint.
-
----
-
-## Semantic, keyword BM25, and graph
-
-- **Semantic:** finds text with similar meaning. Best for natural-language questions, paraphrases, and conceptual lookup.
-- **Keyword BM25:** finds text with matching tokens. Best for error codes, identifiers, names, SKUs, and exact phrases.
-- **Graph:** finds related entities and relationships. Best for multi-hop questions, dependencies, ownership, and project context.
-
-Metadata filters sit on top of all three and decide what is allowed to come back. On `POST /query`:
-
-- **`type`:** what to search. `"knowledge"`, `"memory"` (user-scoped), or `"all"` (both from the same scope, ranked together).
-- **`query_by`:** how to match. `"hybrid"` (semantic plus BM25, the default) or `"text"` (BM25 only, with `operator: "or" | "and" | "phrase"`, default `"or"`).
-- **`graph_context`:** adds the graph. On by default.
+Semantic search is useful because it retrieves by meaning instead of exact wording. It is also incomplete on its own: production agents need exact matches, freshness, scope, database isolation, metadata filters, and graph relationships. HydraDB query combines those signals so you can retrieve context that is useful, not just similar.
 
 ---
 
-## Why pure semantic search breaks
+## Semantic vs Keyword BM25
 
-On its own, vector search misses exact matches, freshness, and relationships:
+| Query Type | Finds | Best For |
+|---|---|---|
+| Semantic | Text with similar meaning | Natural-language questions, paraphrases, conceptual lookup |
+| Keyword BM25 | Text with matching tokens | Error codes, identifiers, names, SKUs, exact phrases |
+| Graph | Related entities and relationships | Multi-hop questions, dependencies, ownership, project context |
+
+`POST /query` is the unified retrieval endpoint. Two parameters decide what runs:
+
+- **`type`** picks the store: `"knowledge"` (Knowledge), `"memory"` (user-scoped Memories), or `"all"` (both from the same scope, merged and re-ranked together).
+- **`query_by`** picks the retrieval method: `"hybrid"` (semantic + BM25, the default) or `"text"` (BM25 only, with `operator: "or" | "and" | "phrase"`, default `"or"`).
+
+---
+
+## Why Pure Semantic Search Breaks
+
+Pure vector search can miss important production constraints:
 
 - Exact identifiers such as `E_AUTH_429` or `payments-worker-v4` may be generalized away.
-- A project name can collide with a normal word, like `strawberry` the project and strawberry the fruit.
-- Old and new documents look equally relevant without recency or metadata signals.
+- A project name can collide with a normal word, like `strawberry` the project vs strawberry the fruit.
+- Old and new documents can look equally relevant without recency or metadata signals.
 - Different users can need different context for the same query.
-- Relationship questions need graph context, not only similar chunks.
+- Relationship questions need graph context, not only similar text chunks.
+
+That is why HydraDB exposes semantic retrieval through `query_by: "hybrid"` inside the unified `/query` endpoint rather than as a separate pure-vector mode.
 
 ---
 
-## The `alpha` parameter
+## The `alpha` Parameter
 
-`alpha` sets the semantic versus BM25 blend when `query_by: "hybrid"`. Higher values lean semantic. It is ignored for `query_by: "text"`.
+`alpha` controls the semantic-vs-keyword-bm25 blend when `query_by: "hybrid"`. Higher values lean semantic. Lower values lean keyword bm25.
 
-- `1.0`: semantic-heavy. For conceptual questions and paraphrases.
-- `0.8`: the default, a semantic-leaning hybrid. For most agent queries.
-- `0.5`: balanced. For mixed natural language and exact terms.
-- `0.2`: BM25-leaning. For queries with product names, error strings, or IDs.
-- `0.0`: BM25-heavy. For debugging exact-match behavior.
+| `alpha` | Behavior | Use When |
+|---|---|---|
+| `1.0` | Semantic-heavy | Conceptual questions and paraphrases |
+| `0.8` | Default semantic-leaning hybrid | Most agent query workflows |
+| `0.5` | Balanced | Mixed natural language and exact terms |
+| `0.2` | Keyword BM25-leaning | Queries with product names, error strings, or IDs |
+| `0.0` | Keyword BM25-heavy | Debugging exact-match behavior |
 
-Start with the default (`0.8`, which `"auto"` also resolves to). Lower it if exact-ID queries return loosely related content. Raise it if broad questions return sparse results.
+Start with the API default (`0.8`; `"auto"` also resolves to `0.8`) and tune from observed results. If users query for exact IDs and get loosely related content, lower `alpha`. If they ask broad conceptual questions and get sparse results, raise it. `alpha` applies only to `query_by: "hybrid"`; it is ignored for `"text"`.
 
 ---
 
-## Query request example
+## Query Request Example
 
 <CodeGroup>
 
@@ -104,15 +109,15 @@ result = client.query(
 
 </CodeGroup>
 
-`metadata_filters` are exact constraints. They run before ranking and are checked again on the loaded results. Top-level keys match `metadata` and take `equals`, `contains`, or `contains_any`. There is no range or fuzzy match. Nest keys under `additional_metadata` to filter free-form per-document fields. See [Metadata](/essentials/v2/metadata).
+`metadata_filters` are exact constraints that run before ranking and are re-checked after hydration. Use them whenever the query has a scope that should not be violated. Top-level keys match `metadata` and support `equals`, `contains`, and `contains_any` (no range or fuzzy match); nest under `additional_metadata` to filter free-form per-document fields.
 
 ---
 
-## Recipes
+## Practical Recipes
 
-### General retrieval
+### General Retrieval
 
-The default semantic-leaning blend, for natural-language questions.
+Use the default semantic-leaning blend for natural-language questions over documents.
 
 <CodeGroup>
 
@@ -155,7 +160,7 @@ result = client.query(
 
 </CodeGroup>
 
-### Technical lookup
+### Technical Lookup
 
 Lower `alpha` when names, IDs, and literal strings matter.
 
@@ -203,9 +208,9 @@ result = client.query(
 
 </CodeGroup>
 
-### Scoped retrieval
+### Scoped Retrieval
 
-Metadata filters keep retrieval inside a project, team, customer, data class, or source.
+Use metadata filters to keep retrieval inside a project, team, customer, data class, or source.
 
 <CodeGroup>
 
@@ -250,9 +255,9 @@ result = client.query(
 
 </CodeGroup>
 
-### Exact phrase query
+### Exact Phrase Query
 
-Use `query_by: "text"` with `operator: "phrase"` when a literal match is the point.
+Switch to `query_by: "text"` with `operator: "phrase"` when a literal match is the point of the query.
 
 <CodeGroup>
 
@@ -297,9 +302,22 @@ result = client.query(
 
 ---
 
-## Reading the response
+## Reading The Response
 
-`POST /query` returns ranked chunks and source metadata, not an answer. Format `chunk_content`, source titles, and graph context into a prompt, and ask your LLM to answer only from that context. Examples: [How to Use API Results](/essentials/v2/api-results).
+`POST /query` returns ranked chunks and source metadata, not an answer. A typical application flow is:
+
+1. Call `POST /query` with the right `type` and `query_by` for the query.
+2. Keep the chunks that are relevant enough for your use case.
+3. Format `chunk_content`, source titles, and graph context into a prompt.
+4. Ask your LLM to answer using only that context.
+
+See [How to Use API Results](/essentials/v2/api-results) for complete context-building examples.
+
+---
+
+## Mental Model
+
+Semantic search finds text that means the same thing. Keyword BM25 search finds text that says the same thing. Graph context finds connected entities. Metadata filters decide what is allowed to be queried. `POST /query` combines all four behind one endpoint via `type`, `query_by`, `metadata_filters`, and `graph_context` so your agents get context that is scoped, relevant, and explainable.
 
 ---
 

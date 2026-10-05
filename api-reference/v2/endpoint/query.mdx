@@ -6,13 +6,19 @@ openapi: "api-reference/v2/openapi.json POST /query"
 
 import { Field } from "/snippets/field.jsx";
 
-The one retrieval endpoint: grounded context for an LLM, a user's preferences, or chunks ranked by relevance. Three independent choices control it:
+The single retrieval endpoint for everything. Use it any time you need to feed an LLM with grounded context, surface user preferences, or fetch chunks ranked by relevance.
 
-- **`type`:** what to query. `"knowledge"` (default) for documents, files, and app sources; `"memory"` for user memories and preferences; `"all"` for both, merged and re-ranked together, for personalized answers.
-- **`query_by`:** how to match. `"hybrid"` (default) is semantic plus BM25, for general retrieval. `"text"` is BM25 only, for exact terms, compliance lookups, and phrases; pair it with `operator`.
-- **`mode`:** how to rank. `"fast"`, `"thinking"`, or `"auto"`. **`"auto"` is the default when you omit `mode`.** See [Modes](#decision-matrix).
+Three independent dimensions control behavior:
 
-To pick a configuration for your use case, see [Recommended configurations](/api-reference/v2/endpoint/query-overview#recommended-configurations).
+- **`type`** picks **what** to query: `"knowledge"`, `"memory"`, or `"all"` (both, merged and re-ranked together).
+- **`query_by`** picks **how** to match: `"hybrid"` (semantic + BM25, the default) or `"text"` (BM25 only; pair with `operator`).
+- **`mode`** picks **how** to rank results: `"fast"` (single-pass, low-latency), `"thinking"` (expands query, reranks, and can include forceful-relation context), or `"auto"` (scores the query and routes to `"fast"` or `"thinking"` automatically, defaulting to `"thinking"` when the signal is inconclusive; **the default if `mode` is omitted**).
+
+Read more about choosing the perfect mode for your use case [here](/api-reference/v2/endpoint/query-overview#recommended-configurations).
+
+<Note>
+`database` and `collection` are the current field names (formerly `tenant_id` and `sub_tenant_id`). The old names remain accepted as deprecated aliases for full backward compatibility.
+</Note>
 
 <RequestExample>
 
@@ -123,7 +129,7 @@ curl -X POST 'https://api.hydradb.com/query' \
 
 ### Querying multiple collections
 
-Use `collections` to fan the whole query out across several user, workspace, or team scopes and merge the results. Send a list or a weighted object:
+Use `collections` when one query should fan out across multiple user, workspace, or team scopes. The field accepts either a list or a weighted object:
 
 ```json Equal weighting
 {
@@ -146,19 +152,13 @@ Use `collections` to fan the whole query out across several user, workspace, or 
 }
 ```
 
-- **List:** every collection gets equal normalized weight.
-- **Object:** HydraDB normalizes the weights server-side. Limits are in the `collections` row below.
-- **`max_results` omitted:** HydraDB takes up to 10 results per collection, capped at 1000 fanout candidates, before shaping the final ranked response.
-- **`max_results` set:** it caps the final response across the merged results.
-- **Missing collections:** every listed collection must exist, or the call returns `400 INVALID_INPUT` naming the missing ones.
+A list gives every collection equal normalized weight. An object treats values as positive relative ranking weights with at most one decimal place and normalizes them server-side. You can send at most 100 collections. When `max_results` is omitted, HydraDB uses up to 10 results per collection, capped at 1000 fanout candidates before the final ranked response is shaped. When `max_results` is set, it is the final global response cap across the merged fanout result set. Every listed collection must exist, or the call returns `400 INVALID_INPUT` naming the missing ones.
 
-<Tip>
-**Caching:** list order does not affect fanout selection. Sort list values, or the keys of a weighted object with weights at one decimal place, before you build cache keys, so equivalent calls share a cache entry.
-</Tip>
+> **Caching tip:** `collections` list order is not semantically significant for fanout selection. Sort list values before constructing cache keys; for weighted objects, sort keys and keep weights at the documented one-decimal precision so equivalent calls share the same cache entry.
 
-### Turning the response into LLM context
+### Transforming the response into LLM context
 
-The SDK's `build_string` (Python) or `buildString` (TypeScript) turns any `POST /query` result into a formatted plain string.
+Use `build_string` / `buildString` from the SDK. It takes any `POST /query` result and returns a formatted plain string.
 
 <CodeGroup>
 ```python Python SDK
@@ -201,7 +201,10 @@ const context = buildString(result);
 ```
 </CodeGroup>
 
-## Common use cases
+
+
+
+## Common use-cases and their configurations
 
 <AccordionGroup>
   <Accordion title="1. Knowledge RAG: answer from shared documents">
@@ -293,7 +296,7 @@ result = client.query(
     </CodeGroup>
   </Accordion>
 
-  <Accordion title="3. User preferences: query only user memories">
+  <Accordion title="3. Retrieve user preferences: query only user memories">
     <CodeGroup>
 
 ```bash cURL
@@ -415,7 +418,7 @@ result = client.query(
 
     </CodeGroup>
 
-    A query that names several distinct entities, like this one, is likely to route to `"thinking"`.
+    HydraDB scores the query before retrieval and routes it to `"fast"` or `"thinking"`: a query naming several distinct entities like this one is likely to route to `"thinking"`. Use `"auto"` for traffic where query complexity varies call-to-call and you don't want to hand-pick per request. This is also the default: an omitted `mode` field behaves exactly like `mode: "auto"`. Set `mode` to `"fast"` or `"thinking"` explicitly if you want a deterministic pipeline instead.
   </Accordion>
 </AccordionGroup>
 
@@ -423,44 +426,64 @@ result = client.query(
 
 | Name | Description |
 | --- | --- |
-| <Field name="database" type="string" required /> | Owning database. Deprecated alias: `tenant_id`. |
-| <Field name="collection" type="string or null" /> | Single collection scope, for example one user's memories. Deprecated alias: `sub_tenant_id`. (default=default collection) |
-| <Field name="collections" type="string[] or object" /> | Multi-collection scope: a list of collection IDs for equal weighting, or an object mapping each ID to a positive relative weight with at most one decimal place (e.g. `{"finance": 1.5, "legal": 0.8}`). Up to 100 collections. Do not combine with `collection`/`sub_tenant_id`. Deprecated alias: `sub_tenant_ids` (since 2.0.1). |
+| <Field name="database" type="string" required /> | Owning database. Formerly `tenant_id`; the `tenant_id` alias is still accepted (deprecated). |
+| <Field name="collection" type="string or null" /> | Single collection scope. Required for per-user memory queries. Formerly `sub_tenant_id`; the `sub_tenant_id` alias is still accepted (deprecated). (default=default collection) |
+| <Field name="collections" type="string[] or object" /> | Multi-collection scope. Send a list of collection IDs for equal weighting, or an object mapping collection ID to a positive relative weight (at most one decimal place, e.g. `{"finance": 1.5, "legal": 0.8}`) to bias ranking. Up to 100 collections. Do not combine with `collection`/`sub_tenant_id`. Formerly `sub_tenant_ids`; the `sub_tenant_ids` alias is still accepted (deprecated since 2.0.1). |
 | <Field name="query" type="string" required /> | Query terms or natural-language question. Cannot be empty. |
 | <Field name="type" type='"knowledge" or "memory" or "all"' /> | What to query. `"all"` runs knowledge and memory in parallel over the same scope and merges by `relevancy_score`. (default=`"knowledge"`) |
-| <Field name="query_by" type='"hybrid" or "text"' /> | Retrieval method. (default=`"hybrid"`) |
-| <Field name="query_apps" type="boolean" /> | Applies to knowledge queries only. Adds an app-aware lane for app sources (thread and relation traversal, exact IDs, actor and provider hints) on top of the full selected knowledge scope. It does **not** limit the query to app sources. Send `false` to turn the lane off. (default=`true`) |
+| <Field name="query_by" type='"hybrid" or "text"' /> | Retrieval method. See [Query methods](#decision-matrix). (default=`"hybrid"`) |
+| <Field name="query_apps" type="boolean" /> | Applies to knowledge queries only. Adds an app-aware retrieval lane for app sources while still querying the full selected knowledge scope, for better app-source matching, thread/relation traversal, exact IDs, and actor/provider hints. It does **not** limit query to only app sources. Send `false` to turn the lane off. (default=`true`) |
 | <Field name="operator" type='"or" or "and" or "phrase"' /> | BM25 operator for `query_by: "text"`. `"and"` or `"phrase"` with any other `query_by` returns `400`. (default=`"or"`) |
-| <Field name="mode" type='"fast", "thinking", or "auto"' /> | Retrieval pipeline, for `hybrid` only (ignored for `text`). `"auto"` scores the query before retrieval and resolves it to `"fast"` or `"thinking"`, picking `"thinking"` when the signal is inconclusive. See [Modes](#decision-matrix). (default=`"auto"`) |
-| <Field name="max_results" type="integer or null" /> | Maximum chunks to return. Default `10`; maximum `250`. |
-| <Field name="alpha" type='float 0.0 to 1.0, or "auto"' /> | Hybrid weight (`1.0` is pure semantic, `0.0` is pure BM25), for `query_by: "hybrid"` only. `"auto"` currently resolves to `0.8`. (default=`0.8`) |
+| <Field name="mode" type='"fast", "thinking", or "auto"' /> | Retrieval pipeline. Applies to `hybrid` only; ignored for `text`. `"auto"` scores the query before retrieval and resolves it to `"fast"` or `"thinking"`, defaulting to `"thinking"` when the signal is inconclusive. (default=`"auto"`) |
+| <Field name="max_results" type="integer or null" /> | Maximum chunks to return. Default `10`; maximum `250`. Start with `10`, use `5` for tight prompts, and increase only when reranking downstream. |
+| <Field name="alpha" type='float 0.0 to 1.0, or "auto"' /> | Hybrid weight (`1.0` = pure semantic, `0.0` = pure BM25). Applies to `query_by: "hybrid"` only. `"auto"` currently resolves to `0.8`. (default=`0.8`) |
 | <Field name="recency_bias" type="float 0.0 to 1.0" /> | Boost newer content. Omitted applies a mild `0.4` tilt; send `0` to turn it off. (default=`0.4`) |
-| <Field name="graph_context" type="boolean" /> | Include the entity and relation graph slice under `graph_context`. `false` only takes effect in `fast` mode: `thinking`, and `auto` when it resolves to thinking, always include it. Relations from [Bring Your Own Graph](/essentials/v2/bring-your-own-graph) appear the same way as extracted ones. (default=`true`) |
-| <Field name="query_forceful_relations" type="boolean" /> | Pull author-declared related sources into `additional_context`. **Only takes effect when `mode` resolves to `"thinking"`;** silently ignored in `fast`. (default=`true`) |
-| <Field name="additional_context" type="string or null" /> | Request-time hint to guide retrieval (for example, "user is on the billing page"). Not the same as the response `additional_context` map. (default=`null`) |
-| <Field name="metadata_filters" type="object or null" /> | Hard filters applied before ranking. See [Filters](#decision-matrix). Each list holds at most 500 values, and the object is capped at 64 KiB of compact JSON, measured after operator objects are reduced to their values. Over either returns `400`. (default=`null`) |
+| <Field name="graph_context" type="boolean" /> | When `true`, includes the entity/relation graph slice in the response under `graph_context`. Set to `false` when you only need ranked chunks. Relations you supplied via [Bring Your Own Graph](/essentials/v2/bring-your-own-graph) appear here identically to extracted ones. (default=`true`). **`false` only takes effect in `fast` mode: `thinking`, and `auto` when it resolves to thinking, always include the graph slice.** |
+| <Field name="query_forceful_relations" type="boolean" /> | Pull author-declared related sources into `additional_context`. **Only takes effect when `mode` resolves to `"thinking"`;** silently skipped in `fast` mode, and under `mode: "auto"` whether it takes effect depends on the automatic routing decision. (default=`true`) |
+| <Field name="additional_context" type="string or null" /> | Request-time hint to guide retrieval (e.g., "user is on the billing page"). This is different from the response `additional_context` map. (default=`null`) |
+| <Field name="metadata_filters" type="object or null" /> | Deterministic narrowing before ranking. See [Filters](#decision-matrix). Each list holds at most 500 values, and the whole object is capped at 64 KiB of compact JSON, measured after operator objects are reduced to their values; over either returns `400`. (default=`null`) |
 
 <Tip>
-**Tuning heuristics:**
-
-- **`alpha`:** start at `0.8`. Lower it toward `0.3` to `0.5` for literal tokens (error codes, SKUs, product names). Raise it toward `0.9` for conceptual questions.
-- **`recency_bias`:** set it to `0` for static reference material. Use `0.2` to `0.4` for mixed content, and `0.6` to `0.8` for changelogs, news, or status updates.
-- **`max_results`:** start at `10`. Drop to `5` for tight context windows. Raise to `20` if you rerank downstream.
+**Tuning heuristics.**
+<ul>
+  <li><strong><code>alpha</code></strong>: start at <code>0.8</code>. Lower toward <code>0.3</code> to <code>0.5</code> when the query contains literal tokens (error codes, SKUs, product names). Raise toward <code>0.9</code> for conceptual questions.</li>
+  <li><strong><code>recency_bias</code></strong>: set to <code>0</code> for static reference material. Set <code>0.2</code> to <code>0.4</code> for mixed content, <code>0.6</code> to <code>0.8</code> for changelogs, news, or status updates.</li>
+  <li><strong><code>max_results</code></strong>: start at <code>10</code>. Drop to <code>5</code> for tight context windows; raise to <code>20</code> if you rerank downstream.</li>
+</ul>
 </Tip>
 
 ### Decision matrix
 
 <AccordionGroup>
+  <Accordion title="Type selection">
+    | Value | Queries | Best for |
+    |---|---|---|
+    | `"knowledge"` *(default)* | Knowledge documents, files, and app sources, plus an app-aware lane unless `query_apps` is `false` | Document Q&A, RAG context. |
+    | `"memory"` | User memories | Personalization and user preferences. |
+    | `"all"` | Both, merged in one ranked result set | Personalized answers grounded in both shared and user-specific context. |
+  </Accordion>
+
+  <Accordion title="Query methods">
+    | Method | Pipeline | Best for |
+    |---|---|---|
+    | `"hybrid"` *(default)* | Dense vectors + BM25 keyword | General-purpose retrieval and RAG. |
+    | `"text"` | BM25 only | Exact terms, compliance lookups, phrase query. Pair with `operator`. |
+  </Accordion>
+
   <Accordion title="Modes">
     For `query_by: "hybrid"`:
 
-    - **`"fast"`:** a single query pass, for real-time chat, autocomplete, and simple lookups.
-    - **`"thinking"`:** multi-query expansion, reranking, and forceful-relation context, for complex queries and customer-facing answers.
-    - **`"auto"` (default):** routes each query to `"fast"` or `"thinking"`, for mixed or unpredictable traffic. The response does not report which pipeline it picked, so budget for thinking-level latency.
+    | Mode | Behavior | When to use |
+    |---|---|---|
+    | `"fast"` | Single query pass | Real-time chat, autocomplete, simple lookups. |
+    | `"thinking"` | Multi-query expansion + reranking + forceful-relation context | Complex queries, customer-facing answers, anything where quality matters. |
+    | `"auto"` *(default if `mode` is omitted)* | Scores the query before retrieval and routes to `"fast"` or `"thinking"`; defaults to `"thinking"` when the signal is inconclusive. | Mixed or unpredictable query traffic where you don't want to hand-pick per request. |
+
+    `"auto"`'s resolved pipeline isn't reported back in the response, so budget latency as thinking-level in the worst case. Omitting `mode` behaves exactly like `mode: "auto"`; set it explicitly to `"fast"` or `"thinking"` if you want a deterministic pipeline instead.
   </Accordion>
 
   <Accordion title="Filters">
-    `metadata_filters` are hard constraints applied before ranking and re-checked after hydration. The object has two scopes:
+    `metadata_filters` are hard constraints applied before ranking and re-checked after hydration. The shape combines two filter scopes:
 
     ```json
     {
@@ -475,10 +498,12 @@ result = client.query(
     }
     ```
 
-    - **Top-level keys** such as `department` and `region` match the source's schema-backed `metadata`. The filter matches stored values, not the schema. In a database with a schema, ingest rejects undeclared keys, so filtering on one returns nothing, except `connector_id` and `provider`, which connectors always write. Declare filter keys in `database_metadata_schema`.
-    - **Keys under `additional_metadata`** match free-form per-document fields, with no schema needed. `document_metadata` is a legacy alias.
+    | Where | What it matches |
+    |---|---|
+    | **Top-level keys** (`department`, `region`) | The source's schema-backed `metadata`. The filter matches stored values, not the schema. In a database with a schema, ingest rejects undeclared keys, so filtering on one returns nothing, except `connector_id` and `provider`, which connectors always write. Declare filter keys in the database's `database_metadata_schema`. |
+    | **Nested under `additional_metadata`** | The source's free-form per-document fields. No schema declaration required. `document_metadata` is accepted as a legacy alias. |
 
-    Separate keys are ANDed. Each top-level `metadata` key takes an operator object:
+    Separate keys are ANDed. Each `metadata` (top-level) key takes an operator object naming the comparison:
 
     | Operator | Value | Matches |
     | --- | --- | --- |
@@ -494,25 +519,23 @@ result = client.query(
     }
     ```
 
-    - Adding values to `contains_any` **widens** the result set. There is no ALL/AND operator within one key, and no range or fuzzy operators; run several queries or post-process client-side.
-    - Operators apply to top-level `metadata` keys only. Inside `additional_metadata`, use a bare scalar for an exact match or a bare array to match any listed value.
+    Adding values to `contains_any` **widens** the result set. There is no ALL/AND operator within a single key, and range and fuzzy operators are not supported; run multiple queries or post-process client-side for those cases.
+
+    Operators apply to `metadata` (top-level keys) only. Inside `additional_metadata`, use a bare scalar for an exact match or a bare array to match any listed value.
 
     <Warning>
-      An operator inside `additional_metadata` is **not** rejected. It is read as an exact match against a stored object, so on a normal field it matches nothing and returns `200` with an empty result.
+      An operator used inside `additional_metadata` is **not** rejected. It is read as an exact-match filter against a stored object, so on a normal field it matches nothing and the request returns `200` with an empty result rather than an error.
     </Warning>
 
     <Note>
-      Bare values still work but are **deprecated**, because the comparison is inferred from the JSON shape. A bare scalar acts as `equals`, a bare array as `contains_any`, and a single-element array as `contains`, so `{"emails": "a@x"}` and `{"emails": ["a@x"]}` return different results.
+      The bare forms still work and are unchanged, but are **deprecated** in favour of the operators, because the comparison they perform is inferred from the JSON shape rather than stated. A bare scalar behaves as `equals`, a bare array as `contains_any`, and a bare single-element array as `contains`, so `{"emails": "a@x"}` and `{"emails": ["a@x"]}` differ by one character and return different results.
     </Note>
 
-    Validation rules:
+    `contains`, `contains_any` and lists are supported on `VARCHAR` fields only: any of them passed for a declared field of another type is rejected with `400 VALIDATION_ERROR`. `equals` works on every declared type, so `{"priority": {"equals": 7}}` is valid on an `INT64` field.
 
-    - **Types:** `contains`, `contains_any`, and lists work on `VARCHAR` fields only; on a declared field of another type they return `400 VALIDATION_ERROR`. `equals` works on every declared type, so `{"priority": {"equals": 7}}` is valid on an `INT64` field.
-    - **Bad operators:** a known operator with the wrong operand type, or several operators in one object, returns `400 INVALID_INPUT`. A **misspelled** operator (`{"contian": "x"}`) does not: it reads as a filter for a stored object with that key and matches nothing.
-    - **Null values:** return `400 INVALID_INPUT`.
-    - **Reserved names:** `contains`, `contains_any`, and `equals` are reserved key names. An object built only from them is read as an operator, so it cannot exact-match a stored object, and one whose keys are ALL operator names is rejected with `400`. Mixing in any other key (`{"contains": "a", "other": 1}`) is unaffected. If you need the reserved shape, rename the nested key or the field.
+    A known operator given the wrong operand type, or several operators in one object, is rejected with `400 INVALID_INPUT`, and so is a `null` filter value. A **misspelled** operator is not: `{"contian": "x"}` is indistinguishable from a filter for a stored object with that key, so it is left alone and matches nothing.
 
-    More examples: [Filter operators](/essentials/v2/metadata#filter-operators).
+    `contains`, `contains_any` and `equals` are reserved key names: an object built only from them is read as an operator and can no longer exact-match a stored object, and an object whose keys are ALL operator names is rejected with `400`. Mixing an operator name with any other key (`{"contains": "a", "other": 1}`) is unaffected. A caller needing the reserved shape must rename the nested key or the field.
   </Accordion>
 </AccordionGroup>
 
@@ -692,41 +715,47 @@ result = client.query(
 
 </ResponseExample>
 
-A query with no matches returns empty arrays and maps, not an error (see the **Zero results** tab).
+A zero-result query returns empty arrays/maps rather than an error, as shown in the **Zero results** tab.
 
 ## Behavior notes
 
-<Warning>
-**Common mistakes:**
+<Info>
+**Default Behaviors**
+- **`mode` defaults to `"auto"`.** Omitting `mode` entirely behaves exactly like `mode: "auto"`; set it explicitly to `"fast"` or `"thinking"` if you want a deterministic pipeline.
+- **`graph_context` is on by default.** Set it to `false` if you only need ranked chunks and want to drop the graph slice from the response. `false` only takes effect in `fast` mode.
+- **`recency_bias` applies a mild tilt by default.** Defaults to `0.4`; send `0` to turn the recency boost off.
+</Info>
 
-- **An omitted `mode` means `"auto"`, not `"fast"`:** under `auto`, `graph_context: false` and `query_forceful_relations` depend on each request's routing, and the response does not say which applied. In `fast`, forceful relations are silently skipped and `additional_context` is empty. Set `mode` to `"fast"` or `"thinking"` explicitly for a deterministic pipeline, and call `"fast"` if you never want the graph.
-- **Relation `timestamp` is a Unix epoch float here:** in `graph_context`, and in the relations [List Documents](/api-reference/v2/endpoint/list-documents) returns with `include_fields: ["relations"]`, each relation's `timestamp` is in seconds (for example `1778573640.0`). [Context Relations](/api-reference/v2/endpoint/source-relations) returns an ISO-8601 string. Normalize before comparing across endpoints.
-- **Query before indexing finishes:** check [Ingestion Status](/api-reference/v2/endpoint/source-status) for recently ingested documents first.
-- **Wrong collection:** an omitted `collection` queries the default collection, and a query that names a collection does not read the default one. Use [List Collections](/api-reference/v2/endpoint/list-sub-tenants) to find IDs.
+<Warning>
+**Important Considerations & Common Mistakes**
+- **`query_forceful_relations` requires `mode` to resolve to `"thinking"`.** In `fast` mode the flag is silently skipped. The server does not error or warn; your `additional_context` will simply be empty. Under `mode: "auto"` this depends on that request's routing decision, not on what you asked for.
+- **`graph_context: false` only takes effect in `fast` mode.** `thinking` always includes the graph slice, so under `mode: "auto"` whether `false` is honored depends on that request's routing decision. This also applies when `mode` is omitted, since it defaults to `"auto"`. Call `"fast"` explicitly if you never want the graph slice.
+- **Want a deterministic pipeline instead of automatic routing?** Set `mode` explicitly to `"fast"` or `"thinking"`; an omitted `mode` field now defaults to `"auto"`, not `"fast"`.
+- **Relation `timestamp` is a Unix epoch float here.** In the `graph_context` slice returned by `/query` (and in the passthrough relations returned by [List Documents](/api-reference/v2/endpoint/list-documents) with `include_fields: ["relations"]`), each relation's `timestamp` is a Unix epoch value in seconds (a float, e.g. `1778573640.0`). The dedicated [Context Relations](/api-reference/v2/endpoint/source-relations) endpoint returns the same field as an ISO-8601 string instead. Normalize before comparing relation timestamps across endpoints.
+- **Use the right metadata namespace.** Top-level `metadata_filters` keys match `metadata`; free-form per-document fields must be nested under `additional_metadata` (`document_metadata` is only a legacy alias). Declare hot top-level filter fields in `database_metadata_schema`.
+- **Common mistakes.** Check [Ingestion Status](/api-reference/v2/endpoint/source-status) for recently ingested documents before querying. If you omit `collection`, HydraDB queries the default collection, and a query that names a collection does not read the default one; use [List Collections](/api-reference/v2/endpoint/list-sub-tenants) to discover available IDs.
 </Warning>
 
 ## Errors
 
-Common codes:
+Common codes: `400 INVALID_INPUT` (empty `query`, `operator: "and"` or `"phrase"` without `query_by: "text"`, a malformed filter operator, or a listed collection that does not exist), `400 VALIDATION_ERROR` (a metadata filter that does not fit the declared field type), `404 DATABASE_NOT_FOUND`, `422 TENANT_INFRA_NOT_READY` (the database is still provisioning; poll [Database Status](/api-reference/v2/endpoint/tenant-status) until `ready_for_ingestion` is `true`), `500 INTERNAL_ERROR`. See [Error Responses](/api-reference/v2/error-responses) for the full list.
 
-- `400 INVALID_INPUT`: the request failed validation, for example an empty `query`, `operator: "and"` without `query_by: "text"`, a malformed filter operator, or a listed collection that does not exist.
-- `400` for oversized filters: a `metadata_filters` list above 500 values, or an object above 64 KiB of compact JSON. The message names the offending key or reports the byte count. See [Filter size limits](/essentials/v2/metadata#filter-size-limits).
-- `400 VALIDATION_ERROR`: a metadata filter does not fit the declared field type, such as `contains` on an `INT64` field.
-- `404 DATABASE_NOT_FOUND`: the database does not exist.
-- `422 TENANT_INFRA_NOT_READY`: the database is still provisioning. Poll [Database Status](/api-reference/v2/endpoint/tenant-status) until `ready_for_ingestion` is `true`, then retry.
-- `429 RATE_LIMITED`, `500 INTERNAL_ERROR`, `503 SERVICE_UNAVAILABLE`: transient. Retry with backoff.
-
-See [Error Responses](/api-reference/v2/error-responses) for the full list.
+`400` also covers oversized filters: a `metadata_filters` list above 500 values, or
+a `metadata_filters` object above 64 KiB of compact JSON. The message names the
+offending key or reports the actual byte count. See
+[Filter size limits](/essentials/v2/metadata#filter-size-limits).
 
 <div className="api-before-related-resources" />
 
 <Tip>
 **Related Resources**
 
-- **Setup first:** [Ingest Context](/api-reference/v2/endpoint/ingest-context). Content must be indexed.
-- **Confirm indexing:** [Ingestion Status](/api-reference/v2/endpoint/source-status). Wait for `completed` (or `graph_creation`).
-- **Graph follow-up:** [Context Relations](/api-reference/v2/endpoint/source-relations) to inspect relationships in detail.
-- **Concepts:** [Query](/essentials/v2/query), [Semantic search](/essentials/v2/semantic-search), and [Context graphs](/essentials/v2/context-graphs).
-- **Response handling:** [How to use API results](/essentials/v2/api-results)
-- **Read more:** [Query overview](/api-reference/v2/endpoint/query-overview)
+- **Setup first:** [Ingest Context](/api-reference/v2/endpoint/ingest-context): content must be indexed
+- **Confirm indexing:** [Ingestion Status](/api-reference/v2/endpoint/source-status): wait for `completed` (or `graph_creation`)
+- **Graph follow-up:** [Context Relations](/api-reference/v2/endpoint/source-relations): inspect relationships in detail
+- **Concepts:** [Usage: Query](/essentials/v2/query)
+- **Concepts:** [Concepts: Semantic Search](/essentials/v2/semantic-search)
+- **Concepts:** [Concepts: Context Graphs](/essentials/v2/context-graphs)
+- **Response handling:** [Usage: How to Use API Results](/essentials/v2/api-results)
+- **Read more:** [Query: Overview](/api-reference/v2/endpoint/query-overview)
 </Tip>

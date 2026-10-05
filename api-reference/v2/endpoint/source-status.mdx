@@ -1,16 +1,18 @@
 ---
 title: "Ingestion Status"
-description: "Check whether ingested documents, app sources, and memories are ready to query."
+description: "Check the processing status of ingested documents. "
 openapi: "api-reference/v2/openapi.json GET /context/status"
 ---
 
 import { Field } from "/snippets/field.jsx";
 
-Ingestion is asynchronous. Poll this endpoint with the IDs from ingest to learn when each document, app source, or memory is ready to query.
+Since ingestion is asynchronous, use this endpoint to determine when context is ready to be retrieved.
+
+Pass one or more IDs in `ids` to retrieve status. Works for documents, app sources, and memories. When passing multiple IDs on the query string, use either repeated params (`?ids=policy_main&ids=runbook_deploy`) or a single comma-joined value (`?ids=policy_main,runbook_deploy`); both forms are equivalent and can be mixed. Surrounding whitespace is trimmed, empty entries are dropped, and duplicates are removed. For more information, see the [Knowledge](/essentials/v2/knowledge) and [Memories](/essentials/v2/memories) guides.
 
 <Info>
-  **Prefer webhooks?** Register one for `indexing.status_changed` events and HydraDB will `POST` to your endpoint when content reaches `completed` or `errored`. See [Webhooks](/essentials/v2/webhooks).
-</Info>
+  **Prefer webhooks over polling?** Register a webhook for `indexing.status_changed` events and HydraDB will `POST` to your endpoint when content reaches a terminal state (`completed` or `errored`). See [Webhooks](/essentials/v2/webhooks) for setup and receiver examples.
+</Info> 
 
 <RequestExample>
 
@@ -45,10 +47,10 @@ curl -G 'https://api.hydradb.com/context/status' \
 
 | Name | Description |
 | --- | --- |
-| <Field name="ids" type="string[]" /> | One or more IDs returned at ingestion. Pass repeated params (`ids=a&ids=b`), one comma-joined value (`ids=a,b`), or both. Whitespace is trimmed, empty entries are dropped, and duplicates are removed. IDs never contain commas (ingest rejects them), so the comma-joined form always splits cleanly. |
+| <Field name="ids" type="string[]" /> | One or more `id` values returned at ingestion. Accepts IDs for documents, app sources, or memories. Pass either repeated params (`ids=a&ids=b`) or a single comma-joined value (`ids=a,b`). Source IDs never contain commas (they are rejected at ingest), so the comma-joined form always splits unambiguously. |
 | <Field name="id" type="string" /> | A single ID. Merged with `ids` when you send both. At least one ID across `id` and `ids` is required. |
-| <Field name="database" type="string" required /> | Database the items belong to. Deprecated alias: `tenant_id`. |
-| <Field name="collection" type="string or null" /> | Collection scope. If omitted, the default collection is used. Deprecated alias: `sub_tenant_id`. (default=`null`) |
+| <Field name="database" type="string" required /> | Database the items belong to. Formerly `tenant_id`; the `tenant_id` alias is still accepted (deprecated). |
+| <Field name="collection" type="string or null" /> | Collection scope. If omitted, the default collection is used. Formerly `sub_tenant_id`; the `sub_tenant_id` alias is still accepted (deprecated). (default=`null`) |
 
 <ResponseExample>
 
@@ -112,26 +114,26 @@ Each entry in `data.statuses` describes one requested `id`:
 
 | Field | Type | Description |
 | --- | --- | --- |
-| `id` | string | The ID you asked about, echoed back. |
+| `id` | string | The source, app-source, or memory ID you asked about (echoed back). |
 | `indexing_status` | string | One of the [status values](#status-values) below. `errored` is terminal. |
-| `error_code` | string | Machine-readable reason an entry is `errored`; **empty string (`""`) otherwise.** See [`error_code` values](#error-code-values). |
-| `error_message` | string | Human-readable explanation of a pipeline `error_code`. Empty otherwise, including for `FILE_NOT_FOUND`. |
-| `success` | boolean | Deprecated. `false` when `indexing_status` is `errored`, otherwise `true`. It describes the item, **not** the HTTP request, so a `200` can contain `errored` items. Read `indexing_status` instead. |
-| `message` | string | Status of the *lookup*: usually "Processing status retrieved successfully", or "ID not found" for an unknown `id`. It does **not** describe the ingestion outcome. |
+| `error_code` | string | Machine-readable reason an entry is `errored`; **empty string (`""`) when the entry is not errored.** See [`error_code` values](#error-code-values). |
+| `error_message` | string | Human-readable explanation that accompanies a pipeline `error_code`; empty otherwise, including for `FILE_NOT_FOUND`. |
+| `success` | boolean | Deprecated. `false` when `indexing_status` is `errored`, otherwise `true`. Describes the item, **not** the HTTP request: a `200` response can contain `errored` items. Read `indexing_status` instead. |
+| `message` | string | Status of the *lookup* itself ("Processing status retrieved successfully", or "ID not found" for an unknown `id`). It does **not** describe the ingestion outcome. Read `indexing_status` / `error_code` for that. |
 
 ### Error code values
 
-`error_code` tells a **caller mistake** apart from a **real ingestion failure**, which `indexing_status: "errored"` alone cannot.
+`error_code` is the field that lets you tell a **caller mistake** apart from a **real ingestion failure**, a distinction you cannot make from `indexing_status: "errored"` alone. It is empty on any non-errored entry.
 
 | `error_code` | Meaning | What to do |
 | --- | --- | --- |
-| `FILE_NOT_FOUND` | No source with this `id` in the given `database` and `collection`: usually a typo, an `id` never ingested, or a deleted source. You still get an entry for it. | Fix the `id`, or ingest the source again. Retrying the status call will not change it. |
-| *ingestion-pipeline codes* | A genuine processing failure, as a numeric `E####` code (for example `E1001` parse failed, `E2002` no text extracted, `E4001` embedding failed). | See [Ingestion error codes](/api-reference/v2/error-responses#ingestion-error-codes). Many clear on re-ingest and retry; some are terminal (unsupported format, empty content). |
+| `FILE_NOT_FOUND` | No source with this `id` exists in the given `database`/`collection`: usually a typo, an `id` that was never ingested, or a deleted source. | Fix the `id`, or (re-)ingest the source. Not a processing failure, so retrying the status call will not change it. |
+| *ingestion-pipeline codes* | A genuine processing failure, as a numeric `E####` code (e.g. `E1001` parse failed, `E2002` no text extracted, `E4001` embedding failed). | Act on the specific code. See the [Error Responses reference](/api-reference/v2/error-responses#ingestion-error-codes). Many are re-ingest-and-retry; some are terminal (unsupported format, empty content). |
 
 Status records can expire. A source that completed still reports `completed` after its record expires. A source that never finished before its record expired reports `errored` with `E9004`; ingest it again.
 
 <Info>
-  Branch on `error_code`, not on `message` or `error_message`, whose text may change.
+  Branch on `error_code`, not on the text in `message` or `error_message`. `message` describes the lookup, not the ingestion result, and human-readable text may change. The full list of codes an `errored` entry can carry is in the [Error Responses reference](/api-reference/v2/error-responses#ingestion-error-codes).
 </Info>
 
 ## Status values
@@ -167,15 +169,17 @@ flowchart LR
 | --- | --- | --- |
 | `queued` | No | Accepted by the server, not yet picked up by a worker. |
 | `processing` | No | Content is being parsed, chunked, and embedded. |
-| `graph_creation` | **Yes** | Indexed and retrievable via `/query`. The knowledge graph is still being built, so graph context may be incomplete. |
+| `graph_creation` | **Yes** | Indexed and retrievable; the knowledge graph is still being built. Already searchable via `/query`, but graph context may still be incomplete. |
 | `completed` | Yes | Fully indexed and graphed. Ready for all retrieval modes. |
-| `errored` | No | Processing failed. Terminal. Inspect `error_code` and `error_message`. |
+| `errored` | No | Processing failed. Inspect `error_code` and `error_message`. |
+
+The normal progression is `queued`, then `processing`, then `graph_creation`, then `completed`. Treat `errored` as terminal.
 
 ## Polling patterns
 
 ### Stop when content is searchable
 
-For normal RAG and search flows. At `graph_creation`, chunks are already retrievable.
+Use this for normal RAG/search flows. `graph_creation` means chunks are indexed and can be retrieved.
 
 <CodeGroup>
 
@@ -222,7 +226,7 @@ while (true) {
 
 ### Stop when graph processing is complete
 
-Wait for `completed` only when you need the full graph: before graph-heavy calls such as `/context/relations`, or when a query needs complete `graph_context`.
+Use this before graph-heavy operations such as `/context/relations` or when you require complete `graph_context`.
 
 ```python
 while True:
@@ -243,9 +247,17 @@ while True:
 
 Typical processing time:
 
-- **Memories** (text, Markdown, conversation pairs): seconds
+- **Memories** (text, markdown, conversation pairs): seconds
 - **Small documents** (under 50 pages): 1 to 5 minutes
 - **Large documents** (50\+ pages): 5 to 15 minutes
+
+## Behavior notes
+
+<Info>
+  **`graph_creation` is searchable.** Items in this state are already retrievable via `/query`. Wait for `completed` only when you specifically need full graph traversal (`graph_context: true`).
+</Info>
+
+- **Unknown IDs return as `errored`:** If you pass an ID that does not exist (e.g., a typo), HydraDB returns an entry with `indexing_status: "errored"` and `error_code: "FILE_NOT_FOUND"` rather than silently dropping it. Use `error_code` to distinguish this from a genuine ingestion failure. See [`error_code` values](#error-code-values).
 
 ## Errors
 
@@ -256,7 +268,10 @@ Common codes: `400 INVALID_INPUT` (for example `database` and `tenant_id` both s
 <Tip>
   **Related Resources**
 
-  - **Before this:** [Ingest Context](/api-reference/v2/endpoint/ingest-context), which returns the IDs
-  - **After completion:** [Query](/api-reference/v2/endpoint/query), [Inspect Context](/api-reference/v2/endpoint/fetch-content), or [Context Relations](/api-reference/v2/endpoint/source-relations)
-  - **Read more:** [Knowledge](/essentials/v2/knowledge) and [Memories](/essentials/v2/memories)
+  - **Before this:** [Ingest Context](/api-reference/v2/endpoint/ingest-context), to get the IDs
+  - **After completion:** [Query](/api-reference/v2/endpoint/query)
+  - **After completion:** [Fetch Content](/api-reference/v2/endpoint/fetch-content)
+  - **After completion:** [Context Relations](/api-reference/v2/endpoint/source-relations)
+  - **Read more:** [Usage: Knowledge](/essentials/v2/knowledge)
+  - **Read more:** [Usage: Memories](/essentials/v2/memories)
 </Tip>

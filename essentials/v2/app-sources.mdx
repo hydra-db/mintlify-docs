@@ -5,44 +5,59 @@ description: "How to ingest Slack, Gmail, Jira, Notion, CRM, and other app data 
 
 import { Field } from "/snippets/field.jsx";
 
-An app source is one record your connector already parsed: an email, a chat message, a ticket, a wiki page, a CRM object, a comment, or an attachment.
+App sources are pre-parsed records from business applications: emails, chat messages, tickets, wiki pages, CRM objects, comments, and attachments. Use them when your connector already extracted the item's text and structured fields.
 
-Send app sources to [`POST /context/ingest`](/api-reference/v2/endpoint/ingest-context) in the `app_knowledge` multipart field. The body uses the same app-native model as v1, not a generic `content` object: `kind`, `provider`, `external_id`, `fields`, metadata, attachments, comments, and typed relations.
+App sources are ingested through [`POST /context/ingest`](/api-reference/v2/endpoint/ingest-context) with the `app_knowledge` multipart field. The app-source payload is **not** a generic top-level `content` object. It uses the same app-native model as v1: `kind`, `provider`, `external_id`, `fields`, metadata, attachments, comments, and typed relations.
 
 <Info>
-  App sources land in the [Knowledge](/essentials/v2/knowledge) store. Query them with [`POST /query`](/api-reference/v2/endpoint/query) and `type: "knowledge"` or `type: "all"`. **`query_apps`** is on by default and turns on the app-aware lane, so do not send `query_apps: false` for app data. Use `mode: "thinking"` for app relation expansion and connected context. See [How app sources affect query](#9-how-app-sources-affect-query).
+  App sources land in the [Knowledge](/essentials/v2/knowledge) store. Query them with [`POST /query`](/api-reference/v2/endpoint/query), `type: "knowledge"` or `type: "all"`, and **`query_apps: true`** (the default). Use `mode: "thinking"` when you want app relation expansion and connected context.
 </Info>
 
-## 1. App source or file upload
+## 1. What it is
 
-- **App source:** you already have the item's text and fields, such as a Slack message, Jira description, Notion page, or email body. Send it in `app_knowledge` as a stringified JSON object or array. HydraDB normalizes app identity, extracts searchable text from `fields`, indexes attachments and comments, and builds app graph links. Best for connectors and live app syncs.
-- **File upload:** HydraDB should parse a file (PDF, DOCX, MD, CSV, TXT). Send it in `documents`, plus optional `document_metadata`. HydraDB parses, chunks, and indexes it.
+| | App source | File upload |
+|---|---|---|
+| **Content** | Pre-extracted app fields: Slack message body, Jira description, Notion page body, email body, etc. | Binary or text file (PDF, DOCX, MD, CSV, TXT) |
+| **Sent in** | `app_knowledge` as a stringified JSON object or array | `documents` plus optional `document_metadata` |
+| **HydraDB does** | Normalizes app identity, extracts searchable text from `fields`, indexes attachments/comments, and builds app graph links | Parses the file, chunks extracted text, and indexes it |
+| **Best for** | Connectors and live app syncs | Documents in their original file format |
 
-Both feed the same Knowledge retrieval. App sources add provider IDs, object kinds, actors, threads, parents, and explicit relations for app-aware recall.
+Both paths eventually feed the same Knowledge retrieval stack, but app sources give HydraDB extra structure for app-aware recall: provider IDs, object kinds, actors, threads, parents, and explicit relations.
 
 ---
 
-## 2. Fields
+## 2. The mental model
 
-Every app source becomes one knowledge source, identified by `id`, `kind`, `provider`, and `external_id`. `external_id` is the item's own ID, not its channel, project, or space. Put those in `metadata`. The [field reference](#top-level-app-source-fields) lists every field.
+Every app-source item becomes one HydraDB Knowledge source. The identity of the item comes from `id`, `kind`, `provider`, and `external_id`. The searchable app content lives in `fields`.
 
-The searchable text lives in `fields`, not in a top-level `content` object. `content` is the older generic knowledge payload, and it hides the actors, thread IDs, parent IDs, and typed body fields that app parsing reads. Put the text in the typed field for the item's `kind`:
+| Category | Fields | Why it matters |
+|---|---|---|
+| **Ingestion envelope** | `id`, `database` (formerly `tenant_id`), `collection` (formerly `sub_tenant_id`) | Routes the item and gives it a stable upsert/delete/status ID. |
+| **Display / source metadata** | `title`, `type`, `url`, `timestamp` | Improves citations, display, chronology, and source rendering. |
+| **App identity** | `kind`, `provider`, `external_id` | Enables exact ID lookup, provider scoping, and relation resolution. |
+| **Searchable structure** | `fields` | Holds the app-native body and typed fields: message body, ticket description, email actors, status, parent IDs, etc. |
+| **Filtering / bookkeeping** | `metadata`, `additional_metadata` | Deterministic scoping and free-form display metadata. |
+| **Connected context** | `relations`, `attachments`, `comments` | Adds explicit links and extra searchable text connected to the parent app item. |
 
-- `email`: `fields.subject`, `fields.body`
-- `message`: `fields.body`
-- `ticket`: `fields.title`, `fields.description`
-- `knowledge_base`: `fields.title`, `fields.body`
-- `comment`: `fields.body`
-- `meeting`: `fields.title`, `fields.body`
-- `custom`: `fields.data`
+Do **not** put the primary app text in a top-level `content` object for app-native ingestion. Top-level `content` is the older generic knowledge payload; app sources should put text in the correct typed field:
 
-Set `fields.kind` to the same value as the top-level `kind`. A mismatch is rejected.
+| `kind` | Main searchable text field |
+|---|---|
+| `email` | `fields.subject`, `fields.body` |
+| `message` | `fields.body` |
+| `ticket` | `fields.title`, `fields.description` |
+| `knowledge_base` | `fields.title`, `fields.body` |
+| `comment` | `fields.body` |
+| `meeting` | `fields.title`, `fields.body` |
+| `custom` | `fields.data` |
+
+`fields.kind` must match the top-level `kind`; a mismatch is rejected.
 
 ---
 
 ## 3. Ingest an app source
 
-`app_knowledge` is nested JSON in a `multipart/form-data` request, so send it as a **JSON-stringified** form value (object or array). Include the scope fields in each item too. They must match the form-level `database` and `collection`.
+Send `app_knowledge` as a **JSON-stringified** form value. Each item should include the request-level scope fields inside the item too; if supplied, they must match the form-level `database` and `collection`.
 
 <CodeGroup>
 ```python Python SDK
@@ -193,25 +208,31 @@ curl -X POST 'https://api.hydradb.com/context/ingest' \
 }
 ```
 
-The call returns `202 Accepted`. The source is not queryable until [`GET /context/status`](/api-reference/v2/endpoint/source-status) reports `indexing_status: "graph_creation"` or `"completed"`.
+The call returns `202 Accepted`; the source is not queryable until [`GET /context/status`](/api-reference/v2/endpoint/source-status) reports `indexing_status: "graph_creation"` or `"completed"`.
+
+<Info>
+  **Multipart, not JSON.** `app_knowledge` is nested JSON inside a `multipart/form-data` request. Stringify the object or array before sending it.
+</Info>
 
 ---
 
 ## 4. Incremental ingestion
 
-Use the same endpoint for backfill and live updates. Each provider event either updates a source or creates one.
+Use the same endpoint for initial backfill and live updates. The important modeling choice is whether the provider event updates an existing source or creates a new source.
 
-- **Ticket title, description, or status changed:** re-ingest the `kind: "ticket"` item with the same `id` and `external_id`, and `upsert: true`.
-- **New Linear, Jira, or Zendesk ticket comment:** ingest a **new** `kind: "comment"` source with its own `id` and `external_id`. Put the parent ticket's provider ID in `fields.parent_id`.
-- **Edited ticket comment:** re-ingest it with the same `id` and `external_id`.
-- **Deleted ticket comment:** call [`DELETE /context`](/api-reference/v2/endpoint/delete-source) with the comment source `id`.
-- **New Slack or Teams message:** ingest a **new** `kind: "message"` source with `fields.thread_id` and, when available, `fields.parent_id`. Do not re-ingest the whole thread per reply: that loses message-level authorship and timestamps and wastes indexing.
-- **New email reply:** ingest a **new** `kind: "email"` source with `fields.thread_id` and `fields.reply_to_id`.
-- **New Notion or Confluence page:** ingest a **new** `kind: "knowledge_base"` source. The space belongs in metadata.
-- **Notion or Confluence page edited:** re-ingest it with the same `id` and `external_id`.
+| Provider event | What to send | Why |
+|---|---|---|
+| Ticket title/description/status changed | Re-ingest the same `kind: "ticket"` item with the same `id` and `external_id`, `upsert: true` | The ticket snapshot changed. |
+| New Linear/Jira/Zendesk ticket comment | Ingest a **new** `kind: "comment"` source with its own `id` and `external_id`; put the parent ticket provider ID in `fields.parent_id` | The comment is a distinct provider object. |
+| Edited ticket comment | Re-ingest the comment source with the same `id` and `external_id` | Same comment changed. |
+| Deleted ticket comment | Call [`DELETE /context`](/api-reference/v2/endpoint/delete-source) with the comment source `id` | The comment should no longer surface. |
+| New Slack/Teams message | Ingest a **new** `kind: "message"` source with `fields.thread_id` and, when available, `fields.parent_id` | Messages are standalone events linked by provider IDs. |
+| New email reply | Ingest a **new** `kind: "email"` source with `fields.thread_id` and `fields.reply_to_id` | Email replies have their own provider IDs, actors, body, and timestamp. |
+| New Notion/Confluence page | Ingest a **new** `kind: "knowledge_base"` source | A page is a standalone document; the space belongs in metadata. |
+| Existing Notion/Confluence page edited | Re-ingest the same page source with the same `id` and `external_id` | The page document changed. |
 
 <Warning>
-  `upsert: true` replaces the whole source with the same `id`. Upserting a parent ticket or page with only a new `comments[]` item can drop existing content. For live events, ingest each new comment as its own `kind: "comment"` source.
+  `upsert: true` replaces the existing source with the same `id`. Do not upsert a parent ticket/page with only a new `comments[]` item unless you intend to replace the whole snapshot. For live webhook events, model each new comment as its own `kind: "comment"` source.
 </Warning>
 
 ---
@@ -220,7 +241,7 @@ Use the same endpoint for backfill and live updates. Each provider event either 
 
 ### Slack message with thread reply and attachment
 
-A Slack thread is several `message` sources connected by `thread_id`, `parent_id`, and optional explicit relations.
+A Slack thread is multiple `message` sources connected by `thread_id`, `parent_id`, and optional explicit relations.
 
 ```json
 {
@@ -255,7 +276,7 @@ A Slack thread is several `message` sources connected by `thread_id`, `parent_id
 }
 ```
 
-For a reply, ingest a second source. `fields.parent_id` points to the parent's provider `external_id`. An explicit relation can point to the parent's HydraDB ID or its provider ID.
+For a reply, ingest a second source. `fields.parent_id` points to the parent message's provider `external_id`; an explicit relation can point to either the parent HydraDB ID or the provider ID.
 
 ```json
 {
@@ -288,7 +309,7 @@ For a reply, ingest a second source. `fields.parent_id` points to the parent's p
 
 ### Jira ticket with linked issues
 
-The ticket body goes in `fields.description` and workflow fields in `fields`. Scope and filter values, such as project and environment, go in `metadata`.
+The ticket body lives in `fields.description`. Workflow fields belong in `fields`; scope/filter values like project and environment belong in `metadata`.
 
 ```json
 {
@@ -326,7 +347,7 @@ The ticket body goes in `fields.description` and workflow fields in `fields`. Sc
 
 ### Linear ticket comment
 
-Comments are first-class app sources. Use `fields.parent_id` for the parent ticket's provider ID, and `relations[]` for a cross-provider link or an explicit relation.
+Comments are first-class app sources. Use `fields.parent_id` for the parent ticket's provider ID. Use `relations[]` when you need a cross-provider link or want to declare the relation explicitly.
 
 ```json
 {
@@ -359,9 +380,9 @@ Comments are first-class app sources. Use `fields.parent_id` for the parent tick
 }
 ```
 
-### Notion or Confluence page
+### Notion / Confluence page
 
-A page is one `knowledge_base` source. Space, workspace, and database values go in metadata, not in `external_id`.
+A page is one `knowledge_base` source. Space/workspace/database values belong in metadata, not in `external_id`.
 
 ```json
 {
@@ -392,7 +413,7 @@ A page is one `knowledge_base` source. Space, workspace, and database values go 
 
 ### Gmail email with reply
 
-Each email is its own `email` source. Link replies with `fields.reply_to_id` and, when useful, a `reply_to` relation.
+Each email message is its own `email` source. Link replies with `fields.reply_to_id` and, when useful, a `reply_to` relation.
 
 ```json
 {
@@ -430,7 +451,7 @@ Each email is its own `email` source. Link replies with `fields.reply_to_id` and
 
 ### Salesforce opportunity linked to a support ticket
 
-CRM records usually use `kind: "custom"`. Use `fields.parent_id` for same-provider hierarchy and `relations[]` for cross-app context.
+CRM records usually use `kind: "custom"`. Use `fields.parent_id` for same-provider hierarchy, and `relations[]` for cross-app context.
 
 ```json
 {
@@ -471,7 +492,7 @@ CRM records usually use `kind: "custom"`. Use `fields.parent_id` for same-provid
 
 ## 6. Relations
 
-Use `relations[]` for a link that matters for search and cannot be safely inferred from the text.
+Use `relations[]` to declare explicit source-to-source connections when the relationship matters for search and cannot be safely inferred from text alone.
 
 ```json
 {
@@ -496,35 +517,41 @@ Use `relations[]` for a link that matters for search and cannot be safely inferr
 }
 ```
 
-The target takes either shape:
+The target can use either shape:
 
-- `{ "id": "..." }`: you know the HydraDB ID.
-- `{ "external_id": "...", "provider": "..." }`: HydraDB resolves the provider ID in that provider's namespace.
+| Target shape | Use when |
+|---|---|
+| `{ "id": "..." }` | You already know the HydraDB ID. |
+| `{ "external_id": "...", "provider": "..." }` | You know the provider ID and want HydraDB to resolve it in the provider namespace. |
 
-Useful predicates, with direction:
+Useful predicates include:
 
-- `reply_to`: from a reply, message, or email to its parent message or email.
-- `comment_on`: from a comment to its parent ticket, page, or source.
-- `forwarded_from`: from a forwarded email to the original email.
-- `child_of`: from a child ticket, page, or custom record to its parent.
-- `linked_to`: from a source to a related peer source.
-- `blocks`: from the blocker to the blocked item.
-- `caused_by`: from the effect to the cause.
-- `related_to`: a generic association.
+| Predicate | Direction |
+|---|---|
+| `reply_to` | reply/message/email to parent message/email |
+| `comment_on` | comment to parent ticket/page/source |
+| `forwarded_from` | forwarded email to original email |
+| `child_of` | child ticket/page/custom record to parent |
+| `linked_to` | source to related peer source |
+| `blocks` | blocker to blocked item |
+| `caused_by` | effect to cause |
+| `related_to` | generic association |
 
 <Warning>
-  External IDs are only unique inside a provider namespace, so a target with `target.external_id` and no `target.provider` is rejected.
+  If you use `target.external_id`, include `target.provider`. External IDs are only unique inside a provider namespace, and a target without `target.provider` is rejected.
 </Warning>
 
 <Note>
-  For app sources, prefer the `relations[]` shape above. `relations.ids` is the forceful-relation shortcut for files and legacy payloads, and carries no predicate or provider.
+  For app sources, prefer the app-native `relations[]` shape above. `relations.ids` is the file/legacy forceful-relation shortcut and does not carry predicate or provider information.
 </Note>
 
 ---
 
 ## 7. Attachments and comments
 
-Attachments and embedded `comments[]` add searchable child content to the app source. Send `attachments[].content` only when you already extracted the text. An attachment URL is metadata: HydraDB does not fetch arbitrary URLs from app-source payloads.
+Attachments and embedded `comments[]` add searchable child content connected to the app source.
+
+Use `attachments[].content` only when you already extracted the attachment text. HydraDB treats an attachment URL as metadata; it does not fetch arbitrary URLs from app-source payloads.
 
 ```json
 {
@@ -549,16 +576,28 @@ Attachments and embedded `comments[]` add searchable child content to the app so
 }
 ```
 
-Use embedded `comments[]` for full backfill snapshots. For live updates, use first-class `kind: "comment"` sources, so you can add, edit, or delete one comment without replacing the parent. See [Incremental ingestion](#4-incremental-ingestion).
+Use embedded `comments[]` for full backfill snapshots. For live incremental webhooks, prefer first-class `kind: "comment"` sources so a single new/edited/deleted comment can be handled without replacing the parent ticket or page.
 
 ---
 
 ## 8. Metadata: scoping vs display
 
-- **`metadata`:** the canonical filterable field, for deterministic filtering with `metadata_filters`. Declare the key in `database_metadata_schema`. Examples: `department`, `channel`, `project`, `space`, `pipeline`, `environment`, `region`.
-- **`additional_metadata`:** the canonical free-form field, for display, citation, debugging, per-source bookkeeping, or keys not worth adding to the schema. Examples: `slack_ts`, `ticket_key`, `comment_id`, `raw_provider_payload_id`, `golden_run`. Filters on it are slower and need nested syntax, so put hot filters in `metadata`.
+For v2 Knowledge ingestion, `metadata` is the canonical filterable metadata field and `additional_metadata` is the canonical free-form metadata field.
 
-Some request shapes accept legacy aliases: `tenant_metadata` for `metadata`, `document_metadata` for `additional_metadata`. Filter with top-level keys for `metadata` and a nested `additional_metadata` object:
+| Use `metadata` when | Use `additional_metadata` when |
+|---|---|
+| You want deterministic query-time filtering via `metadata_filters` | The field is for display, citation, debugging, or per-source bookkeeping |
+| The key is declared in `database_metadata_schema` | The key is unique or not worth adding to the database schema |
+| Examples: `department`, `channel`, `project`, `space`, `pipeline`, `environment`, `region` | Examples: `slack_ts`, `ticket_key`, `comment_id`, `raw_provider_payload_id`, `golden_run` |
+
+Legacy aliases are accepted for compatibility in some request shapes:
+
+| Canonical v2 field | Legacy alias |
+|---|---|
+| `metadata` | `tenant_metadata` |
+| `additional_metadata` | `document_metadata` |
+
+Filterable database metadata keys must be declared in the database schema. Query-time filters use top-level keys for `metadata` and nested `additional_metadata` for free-form fields:
 
 ```json
 {
@@ -576,19 +615,23 @@ See [Scoping using metadata](/essentials/v2/metadata) for the full schema and fi
 
 ## 9. How app sources affect query
 
-With `query_apps: true` (the default), an app-aware lane runs alongside normal semantic and lexical retrieval. `query_apps: false` leaves only text and vector retrieval, with no app-aware ID or relation expansion. The app lane uses signals raw text lacks:
+When `query_apps: true` (the default), HydraDB runs an app-aware retrieval lane alongside normal semantic and lexical retrieval. It can use app-specific signals that are not available from raw text alone.
 
-- **`kind`, `provider`:** route queries such as "Slack messages", "Jira tickets", or "ticket comments".
-- **`external_id`:** exact ID lookup, such as `AUTH-123`, `1716213600.000100`, or `page_abc`.
-- **Workflow fields:** `status`, `priority`, `assignee`, `reporter`, and similar, when the query implies them.
-- **Actors:** queries like "emails from Alice", "tickets assigned to Bob", or "comments by Carol".
-- **Thread and parent fields:** expansion around replies, parents, children, epics, subtasks, accounts, deals, and pages.
-- **`relations[]`:** traversal of explicit links like `linked_to`, `blocks`, `comment_on`, `reply_to`, and `child_of`.
-- **Attachments and comments:** search over extracted attachment text and embedded comment bodies.
+| Query signal | Uses |
+|---|---|
+| `kind`, `provider` | Routes queries such as "Slack messages", "Jira tickets", or "ticket comments". |
+| `external_id` | Exact ID lookup like `AUTH-123`, `1716213600.000100`, or `page_abc`. |
+| Workflow fields | Uses `status`, `priority`, `assignee`, `reporter`, etc. when the query implies them. |
+| Actors | Answers queries like "emails from Alice", "tickets assigned to Bob", or "comments by Carol". |
+| Thread and parent fields | Expands around replies, parents, children, epics, subtasks, accounts, deals, and pages. |
+| `relations[]` | Traverses explicit links like `linked_to`, `blocks`, `comment_on`, `reply_to`, and `child_of`. |
+| Attachments / comments | Searches extracted attachment text and embedded comment bodies. |
 
 ### Parent and child query
 
-A child's `fields.parent_id` can match another source's `external_id` under the same `provider`. The app lane finds an initial source by text, exact ID, actor, provider, or kind. In `thinking` mode, words like "parent", "children", "epic", "subtask", "account", or "deal" can trigger expansion around it.
+Parent/child query is based on provider-scoped external IDs. When a child source has `fields.parent_id`, HydraDB can match that value to another source's `external_id` under the same `provider`.
+
+At recall time, `query_apps: true` lets the app-aware lane find an initial source by text, exact ID, actor, provider, or kind. In `thinking` mode, hierarchy language such as "parent", "children", "epic", "subtask", "account", or "deal" can trigger expansion around the matched source.
 
 ```json
 {
@@ -602,16 +645,16 @@ A child's `fields.parent_id` can match another source's `external_id` under the 
 
 ---
 
-## 10. Field reference
+## 10. TLDR field reference
 
 ### Top-level app source fields
 
 | Field | Why send it | Query / ingestion effect |
 |---|---|---|
 | <Field name="id" type="string" required /> | Stable HydraDB ID for this item. | Upsert key, delete/status/list ID, and direct relation target. |
-| <Field name="database" type="string" required /> | Database that owns the item (formerly `tenant_id`). | Must match the form-level `database` when present. |
-| <Field name="collection" type="string" required /> | Logical partition (formerly `sub_tenant_id`). Use `"default"` if you do not partition. | Must match the form-level `collection` when present. |
-| <Field name="title" type="string" recommended /> | Subject, page name, ticket title, or message label. | Improves display, citations, and semantic matching. |
+| <Field name="database" type="string" required /> | Database that owns the item. | Must match the form-level `database` when present. |
+| <Field name="collection" type="string" required /> | Logical partition. Use `"default"` if you do not partition. | Must match the form-level `collection` when present. |
+| <Field name="title" type="string" recommended /> | Human-readable subject, page name, ticket title, or message label. | Improves display, citations, and semantic matching. |
 | <Field name="type" type="string" recommended /> | Source category such as `slack`, `gmail`, `jira`, `notion`, `salesforce`, or `linear_comment`. | Preserved for source rendering and analytics; not the app discriminator. |
 | <Field name="kind" type="email, message, ticket, knowledge_base, comment, meeting, custom" recommended /> | App object kind. | Selects the app parser and query behavior. |
 | <Field name="provider" type="string" recommended /> | App namespace such as `slack`, `gmail`, `jira`, `notion`, `salesforce`, or `linear`. | Prevents ID collisions and scopes relation resolution. |
@@ -619,10 +662,10 @@ A child's `fields.parent_id` can match another source's `external_id` under the 
 | <Field name="url" type="string" /> | Canonical link back to the provider item. | Improves citations and source navigation. |
 | <Field name="timestamp" type="ISO-8601 datetime" /> | Creation, sent, or last-updated time. | Helps chronology, display, and recency-aware ranking. |
 | <Field name="fields" type="object" required /> | Structured kind-specific content. | Primary app-native searchable payload. |
-| <Field name="metadata" type="object" /> | Schema-aligned filterable fields. | Queryable with top-level `metadata_filters` keys when declared in the database schema. |
+| <Field name="metadata" type="object" /> | Schema-aligned filterable fields. | Queryable with top-level `metadata_filters` keys when declared in database schema. |
 | <Field name="additional_metadata" type="object" /> | Free-form display/bookkeeping metadata. | Queryable under `metadata_filters.additional_metadata`. |
 | <Field name="relations" type="Relation[]" /> | Explicit app-source links. | Enables connected-context retrieval and app graph expansion. |
-| <Field name="acl" type="string[]" /> | Who may retrieve this item. Emails, `group:<provider>:<id>`, `domain:<domain>`, or `__public__`. | Omit to leave it unrestricted. Only a query that carries `acl` is filtered: it sees this item only with a matching principal. See [Access Control](/essentials/v2/access-control). |
+| <Field name="acl" type="string[]" /> | Who may retrieve this item. Emails, `group:<provider>:<id>`, `domain:<domain>`, or `__public__`. | Omit to leave it unrestricted. Enforcement is opt-in on the query side: a query that carries `acl` sees this item only with a matching principal, and a query without `acl` is not filtered at all. See [Access Control](/essentials/v2/access-control). |
 | <Field name="attachments" type="Attachment[]" /> | Pre-extracted files attached to the item. | Attachment text is indexed and connected to the source. |
 | <Field name="comments" type="Comment[]" /> | Embedded snapshot/backfill comments. | Comment text and authors become searchable. |
 
@@ -734,6 +777,21 @@ A child's `fields.parent_id` can match another source's `external_id` under the 
 
 ---
 
+## 11. Common mistakes
+
+| Mistake | Why it breaks | Fix |
+|---|---|---|
+| Sending a generic `content: { "text": "..." }` payload for app-native data | App-specific parsing cannot see `kind`, `provider`, `external_id`, actors, thread IDs, parent IDs, or typed body fields | Use `kind`, `provider`, `external_id`, and `fields`. |
+| Putting the main text outside `fields` | App-source extraction and query expansion lose structure | Put text in `fields.body`, `fields.description`, `fields.title`, or `fields.data` depending on `kind`. |
+| Using container IDs as `external_id` | Relations and exact lookup point to the channel/project/space instead of the item | Use the individual item ID as `external_id`; put channel/project/space in `metadata`. |
+| Omitting `provider` on a relation target | External IDs collide across apps | Include `target.provider` whenever you use `target.external_id`. |
+| Re-ingesting a whole Slack thread for every reply | Loses message-level authorship/timestamps and wastes indexing | Ingest each message as its own `kind: "message"` source with `thread_id` / `parent_id`. |
+| Sending only a new ticket comment in `comments[]` during an upsert | Replaces the parent snapshot and may drop existing content | Ingest live comments as first-class `kind: "comment"` sources. |
+| Putting filterable fields only in `additional_metadata` | Filters are slower and require nested filter syntax | Put hot filters in `metadata` and declare them in the database schema. |
+| Sending `query_apps: false` | You only get normal text/vector retrieval, not app-aware ID/relation expansion | Leave `query_apps` at its default (`true`); use `mode: "thinking"` for relation-heavy queries. |
+
+---
+
 ## Related
 
 - [Knowledge](/essentials/v2/knowledge): the broader ingestion path
@@ -742,5 +800,5 @@ A child's `fields.parent_id` can match another source's `external_id` under the 
 - [Scoping using metadata](/essentials/v2/metadata): designing filterable metadata
 - [Context Graphs](/essentials/v2/context-graphs): graph enrichment and traversal
 - [Access Control](/essentials/v2/access-control): restricting who may retrieve an item
-- [Ingest Content API Reference](/api-reference/v2/endpoint/ingest-context)
-- [Ingestion Status API Reference](/api-reference/v2/endpoint/source-status)
+- [Ingest Content (API Reference)](/api-reference/v2/endpoint/ingest-context)
+- [Ingestion Status (API Reference)](/api-reference/v2/endpoint/source-status)
