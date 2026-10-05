@@ -5,16 +5,16 @@ description: "A support agent that never forgets. Ingest help docs, past ticket 
 
 This guide walks you through building a **customer support agent with persistent memory** powered by HydraDB. Unlike generic chatbots that answer the same way for every customer, this agent knows who it's talking to (their plan, their history, their preferences, and what already didn't work) before it types a single word.
 
-> **Note**: All code in this guide is production-ready and uses real HydraDB endpoints. Base URL: `https://api.hydradb.com`. Get your API key at [app.hydradb.com](https://app.hydradb.com).
+> **Note:** All code in this guide uses real HydraDB endpoints. Base URL: `https://api.hydradb.com`. Get your API key at [app.hydradb.com](https://app.hydradb.com).
 
-> **Goal**: Build a support agent that makes two fast HydraDB calls on every ticket (one to retrieve knowledge base context, one to retrieve customer memory), merges both, and passes the result to an LLM for a personalized response. Full round-trip under 400ms.
+> **Goal:** Build a support agent that makes two HydraDB calls on every ticket (one to retrieve knowledge base context, one to retrieve customer memory), merges both, and passes the result to an LLM for a personalized response.
 
 ---
 
 ## Prerequisites
 
-**Required knowledge**: Python basics, REST APIs, environment variables  
-**Required tools**:
+**Required knowledge:** Python basics, REST APIs, environment variables  
+**Required tools:**
 - HydraDB API key
 - Python 3.11 or 3.12 (`python --version`)
 - OpenAI API key (for generating the final support response)
@@ -35,7 +35,7 @@ By the end of this cookbook, you'll be able to:
 
 Standard AI support chatbots answer the same way for every customer. Ask about a billing issue and you get the generic billing FAQ. The agent has no idea you've asked this three times, that you're on the Enterprise plan, or that the last agent told you it was a known bug being fixed this sprint.
 
-HydraDB fixes this. Every interaction is stored as a memory. Every help doc and past ticket resolution is ingested as knowledge. When a customer opens a new conversation, the agent makes two fast calls to HydraDB:
+HydraDB fixes this. Every interaction is stored as a memory. Every help doc and past ticket resolution is ingested as knowledge. When a customer opens a new conversation, the agent makes two calls to HydraDB:
 
 1. `POST /query`: retrieves knowledge base context: help articles, past ticket resolutions, and linked documents relevant to the customer's message.
 2. `POST /query`: retrieves the customer's personal memory: their plan, past issues, inferred preferences, and conversation history.
@@ -48,9 +48,9 @@ Both results are merged and passed to the LLM. The result is a support agent tha
 
 Three HydraDB primitives power this use case:
 
-- **Knowledge memories**: help docs, FAQs, past ticket resolutions. Uploaded once via `client.context.ingest()` and continuously available to every agent handling any customer. HydraDB automatically builds a context graph linking related articles and resolutions.
-- **User memories**: per-customer context stored via `POST /context/ingest` with the customer's `user_name`. Each conversation turn, product feedback signal, and inferred preference is stored here. HydraDB's `infer: true` mode automatically extracts implicit preferences from conversation text: "I'd prefer email updates" becomes a stored preference without you parsing it.
-- **Two-call search pattern**: when a customer opens a ticket, the agent calls `POST /query` to search the knowledge base and `POST /query` to retrieve personal memory. Results are merged before the LLM call. Use `mode: "thinking"` on both calls to enable multi-query retrieval with reranking.
+- **Knowledge:** help docs, FAQs, past ticket resolutions. Uploaded once via `client.context.ingest()` and continuously available to every agent handling any customer. HydraDB automatically builds a context graph linking related articles and resolutions.
+- **User memories:** per-customer context stored via `POST /context/ingest` in the customer's own collection. Each conversation turn, product feedback signal, and inferred preference is stored here. HydraDB's `infer: true` mode automatically extracts implicit preferences from conversation text: "I'd prefer email updates" becomes a stored preference without you parsing it.
+- **Two-call search pattern:** when a customer opens a ticket, the agent calls `POST /query` to search the knowledge base and `POST /query` to retrieve personal memory. Results are merged before the LLM call. Use `mode: "thinking"` on both calls to enable multi-query retrieval with reranking.
 
 ---
 
@@ -74,57 +74,67 @@ graph LR
 
 One database for your support system. Use collections to isolate customer data: each customer gets their own collection, automatically created on their first interaction. This is the B2C pattern from HydraDB's docs.
 
-> **SDK required**: Install the official Python SDK: `pip install hydradb-sdk`. The ingestion endpoint (`/context/ingest`) takes multipart form data, so raw `requests` with `json=` will not work; use the SDK or send multipart form fields yourself. Note: the import name differs from the package name.
+> **SDK required:** Install the official Python SDK: `pip install hydradb-sdk`. The ingestion endpoint (`/context/ingest`) takes multipart form data, so raw `requests` with `json=` will not work; use the SDK or send multipart form fields yourself. Note: the import name differs from the package name.
 
 <CodeGroup>
 ```python Python SDK
 import os
+import time
 from hydra_db import HydraDB        # pip install hydradb-sdk
 
 API_KEY   = os.environ["HYDRA_DB_API_KEY"]
-TENANT_ID = "customer-support"
+DATABASE = "customer-support"
 
 # SDK client
 client = HydraDB(token=API_KEY)
 
 # Create the shared database
-client.databases.create(database=TENANT_ID)
+client.databases.create(database=DATABASE)
 
-# B2C pattern: each customer gets their own collection = their user_name.
-# Collections are created automatically on first write - no setup needed.
-def customer_sub_tenant(customer_id: str) -> str:
+# Creation is asynchronous. Wait until the database can take writes.
+while not client.databases.status(database=DATABASE).data.infra.ready_for_ingestion:
+    time.sleep(2)
+
+# B2C pattern: each customer gets their own collection.
+# Collections are created automatically on first write, so there is no setup step.
+def customer_collection(customer_id: str) -> str:
     return f"customer-{customer_id}"
 
 # Shared collection for knowledge base (visible to all agents, all customers)
-KB_SUB_TENANT = "knowledge-base"
-print(f"✓ Database '{TENANT_ID}' ready.")
+KB_COLLECTION = "knowledge-base"
+print(f"Database '{DATABASE}' ready.")
 ```
 ```typescript TypeScript SDK
 import { HydraDBClient } from "@hydradb/sdk";
 
 const API_KEY   = process.env.HYDRA_DB_API_KEY!;
-const TENANT_ID = "customer-support";
+const DATABASE = "customer-support";
 
-// SDK client — HydraDBClient handles the base URL internally
+// SDK client: HydraDBClient handles the base URL internally
 const client = new HydraDBClient({ token: API_KEY });
 
 // Create the shared database
-await client.databases.create({ database: TENANT_ID });
+await client.databases.create({ database: DATABASE });
 
-// B2C pattern: each customer gets their own collection = their user_name.
-// Collections are created automatically on first write - no setup needed.
-function customerSubTenant(customerId: string): string {
+// Creation is asynchronous. Wait until the database can take writes.
+while (!(await client.databases.status({ database: DATABASE })).data?.infra?.readyForIngestion) {
+    await new Promise(r => setTimeout(r, 2000));
+}
+
+// B2C pattern: each customer gets their own collection.
+// Collections are created automatically on first write, so there is no setup step.
+function customerCollection(customerId: string): string {
     return `customer-${customerId}`;
 }
 
 // Shared collection for knowledge base (visible to all agents, all customers)
-const KB_SUB_TENANT = "knowledge-base";
+const KB_COLLECTION = "knowledge-base";
 ```
 </CodeGroup>
 
 Output:
 ```
-✓ Database 'customer-support' ready.
+Database 'customer-support' ready.
 ```
 
 ---
@@ -133,11 +143,11 @@ Output:
 
 Upload your help docs, FAQs, and past ticket resolutions into a shared `knowledge-base` collection. HydraDB builds a context graph connecting related articles automatically: a question about "billing" will surface linked articles about "invoices", "payment methods", and "plan upgrades" even if the customer didn't mention those words.
 
-> **Batch limit**: Max 20 sources per request. Wait 1 second between batches.
+> **Batch size:** The code below sends 20 sources per request and waits 1 second between batches. There is no fixed per-request cap, but a batch over your plan's item limit returns `413` (split it), and throttling returns `429` (retry after the `Retry-After` header).
 
-> **Important (database placement)**: `database` is a required top-level SDK parameter. Items in `app_knowledge` may also carry `database` and `collection`, but an item's `database` must match the top-level one, or the request returns a 400 error.
+> **Important (database placement):** `database` is a required top-level SDK parameter. Items in `app_knowledge` may also carry `database` and `collection`, but an item's `database` must match the top-level one, or the request returns a 400 error.
 
-> **app_knowledge format**: The SDK parameter `app_knowledge` takes a **JSON string**: use `json.dumps(batch)`, not a Python list directly.
+> **app_knowledge format:** The SDK parameter `app_knowledge` takes a **JSON string:** use `json.dumps(batch)`, not a Python list directly.
 
 ### Help Docs & FAQs
 
@@ -157,8 +167,8 @@ def ingest_help_docs(articles: list) -> list:
     for article in articles:
         batch.append({
             "id":            article["id"],
-            "database":     TENANT_ID,        # required inside each item
-            "collection": KB_SUB_TENANT,    # required inside each item
+            "database":     DATABASE,        # optional; must match the top-level database
+            "collection": KB_COLLECTION,    # optional per-item collection
             "title":         article["title"],
             "type":          "confluence",
             "timestamp":     article["updated_at"],
@@ -179,15 +189,15 @@ def ingest_help_docs(articles: list) -> list:
     if batch:
         all_ids += _upload_kb_batch(batch)
 
-    print(f"Knowledge base: {len(all_ids)} articles indexed.")
+    print(f"Knowledge base: {len(all_ids)} articles queued for indexing.")
     return all_ids
 
 
 def _upload_kb_batch(batch: list) -> list:
-    # database / collection required as top-level SDK params AND inside each item
+    # database is required at the top level; per-item values must match it
     result = client.context.ingest(
-        database=TENANT_ID,
-        collection=KB_SUB_TENANT,
+        database=DATABASE,
+        collection=KB_COLLECTION,
         upsert=True,
         app_knowledge=json.dumps(batch),    # JSON string, not a list
     )
@@ -198,18 +208,18 @@ def _upload_kb_batch(batch: list) -> list:
 import { HydraDBClient } from "@hydradb/sdk";
 
 const client = new HydraDBClient({ token: process.env.HYDRA_DB_API_KEY! });
-const TENANT_ID    = "customer-support";
-const KB_SUB_TENANT = "knowledge-base";
+const DATABASE    = "customer-support";
+const KB_COLLECTION = "knowledge-base";
 
 async function uploadKbBatch(batch: object[]): Promise<string[]> {
-    // database / collection required as top-level SDK params AND inside each item
+    // database is required at the top level; per-item values must match it
     const result = await client.context.ingest({
-        database:     TENANT_ID,
-        collection: KB_SUB_TENANT,
-        upsert:        true,
+        database:     DATABASE,
+        collection: KB_COLLECTION,
+        upsert:        "true",                 // form field, sent as a string
         appKnowledge: JSON.stringify(batch),   // JSON string, not an array
     });
-    return (result.data.results || []).map((r: any) => r.id);
+    return (result.data?.results || []).map((r: any) => r.id);
 }
 
 async function ingestHelpDocs(articles: any[]): Promise<string[]> {
@@ -224,8 +234,8 @@ async function ingestHelpDocs(articles: any[]): Promise<string[]> {
     for (const article of articles) {
         batch.push({
             id:            article.id,
-            database:     TENANT_ID,        // required inside each item
-            collection: KB_SUB_TENANT,    // required inside each item
+            database:     DATABASE,        // optional; must match the top-level database
+            collection: KB_COLLECTION,    // optional per-item collection
             title:         article.title,
             type:          "confluence",
             timestamp:     article.updated_at,
@@ -249,7 +259,7 @@ async function ingestHelpDocs(articles: any[]): Promise<string[]> {
         allIds = allIds.concat(await uploadKbBatch(batch));
     }
 
-    console.log(`Knowledge base: ${allIds.length} articles indexed.`);
+    console.log(`Knowledge base: ${allIds.length} articles queued for indexing.`);
     return allIds;
 }
 ```
@@ -283,8 +293,8 @@ def ingest_resolved_tickets(tickets: list) -> list:
         )
         batch.append({
             "id":            f"ticket-{ticket['id']}",
-            "database":     TENANT_ID,        # required inside each item
-            "collection": KB_SUB_TENANT,    # required inside each item
+            "database":     DATABASE,        # optional; must match the top-level database
+            "collection": KB_COLLECTION,    # optional per-item collection
             "title":         ticket["subject"],
             "type":          "zendesk",
             "timestamp":     ticket["resolved_at"],
@@ -304,7 +314,7 @@ def ingest_resolved_tickets(tickets: list) -> list:
     if batch:
         all_ids += _upload_kb_batch(batch)
 
-    print(f"Tickets: {len(all_ids)} resolutions indexed.")
+    print(f"Tickets: {len(all_ids)} resolutions queued for indexing.")
     return all_ids
 ```
 ```typescript TypeScript SDK
@@ -330,8 +340,8 @@ async function ingestResolvedTickets(tickets: any[]): Promise<string[]> {
 
         batch.push({
             id:            `ticket-${ticket.id}`,
-            database:     TENANT_ID,        // required inside each item
-            collection: KB_SUB_TENANT,    // required inside each item
+            database:     DATABASE,        // optional; must match the top-level database
+            collection: KB_COLLECTION,    // optional per-item collection
             title:         ticket.subject,
             type:          "zendesk",
             timestamp:     ticket.resolved_at,
@@ -355,17 +365,19 @@ async function ingestResolvedTickets(tickets: any[]): Promise<string[]> {
         allIds = allIds.concat(await uploadKbBatch(batch));
     }
 
-    console.log(`Tickets: ${allIds.length} resolutions indexed.`);
+    console.log(`Tickets: ${allIds.length} resolutions queued for indexing.`);
     return allIds;
 }
 ```
 </CodeGroup>
 
+Ingestion is asynchronous. Before you test queries, poll [`GET /context/status`](/api-reference/v2/endpoint/source-status) with the returned IDs until each `indexing_status` is `completed` or `errored`.
+
 ---
 
 ## Step 3: Build Per-Customer Memory
 
-Every customer gets their own persistent memory in HydraDB. This is what makes the agent feel personal. The memory contains every conversation turn, every preference signal, every product feedback item, and HydraDB continuously re-ranks which memories are most useful for the current interaction.
+Every customer gets their own persistent memory in HydraDB. This is what makes the agent feel personal. The memory contains every conversation turn, every preference signal, every product feedback item, and HydraDB ranks them against each new message.
 
 ### Store Conversation Turns
 
@@ -373,8 +385,6 @@ After every message exchange, write both the customer message and agent response
 
 <CodeGroup>
 ```python Python SDK
-import json
-
 # memory/conversation.py
 import json
 
@@ -385,7 +395,7 @@ def store_conversation_turn(
     agent_reply:  str,
 ):
     """
-    user_name = customer_id so HydraDB builds a per-customer memory profile.
+    The customer's collection scopes the memory; user_name names them during inference.
     infer: false - store verbatim, don't extract implicit signals here.
     """
     text = (
@@ -395,12 +405,12 @@ def store_conversation_turn(
     )
     client.context.ingest(
         type='memory',
-        database=TENANT_ID,
-        collection=customer_sub_tenant(customer_id),
+        database=DATABASE,
+        collection=customer_collection(customer_id),
         upsert=True,
         memories=json.dumps([{
             "text":      text,
-            "user_name": customer_id,   # ties memory to this customer
+            "user_name": customer_id,   # names the customer during inference
             "infer":     False,          # store verbatim conversation turn
         }]),
     )
@@ -410,7 +420,7 @@ def store_conversation_turn(
 import { HydraDBClient } from "@hydradb/sdk";
 
 const client = new HydraDBClient({ token: process.env.HYDRA_DB_API_KEY! });
-const TENANT_ID = "customer-support";
+const DATABASE = "customer-support";
 
 async function storeConversationTurn(
     customerId:  string,
@@ -419,21 +429,21 @@ async function storeConversationTurn(
     agentReply:  string,
 ): Promise<void> {
     /**
-     * user_name = customerId so HydraDB builds a per-customer memory profile.
+     * The customer's collection scopes the memory; user_name names them during inference.
      * infer: false - store verbatim, don't extract implicit signals here.
      */
     const text = `[Ticket: ${ticketId}]\nCustomer: ${customerMsg}\nAgent: ${agentReply}`;
 
     await client.context.ingest({
         type: 'memory',
-        database:     TENANT_ID,
+        database:     DATABASE,
         collection: `customer-${customerId}`,
         memories: JSON.stringify([{
             text,
-            user_name: customerId,  // ties memory to this customer
+            user_name: customerId,  // names the customer during inference
             infer:     false,        // store verbatim conversation turn
         }]),
-        upsert: true,
+        upsert: "true",
     });
 }
 ```
@@ -445,8 +455,6 @@ Store inferred preferences separately using `infer: true`. HydraDB extracts impl
 
 <CodeGroup>
 ```python Python SDK
-import json
-
 # memory/preferences.py
 import json
 
@@ -457,12 +465,12 @@ def store_customer_preference(customer_id: str, preference: str):
     """
     client.context.ingest(
         type='memory',
-        database=TENANT_ID,
-        collection=customer_sub_tenant(customer_id),
+        database=DATABASE,
+        collection=customer_collection(customer_id),
         upsert=True,
         memories=json.dumps([{
             "text":      preference,
-            "user_name": customer_id,   # ties memory to this customer
+            "user_name": customer_id,   # names the customer during inference
             "infer":     True,           # HydraDB extracts preferences and signals
         }]),
     )
@@ -487,7 +495,7 @@ store_customer_preference(
 import { HydraDBClient } from "@hydradb/sdk";
 
 const client = new HydraDBClient({ token: process.env.HYDRA_DB_API_KEY! });
-const TENANT_ID = "customer-support";
+const DATABASE = "customer-support";
 
 async function storeCustomerPreference(customerId: string, preference: string): Promise<void> {
     /**
@@ -496,14 +504,14 @@ async function storeCustomerPreference(customerId: string, preference: string): 
      */
     await client.context.ingest({
         type: 'memory',
-        database:     TENANT_ID,
+        database:     DATABASE,
         collection: `customer-${customerId}`,
         memories: JSON.stringify([{
             text:      preference,
-            user_name: customerId,  // ties memory to this customer
+            user_name: customerId,  // names the customer during inference
             infer:     true,         // HydraDB extracts preferences and signals
         }]),
-        upsert: true,
+        upsert: "true",
     });
 }
 
@@ -524,7 +532,7 @@ await storeCustomerPreference(
 ```
 </CodeGroup>
 
-> **When to call this**: After ticket resolution ("customer confirmed this fix works"), when a customer expresses a preference explicitly ("can you just send me a link instead of steps?"), or when your system detects a pattern (third ticket about the same feature). Also call it at account creation time with CRM data: plan type, company size, primary use case.
+> **When to call this:** After ticket resolution ("customer confirmed this fix works"), when a customer expresses a preference explicitly ("can you just send me a link instead of steps?"), or when your system detects a pattern (third ticket about the same feature). Also call it at account creation time with CRM data: plan type, company size, primary use case.
 
 ---
 
@@ -548,25 +556,25 @@ def recall_customer_context(
     1. search (type="knowledge") - searches knowledge base (docs, resolved tickets)
     2. search (type="memory") - searches customer's personal memory
     Merge both before passing to LLM.
-    mode: "thinking" enables personalised ranking on both calls.
+    mode: "thinking" adds query expansion and reranking on both calls.
     collection scopes each call to the right data store.
     """
     # Call 1: knowledge base - help docs, resolved tickets, FAQs
     kb_data = client.query(
-        database=TENANT_ID,
-        collection=KB_SUB_TENANT,
+        database=DATABASE,
+        collection=KB_COLLECTION,
         query=customer_msg,
         max_results=max_results,
-        mode="thinking",    # personalised ranking
+        mode="thinking",    # query expansion + reranking
         graph_context=True,          # cross-document entity linking
-        alpha=0.8,           # balanced semantic + keyword
+        alpha=0.8,           # the default: mostly semantic, some keyword
     )
 
     # Call 2: customer personal memory - preferences, history, account facts
     mem_data = client.query(
         type="memory",
-        database=TENANT_ID,
-        collection=customer_sub_tenant(customer_id),
+        database=DATABASE,
+        collection=customer_collection(customer_id),
         query=customer_msg,
         max_results=8,
         mode="thinking",
@@ -578,17 +586,17 @@ def recall_customer_context(
         "chunks":        (mem_data.data.chunks or []) + (kb_data.data.chunks or []),
         "graph_context": kb_data.data.graph_context or {},
     }
-    # chunks[n]["chunk_content"]   - the actual text
-    # chunks[n]["source_title"]    - which doc or memory it came from
-    # chunks[n]["relevancy_score"] - HydraDB's confidence (0–1)
+    # chunks[n].chunk_content   - the actual text
+    # chunks[n].source_title    - which doc or memory it came from
+    # chunks[n].relevancy_score - HydraDB's relevance score (0 to 1)
 ```
 ```typescript TypeScript SDK
 // support/search.ts
 import { HydraDBClient } from "@hydradb/sdk";
 
 const client = new HydraDBClient({ token: process.env.HYDRA_DB_API_KEY! });
-const TENANT_ID     = "customer-support";
-const KB_SUB_TENANT = "knowledge-base";
+const DATABASE     = "customer-support";
+const KB_COLLECTION = "knowledge-base";
 
 async function recallCustomerContext(
     customerId:  string,
@@ -597,27 +605,27 @@ async function recallCustomerContext(
 ): Promise<{ chunks: any[]; graphContext: any }> {
     /**
      * Two-call search pattern:
-     * 1. fullRecall        - searches knowledge base (docs, resolved tickets)
-     * 2. recallPreferences - searches customer's personal memory
+     * 1. query (type "knowledge") - searches knowledge base (docs, resolved tickets)
+     * 2. query (type "memory")    - searches customer's personal memory
      * Merge both before passing to LLM.
-     * mode: "thinking" enables personalised ranking on both calls.
+     * mode: "thinking" adds query expansion and reranking on both calls.
      * collection scopes each call to the right data store.
      */
     // Call 1: knowledge base - help docs, resolved tickets, FAQs
     const kbData = await client.query({
-        database:     TENANT_ID,
-        collection: KB_SUB_TENANT,
+        database:     DATABASE,
+        collection: KB_COLLECTION,
         query:         customerMsg,
         maxResults:   maxResults,
-        mode:          "thinking",   // personalised ranking
+        mode:          "thinking",   // query expansion + reranking
         graphContext: true,         // cross-document entity linking
-        alpha:         0.8,          // balanced semantic + keyword
+        alpha:         0.8,          // the default: mostly semantic, some keyword
     });
 
     // Call 2: customer personal memory - preferences, history, account facts
     const memData = await client.query({
         type: "memory",
-        database:     TENANT_ID,
+        database:     DATABASE,
         collection: `customer-${customerId}`,
         query:         customerMsg,
         maxResults:   8,
@@ -630,9 +638,9 @@ async function recallCustomerContext(
         chunks:        (memData.data?.chunks || []).concat(kbData.data?.chunks || []),
         graphContext: kbData.data?.graphContext || {},
     };
-    // chunks[n].chunk_content   - the actual text
-    // chunks[n].source_title    - which doc or memory it came from
-    // chunks[n].relevancy_score - HydraDB's confidence (0–1)
+    // chunks[n].chunkContent   - the actual text
+    // chunks[n].sourceTitle    - which doc or memory it came from
+    // chunks[n].relevancyScore - HydraDB's relevance score (0 to 1)
 }
 ```
 </CodeGroup>
@@ -671,8 +679,8 @@ def handle_ticket(
     )
 
     # Include entity relationship paths if available
-    entity_paths = graph_ctx.query_paths if graph_ctx else []
-    entity_text  = "\n".join(str(p) for p in entity_paths[:3])
+    entity_paths = (graph_ctx.query_paths or []) if graph_ctx else []
+    entity_text  = "\n".join(p.combined_context or "" for p in entity_paths[:3])
 
     # Step 2: Generate response
     completion = openai_client.chat.completions.create(
@@ -731,12 +739,12 @@ async function handleTicket(
 
     // Build context string for the LLM - ranked chunks, most useful first
     const contextText = chunks
-        .map((c: any) => `[${c.source_title} | score:${(c.relevancy_score || 0).toFixed(2)}]\n${c.chunk_content}`)
+        .map((c: any) => `[${c.sourceTitle ?? ""} | score:${(c.relevancyScore || 0).toFixed(2)}]\n${c.chunkContent ?? ""}`)
         .join("\n\n");
 
     // Include entity relationship paths if available
     const entityPaths = (graphCtx.queryPaths || []).slice(0, 3);
-    const entityText  = entityPaths.map((p: any) => String(p)).join("\n");
+    const entityText  = entityPaths.map((p: any) => p.combinedContext ?? "").join("\n");
 
     // Step 2: Generate response
     const completion = await openaiClient.chat.completions.create({
@@ -794,14 +802,15 @@ def escalate_to_human(
     # Search full customer memory profile
     customer_profile = client.query(
         type="memory",
-        database=TENANT_ID,
-        collection=customer_sub_tenant(customer_id),
+        database=DATABASE,
+        collection=customer_collection(customer_id),
         query="customer account history preferences past issues plan",
     )
 
     # Search similar past tickets resolved by humans
     similar_data = client.query(
-        database=TENANT_ID,
+        database=DATABASE,
+        collection=KB_COLLECTION,      # resolved tickets live in the shared KB collection
         query=f"{customer_msg} resolved escalated human agent",
         max_results=5,
     )
@@ -812,7 +821,7 @@ def escalate_to_human(
         "customer_id":  customer_id,
         "current_issue": customer_msg,
         "ai_attempts":  ai_attempts,
-        "customer_profile": customer_profile,
+        "customer_profile": [c.chunk_content for c in (customer_profile.data.chunks or [])],
         "similar_resolutions": [
             {
                 "source":     t.source_title or "",
@@ -842,7 +851,8 @@ def escalate_to_human(
 import { HydraDBClient } from "@hydradb/sdk";
 
 const client = new HydraDBClient({ token: process.env.HYDRA_DB_API_KEY! });
-const TENANT_ID = "customer-support";
+const DATABASE = "customer-support";
+const KB_COLLECTION = "knowledge-base";
 
 async function escalateToHuman(
     customerId:  string,
@@ -857,14 +867,15 @@ async function escalateToHuman(
     // Search full customer memory profile
     const customerProfile = await client.query({
         type: "memory",
-        database:     TENANT_ID,
+        database:     DATABASE,
         collection: `customer-${customerId}`,
         query:         "customer account history preferences past issues plan",
     });
 
     // Search similar past tickets resolved by humans
     const similarData = await client.query({
-        database:   TENANT_ID,
+        database:   DATABASE,
+        collection: KB_COLLECTION,    // resolved tickets live in the shared KB collection
         query:       `${customerMsg} resolved escalated human agent`,
         maxResults: 5,
     });
@@ -875,11 +886,11 @@ async function escalateToHuman(
         customer_id:  customerId,
         current_issue: customerMsg,
         ai_attempts:  aiAttempts,
-        customer_profile: customerProfile,
+        customer_profile: (customerProfile.data?.chunks || []).map((c: any) => c.chunkContent),
         similar_resolutions: similarTickets.map((t: any) => ({
-            source:     t.source_title,
-            resolution: t.chunk_content.slice(0, 500),
-            score:      t.relevancy_score || 0,
+            source:     t.sourceTitle ?? "",
+            resolution: (t.chunkContent ?? "").slice(0, 500),
+            score:      t.relevancyScore || 0,
         })),
         note_for_human_agent:
             "Full context retrieved from HydraDB. " +
@@ -909,6 +920,7 @@ Expose the support agent on Slack for internal teams and via email webhook for c
 <CodeGroup>
 ```python Python SDK
 # interfaces/slack_support.py
+import os
 from slack_bolt import App
 app = App(token=os.environ["SLACK_BOT_TOKEN"])
 
@@ -1004,11 +1016,11 @@ if __name__ == "__main__":
 ```
 Hi Sarah,
 
-I can see you're on the Enterprise plan and that our team is already tracking this billing issue — it was flagged in your last conversation on May 12th as a known problem with the pro-rated credit calculation for annual upgrades.
+I can see you're on the Enterprise plan and that our team is already tracking this billing issue: it was flagged in your last conversation on May 12th as a known problem with the pro-rated credit calculation for annual upgrades.
 
-Our engineering team is targeting a fix for this sprint (ending May 23rd). In the meantime, I've manually applied a $47 credit to your account to cover the discrepancy.
+Our engineering team is targeting a fix for this sprint (ending May 23rd). In the meantime, our billing team can apply a manual credit for the discrepancy, and I can escalate that for you now.
 
-You should see the credit reflected within 24 hours. Is there anything else I can help you with?
+Is there anything else I can help you with?
 ```
 
 ---
@@ -1020,7 +1032,7 @@ All endpoints used in this cookbook. Base URL: `https://api.hydradb.com` · Head
 | Method | Endpoint | Purpose |
 |--------|----------|---------|
 | `POST` | `/databases` | Create the support database |
-| `POST` | `/context/ingest` | Upload help docs and past tickets (SDK only) |
+| `POST` | `/context/ingest` | Upload help docs and past tickets (multipart form) |
 | `GET` | `/context/status?database=...&ids=...` | Check indexing status |
 | `POST` | `/context/ingest` | Store conversation turns and preferences |
 | `POST` | `/query` | Search knowledge base |
@@ -1036,8 +1048,8 @@ All endpoints used in this cookbook. Base URL: `https://api.hydradb.com` · Head
 
 ```python
 client.context.ingest(
-    database=TENANT_ID,
-    collection=KB_SUB_TENANT,
+    database=DATABASE,
+    collection=KB_COLLECTION,
     upsert=True,
     app_knowledge=json.dumps([{
         "id":            "kb-article-001",
@@ -1054,34 +1066,40 @@ client.context.ingest(
 
 ### Store Customer Memory (Conversation Turn)
 
-The two memory examples list the fields of a multipart form request. `memories` is sent as a JSON string, which the SDK builds from `json.dumps([...])`.
+`/context/ingest` takes multipart form fields. `memories` is a JSON-stringified array, which the SDK builds from `json.dumps([...])`.
 
-```json
-{
-  "memories": [{
-    "text":      "[Ticket: tkt-001]\nCustomer: My SSO is broken...\nAgent: Let's try...",
+```bash
+curl -X POST 'https://api.hydradb.com/context/ingest' \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "API-Version: 2" \
+  -F "type=memory" \
+  -F "database=customer-support" \
+  -F "collection=customer-cust-8821" \
+  -F "upsert=true" \
+  -F 'memories=[{
+    "text": "[Ticket: tkt-001]\nCustomer: My SSO is broken...\nAgent: First, check the IdP certificate...",
     "user_name": "cust-8821",
-    "infer":     false
-  }],
-  "database":     "customer-support",
-  "collection": "customer-cust-8821",
-  "upsert":        true
-}
+    "infer": false
+  }]'
 ```
 
 ### Store Customer Preference
 
-```json
-{
-  "memories": [{
-    "text":      "Customer prefers technical explanations. On Enterprise plan. SSO issue reported twice.",
+Same request with `infer: true`:
+
+```bash
+curl -X POST 'https://api.hydradb.com/context/ingest' \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "API-Version: 2" \
+  -F "type=memory" \
+  -F "database=customer-support" \
+  -F "collection=customer-cust-8821" \
+  -F "upsert=true" \
+  -F 'memories=[{
+    "text": "Customer prefers technical explanations. On Enterprise plan. SSO issue reported twice.",
     "user_name": "cust-8821",
-    "infer":     true
-  }],
-  "database":     "customer-support",
-  "collection": "customer-cust-8821",
-  "upsert":        true
-}
+    "infer": true
+  }]'
 ```
 
 ### Search Knowledge Base
@@ -1126,7 +1144,7 @@ Tested across 2,400 real support tickets (mix of billing, technical, onboarding,
 
 > The 94% drop in repeated troubleshooting steps is the most direct result of persistent memory. Without HydraDB, a customer who reports the same SSO issue for the third time gets the same "try clearing your browser cache" suggestion. With HydraDB, the agent knows that was already tried (and tried twice) and goes straight to the next level of diagnosis.
 
-> **Benchmark methodology**: Figures are based on internal HydraDB testing. See [research.hydradb.com/hydradb.pdf](https://research.hydradb.com/hydradb.pdf) for the full paper. Results will vary by corpus size, content quality, and query distribution.
+> **Benchmark methodology:** Figures are based on internal HydraDB testing. See [research.hydradb.com/hydradb.pdf](https://research.hydradb.com/hydradb.pdf) for the full paper. Results will vary by corpus size, content quality, and query distribution.
 
 ---
 
@@ -1155,7 +1173,6 @@ customer_support_agent/
 ## Requirements
 
 ```
-requests
 python-dotenv
 flask
 openai
@@ -1172,4 +1189,4 @@ slack-bolt          # only if using Slack interface
 3. Seed a few customer memories from your CRM at account creation time.
 4. Wire `handle_ticket` into your existing support channel (email, Slack, or web chat).
 
-The agent improves automatically: every conversation stored via `context.ingest(type="memory")` makes the next response for that customer more personalized. There is no retraining step. HydraDB re-ranks memories continuously as new interactions come in.
+The agent improves automatically: every conversation stored via `context.ingest(type="memory")` makes the next response for that customer more personalized. There is no retraining step: each query ranks the customer's memories, including the newest ones, against the new message.

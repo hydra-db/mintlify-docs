@@ -5,7 +5,7 @@ description: "Ingest Slack, Gmail, Confluence, GitHub, and Linear into one Hydra
 
 This guide walks you through building a **company-wide internal search engine** powered by HydraDB. Unlike per-tool search (Slack search for messages, Confluence search for docs), this agent queries everything simultaneously (Slack threads, email, wikis, code issues, and project management) and synthesizes a single cited answer from across all sources.
 
-> **Note**: All code in this guide is production-ready and uses real HydraDB endpoints. Base URL: `https://api.hydradb.com`. Get your API key at [app.hydradb.com](https://app.hydradb.com).
+> **Note**: All code in this guide uses real HydraDB endpoints. Base URL: `https://api.hydradb.com`. Get your API key at [app.hydradb.com](https://app.hydradb.com).
 
 > **Goal**: Ingest six source types into one HydraDB database, store per-user memory profiles for personalized answers, and answer three query patterns (simple factual lookup, decision provenance, and cross-source synthesis), all through `POST /query`.
 
@@ -63,7 +63,7 @@ graph LR
     C -->|"POST /query"| D
 ```
 
-- **Ingestion Layer**: Six connector scripts that format source content and upload to HydraDB via `POST /context/ingest` using multipart form-data.
+- **Ingestion Layer**: Connector scripts that format source content and upload to HydraDB via `POST /context/ingest` using multipart form-data.
 - **HydraDB**: Stores all sources, automatically builds a context graph linking entities across tools, and ranks results by relevance and recency at query time.
 - **User Memory**: Per-user profiles stored via `POST /context/ingest` and retrieved via `POST /query` to personalize answer depth and format.
 
@@ -111,7 +111,7 @@ All connectors use the same endpoint: `POST /context/ingest`. This endpoint uses
 
 > **Important**: Do not set `Content-Type: application/json`. Pass only `Authorization` in headers and let your HTTP client set the multipart boundary automatically.
 
-> **Batch limit**: Max 20 sources per request. Wait 1 second between batches. Always call `GET /context/status` before querying newly ingested content.
+> **Pacing**: The connectors below upload one file per request with a short pause between uploads. If you batch, keep it to about 20 sources per request and wait 1 second between batches to stay under your plan's rate limits. Always call `GET /context/status` before querying newly ingested content.
 
 The upload response for all connectors looks like this (this is the envelope's `data` field, `result.data` in the SDK):
 
@@ -222,7 +222,6 @@ def _upload_batch(batch: list, sub_tenant: str) -> list:
 ```typescript TypeScript SDK
 // connectors/slack.ts
 import { HydraDBClient } from "@hydradb/sdk";
-import { readFileSync, writeFileSync } from "fs";
 import { WebClient } from "@slack/web-api";
 
 const client = new HydraDBClient({ token: process.env.HYDRA_DB_API_KEY! });
@@ -265,13 +264,12 @@ async function ingestSlackChannel(
         .slice(0, 10);
       const content =
         `Source: Slack #${channelName}\nDate: ${tsDate}\n\n${threadText}`;
-      const filename = `/tmp/slack-${channelName}-${msg.ts}.txt`;
-      writeFileSync(filename, content, "utf-8");
+      const filename = `slack-${channelName}-${msg.ts}.txt`;
 
       const result = await client.context.ingest({
         database: TENANT_ID,
         collection: "slack",
-        documents: [{ data: readFileSync(filename), filename, contentType: "application/octet-stream" }],
+        documents: [{ data: Buffer.from(content, "utf-8"), filename, contentType: "text/plain" }],
       });
       const results = result.data?.results ?? [];
       if (results[0]?.id) allIds.push(results[0].id);
@@ -366,7 +364,6 @@ def ingest_gmail_threads(credentials_path: str, query: str, max_threads: int = 2
 ```typescript TypeScript SDK
 // connectors/gmail.ts
 import { HydraDBClient } from "@hydradb/sdk";
-import { readFileSync, writeFileSync } from "fs";
 
 const client = new HydraDBClient({ token: process.env.HYDRA_DB_API_KEY! });
 const TENANT_ID = "company-knowledge";
@@ -421,13 +418,12 @@ async function ingestGmailThreads(
     const content =
       `Source: Gmail\nSubject: ${subject}\nDate: ${date}\n\n` +
       parts.join("\n\n---\n\n");
-    const filename = `/tmp/email-${thread.id}.txt`;
-    writeFileSync(filename, content, "utf-8");
+    const filename = `email-${thread.id}.txt`;
 
     const result = await client.context.ingest({
       database: TENANT_ID,
       collection: "email",
-      documents: [{ data: readFileSync(filename), filename, contentType: "application/octet-stream" }],
+      documents: [{ data: Buffer.from(content, "utf-8"), filename, contentType: "text/plain" }],
     });
     const results = result.data?.results ?? [];
     if (results[0]?.id) allIds.push(results[0].id);
@@ -512,7 +508,6 @@ def ingest_confluence_space(space_key: str):
 ```typescript TypeScript SDK
 // connectors/confluence.ts
 import { HydraDBClient } from "@hydradb/sdk";
-import { readFileSync, writeFileSync } from "fs";
 import axios from "axios";
 
 const client = new HydraDBClient({ token: process.env.HYDRA_DB_API_KEY! });
@@ -546,13 +541,12 @@ async function ingestConfluenceSpace(spaceKey: string): Promise<string[]> {
       const content =
         `Source: Confluence\nSpace: ${spaceKey}\nTitle: ${page.title}\n` +
         `Version: ${page.version.number}\n\n${text}`;
-      const filename = `/tmp/confluence-${spaceKey}-${page.id}.txt`;
-      writeFileSync(filename, content, "utf-8");
+      const filename = `confluence-${spaceKey}-${page.id}.txt`;
 
       const result = await client.context.ingest({
         database: TENANT_ID,
         collection: "docs",
-        documents: [{ data: readFileSync(filename), filename, contentType: "application/octet-stream" }],
+        documents: [{ data: Buffer.from(content, "utf-8"), filename, contentType: "text/plain" }],
       });
       const results = result.data?.results ?? [];
       if (results[0]?.id) allIds.push(results[0].id);
@@ -633,7 +627,6 @@ def ingest_github_issues(repo_name: str, state: str = "all", limit: int = 500):
 ```typescript TypeScript SDK
 // connectors/github.ts
 import { HydraDBClient } from "@hydradb/sdk";
-import { readFileSync, writeFileSync } from "fs";
 import { Octokit } from "@octokit/rest";
 
 const client = new HydraDBClient({ token: process.env.HYDRA_DB_API_KEY! });
@@ -675,13 +668,12 @@ async function ingestGithubIssues(
         `Issue #${item.number}: ${item.title}\n` +
         `State: ${item.state}\nLabels: ${labelList}\n\n` +
         `${item.body ?? ""}\n\nDiscussion:\n${comments.join("\n\n")}`;
-      const filename = `/tmp/github-${sub}-issue-${item.number}.txt`;
-      writeFileSync(filename, content, "utf-8");
+      const filename = `github-${sub}-issue-${item.number}.txt`;
 
       const result = await client.context.ingest({
         database: TENANT_ID,
         collection: "github",
-        documents: [{ data: readFileSync(filename), filename, contentType: "application/octet-stream" }],
+        documents: [{ data: Buffer.from(content, "utf-8"), filename, contentType: "text/plain" }],
       });
       const results = result.data?.results ?? [];
       if (results[0]?.id) allIds.push(results[0].id);
@@ -703,13 +695,14 @@ async function ingestGithubIssues(
 
 After uploading, poll `GET /context/status` until `indexing_status` is `completed` before running any queries. HydraDB indexes asynchronously, typically 10 to 30 seconds per file. A source is searchable at `graph_creation`, done at `completed`, and failed at `errored`.
 
-> **Note**: [`GET /context/status`](/api-reference/v2/endpoint/source-status) takes `ids` and `database` as **query parameters**. Pass multiple `ids` to check a batch in one call.
+> **Note**: [`GET /context/status`](/api-reference/v2/endpoint/source-status) takes `ids`, `database`, and `collection` as **query parameters**. Pass the collection you uploaded into (`slack`, `email`, `docs`, or `github`); without it, the lookup searches the default collection and does not find the source. Pass multiple `ids` to check a batch in one call.
 
 ```bash
 curl -G \
   'https://api.hydradb.com/context/status' \
   -H "Authorization: Bearer YOUR_API_KEY" \
   --data-urlencode "database=company-knowledge" \
+  --data-urlencode "collection=slack" \
   --data-urlencode "ids=YOUR_ID"
 ```
 
@@ -737,25 +730,26 @@ TENANT_ID = "company-knowledge"
 client    = HydraDB(token=os.environ["HYDRA_DB_API_KEY"])
 
 
-def wait_until_indexed(id: str, max_tries: int = 20, interval: int = 3) -> None:
+def wait_until_indexed(id: str, collection: str, max_tries: int = 20, interval: int = 3) -> None:
     for i in range(max_tries):
         time.sleep(interval)
         result = client.context.status(
             database=TENANT_ID,
+            collection=collection,
             ids=[id],
         )
         items  = result.data.statuses or []
         status = items[0].indexing_status if items else None
 
         if status == "completed":
-            print(f"Indexed ✓ ({id})")
+            print(f"Indexed ({id})")
             return
         if status == "errored":
             raise RuntimeError(f"Indexing failed for {id}")
 
         print(f"Indexing... {status or 'queued'} (attempt {i+1}/{max_tries})")
 
-    print(f"Timeout - {id} may still complete in background.")
+    print(f"Timeout: {id} may still complete in background.")
 ```
 
 ```typescript TypeScript SDK
@@ -782,7 +776,7 @@ async function waitUntilIndexed(
     const status = statuses[0]?.indexingStatus as string | undefined;
 
     if (status === "completed") {
-      console.log(`Indexed ✓ (${id})`);
+      console.log(`Indexed (${id})`);
       return;
     }
     if (status === "errored") {
@@ -790,7 +784,7 @@ async function waitUntilIndexed(
     }
     console.log(`Indexing... ${status ?? "queued"} (attempt ${i + 1}/${maxTries})`);
   }
-  console.log(`Timeout - ${id} may still complete in background.`);
+  console.log(`Timeout: ${id} may still complete in background.`);
 }
 ```
 </CodeGroup>
@@ -804,17 +798,14 @@ Each user gets a persistent memory profile in their own collection, which knowle
 ```bash
 curl -X POST 'https://api.hydradb.com/context/ingest' \
   -H "Authorization: Bearer YOUR_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "memories": [{
-      "text": "Alice is a senior engineer on the platform team. She owns the auth service and data pipeline. Prefers technical depth with references to PRs and ADRs.",
-      "infer": true,
-      "user_name": "alice"
-    }],
-    "database": "company-knowledge",
-    "collection": "user-alice",
-    "upsert": true
-  }'
+  -F "type=memory" \
+  -F "database=company-knowledge" \
+  -F "collection=user-alice" \
+  -F 'memories=[{
+    "text": "Alice is a senior engineer on the platform team. She owns the auth service and data pipeline. Prefers technical depth with references to PRs and ADRs.",
+    "infer": true,
+    "user_name": "alice"
+  }]'
 ```
 
 **Response** (the envelope's `data` field):
@@ -825,9 +816,9 @@ curl -X POST 'https://api.hydradb.com/context/ingest' \
   "results": [
     {
       "id": "ddb780a2-354f-4a71-8e1b-5101c91c69ce",
-      "title": "First Document",
+      "title": "ddb780a2-354f-4a71-8e1b-5101c91c69ce",
       "status": "queued",
-      "infer": false,
+      "infer": true,
       "error": null
     }
   ],
@@ -859,7 +850,7 @@ def store_user_profile(user_id: str, profile_text: str) -> str:
         type='memory',
         database=TENANT_ID,
         collection=f"user-{user_id}",
-        upsert=True,
+        upsert="true",
         memories=json.dumps([{
             "text":      profile_text,
             "infer":     True,
@@ -868,7 +859,7 @@ def store_user_profile(user_id: str, profile_text: str) -> str:
     )
     items = result.data.results or []
     id = items[0].id if items else None
-    print(f"Profile stored for {user_id} → id: {id}")
+    print(f"Profile stored for {user_id}, id: {id}")
     return id
 ```
 
@@ -894,7 +885,7 @@ async function storeUserProfile(
     type: 'memory',
     database: TENANT_ID,
     collection: `user-${userId}`,
-    upsert: true,
+    upsert: "true",
     memories: JSON.stringify([
       {
         text: profileText,
@@ -905,7 +896,7 @@ async function storeUserProfile(
   });
   const results = result.data?.results ?? [];
   const id: string | null = results[0]?.id ?? null;
-  console.log(`Profile stored for ${userId} → id: ${id}`);
+  console.log(`Profile stored for ${userId}, id: ${id}`);
   return id;
 }
 
@@ -978,7 +969,7 @@ def search(
 ) -> dict:
     """
     Core search function. Returns chunks + graph_context.
-    user_id personalizes answer depth based on stored profile.
+    user_id is not sent to HydraDB here; explain_decision() shows how to apply the stored profile.
     mode="thinking" enables multi-query reranking automatically.
     """
     return client.query(
@@ -998,9 +989,9 @@ def print_results(result) -> None:
     chunks = result.data.chunks or []
     print(f"\n{len(chunks)} chunks retrieved:\n")
     for chunk in chunks:
-        fname = chunk.additional_metadata or {}
+        fname = chunk.source_title or "untitled"   # the uploaded filename
         score = chunk.relevancy_score or 0
-        print(f"  [{fname.get('filename', 'memory')} - {score:.2f}]")
+        print(f"  [{fname} - {score:.2f}]")
         print(f"  {(chunk.chunk_content or '')[:200]}...")
         print()
 
@@ -1042,7 +1033,7 @@ async function search(
 ): Promise<any> {
   /**
    * Core search function. Returns chunks + graph_context.
-   * userId personalizes answer depth based on stored profile.
+   * userId is not sent to HydraDB here; explainDecision() shows how to apply the stored profile.
    * mode="thinking" enables multi-query reranking automatically.
    */
   const payload: Record<string, any> = {
@@ -1065,7 +1056,7 @@ function printResults(result: any): void {
   const chunks = result?.data?.chunks ?? [];
   console.log(`\n${chunks.length} chunks retrieved:\n`);
   for (const chunk of chunks) {
-    const fname = chunk?.additionalMetadata?.filename ?? "memory";
+    const fname = chunk?.sourceTitle ?? "untitled"; // the uploaded filename
     const score = chunk?.relevancyScore ?? 0;
     console.log(`  [${fname} - ${score.toFixed(2)}]`);
     console.log(`  ${(chunk?.chunkContent ?? "").slice(0, 200)}...`);
@@ -1134,17 +1125,17 @@ def explain_decision(question: str, user_id: str) -> str:
         recency_bias=0.4,   # low = surfaces both old and recent for decision trails
     )
     chunks          = data.data.chunks or []
-    chunk_relations = (data.data.graph_context.chunk_relations if data.data.graph_context else [])
+    chunk_relations = (data.data.graph_context.chunk_relations if data.data.graph_context else None) or []
 
     # Build context with source attribution
     ctx_parts = []
     for c in chunks:
-        fname = (c.additional_metadata or {}).get("filename", "unknown source")
+        fname = c.source_title or "unknown source"
         score = c.relevancy_score or 0
         ctx_parts.append(f"[{fname} | score:{score:.2f}]\n{c.chunk_content or ''}")
 
     for rel in chunk_relations[:6]:
-        combined = rel.get("combined_context", "")
+        combined = rel.combined_context or ""
         if combined:
             ctx_parts.append(f"[Entity relationship]: {combined}")
 
@@ -1186,7 +1177,7 @@ if __name__ == "__main__":
         user_id = "priya"
     )
     print(answer)
-    # → "The decision emerged from three threads:
+    # Example output: "The decision emerged from three threads:
     #    1. [confluence-ENG-12345.txt] Engineering formally documented in ADR-019...
     #    2. [slack-product-1699430400.txt] Initial discussion when metrics showed...
     #    3. [email-thread-abc123.txt] Leadership confirmed the timeline in Q4..."
@@ -1243,8 +1234,7 @@ async function explainDecision(
   // Build context with source attribution
   const ctxParts: string[] = [];
   for (const c of chunks) {
-    const fname =
-      (c.additionalMetadata as any)?.filename ?? "unknown source";
+    const fname = c.sourceTitle ?? "unknown source";
     const score = c.relevancyScore ?? 0;
     ctxParts.push(`[${fname} | score:${score.toFixed(2)}]\n${c.chunkContent ?? ""}`);
   }
@@ -1298,13 +1288,14 @@ For questions that span multiple topics or time periods, use `mode: "thinking"` 
 
 ```python
 # search/synthesis.py
-# (uses search() from search/qa.py)
+from search.qa         import search
+from search.provenance import explain_decision
 
 def smart_search(question: str, user_id: str) -> dict:
     """
     Route to the right query strategy based on question type.
-    Provenance questions → explain_decision()
-    Everything else    → search()
+    Provenance questions: explain_decision()
+    Everything else:      search()
     """
     PROVENANCE_SIGNALS = ["why did", "what led", "how did we decide", "decision to", "reason for"]
     is_provenance      = any(s in question.lower() for s in PROVENANCE_SIGNALS)
@@ -1367,18 +1358,10 @@ curl -X POST 'https://api.hydradb.com/query' \
 
 ```python
 # interfaces/web_api.py
-import uuid
 from flask import Flask, request, jsonify
 from search.synthesis import smart_search
 
 flask_app = Flask(__name__)
-sessions  = {}   # user_id → session_id (in production: use Redis)
-
-
-def get_session(user_id: str) -> str:
-    if user_id not in sessions:
-        sessions[user_id] = str(uuid.uuid4())
-    return sessions[user_id]
 
 
 @flask_app.route("/search", methods=["POST"])
@@ -1399,6 +1382,7 @@ if __name__ == "__main__":
 
 ```python
 # interfaces/slack_search.py
+import os
 from slack_bolt import App
 from search.synthesis import smart_search
 
@@ -1454,7 +1438,7 @@ def run_sync(
     """
     Incremental sync - run nightly.
     Slack/email: only content from last N days.
-    Confluence:  full re-ingest (idempotent).
+    Confluence:  full re-ingest of each space.
     GitHub:      recent issues only (use webhooks for real-time).
     """
     print(f"Sync starting...")
@@ -1495,7 +1479,7 @@ All endpoints used in this cookbook. Base URL: `https://api.hydradb.com` · Head
 |--------|----------|---------|
 | `POST` | `/databases` | Create the company-knowledge database |
 | `POST` | `/context/ingest` | Upload a source file (multipart form-data) |
-| `GET` | `/context/status?database=...&ids=...` | Check indexing status |
+| `GET` | `/context/status?database=...&collection=...&ids=...` | Check indexing status |
 | `POST` | `/context/ingest` | Store a user profile memory |
 | `POST` | `/query` | Retrieve user profile for personalization |
 | `POST` | `/query` | Query all indexed knowledge |
@@ -1517,22 +1501,17 @@ All endpoints used in this cookbook. Base URL: `https://api.hydradb.com` · Head
 
 ### Verify Processing (query params)
 ```
-GET /context/status?database=company-knowledge&ids=YOUR_ID
+GET /context/status?database=company-knowledge&collection=slack&ids=YOUR_ID
 ```
 
-### Store User Memory
-```json
-{
-  "memories": [{
-    "text":      "Alice is a senior engineer...",
-    "infer":     true,
-    "user_name": "alice"
-  }],
-  "database":     "company-knowledge",
-  "collection": "user-alice",
-  "upsert":        true
-}
-```
+### Store User Memory (form-data)
+
+| Form field | Type | Value |
+|---|---|---|
+| `type` | Text | `memory` |
+| `database` | Text | `company-knowledge` |
+| `collection` | Text | `user-alice` |
+| `memories` | Text | JSON string array, e.g. `[{"text": "Alice is a senior engineer...", "infer": true, "user_name": "alice"}]` |
 
 ### Search User Preferences
 ```json
