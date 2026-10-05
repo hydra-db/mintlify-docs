@@ -1,16 +1,16 @@
 ---
 title: "AI Financial Analyst with Memory"
-description: "Upload earnings PDFs, internal metrics, and board memos into HydraDB. Ask trend questions across quarters, get temporally-aware answers, and surface the exact clause, figure, or narrative shift - not a generic summary."
+description: "Upload earnings PDFs, internal metrics, and board memos into HydraDB. Ask trend questions across quarters, get temporally-aware answers, and surface the exact clause, figure, or narrative shift, not a generic summary."
 ---
 
-This guide walks you through building a production-grade **AI Financial Analyst** powered by HydraDB. The agent ingests structured and unstructured financial data - earnings call transcripts, PDF filings, internal metric exports, and board memos - and answers questions that require reasoning across time:
+This guide walks you through building a production-grade **AI Financial Analyst** powered by HydraDB. The agent ingests structured and unstructured financial data (earnings call transcripts, PDF filings, internal metric exports, and board memos) and answers questions that require reasoning across time:
 
 - _"How did our gross margin trend across the last four quarters?"_
 - _"What did the CFO say about guidance in Q2 vs Q4?"_
 - _"Which metric deteriorated most between Q3 2023 and Q1 2024?"_
 - _"Summarise all references to churn risk across our last six board memos."_
 
-Standard RAG fails on these because **two earnings calls produce nearly identical embeddings** - they're the same format, the same vocabulary, the same topics. A vector search can't tell Q2 from Q4 without temporal structure. HydraDB's `recency_bias` parameter, timestamp-aware graph, and multi-stage retrieval pipeline solve this structurally.
+Standard RAG fails on these because **two earnings calls produce nearly identical embeddings**: they're the same format, the same vocabulary, the same topics. A vector search can't tell Q2 from Q4 without temporal structure. HydraDB's `recency_bias` parameter, timestamp-aware graph, and multi-stage retrieval pipeline solve this structurally.
 
 > **Note**: All API calls in this guide are real and ready to run. Base URL: `https://api.hydradb.com`. Get your API key at [app.hydradb.com](https://app.hydradb.com).
 
@@ -23,6 +23,7 @@ Standard RAG fails on these because **two earnings calls produce nearly identica
 - HydraDB API key
 - Python 3.11 or 3.12 (`python --version`)
 - `pip install hydradb-sdk`
+- An OpenAI API key and `pip install openai`, for the steps that write answers from the retrieved chunks
 
 ## What You'll Build
 
@@ -36,13 +37,13 @@ By the end of this cookbook, you'll be able to:
 
 ## Why Naive RAG Fails on Financial Data
 
-The structural problem is **temporal ambiguity**. A Q2 2023 earnings call and a Q4 2023 earnings call are nearly identical in vocabulary, format, and topic distribution. Both discuss revenue, margins, guidance, and macro headwinds. Their embeddings sit close together in vector space. When you ask "how did guidance change between Q2 and Q4?", a cosine similarity search returns whichever call scores slightly higher - not both, not in order, not with any awareness that temporal comparison is what the question requires.
+The structural problem is **temporal ambiguity**. A Q2 2023 earnings call and a Q4 2023 earnings call are nearly identical in vocabulary, format, and topic distribution. Both discuss revenue, margins, guidance, and macro headwinds. Their embeddings sit close together in vector space. When you ask "how did guidance change between Q2 and Q4?", a cosine similarity search returns whichever call scores slightly higher: not both, not in order, not with any awareness that temporal comparison is what the question requires.
 
 HydraDB fixes this through three architectural properties:
 
-1. **Timestamp-aware indexing** - every ingested document carries an ISO 8601 `timestamp` field that HydraDB indexes as a first-class attribute alongside the vector. `recency_bias` uses this to weight results by recency or spread results across time depending on what the query needs.
-2. **Temporal Knowledge Graph** - entities (companies, executives, metrics, products) are stored as nodes. Each mention of a metric across different documents creates a time-ordered edge sequence on that entity - effectively a versioned history. Querying "revenue trend" traverses these edges in temporal order rather than returning a flat ranked list of chunks.
-3. **Multi-query expansion** - in `mode: "thinking"`, HydraDB expands the query into semantically diverse reformulations, then executes all of them in parallel. "How did guidance change between Q2 and Q4?" becomes "Q2 guidance outlook", "Q4 forward guidance revised", "guidance comparison quarterly" - each targeting a different point on the timeline.
+1. **Timestamp-aware indexing:** every ingested document carries an ISO 8601 event date (`event_time` in `additional_metadata`) that HydraDB reads as a first-class attribute alongside the vector. `recency_bias` uses this to weight results by recency or spread results across time depending on what the query needs.
+2. **Temporal Knowledge Graph:** entities (companies, executives, metrics, products) are stored as nodes. Each mention of a metric across different documents creates a time-ordered edge sequence on that entity, effectively a versioned history. Querying "revenue trend" traverses these edges in temporal order rather than returning a flat ranked list of chunks.
+3. **Multi-query expansion:** in `mode: "thinking"`, HydraDB expands the query into semantically diverse reformulations, then executes all of them in parallel. "How did guidance change between Q2 and Q4?" becomes "Q2 guidance outlook", "Q4 forward guidance revised", "guidance comparison quarterly", each targeting a different point on the timeline.
 
 | Failure mode | Naive RAG | HydraDB |
 |---|---|---|
@@ -50,7 +51,7 @@ HydraDB fixes this through three architectural properties:
 | "Current" vs "historical" | No distinction | `recency_bias` controls the balance |
 | Same metric across quarters | Chunks look identical, rank arbitrarily | Graph edges connect metric nodes across time |
 | CFO quote attribution | Quote appears; quarter is lost | Source metadata + timestamp surfaced in every chunk |
-| Cross-source synthesis (PDF + metrics + memo) | Siloed - no linking across sources | Context graph links by entity across all sources |
+| Cross-source synthesis (PDF + metrics + memo) | Siloed: no linking across sources | Context graph links by entity across all sources |
 
 ---
 
@@ -70,13 +71,13 @@ graph TD
 
 **Key design decisions:**
 - One **database** for the entire financial data corpus. Collections namespace by company or analyst team.
-- **`recency_bias: 0.7`** for trend questions (surface recent but still gather historical). **`recency_bias: 0.3`** for historical comparison (spread evenly across time).
-- **`mode: "thinking"`** for all analytical queries - multi-query reranking is essential for financial reasoning.
-- **`graph_context: true`** on `/query` gives you `query_paths` - the entity relationship chains that show how a metric's value evolved across documents.
+- **`recency_bias: 0.7`** for point-in-time questions (target the quarter but still gather adjacent context). **`recency_bias: 0.3`** for trend and historical comparison (spread evenly across time).
+- **`mode: "thinking"`** for all analytical queries: multi-query reranking is essential for financial reasoning.
+- **`graph_context: true`** on `/query` gives you `query_paths`: the entity relationship chains that show how a metric's value evolved across documents.
 
 ---
 
-## Step 1 - Create Database & Environment
+## Step 1: Create Database & Environment
 
 One database for the whole financial corpus. Collections isolate by company, fund, or analyst team.
 
@@ -102,15 +103,19 @@ print(result)
 #   "analyst-{user_id}"        - per-analyst preference memory
 ```
 
-> **SDK required for all API calls.** Install: `pip install hydradb-sdk`. Import as `from hydra_db import HydraDB` (the import name differs from the package name).
+> **SDK used for all API calls in this guide.** Install: `pip install hydradb-sdk`. Import as `from hydra_db import HydraDB` (the import name differs from the package name).
 
 ---
 
-## Step 2 - Upload Financial Documents
+## Step 2: Upload Financial Documents
 
 ### 2.1 Earnings Call Transcripts & SEC Filings (PDF)
 
-Earnings PDFs are the primary context. Tag each with structured metadata - `ticker`, `period`, `doc_type`, `fiscal_year`, `fiscal_quarter` - so you can filter search to a specific company or exact fiscal period before semantic search even runs.
+Earnings PDFs are the primary context. Tag each with structured metadata (`ticker`, `doc_type`, `fiscal_year`, `fiscal_quarter`) so you can filter search to a specific company or exact fiscal period before semantic search even runs. For an uploaded file, per-file metadata goes in the `document_metadata` form field: a JSON array with one item per file, in the same order as `documents`.
+
+- **`metadata`:** the fields you filter on (`ticker`, `doc_type`, `fiscal_year`, `fiscal_quarter`). Declare them in the database metadata schema. In a database with a schema, an undeclared `metadata` key is rejected.
+- **`additional_metadata`:** labels you read back (`period_label`, `period_end_date`) and `event_time`. Recency ranking reads the event time from `additional_metadata` (`event_time`, `timestamp`, or `date`), never the upload time, so set it to the period end.
+- **Title:** `document_metadata` takes no `title`. The source title comes from the filename, so name files clearly (for example `NVDA-Q2-2023-earnings.pdf`).
 
 ```python
 # ingest/earnings_pdfs.py
@@ -129,37 +134,33 @@ def ingest_earnings_pdf(
     period_label: str,    # e.g. "Q2 2023" - human-readable label for UI
     period_end_date: str, # ISO 8601, e.g. "2023-06-30T00:00:00Z"
 ) -> str:
-    """
-    Upload a single earnings PDF. Returns the id for verification.
-
-    IMPORTANT: database and collection must appear both as top-level
-    SDK params AND inside the app_knowledge JSON - AppKnowledgeModel validates both.
-    """
+    """Upload a single earnings PDF. Returns the id for verification."""
     collection = f"earnings-{ticker.lower()}"
 
-    app_knowledge = json.dumps([{
-        "id":           f"{ticker}-{doc_type}-{fiscal_year}-Q{fiscal_quarter}",
-        "title":        f"{ticker} {period_label} {doc_type.replace('_', ' ').title()}",
-        "type":         "pdf",
-        "timestamp":    period_end_date,   # drives recency ranking - must be accurate
-        "database":    TENANT_ID,
-        "collection": collection,
+    # One item per file in `documents`, in the same order.
+    document_metadata = json.dumps([{
+        "id": f"{ticker}-{doc_type}-{fiscal_year}-Q{fiscal_quarter}",
+        # Schema fields you filter on.
         "metadata": {
-            "ticker":          ticker,
-            "doc_type":        doc_type,
-            "fiscal_year":     fiscal_year,
-            "fiscal_quarter":  fiscal_quarter,
+            "ticker":         ticker,
+            "doc_type":       doc_type,
+            "fiscal_year":    fiscal_year,
+            "fiscal_quarter": fiscal_quarter,
+        },
+        # Free-form fields. event_time drives recency ranking, so it must be
+        # the period end, not the upload date.
+        "additional_metadata": {
             "period_label":    period_label,
             "period_end_date": period_end_date,
-        }
+            "event_time":      period_end_date,
+        },
     }])
 
     with open(file_path, "rb") as f:
-        # FIX: SDK expects a tuple of (filename, file_obj, mime_type), not a raw file handle.
         result = client.context.ingest(
             database=TENANT_ID,
             collection=collection,
-            app_knowledge=app_knowledge,
+            document_metadata=document_metadata,
             documents=[(os.path.basename(file_path), f, "application/pdf")],
         )
 
@@ -226,17 +227,17 @@ filings = [
 ]
 ids = ingest_earnings_batch(filings)
 # Output:
-# Uploaded ACME Q1 2023 earnings_transcript → id: 988293fa-e29
-# Uploaded ACME Q2 2023 earnings_transcript → id: 9d7951c8-160
-# Uploaded ACME Q3 2023 earnings_transcript → id: 2cf6ea6e-5fe
-# Uploaded ACME Q4 2023 earnings_transcript → id: edff67d5-237
+# Uploaded ACME Q1 2023 earnings_transcript → id: ACME-earnings_transcript-2023-Q1
+# Uploaded ACME Q2 2023 earnings_transcript → id: ACME-earnings_transcript-2023-Q2
+# Uploaded ACME Q3 2023 earnings_transcript → id: ACME-earnings_transcript-2023-Q3
+# Uploaded ACME Q4 2023 earnings_transcript → id: ACME-earnings_transcript-2023-Q4
 ```
 
-> **The `timestamp` field is load-bearing.** HydraDB uses `timestamp` to sort and weight results when `recency_bias` is set. If you leave it blank or use the upload date instead of the reporting period end date, every Q2 and Q4 call will look equally "recent" and temporal queries will fail. Always use the fiscal period end date.
+> **The `event_time` field is load-bearing.** HydraDB uses `additional_metadata.event_time` to weight results when `recency_bias` is set. If you leave it blank or use the upload date instead of the reporting period end date, every Q2 and Q4 call will look equally "recent" and temporal queries will fail. Always use the fiscal period end date.
 
 ### 2.2 Internal Metrics (CSV / JSON)
 
-Internal financial metrics - revenue, ARR, churn, CAC, LTV, burn rate - are typically exported from a data warehouse or BI tool as CSV or JSON. Convert them to structured text chunks with one row per metric-per-period before uploading. This gives HydraDB the granularity to answer "what was CAC in Q2 2023?" precisely.
+Internal financial metrics (revenue, ARR, churn, CAC, LTV, burn rate) are typically exported from a data warehouse or BI tool as CSV or JSON. Convert them to structured text chunks with one row per metric-per-period before uploading. This gives HydraDB the granularity to answer "what was CAC in Q2 2023?" precisely.
 
 ```python
 # ingest/internal_metrics.py
@@ -388,7 +389,7 @@ ingest_metrics_series(metrics_series)
 
 ### 2.3 Board Memos & Investor Letters
 
-Board memos contain the strategic narrative behind the numbers - the reasoning that doesn't appear in the income statement. Upload them as text alongside the earnings PDFs. HydraDB's context graph automatically links board memo references to related earnings call chunks.
+Board memos contain the strategic narrative behind the numbers: the reasoning that doesn't appear in the income statement. Upload them as text alongside the earnings PDFs. HydraDB's context graph automatically links board memo references to related earnings call chunks.
 
 ```python
 # ingest/board_memos.py
@@ -407,27 +408,24 @@ def ingest_board_memo(
 ) -> str:
     collection = "board-memos"
 
-    app_knowledge = json.dumps([{
-        "id":           f"{ticker}-{memo_type}-{meeting_date[:10]}",
-        "title":        f"{ticker} {period_label} - {memo_type.replace('_', ' ').title()}",
-        "type":         "pdf",
-        "timestamp":    meeting_date,
-        "database":    TENANT_ID,
-        "collection": collection,
+    document_metadata = json.dumps([{
+        "id": f"{ticker}-{memo_type}-{meeting_date[:10]}",
         "metadata": {
-            "ticker":       ticker,
-            "doc_type":     memo_type,
+            "ticker":   ticker,
+            "doc_type": memo_type,
+        },
+        "additional_metadata": {
             "period_label": period_label,
             "meeting_date": meeting_date,
-        }
+            "event_time":   meeting_date,   # drives recency ranking
+        },
     }])
 
     with open(file_path, "rb") as f:
-        # FIX: SDK expects a tuple of (filename, file_obj, mime_type), not a raw file handle.
         result = client.context.ingest(
             database=TENANT_ID,
             collection=collection,
-            app_knowledge=app_knowledge,
+            document_metadata=document_metadata,
             documents=[(os.path.basename(file_path), f, "application/pdf")],
         )
 
@@ -438,7 +436,7 @@ def ingest_board_memo(
 
 ### 2.4 Verify Indexing Before Going Live
 
-Always verify all uploaded documents are indexed before running any queries. Unverified documents return silently empty results - a hard bug to diagnose in production.
+Always verify all uploaded documents are indexed before running any queries. Unverified documents return silently empty results, a hard bug to diagnose in production.
 
 ```python
 # ingest/verify.py
@@ -495,9 +493,9 @@ verify_all_indexed(ids)
 
 ---
 
-## Step 3 - Store Analyst Memory
+## Step 3: Store Analyst Memory
 
-Per-analyst memory personalizes search based on the analyst's focus area, preferred companies, and communication style. A macro fund PM cares about different metrics than a sector-specialist equity analyst.
+Per-analyst memory records the analyst's focus area, preferred companies, and communication style, which your app passes to the LLM to personalize answers. A macro fund PM cares about different metrics than a sector-specialist equity analyst.
 
 ```python
 # memory/analysts.py
@@ -562,11 +560,11 @@ store_analyst_profile(
 # Output: Stored analyst profile for 'priya'  =>  ok
 ```
 
-> **`infer: true` is the default and should stay on for analyst profiles.** HydraDB extracts signals like `user COVERS ticker:ACME`, `user PREFERS format:quantitative`, `user FOCUS unit_economics`, and builds graph connections automatically. These become structured priors that influence search ranking for every subsequent query from that analyst.
+> **Set `infer: true` for analyst profiles (the default is `false`).** HydraDB extracts signals like `user COVERS ticker:ACME`, `user PREFERS format:quantitative`, `user FOCUS unit_economics`, and builds graph connections automatically. The profile lives in the analyst's own collection, so knowledge queries on other collections do not read it. Steps 4.2 and 6 fetch it with a separate `type: "memory"` query on `analyst-{user_id}` and pass it to the LLM.
 
 ---
 
-## Step 4 - Temporal Search Queries
+## Step 4: Temporal Search Queries
 
 This is the core of the financial analyst use case. Four distinct query patterns, each with different `recency_bias` and retrieval configuration.
 
@@ -681,10 +679,10 @@ def query_trend(
     if not chunks:
         return "No relevant context found - verify documents are uploaded and indexed."
 
-    # Sort chunks by timestamp so LLM sees them in chronological order
+    # Sort chunks by fiscal period (event_time, ISO 8601) so the LLM sees them in order
     chunks_sorted = sorted(
         chunks,
-        key=lambda c: c.source_upload_time or "",
+        key=lambda c: (c.additional_metadata or {}).get("event_time", ""),
     )
 
     # Build context with explicit period labels and source attribution
@@ -765,11 +763,11 @@ print(answer)
 #   Recovery in Q4 driven by efficiency programs.
 ```
 
-> **Why `recency_bias: 0.3` for trend queries?** With `recency_bias: 0.7`, HydraDB weights recent quarters heavily - you get Q4 results dominating, and Q1/Q2 are underrepresented. For trend analysis you need all four quarters equally weighted. Setting `recency_bias: 0.3` spreads retrieval across the timeline without penalising recent data entirely.
+> **Why `recency_bias: 0.3` for trend queries?** With `recency_bias: 0.7`, HydraDB weights recent quarters heavily: you get Q4 results dominating, and Q1/Q2 are underrepresented. For trend analysis you need all four quarters equally weighted. Setting `recency_bias: 0.3` spreads retrieval across the timeline without penalising recent data entirely.
 
 ### 4.3 Cross-Source Synthesis: "Do the numbers match the narrative?"
 
-This is Priya's use case - reconciling what the CEO said on the earnings call against internal metrics and the board memo for the same quarter. HydraDB's context graph automatically links the three sources by entity (the company, the metric, the period).
+This is Priya's use case: reconciling what the CEO said on the earnings call against internal metrics and the board memo for the same quarter. HydraDB's context graph automatically links the three sources by entity (the company, the metric, the period).
 
 ```python
 # query/cross_source.py
@@ -895,7 +893,7 @@ print(report)
 
 ### 4.4 Guidance Tracking: "How has management's tone on X changed?"
 
-Track how management's language around a specific topic (e.g. guidance, macro risk, hiring) has shifted across quarters. Uses `recency_bias: 0.3` and full timeline retrieval, with explicit chronological sorting.
+Track how management's language around a specific topic (e.g. guidance, macro risk, hiring) has shifted across quarters. Uses `recency_bias: 0.2` and full timeline retrieval, with explicit chronological sorting. The code sets `graph_context: false`, but that flag only takes effect in `mode: "fast"`; with `mode: "thinking"`, as here, the graph slice is always included.
 
 ```python
 # query/guidance_tracking.py
@@ -1000,7 +998,7 @@ print(arc)
 
 ---
 
-## Step 5 - Analyst Search Interface
+## Step 5: Analyst Search Interface
 
 For analyst chat interfaces, use `POST /query` to retrieve chunks, sources, and graph context. Generate the final answer in your application layer with your LLM provider so citations, formatting, and conversation memory stay under your control.
 
@@ -1115,9 +1113,9 @@ print(context_for_llm(r4)[:1000])
 
 ---
 
-## Step 6 - Automated Quarterly Briefing Agent
+## Step 6: Automated Quarterly Briefing Agent
 
-Run this agent after each earnings release. It assembles a full briefing - performance summary, trend table, guidance revision, and narrative shift - and saves it back to HydraDB as a memory for the analyst's next session.
+Run this agent after each earnings release. It assembles a full briefing (performance summary, trend table, guidance revision, and narrative shift) and saves it back to HydraDB as a memory for the analyst's next session.
 
 ```python
 # agents/briefing.py
@@ -1283,7 +1281,7 @@ if __name__ == "__main__":
 
 ---
 
-## Step 7 - Multi-Analyst Slack Interface (Optional)
+## Step 7: Multi-Analyst Slack Interface (Optional)
 
 Expose the analyst to your team via a Slack slash command. Each analyst has their own session, preserving conversation context across messages in the same thread.
 
@@ -1384,7 +1382,7 @@ POST /databases
 { "database": "financial-analyst" }
 ```
 
-### Upload Financial Document (SDK required)
+### Upload Financial Document (SDK)
 
 ```http
 POST /context/ingest
@@ -1392,21 +1390,20 @@ Content-Type: multipart/form-data
 ```
 
 ```jsonc
-// app_knowledge - JSON string of the array below
+// document_metadata - JSON string of the array below, one item per file in `documents`
+// (database=financial-analyst and collection=earnings-acme are separate form fields)
 [{
-  "id":           "ACME-earnings_transcript-2023-Q2",
-  "title":        "ACME Q2 2023 Earnings Transcript",
-  "type":         "pdf",
-  "timestamp":    "2023-06-30T00:00:00Z",
-  "database":    "financial-analyst",
-  "collection":"earnings-acme",
+  "id": "ACME-earnings_transcript-2023-Q2",
   "metadata": {
     "ticker":          "ACME",
     "doc_type":        "earnings_transcript",
     "fiscal_year":     2023,
-    "fiscal_quarter":  2,
+    "fiscal_quarter":  2
+  },
+  "additional_metadata": {
     "period_label":    "Q2 2023",
-    "period_end_date": "2023-06-30T00:00:00Z"
+    "period_end_date": "2023-06-30T00:00:00Z",
+    "event_time":      "2023-06-30T00:00:00Z"
   }
 }]
 ```
@@ -1434,6 +1431,8 @@ GET /context/status?ids=ID&database=financial-analyst
 ```http
 POST /context/ingest
 ```
+
+> Send these as multipart form fields, with `type=memory` and `memories` as a JSON string; they are shown as JSON for readability.
 
 ```json
 {
@@ -1525,12 +1524,15 @@ POST /query
 {
   "database":     "financial-analyst",
   "collection": "analyst-alice",
+  "type":          "memory",
   "mode":          "thinking",
   "query":         "coverage focus metrics preferences output format"
 }
 ```
 
-### Response Shape - `/query`
+### Response Shape: `/query`
+
+This object is the `data` field of the response envelope (`success`, `data`, `error`, `meta`), which the SDK exposes as `result.data`.
 
 ```json
 {
@@ -1568,7 +1570,7 @@ POST /query
 
 | Query type | `recency_bias` | Reasoning |
 |---|---|---|
-| What happened in Q4? (point-in-time) | `0.8 – 0.9` | Target the specific most-recent relevant document |
+| What happened in Q4? (point-in-time) | `0.8` to `0.9` | Target the specific most-recent relevant document |
 | How did metric X trend in 2023? | `0.3` | Spread evenly across all 4 quarters |
 | How has tone on X shifted over the past 2 years? | `0.2` | Even wider spread, oldest documents matter |
 | Current guidance / most recent statement | `0.9` | Strongly prefer the latest document |
@@ -1589,7 +1591,7 @@ Tested across 3 company corpora (4 quarters of earnings transcripts + internal m
 | Stale data in top results | 41% | 5% | −88% |
 | P95 query latency | 220ms | under 200 ms | Sub-second |
 
-> **On the 18% trend accuracy for naive RAG.** This is a structural limitation. Embedding a Q2 earnings call and a Q4 earnings call produces very similar vectors - they are the same format, vocabulary, and topic distribution. Vector search returns whichever ranks slightly higher, ignoring the other entirely. HydraDB's timestamp-aware retrieval, `recency_bias`, and multi-query expansion solve this without any prompt engineering.
+> **On the 18% trend accuracy for naive RAG.** This is a structural limitation. Embedding a Q2 earnings call and a Q4 earnings call produces very similar vectors: they are the same format, vocabulary, and topic distribution. Vector search returns whichever ranks slightly higher, ignoring the other entirely. HydraDB's timestamp-aware retrieval, `recency_bias`, and multi-query expansion solve this without any prompt engineering.
 
 > **Benchmark methodology.** Figures are based on internal HydraDB testing. For the formal benchmark paper and methodology, see [research.hydradb.com/hydradb.pdf](https://research.hydradb.com/hydradb.pdf). Results will vary by corpus size, document quality, and query distribution.
 
@@ -1599,13 +1601,13 @@ Tested across 3 company corpora (4 quarters of earnings transcripts + internal m
 
 | Pitfall | Symptom | Fix |
 |---|---|---|
-| Wrong `timestamp` on upload | Q1 and Q4 both surface for "most recent" queries | Use `period_end_date`, not upload date |
+| Wrong `event_time` on upload | Q1 and Q4 both surface for "most recent" queries | Set `additional_metadata.event_time` to `period_end_date`, not upload date |
 | Too high `recency_bias` for trend queries | Only Q4 results returned for "how did X trend?" | Use `recency_bias: 0.3` for trend questions |
-| Missing `fiscal_quarter` in metadata | "Q2" filter returns all quarters | Add `fiscal_quarter: 2` to `meta` on upload |
+| Missing `fiscal_quarter` in metadata | "Q2" filter returns all quarters | Add `fiscal_quarter: 2` to `metadata` on upload |
 | `file=f` instead of `documents=[f]` in SDK | `TypeError` on `context.ingest()` | SDK expects a **list**: `documents=[f]` not `file=f` |
-| Raw `requests` for PDF upload | 422 error on `/context/ingest` | Use the SDK: `pip install hydradb-sdk` |
+| Raw `requests` with a JSON body for PDF upload | Upload rejected on `/context/ingest` | Send multipart form data (`files=`), or use the SDK: `pip install hydradb-sdk` |
 | No `/context/status` polling | Queries return empty results silently | Always poll status before querying |
-| `infer: false` on analyst profiles | No personalization applied | Leave `infer: true` (the default) for profiles |
+| `infer: false` on analyst profiles | No personalization applied | Set `infer: true` for profiles (the default is `false`) |
 | Empty `chunks` passed to LLM | Confident hallucinations about quarters | Add guard: `if not chunks: return "No data found"` |
 | Mismatched `collection` on read/write | Empty results despite successful ingestion | Read and write collections must match exactly |
 | Relative imports in `briefing.py` / `slack_bot.py` | `ModuleNotFoundError` when running as a script | Add `sys.path.insert(0, project_root)` at top of file |
@@ -1615,10 +1617,10 @@ Tested across 3 company corpora (4 quarters of earnings transcripts + internal m
 
 ## Next Steps
 
-1. **Expand your corpus** - add 10-K and 10-Q filings as `doc_type: "10K"` / `"10Q"` with annual timestamps.
-2. **Add a second company** - create a new collection `earnings-{TICKER2}` and compare two companies directly using cross-ticker queries.
-3. **Schedule automated ingestion** - run the ingestion pipeline on a cron job triggered by each earnings release date.
-4. **Wire up a Slack briefing** - schedule `generate_quarterly_briefing` to post to a `#earnings-briefings` channel automatically after each filing.
-5. **Add a web scraper** - ingest sell-side analyst notes or financial news articles alongside the official filings for a richer context graph.
+1. **Expand your corpus:** add 10-K and 10-Q filings as `doc_type: "10K"` / `"10Q"` with annual timestamps.
+2. **Add a second company:** create a new collection `earnings-{TICKER2}` and compare two companies directly using cross-ticker queries.
+3. **Schedule automated ingestion:** run the ingestion pipeline on a cron job triggered by each earnings release date.
+4. **Wire up a Slack briefing:** schedule `generate_quarterly_briefing` to post to a `#earnings-briefings` channel automatically after each filing.
+5. **Add a web scraper:** ingest sell-side analyst notes or financial news articles alongside the official filings for a richer context graph.
 
-As your corpus grows across companies and years, HydraDB's temporal graph compounds in value - every new earnings call adds edges to existing entity nodes, making historical comparison queries progressively more accurate without any re-indexing.
+As your corpus grows across companies and years, HydraDB's temporal graph compounds in value: every new earnings call adds edges to existing entity nodes, making historical comparison queries progressively more accurate without any re-indexing.
