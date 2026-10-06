@@ -412,7 +412,7 @@
       "fetch.V2SourceFetchResponse": {
         "properties": {
           "content": {
-            "description": "Extracted text content of the source document.",
+            "description": "Stored original bytes as text when valid UTF-8. Binary originals, such as PDF and DOCX, are returned in content_base64 instead. Null in url mode.",
             "example": "# Q4 Report\n\nRevenue grew 23% quarter over quarter.",
             "type": "string"
           },
@@ -436,7 +436,7 @@
             "type": "string"
           },
           "inferred_content": {
-            "description": "LLM-generated summary of the source content.",
+            "description": "Model-derived content when available in content or both mode. Null in url mode.",
             "example": "Summary: Q4 revenue rose 23% QoQ, driven by enterprise expansion.",
             "type": "string"
           },
@@ -4494,9 +4494,16 @@
             "type": "string"
           },
           "indexing_status": {
-            "description": "Current processing state: `queued`, `processing`, `completed`, or `failed`.",
+            "description": "Current indexing state. graph_creation is searchable; completed has finished; errored is terminal.",
             "example": "completed",
-            "type": "string"
+            "type": "string",
+            "enum": [
+              "queued",
+              "processing",
+              "graph_creation",
+              "completed",
+              "errored"
+            ]
           },
           "message": {
             "description": "Human-readable status description.",
@@ -4505,7 +4512,7 @@
           },
           "success": {
             "deprecated": true,
-            "description": "Deprecated for API clients: this reads like a per-source outcome but is\na constant echo of the envelope's `success` — it is true even for a\nsource that failed indexing. For the state of THIS source read\nindexing_status (and error_code/error_message when it is errored); for\nwhether the request itself succeeded read the HTTP status code or the\nenvelope's top-level `success`. Still emitted unchanged for existing\nclients (PRO-1208).",
+            "description": "Deprecated per-item success flag. Use indexing_status and error_code to determine whether indexing completed.",
             "example": true,
             "type": "boolean",
             "x-deprecated": "true"
@@ -5170,7 +5177,8 @@
           "OperatorOr",
           "OperatorAnd",
           "OperatorPhrase"
-        ]
+        ],
+        "default": "or"
       },
       "search.PathTriplet": {
         "properties": {
@@ -5215,7 +5223,8 @@
         "x-enum-varnames": [
           "QueryByHybrid",
           "QueryByText"
-        ]
+        ],
+        "default": "hybrid"
       },
       "search.QueryRequest": {
         "properties": {
@@ -5233,7 +5242,21 @@
             "type": "string"
           },
           "alpha": {
-            "description": "Weighting balance between dense and sparse retrieval in hybrid mode. `\"auto\"` lets HydraDB choose; a number from 0 (full BM25) to 1 (full dense) sets it explicitly."
+            "description": "Semantic weight in hybrid search: 0 is BM25 only and 1 is semantic only. The default is 0.8; \"auto\" also resolves to 0.8.",
+            "default": 0.8,
+            "oneOf": [
+              {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              },
+              {
+                "type": "string",
+                "enum": [
+                  "auto"
+                ]
+              }
+            ]
           },
           "collection": {
             "description": "Collection scope. Defaults to the default collection when omitted. Formerly `sub_tenant_id`; the `sub_tenant_id` alias is still accepted (deprecated).",
@@ -5241,7 +5264,7 @@
             "type": "string"
           },
           "collections": {
-            "description": "Preferred /query scope selector. Send either a list of collection IDs for equal normalized weighting, or an object mapping collection ID to a positive relative ranking weight with at most one decimal place. Do not send together with the deprecated sub_tenant_ids or sub_tenant_id.",
+            "description": "A list of existing collections (equal weights), or an object mapping collection IDs to positive ranking weights with at most one decimal place. Maximum 100 collections. A missing collection returns 400. Use instead of a single collection selector.",
             "example": [
               "team_docs",
               "engineering"
@@ -5277,14 +5300,15 @@
             "x-preferred": true
           },
           "database": {
-            "description": "Database is the canonical v2 name for the tenant scope. TenantID is its\ndeprecated alias and remains fully accepted. The TenantAliases middleware\nreconciles the two before binding, so TenantID is always populated and the\nhandler reads it; Database/Collection are carried only for docs/OpenAPI.",
+            "description": "Database to query. The deprecated tenant_id alias is still accepted.",
             "example": "acme_corp",
             "type": "string"
           },
           "graph_context": {
-            "description": "Whether to include graph context in the response. Defaults to true for /query when omitted.",
+            "description": "Include the graph slice. False takes effect only in fast mode; thinking always includes graph context.",
             "example": true,
-            "type": "boolean"
+            "type": "boolean",
+            "default": true
           },
           "graph_vector_prune": {
             "description": "GraphVectorPrune switches the graph-connected-chunks lane from \"fetch\ngraph-selected chunks and let the fusion reranker sort them out\" to \"fetch\na wider graph-selected candidate pool, then rank that pool by Milvus vector\nsimilarity, fully replacing the final chunk list.\" Works in either fast or\nthinking mode. Default false preserves existing behavior. Also gated\nserver-side by a repo-level config flag (SearchService's\ngraphVectorPruneEnabled) — if that flag is off, this is forced to false\nregardless of what the request sets, so a deployment can disable the\nmechanism without any client-side change.",
@@ -5311,7 +5335,10 @@
           "max_results": {
             "description": "Maximum number of chunks to return.",
             "example": 10,
-            "type": "integer"
+            "type": "integer",
+            "default": 10,
+            "minimum": 1,
+            "maximum": 250
           },
           "metadata_filters": {
             "$ref": "#/components/schemas/search.MetadataFilters"
@@ -5327,7 +5354,8 @@
           },
           "operator": {
             "$ref": "#/components/schemas/search.Operator",
-            "example": "and"
+            "example": "and",
+            "description": "BM25 term operator. \"and\" and \"phrase\" require query_by: \"text\"; otherwise the request returns 400."
           },
           "query": {
             "description": "Natural-language search query.",
@@ -5335,9 +5363,10 @@
             "type": "string"
           },
           "query_apps": {
-            "description": "Whether to include app-aware knowledge retrieval. Applies to knowledge hybrid queries.",
+            "description": "Adds app-aware retrieval to knowledge hybrid queries without excluding other knowledge. Send false to disable it.",
             "example": true,
-            "type": "boolean"
+            "type": "boolean",
+            "default": true
           },
           "query_by": {
             "$ref": "#/components/schemas/search.QueryBy",
@@ -5345,14 +5374,18 @@
             "example": "hybrid"
           },
           "query_forceful_relations": {
-            "description": "Whether to force relation expansion for graph-aware query retrieval. Defaults to true when omitted.",
+            "description": "Include declared related knowledge sources in additional_context when mode resolves to thinking. Ignored in fast mode.",
             "example": true,
-            "type": "boolean"
+            "type": "boolean",
+            "default": true
           },
           "recency_bias": {
             "description": "Recency boost applied to ranking. 0 disables it; higher values favour more recent sources.",
             "example": 0.2,
-            "type": "number"
+            "type": "number",
+            "default": 0.4,
+            "minimum": 0,
+            "maximum": 1
           },
           "sub_tenant_id": {
             "deprecated": true,
@@ -5424,7 +5457,7 @@
           },
           "type": {
             "$ref": "#/components/schemas/search.SourceType",
-            "description": "Corpus to query: knowledge, memory, or all."
+            "description": "Store to query: knowledge (default), memory, or all. Both stores use the same collection scope."
           }
         },
         "type": "object"
@@ -5440,7 +5473,9 @@
           "RecallModeFast",
           "RecallModeThinking",
           "RecallModeAuto"
-        ]
+        ],
+        "default": "auto",
+        "description": "fast: one retrieval pass; thinking: expanded retrieval and reranking; auto (default): select fast or thinking per query."
       },
       "search.ScoredPathResponse": {
         "properties": {
@@ -5684,7 +5719,8 @@
           "SourceKnowledge",
           "SourceMemory",
           "SourceAll"
-        ]
+        ],
+        "default": "knowledge"
       },
       "search.TemporalDuration": {
         "description": "TemporalDuration is the computed event-duration answer, when resolved.",
@@ -6392,11 +6428,6 @@
           },
           "enable_dense_embedding": {
             "description": "Whether to enable semantic (dense) embedding search on this field.",
-            "example": true,
-            "type": "boolean"
-          },
-          "enable_match": {
-            "description": "Whether to enable exact-match filtering on this field.",
             "example": true,
             "type": "boolean"
           },
@@ -8679,7 +8710,7 @@
               "schema": {
                 "properties": {
                   "app_knowledge": {
-                    "description": "App-knowledge items as a JSON array (type=knowledge). Per item, `metadata` is capped at 16 KiB and `additional_metadata` at 1 KiB, measured on the compact JSON encoding of the whole map in UTF-8 bytes (keys and punctuation count). The deprecated `tenant_metadata` / `document_metadata` spellings are accepted here and held to the same caps. Over-cap returns 400 with the actual byte count. Each item may also carry `acl`, a list of principals (`user_email:<email>`, a bare email, `group:<provider>:<id>`, `domain:<domain>`, or `__public__`) restricting who may retrieve it; omit it to leave the document unrestricted, and send an empty list to restrict it to nobody. A malformed principal rejects the whole request with 400.",
+                    "description": "JSON-stringified array of app sources (type=knowledge). Typed items use kind, provider, external_id, and fields. Metadata limits: 16 KiB metadata and 1 KiB additional_metadata. Optional acl restricts retrieval when the query supplies principals; an empty item ACL restricts it to nobody.",
                     "title": "app_knowledge",
                     "type": "string"
                   },
@@ -8692,7 +8723,7 @@
                     "type": "string"
                   },
                   "document_metadata": {
-                    "description": "Per-document metadata as a JSON array (type=knowledge). Per item, `metadata` is capped at 16 KiB and `additional_metadata` at 1 KiB. Both caps are measured on the compact JSON encoding of the whole map in UTF-8 bytes, so keys, quotes, commas and braces count toward the budget. Over-cap returns 400 with the actual byte count.",
+                    "description": "JSON-stringified array, one item per uploaded file in the same order. Items accept id, metadata, additional_metadata, relations, infer, evidence_kind, and evidence_subject. Metadata limits: 16 KiB schema fields and 1 KiB free-form fields, measured as compact JSON in UTF-8 bytes.",
                     "title": "document_metadata",
                     "type": "string"
                   },
@@ -8706,7 +8737,7 @@
                     "type": "string"
                   },
                   "memories": {
-                    "description": "Memory items as a JSON array (type=memory). Per item, `metadata` is capped at 16 KiB and `additional_metadata` at 1 KiB, measured on the compact JSON encoding of the whole map in UTF-8 bytes (keys and punctuation count). Over-cap returns 400 with the actual byte count.",
+                    "description": "JSON-stringified array of memory items (type=memory). Each item has text or user_assistant_pairs, and optional infer (default false), id, user_name, metadata, and additional_metadata. Nested metadata values are objects, not JSON strings. Limits: 16 KiB metadata and 1 KiB additional_metadata.",
                     "title": "memories",
                     "type": "string"
                   },
@@ -8786,7 +8817,7 @@
                 }
               }
             },
-            "description": "Body is not multipart/form-data (e.g. a JSON body)"
+            "description": "Unsupported Content-Type: the body is neither multipart/form-data nor JSON."
           },
           "422": {
             "content": {
