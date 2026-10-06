@@ -179,7 +179,7 @@ class GmailConnector {
 
 ### 1.2 Data Normalization
 
-Create a unified data format for all sources. The optional `acl` restricts who can retrieve each source; see [Access Control](/essentials/v2/access-control).
+Create a unified data format for all sources. The upload helpers require an explicit `acl` on every source (`[]` grants access to nobody). Query with principals derived from your authenticated server session. The search helpers below require those principals; see [Access Control](/essentials/v2/access-control).
 
 > **Pacing:** The sample sends 20 app sources per batch with a 1-second pause. Split a batch on `413`, and honor `Retry-After` on `429`.
 
@@ -191,7 +191,6 @@ const normalizedData = {
   database: 'your_database',
   collection: 'your_collection',
   title: 'Document/Message Title',
-  type: 'slack_message', // Source category: gmail, slack_message, notion_page, document, etc.
   timestamp: '2024-01-01T00:00:00Z', // ISO timestamp
   content: {
     text: 'Main content text',
@@ -202,11 +201,13 @@ const normalizedData = {
   description: 'Optional description of the source', // Optional
   metadata: {}, // Optional database-level metadata
   additional_metadata: {
+    source_category: 'slack_message',
+    source_label: 'Document/Message Title',
     author: 'user@company.com',
     id: 'original_id',
     tags: ['project-a', 'urgent', 'meeting-notes']
   },
-  acl: ['user1@company.com', 'user2@company.com'] // Optional: who may retrieve this source
+  acl: ['user_email:user1@company.com', 'user_email:user2@company.com']
 };
 ```
 
@@ -230,8 +231,17 @@ client = HydraDB(token=os.environ["HYDRA_DB_API_KEY"])
 # Upload a batch of knowledge sources.
 # The top-level collection decides where the sources land; omit it for the default collection.
 def upload_batch(sources: list, database: str, collection: str = None):
+    if any(not isinstance(source.get("acl"), list) for source in sources):
+        raise ValueError("Set an explicit ACL on every source before upload")
     app_knowledge = [
-        {**source, "database": database, "collection": collection}
+        {
+            **source, "database": database, "collection": collection,
+            "additional_metadata": {
+                "source_category": source.get("type", "document"),
+                "source_label": source.get("title", ""),
+                **source.get("additional_metadata", {}),
+            },
+        }
         for source in sources
     ]
 
@@ -271,10 +281,18 @@ const client = new HydraDBClient({ token: process.env.HYDRA_DB_API_KEY! });
 // Upload a batch of knowledge sources.
 // The top-level collection decides where the sources land; omit it for the default collection.
 const uploadBatch = async (sources: any[], database: string, collection?: string) => {
+  if (sources.some(source => !Array.isArray(source.acl))) {
+    throw new Error("Set an explicit ACL on every source before upload");
+  }
   const appKnowledge = sources.map(source => ({
     ...source,
     database: database,
-    collection: collection
+    collection: collection,
+    additional_metadata: {
+      source_category: source.type || "document",
+      source_label: source.title || "",
+      ...source.additional_metadata,
+    },
   }));
 
   const result = await client.context.ingest({
@@ -320,7 +338,7 @@ const uploadWithVerification = async (sources: any[], database: string, collecti
 
 Create a search interface that queries across all data sources:
 
-> **Note**: HydraDB supports filtering by `source_title` and `source_type` using the `metadata_filters` parameter. Filters match fields in each source's `metadata`, so set these fields at ingest and declare them in the database metadata schema. Use these for targeted searches across specific data sources.
+Source filters below match `source_category` and `source_label` in `additional_metadata`, populated by the upload helpers. They describe the originating app and document title; they are not the built-in `source_type` field. Keep these search functions on your server, and derive `caller_acl` / `callerAcl` from the authenticated session.
 
 
 <CodeGroup>
@@ -330,10 +348,15 @@ from hydra_db import HydraDB
 
 client = HydraDB(token=os.environ["HYDRA_DB_API_KEY"])
 
-def search(query: str, database: str, collection: str = None,
+def query_as_caller(client, caller_acl: list, **request):
+    if not caller_acl:
+        raise ValueError("Authenticated caller principals are required")
+    return client.query(acl=caller_acl, **request)
+
+def search(query: str, database: str, caller_acl: list, collection: str = None,
            max_results: int = 10, mode: str = "fast",
            metadata: dict = None):
-    return client.query(
+    return query_as_caller(client, caller_acl,
         query=query,
         database=database,
         collection=collection,
@@ -345,17 +368,22 @@ def search(query: str, database: str, collection: str = None,
     )
 
 # Filter search by source type
-def query_by_source_type(query: str, database: str, source_type: str):
-    return search(query, database, metadata={"source_type": {"equals": source_type}})
+def query_by_source_type(query: str, database: str, caller_acl: list, source_type: str):
+    return search(query, database, caller_acl, metadata={"additional_metadata": {"source_category": {"equals": source_type}}})
 
 # Filter search by source title
-def query_by_source_title(query: str, database: str, source_title: str):
-    return search(query, database, metadata={"source_title": {"equals": source_title}})
+def query_by_source_title(query: str, database: str, caller_acl: list, source_title: str):
+    return search(query, database, caller_acl, metadata={"additional_metadata": {"source_label": {"equals": source_title}}})
 ```
 ```typescript TypeScript SDK
 import { HydraDBClient } from "@hydradb/sdk";
 
 const client = new HydraDBClient({ token: process.env.HYDRA_DB_API_KEY! });
+
+const queryAsCaller = (callerAcl: string[], request: Parameters<typeof client.query>[0]) => {
+  if (!callerAcl?.length) throw new Error("Authenticated caller principals are required");
+  return client.query({ ...request, acl: callerAcl });
+};
 
 interface SearchOptions {
   collection?: string;
@@ -364,7 +392,7 @@ interface SearchOptions {
   metadata?: Record<string, any>;
 }
 
-const search = async (query: string, database: string, options: SearchOptions = {}) => {
+const search = async (query: string, database: string, callerAcl: string[], options: SearchOptions = {}) => {
   const {
     collection,
     max_results = 10,
@@ -372,7 +400,7 @@ const search = async (query: string, database: string, options: SearchOptions = 
     metadata,
   } = options;
 
-  return await client.query({
+  return await queryAsCaller(callerAcl, {
     query,
     database: database,
     collection: collection,
@@ -385,19 +413,19 @@ const search = async (query: string, database: string, options: SearchOptions = 
 };
 
 // Filter search by source type
-const searchBySourceType = (query: string, database: string, sourceType: string) =>
-  search(query, database, { metadata: { source_type: { equals: sourceType } } });
+const searchBySourceType = (query: string, database: string, callerAcl: string[], sourceType: string) =>
+  search(query, database, callerAcl, { metadata: { additional_metadata: { source_category: { equals: sourceType } } } });
 
 // Filter search by source title
-const searchBySourceTitle = (query: string, database: string, sourceTitle: string) =>
-  search(query, database, { metadata: { source_title: { equals: sourceTitle } } });
+const searchBySourceTitle = (query: string, database: string, callerAcl: string[], sourceTitle: string) =>
+  search(query, database, callerAcl, { metadata: { additional_metadata: { source_label: { equals: sourceTitle } } } });
 ```
 </CodeGroup>
 
 
 ### 2.2 Advanced Search Features
 
-Implement advanced search capabilities:
+Reuse `query_as_caller` / `queryAsCaller` from 2.1 for the searches below.
 
 > **Advanced Features**:
 >
@@ -415,26 +443,26 @@ from hydra_db import HydraDB
 client = HydraDB(token=os.environ["HYDRA_DB_API_KEY"])
 
 # Search with optional source type / title metadata filters
-def search_with_filters(query: str, database: str, source_types: list = None, source_titles: list = None):
+def search_with_filters(query: str, database: str, caller_acl: list, source_types: list = None, source_titles: list = None):
     metadata = {}
     if source_types:
-        metadata["source_type"] = {"contains_any": source_types}
+        metadata["source_category"] = {"contains_any": source_types}
     if source_titles:
-        metadata["source_title"] = {"contains_any": source_titles}
+        metadata["source_label"] = {"contains_any": source_titles}
 
-    return client.query(
+    return query_as_caller(client, caller_acl,
         query=query,
         database=database,
         max_results=10,
         mode="fast",
         alpha=0.5,
         recency_bias=0.3,
-        **({"metadata_filters": metadata} if metadata else {})
+        **({"metadata_filters": {"additional_metadata": metadata}} if metadata else {})
     )
 
 # Guide retrieval with additional context, such as the page the user is on
-def search_with_context(query: str, database: str, context: str):
-    return client.query(
+def search_with_context(query: str, database: str, caller_acl: list, context: str):
+    return query_as_caller(client, caller_acl,
         query=query,
         database=database,
         additional_context=context,
@@ -445,13 +473,13 @@ def search_with_context(query: str, database: str, context: str):
     )
 
 # Conversational search: fold prior conversation turns into the query
-def conversational_search(query: str, database: str, conversation_history: list = None):
+def conversational_search(query: str, database: str, caller_acl: list, conversation_history: list = None):
     history = conversation_history or []
     enriched_query = (
         f"Previous conversation context: {json.dumps(history)}\n\n{query}"
         if history else query
     )
-    return client.query(
+    return query_as_caller(client, caller_acl,
         query=enriched_query,
         database=database,
         max_results=10,
@@ -469,26 +497,27 @@ const client = new HydraDBClient({ token: process.env.HYDRA_DB_API_KEY! });
 const searchWithFilters = async (
   query: string,
   database: string,
+  callerAcl: string[],
   filters: { sourceTypes?: string[]; sourceTitles?: string[] } = {}
 ) => {
   const metadata: Record<string, any> = {};
-  if (filters.sourceTypes?.length) metadata.source_type = { contains_any: filters.sourceTypes };
-  if (filters.sourceTitles?.length) metadata.source_title = { contains_any: filters.sourceTitles };
+  if (filters.sourceTypes?.length) metadata.source_category = { contains_any: filters.sourceTypes };
+  if (filters.sourceTitles?.length) metadata.source_label = { contains_any: filters.sourceTitles };
 
-  return await client.query({
+  return await queryAsCaller(callerAcl, {
     query,
     database: database,
     maxResults: 10,
     mode: "fast",
     alpha: 0.5,
     recencyBias: 0.3,
-    ...(Object.keys(metadata).length > 0 && { metadataFilters: metadata })
+    ...(Object.keys(metadata).length > 0 && { metadataFilters: { additional_metadata: metadata } })
   });
 };
 
 // Guide retrieval with additional context, such as the page the user is on
-const searchWithContext = async (query: string, database: string, context: string) =>
-  client.query({
+const searchWithContext = async (query: string, database: string, callerAcl: string[], context: string) =>
+  queryAsCaller(callerAcl, {
     query,
     database: database,
     additionalContext: context,
@@ -502,9 +531,10 @@ const searchWithContext = async (query: string, database: string, context: strin
 const conversationalSearch = async (
   query: string,
   database: string,
+  callerAcl: string[],
   conversationHistory: object[] = []
 ) =>
-  client.query({
+  queryAsCaller(callerAcl, {
     query: conversationHistory.length
       ? `Previous conversation context: ${JSON.stringify(conversationHistory)}\n\n${query}`
       : query,
@@ -533,7 +563,7 @@ HydraDB's AI memories are dynamic, user-specific profiles that evolve over time.
 
 #### Implementing AI Memories in Your Search
 
-The code below keeps the profile in a local store and folds it into the query text. To keep preferences in HydraDB instead, store them as [memories](/essentials/v2/memories).
+The code below reuses the caller-bound query helper from 2.1, keeps the profile in a local store, and folds it into the query text. To keep preferences in HydraDB instead, store them as [memories](/essentials/v2/memories).
 
 
 <CodeGroup>
@@ -580,7 +610,7 @@ def save_user_profile(user_id: str, profile: dict):
     print(f"Saving profile for user {user_id}:", profile)
 
 # Search with personalized query enrichment derived from the user's local profile
-def search_with_memory(query: str, database: str, user_id: str):
+def search_with_memory(query: str, database: str, user_id: str, caller_acl: list):
     profile = get_user_profile(user_id)
     enriched_query = f"{build_personalized_instructions(profile, query)}\n\n{query}"
 
@@ -593,9 +623,9 @@ def search_with_memory(query: str, database: str, user_id: str):
         recency_bias=0.3,
     )
     if profile["preferred_source_types"]:
-        kwargs["metadata_filters"] = {"source_type": {"contains_any": profile["preferred_source_types"]}}
+        kwargs["metadata_filters"] = {"additional_metadata": {"source_category": {"contains_any": profile["preferred_source_types"]}}}
 
-    search_results = client.query(**kwargs)
+    search_results = query_as_caller(client, caller_acl, **kwargs)
 
     # Update local profile history
     profile["search_history"].append({
@@ -659,11 +689,11 @@ const saveUserProfile = async (userId: string, profile: any) => {
 };
 
 // Search with personalized query enrichment derived from the user's local profile
-const searchWithMemory = async (query: string, database: string, userId: string) => {
+const searchWithMemory = async (query: string, database: string, userId: string, callerAcl: string[]) => {
   const userProfile = getUserProfile(userId);
   const enrichedQuery = `${buildPersonalizedInstructions(userProfile, query)}\n\n${query}`;
 
-  const searchResults = await client.query({
+  const searchResults = await queryAsCaller(callerAcl, {
     query: enrichedQuery,
     database: database,
     maxResults: 10,
@@ -671,7 +701,7 @@ const searchWithMemory = async (query: string, database: string, userId: string)
     alpha: 0.5,
     recencyBias: 0.3,
     ...(userProfile.preferredSourceTypes?.length > 0 && {
-      metadataFilters: { source_type: { contains_any: userProfile.preferredSourceTypes } }
+      metadataFilters: { additional_metadata: { source_category: { contains_any: userProfile.preferredSourceTypes } } }
     })
   });
 
@@ -764,7 +794,8 @@ class PreferenceLearner {
 
   learnSourcePreferences(patterns, selectedResults) {
     selectedResults.forEach(result => {
-      const sourceType = result.sourceType;
+      const sourceType = result.additionalMetadata?.source_category;
+      if (!sourceType) return;
       if (!patterns.sourcePreferences[sourceType]) {
         patterns.sourcePreferences[sourceType] = 0;
       }
@@ -799,14 +830,16 @@ class PreferenceLearner {
 #### Memory-Enhanced Search Interface
 
 
+The UI receives a `searchApi(query)` function for your authenticated backend. That backend derives the user ID and ACL principals before calling `searchWithMemory`; keep the HydraDB key on the server.
+
 ```javascript
-const MemoryEnhancedSearch = ({ userId }) => {
+const MemoryEnhancedSearch = ({ userId, searchApi }) => {
   const [query, setQuery] = useState('');
   const [results, setResults] = useState(null);
   const [userPreferences, setUserPreferences] = useState(null);
   const [suggestions, setSuggestions] = useState([]);
 
-  // getUserProfile, saveUserProfile, and searchWithMemory come from 2.3
+  // Profile helpers come from 2.3. searchApi calls your authenticated backend.
   const preferenceLearner = new PreferenceLearner();
 
   useEffect(() => {
@@ -857,7 +890,7 @@ const MemoryEnhancedSearch = ({ userId }) => {
     const startTime = Date.now();
     
     try {
-      const searchResults = await searchWithMemory(query, DATABASE, userId);
+      const searchResults = await searchApi(query);
       setResults(searchResults);
       
       // Learn from this interaction
@@ -882,8 +915,9 @@ const MemoryEnhancedSearch = ({ userId }) => {
     const profile = getUserProfile(userId);
     
     // Mark this source type as preferred
-    if (result.sourceType && !profile.preferredSourceTypes.includes(result.sourceType)) {
-      profile.preferredSourceTypes.push(result.sourceType);
+    const sourceCategory = result.additionalMetadata?.source_category;
+    if (sourceCategory && !profile.preferredSourceTypes.includes(sourceCategory)) {
+      profile.preferredSourceTypes.push(sourceCategory);
       await saveUserProfile(userId, profile);
     }
   };
