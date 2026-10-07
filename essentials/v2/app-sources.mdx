@@ -1,15 +1,59 @@
 ---
 title: "App Sources"
-description: "Ingest app content with its connected context."
+description: "Bring app data from your own connectors into HydraDB."
 ---
 
 import { Field } from "/snippets/field.jsx";
 
-An **app source** is one item from an app, such as a Slack message or Jira ticket.
+Use [`POST /context/ingest`](/api-reference/v2/endpoint/ingest-context) in **bring your own connectors** mode. **Your connector fetches and parses the app data, then maps each item to a supported class (`kind`) and its fields.** Send those items in `app_knowledge` as **multipart/form-data**, with `type=knowledge`.
+
+**HydraDB provides the ontology engine and retrieval:** it organizes the content and relationships, indexes the sources, and retrieves them through [`POST /query`](/api-reference/v2/endpoint/query).
+
+## Choose the class for each item
+
+An **app source** is one mapped item. **Choose its class with `kind`, identify its app with `provider`, and put its content in `fields`.**
+
+| Object class (`kind`) | Use for | Main text |
+|---|---|---|
+| `message` | Slack / Teams messages and replies | `fields.body` |
+| `ticket` | Issues and support tickets | `fields.title`, `fields.description` |
+| `comment` | Comments on tickets, pages, or records | `fields.body` |
+| `knowledge_base` | Wiki pages | `fields.title`, `fields.body` |
+| `email` | Emails and email replies | `fields.subject`, `fields.body` |
+| `meeting` | Recorded meetings and calls | `fields.title`, `fields.body` |
+| `custom` | CRM and other app records | `fields.data` |
+
+
+A connector can produce more than one class: your Jira connector sends tickets as `ticket` and their comments as `comment`. Repeat the class in `fields.kind`, matching the top-level `kind`.
+
+## Start with the API request
+
+The request is **multipart/form-data**. The mapped app-source JSON is the value of one form field, `app_knowledge`.
+
+| Form field | What to send |
+|---|---|
+| `type` | `knowledge` |
+| `database` | The existing database that should own these sources |
+| `collection` | Your collection, or `default` |
+| `app_knowledge` | Your mapped source object or array, serialized as a JSON string |
+
+Create the [database](/api-reference/v2/endpoint/create-tenant) first if needed. Save your mapped items as `app-sources.json`, using one of the complete patterns below. Send that file's JSON as the form value:
+
+```bash POST /context/ingest
+curl -X POST 'https://api.hydradb.com/context/ingest' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -F 'type=knowledge' \
+  -F 'database=acme_corp' \
+  -F 'collection=default' \
+  -F 'app_knowledge=<app-sources.json'
+```
+
+Here, `<app-sources.json` reads the file's contents into the form field. Each item in the file must use the same `database` and `collection` as the request. With an SDK, serialize the mapped items with `json.dumps(...)` in Python or `JSON.stringify(...)` in TypeScript; the SDK constructs the multipart request. See [SDK examples and ingestion status](#3-ingest-an-app-source).
 
 ## Choose your app pattern
 
-Expand a pattern to see its classes and payload.
+These five patterns show how to map the app data your connector has fetched. Expand one to see the source fields and connections; send the resulting JSON using the request above.
 
 <AccordionGroup>
 <Accordion title="Slack / Teams: threads, replies, attachments">
@@ -210,21 +254,20 @@ For example, a Slack conversation has an opening message, replies, and perhaps a
 
 The steps below show how to choose an object class, connect items, [ingest them](#3-ingest-an-app-source), keep them updated, and query them.
 
-## 1. Choose the object's class and fields
+## 1. Map your app data
 
-**The object class is the starting point. Set it with `kind`.** It tells HydraDB what the item represents and how to read its fields. The app name goes in `provider`: a Slack message is `kind: "message"`, `provider: "slack"`; a Jira ticket is `kind: "ticket"`, `provider: "jira"`.
+Your connector translates the app's API response into the fields for the class you chose above. Fetch the item and extract its text, authors, timestamps, and app IDs before building the source. Extract attachment text too if you want it searched. For example, a Slack API message maps like this:
 
-| Object class (`kind`) | One source represents | Main text | Useful connections |
-|---|---|---|---|
-| `message` | One Slack or Teams message, including a reply | `fields.body` | `thread_id`, `parent_id` |
-| `ticket` | One issue or support ticket | `fields.title`, `fields.description` | `parent_id`, `linked_issue_ids` |
-| `comment` | One comment on a ticket, page, or record | `fields.body` | `parent_id`, optional `thread_id` |
-| `knowledge_base` | One wiki page | `fields.title`, `fields.body` | `parent_id` |
-| `email` | One email, including a reply | `fields.subject`, `fields.body` | `thread_id`, `reply_to_id` |
-| `meeting` | One recorded meeting or call | `fields.title`, `fields.body` | `parent_id` |
-| `custom` | One CRM or other app record | `fields.data` | `parent_id`, optional `thread_id`, `relations` |
+| Slack API value | App-source field |
+|---|---|
+| Message `ts` | `external_id` |
+| Message `text` | `fields.body` |
+| Sender `user` | `fields.author` (resolve the user ID to a name or email when available) |
+| Reply's `thread_ts`, or the root's own `ts` | `fields.thread_id` |
+| Reply's `thread_ts` | `fields.parent_id`; omit on the opening message |
+| File text extracted by your connector | `attachments[].content.text` or `attachments[].content.markdown` |
 
-Repeat the class in `fields.kind`, with the same value as the top-level `kind`. Add the fields that describe that class: an author for a message, an assignee and status for a ticket, or a sender and recipients for an email.
+Set `kind: "message"` and `fields.kind: "message"` for this mapping. For a ticket, map its title and description to `fields.title` and `fields.description`; for an email, map its subject, body, sender, and recipients to the email fields. Keep the original item's ID so later updates and relationships refer to the same item.
 
 ### Item IDs
 
@@ -312,7 +355,9 @@ Keep both sources in the same database and collection. A relation connects sourc
 
 ### Link items across connectors
 
-**Sources from different connectors can be linked.** A HubSpot deal can point to a Gmail email, just as a Slack message can point to a Jira ticket. Both sources must belong to the same database and collection. The target's provider identifies its app; it does not need to match the source's provider. You do not need to include a connector ID in the relation.
+**You can connect data from connector A with data from connector B.** Each connector maps and ingests its app's items; a relation connects an item from one connector to an item from the other. For example, connector A syncs HubSpot deals and connector B syncs Gmail emails. Link a deal to its related email using their source IDs.
+
+Both sources must belong to the same database and collection. The target's provider identifies its app; it does not need to match the source's provider. You do not need to include a connector ID in the relation.
 
 If you already have both HydraDB source IDs, add a `linked_to` relation to one source with the other source's ID as `target.source_id`. For example, link the HubSpot deal `hubspot_deal_789` to the Gmail source `gmail_msg_19a2b3c` from the email pattern above.
 
