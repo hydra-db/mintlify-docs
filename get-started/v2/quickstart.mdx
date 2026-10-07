@@ -1,36 +1,40 @@
 ---
 title: "Quickstart"
-description: "Build your first working query in five minutes."
+description: "Save a user preference, retrieve it, and prepare it for your AI model."
 ---
 
-This guide walks you through the full HydraDB loop end to end (create a workspace, ingest some content, wait for indexing, and run a query) using the [API](/api-reference/v2). By the end you'll have a working personalized-RAG flow that you can plug into your own LLM prompt.
-
-New to HydraDB? [Core Concepts](/get-started/v2/core-concepts) is a 5-minute primer.
+Save a preference for `user_123`, search it, and use it in a model prompt. You will create a **database** (a separate workspace for your data) and write to a **collection** (a named group inside it) for this user.
 
 ## Install and initialize
 
-Grab an API key from [app.hydradb.com](https://app.hydradb.com), then install an SDK or use cURL.
+Get an API key from [app.hydradb.com](https://app.hydradb.com), then set it in the terminal where you run the examples:
+
+```bash
+export HYDRA_DB_API_KEY="your_api_key"
+```
+
+Choose Python, TypeScript, or cURL and keep using that tab below. For TypeScript, use a Node.js project that supports top-level `await`. The cURL examples also require `jq` to read JSON responses. Install the SDK with the command shown in its tab; keep the initialized `client` for the next step.
 
 <CodeGroup>
 ```python Python SDK
 # Install: pip install "hydradb-sdk>=2,<3"
 import os
 from hydra_db import HydraDB
+from hydra_db.helpers import build_string
 
 client = HydraDB(token=os.environ["HYDRA_DB_API_KEY"])
 ```
 ```typescript TypeScript SDK
 // Install: npm install @hydradb/sdk@^2
 import { HydraDBClient } from "@hydradb/sdk";
+import { buildString } from "@hydradb/sdk/helpers";
 
 const client = new HydraDBClient({
-  token: process.env.HYDRA_DB_API_KEY,
+  token: process.env.HYDRA_DB_API_KEY!,
 });
 ```
 ```bash cURL
-# No SDK needed. Set your key once and reuse it.
-export HYDRA_DB_API_KEY="your_api_key"
-
+# Confirm your key works by listing databases.
 curl 'https://api.hydradb.com/databases' \
   -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
   -H "API-Version: 2"
@@ -39,15 +43,16 @@ curl 'https://api.hydradb.com/databases' \
 
 ---
 
-## Fast path: create, ingest, query
+## Save and retrieve a memory
 
-Create a database, add one memory to the default collection, wait for indexing, then query it.
+Use an unused database name, or skip the create call if you already have a database. Writing the memory creates `user_123` automatically. Checking **indexing** means waiting until HydraDB has processed the memory and made it searchable.
 
 <CodeGroup>
 ```python Python SDK
 import json, time
 
 database = "my_first_database"
+collection = "user_123"
 
 # 1. Create a database.
 client.databases.create(database=database)
@@ -59,10 +64,11 @@ while True:
         break
     time.sleep(5)
 
-# 3. Ingest one memory into the default collection.
+# 3. Save one memory in the user's collection.
 ingest = client.context.ingest(
     type="memory",
     database=database,
+    collection=collection,
     memories=json.dumps([
         {"text": "User prefers detailed technical explanations and dark mode"}
     ]),
@@ -74,6 +80,7 @@ id = ingest.data.results[0].id
 while True:
     status = client.context.status(
         database=database,
+        collection=collection,
         ids=[id],
     ).data.statuses[0]
 
@@ -87,14 +94,16 @@ while True:
 # 5. Search memories.
 results = client.query(
     database=database,
+    collection=collection,
     type="memory",
     query="What does the user prefer?",
 )
 
-print(results.data.chunks)
+print(build_string(results))
 ```
 ```typescript TypeScript SDK
 const database = "my_first_database";
+const collection = "user_123";
 
 // 1. Create a database.
 await client.databases.create({ database: database });
@@ -102,31 +111,35 @@ await client.databases.create({ database: database });
 // 2. Wait until the database can accept data.
 while (true) {
   const { data } = await client.databases.status({ database: database });
-  if (data?.infra.readyForIngestion) break;
+  if (data?.infra?.readyForIngestion) break;
   await new Promise((resolve) => setTimeout(resolve, 5_000));
 }
 
-// 3. Ingest one memory into the default collection.
+// 3. Save one memory in the user's collection.
 const ingest = await client.context.ingest({
   type: "memory",
   database: database,
+  collection: collection,
   memories: JSON.stringify([
     { text: "User prefers detailed technical explanations and dark mode" },
   ]),
 });
 
-const id = ingest.data.results[0].id;
+const id = ingest.data?.results?.[0]?.id;
+if (!id) throw new Error("Ingestion returned no memory ID");
 
 // 4. Wait until the memory is indexed.
 while (true) {
   const status = (await client.context.status({
     database: database,
+    collection: collection,
     ids: [id],
-  })).data.statuses[0];
+  })).data?.statuses?.[0];
+  if (!status) throw new Error("Memory status is missing");
 
   if (status.indexingStatus === "completed") break;
   if (status.indexingStatus === "errored") {
-    throw new Error(status.errorMessage);
+    throw new Error(status.errorMessage ?? "Memory indexing failed");
   }
 
   await new Promise((resolve) => setTimeout(resolve, 2_000));
@@ -135,15 +148,17 @@ while (true) {
 // 5. Search memories.
 const results = await client.query({
   database: database,
+  collection: collection,
   type: "memory",
   query: "What does the user prefer?",
 });
 
-console.log(results.data.chunks);
+console.log(buildString(results));
 ```
 ```bash cURL
 export HYDRA_DB_API_KEY="your_api_key"
 DATABASE="my_first_database"
+COLLECTION="user_123"
 
 # 1. Create a database.
 curl -s -X POST 'https://api.hydradb.com/databases' \
@@ -160,12 +175,13 @@ until curl -s "https://api.hydradb.com/databases/status?database=${DATABASE}" \
   sleep 5
 done
 
-# 3. Ingest one memory into the default collection.
+# 3. Save one memory in the user's collection.
 ID=$(curl -s -X POST 'https://api.hydradb.com/context/ingest' \
   -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
   -H "API-Version: 2" \
   -F "type=memory" \
   -F "database=${DATABASE}" \
+  -F "collection=${COLLECTION}" \
   -F 'memories=[{"text":"User prefers detailed technical explanations and dark mode"}]' \
   | jq -r '.data.results[0].id')
 
@@ -175,6 +191,7 @@ while true; do
     -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
     -H "API-Version: 2" \
     --data-urlencode "database=${DATABASE}" \
+    --data-urlencode "collection=${COLLECTION}" \
     --data-urlencode "ids=${ID}")
 
   INDEXING_STATUS=$(echo "$STATUS" | jq -r '.data.statuses[0].indexing_status')
@@ -193,9 +210,10 @@ curl -s -X POST 'https://api.hydradb.com/query' \
   -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
   -H "API-Version: 2" \
   -H "Content-Type: application/json" \
-  --data-binary @- <<EOF | jq '.data.chunks'
+  --data-binary @- <<EOF | jq -r '.data.chunks[].chunk_content'
 {
   "database": "${DATABASE}",
+  "collection": "${COLLECTION}",
   "type": "memory",
   "query": "What does the user prefer?"
 }
@@ -205,27 +223,38 @@ EOF
 
 ---
 
-## What you have built
+## Check the result
 
-That is the full HydraDB loop: create an isolated workspace, ingest context, wait for indexing, query it, and pass the returned context to an LLM. HydraDB handles parsing, chunking, embedding, graph construction, and hybrid retrieval. Your application sends the query and gets back the right slice of context.
+The query returns passages from your saved memory, not a generated answer. The SDK examples print formatted context; cURL prints the passage text. Both should include the preference you stored:
 
-```mermaid
-flowchart LR
-  A([1. Create Database]) --> B([2. Ingest Data])
-  B --> C([3. Verify Processing])
-  C --> D([4. Query Context])
-  D --> E([5. Pass to LLM])
-
-  style A fill:#0f172a,stroke:#334155,stroke-width:2px,color:#f8fafc,stroke-linecap:round
-  style B fill:#0f172a,stroke:#334155,stroke-width:2px,color:#f8fafc,stroke-linecap:round
-  style C fill:#0f172a,stroke:#334155,stroke-width:2px,color:#f8fafc,stroke-linecap:round
-  style D fill:#0f172a,stroke:#334155,stroke-width:2px,color:#f8fafc,stroke-linecap:round
-  style E fill:#0f172a,stroke:#334155,stroke-width:2px,color:#f8fafc,stroke-linecap:round
+```text
+User prefers detailed technical explanations and dark mode
 ```
 
-Creating the database and indexing your content run in the background, which is why the sample polls after each (steps 2 and 4). Ingest and query return right away. Nothing in the code changes between 10 documents and 10,000.
+The same `collection` on ingest, status, and query keeps the steps pointed at `user_123`. Your backend must select the collection for the authenticated user; the name itself does not authenticate them.
 
-Everything else in HydraDB ([metadata filters](/essentials/v2/metadata), [collections](/essentials/v2/multi-tenant), [graph traversal](/essentials/v2/context-graphs), forceful relations) builds on this loop.
+## Use the memory in a model prompt
+
+Continue from the `results` above. The SDK helper formats the returned passages and any relationships into a string, which you can add to the messages you send to your model:
+
+<CodeGroup>
+```python Python SDK
+messages = [
+    {"role": "system", "content": "Use these saved preferences when answering:\n" + build_string(results)},
+    {"role": "user", "content": "How should I set up my editor?"},
+]
+```
+```typescript TypeScript SDK
+const messages = [
+  { role: "system", content: "Use these saved preferences when answering:\n" + buildString(results) },
+  { role: "user", content: "How should I set up my editor?" },
+];
+```
+</CodeGroup>
+
+Send `messages` to the chat model your application uses. It now has the user's preferences available when answering the editor question. For raw HTTP response formatting and complete model-call examples, see [How to Use API Results](/essentials/v2/api-results).
+
+Database creation and indexing run in the background, which is why the example waits for both. When adding more data, reuse the database and save each user's memories in their own collection.
 
 ## Where to go next
 
@@ -235,7 +264,7 @@ Everything else in HydraDB ([metadata filters](/essentials/v2/metadata), [collec
 | Tune query behavior (`alpha`, `mode`, `recency_bias`) | [Query](/essentials/v2/query) |
 | Design a filterable metadata schema | [Metadata](/essentials/v2/metadata) |
 | Scope data per user or workspace | [Multi-Tenant](/essentials/v2/multi-tenant) |
-| Format the LLM prompt from `RetrievalResult` | [How to Use API Results](/essentials/v2/api-results) |
+| Turn query results into a model prompt | [How to Use API Results](/essentials/v2/api-results) |
 | See the full endpoint reference | [API Reference](/api-reference/v2) |
 | Pick from real-world recipes | [Cookbooks](/cookbooks/v2/index) |
 
