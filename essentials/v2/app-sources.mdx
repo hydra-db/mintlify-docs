@@ -20,8 +20,7 @@ An **app source** is one mapped item. **Choose its class with `kind`, identify i
 | `comment` | Comments on tickets, pages, or records | `fields.body` |
 | `knowledge_base` | Wiki pages | `fields.title`, `fields.body` |
 | `email` | Emails and email replies | `fields.subject`, `fields.body` |
-| `meeting` | Recorded meetings and calls | `fields.title`, `fields.body` |
-| [`custom`](#custom-records-map-your-own-fields) | CRM and other app records | `fields.body`, `fields.data` |
+| [`custom`](#custom-records-map-your-own-fields) | CRM records, meeting transcripts, and other app records | `fields.body`, `fields.data` |
 
 
 A connector can produce more than one class: your Jira connector sends tickets as `ticket` and their comments as `comment`. Repeat the class in `fields.kind`, matching the top-level `kind`.
@@ -273,7 +272,7 @@ Set `kind: "message"` and `fields.kind: "message"` for this mapping. For a ticke
 
 ### Custom records: map your own fields
 
-**Use `kind: "custom"` for records that do not fit another class**, such as CRM deals, contacts, invoices, or records from your internal app. Your connector defines the business fields; HydraDB indexes their content and connects the record to other sources.
+**Use `kind: "custom"` for records that do not fit another class**, such as CRM deals, contacts, invoices, meeting transcripts, or records from your internal app. Your connector defines the business fields; HydraDB indexes their content and connects the record to other sources. For a meeting transcript, put the transcript in `fields.body` and details such as participants in `fields.data`.
 
 Set both `kind` and `fields.kind` to `custom`. The ingestion request still uses **`type=knowledge`**. Put your business record type, such as `deal` or `invoice`, in `fields.data.record_type`.
 
@@ -373,7 +372,7 @@ HydraDB creates these connections from the fields you send:
 | `parent_id` | Message | Reply → parent message (`reply_to`) |
 | `reply_to_id` | Email | Reply → original email (`reply_to`) |
 | `parent_id` | Comment | Comment → ticket, page, or record (`comment_on`) |
-| `parent_id` | Ticket, page, meeting, custom | Child → parent (`child_of`) |
+| `parent_id` | Ticket, page, custom | Child → parent (`child_of`) |
 | `linked_issue_ids` | Ticket | Ticket → related issues (`linked_to`) |
 
 Parent and reply IDs use the same provider as the source. Ingest the referenced items too so their content can be retrieved.
@@ -473,7 +472,7 @@ To add the link to an existing email, send its complete updated snapshot with `u
 }
 ```
 
-Some app names are normalized when sources are stored. Explicit relation targets must use the resulting provider name:
+Some app names are normalized when sources are stored. You can use the stored provider name for an external-ID target:
 
 | Target app | `target.provider` |
 |---|---|
@@ -482,7 +481,7 @@ Some app names are normalized when sources are stored. Explicit relation targets
 | HubSpot | `hubspot` |
 | Jira | `jira` |
 
-For example, a Gmail source submitted with `provider: "gmail"` is stored under `google`. Use `google` in an external-ID relation target so it matches that source. Prefer `source_id` when you know the HydraDB ID; it avoids provider-name matching.
+For example, a Gmail source submitted with `provider: "gmail"` is stored under `google`. Gmail external-ID targets accept `gmail` as well as `google`; the example uses the stored name. Prefer `source_id` when you know the HydraDB ID; it avoids provider-name matching.
 
 With `query_apps: true` and `mode: "thinking"`, HydraDB can follow a `linked_to` connection from either side: a query about the email can retrieve the runbook, and a query about the runbook can retrieve the email. You can declare the link on one source without adding a reverse relation. Ingest both items before expecting their content in query results. To connect a whole conversation, link to an ingested email in that conversation and keep its thread fields populated.
 
@@ -684,6 +683,8 @@ The call returns `202 Accepted`. Check each item's entry in `data.results` for i
 
 Use [`GET /context/status`](/api-reference/v2/endpoint/source-status) with that ID to follow ingestion. The source is queryable when `indexing_status` reaches `graph_creation` or `completed`.
 
+At `graph_creation`, text can already be searchable while the graph is still being built. Before checking thread or relation expansion, wait for the involved sources to reach `completed`. Use the [connected subgraph endpoint](/api-reference/v2/endpoint/subgraph) to confirm that the expected source IDs and links are present.
+
 ## 4. Keep app sources updated
 
 Use the same endpoint for the first sync and later changes. **A new item gets a new source ID. An edited item keeps its source ID and is sent with `upsert: true`.**
@@ -740,9 +741,11 @@ The same rule applies across apps:
 | Ticket status or page body changes | The updated source with the same IDs and `upsert: true` |
 | New ticket or page comment | A new `comment` source with its own IDs and the parent's external ID in `fields.parent_id` |
 | Existing comment edited | The updated comment source with the same IDs and `upsert: true` |
-| Item deleted | `DELETE /context` with the item's HydraDB source ID |
+| Item deleted | `DELETE /context` with the item's HydraDB source ID, after ingestion completes |
 
-`upsert: true` replaces the source snapshot. Include the current fields, metadata, attachments, comments, and relations you want to retain. For a new comment arriving on a ticket, ingest a separate `comment` source so you can update or delete that comment independently.
+`upsert: true` replaces the source snapshot. Include the current fields, metadata, attachments, comments, and relations you want to retain. Process updates for the same source in order: wait for its current ingestion to reach `completed` before submitting another snapshot. For a new comment arriving on a ticket, ingest a separate `comment` source so you can update or delete that comment independently.
+
+For deletion, check the response's `data.results[].deleted` value. An HTTP 200 alone can include a failed deletion when the source is still processing; wait for `completed` and retry. Set `X-HydraDB-Delete-Status: strict` to receive an HTTP error for a failed deletion. See [Delete source](/api-reference/v2/endpoint/delete-source).
 
 ## 5. Include attachments and comments
 
@@ -874,7 +877,7 @@ Expand the source fields or the object class you are implementing. `kind` choose
 | <Field name="database" type="string" required /> | Database that owns the item. | Must match the form-level `database` when present. |
 | <Field name="collection" type="string" required /> | Logical partition. Use `"default"` if you do not partition. | Must match the form-level `collection` when present. |
 | <Field name="title" type="string" recommended /> | Human-readable subject, page name, ticket title, or message label. | Improves display, citations, and semantic matching. |
-| <Field name="kind" type="email, message, ticket, knowledge_base, comment, meeting, custom" recommended /> | App object kind. | Selects the app parser and query behavior. |
+| <Field name="kind" type="email, message, ticket, knowledge_base, comment, custom" recommended /> | App object kind. | Selects the app parser and query behavior. |
 | <Field name="provider" type="string" recommended /> | App namespace such as `slack`, `gmail`, `jira`, `notion`, `salesforce`, or `linear`. | Prevents ID collisions and scopes relation resolution. |
 | <Field name="external_id" type="string" recommended /> | Stable provider ID for this exact item. | Exact lookup and relation/hierarchy resolution. |
 | <Field name="url" type="string" /> | Canonical link back to the provider item. | Improves citations and source navigation. |
@@ -965,22 +968,6 @@ Expand the source fields or the object class you are implementing. `kind` choose
 | <Field name="updated_at" type="ISO-8601 datetime" /> | Last update time. | Freshness. |
 | <Field name="url" type="string" /> | Link back to the comment. | Citations/navigation. |
 | <Field name="properties" type="object" /> | Provider-specific comment details. | Preserved in payload. |
-
-</Accordion>
-<Accordion title="meeting fields">
-
-| Field | Why send it | Search / ingestion effect |
-|---|---|---|
-| <Field name="kind" type="meeting" required /> | Object class inside `fields`. | Should match top-level `kind`. |
-| <Field name="title" type="string" recommended /> | Meeting title. | Display and matching. |
-| <Field name="body" type="string" recommended /> | Transcript or meeting notes. | Main searchable text. |
-| <Field name="host" type="string" /> | Host or organizer. | Actor context. |
-| <Field name="participants" type="string[]" /> | Attendees. | Actor context. |
-| <Field name="started_at" type="ISO-8601 datetime" /> | Meeting start time. | Chronology. |
-| <Field name="summary" type="string" /> | Meeting summary. | Additional searchable text. |
-| <Field name="action_items" type="string[]" /> | Follow-up actions. | Additional searchable text. |
-| <Field name="parent_id" type="string" /> | Parent source's external ID. | Parent/child connection. |
-| <Field name="url" type="string" /> | Link to the recording. | Citations/navigation. |
 
 </Accordion>
 <Accordion title="custom fields">
