@@ -5,11 +5,126 @@ description: "Bring app data from your own connectors into HydraDB."
 
 import { Field } from "/snippets/field.jsx";
 
-Use [`POST /context/ingest`](/api-reference/v2/endpoint/ingest-context) in **bring your own connectors** mode. **Your connector fetches and parses the app data, then maps each item to a supported class (`kind`) and its fields.** Send those items in `app_knowledge` as **multipart/form-data**, with `type=knowledge`.
+Use [`POST /context/ingest`](/api-reference/v2/endpoint/ingest-context) in **bring your own connectors** mode to ingest data from your apps.
 
-**HydraDB provides the ontology engine and retrieval:** it organizes the content and relationships, indexes the sources, and retrieves them through [`POST /query`](/api-reference/v2/endpoint/query).
+HydraDB organizes your content and relationships with its ontology engine, indexes the data, and lets you retrieve it through [`POST /query`](/api-reference/v2/endpoint/query).
 
-## Choose the class for each item
+<a id="2-ingest-an-app-source"></a>
+<a id="3-ingest-an-app-source"></a>
+
+## 1. Ingest an app source
+
+Send your mapped sources to [`POST /context/ingest`](/api-reference/v2/endpoint/ingest-context), using an existing [database](/api-reference/v2/endpoint/create-tenant) and collection. The request is **multipart/form-data**. `app_knowledge` is your mapped source object or array, serialized as a JSON string in one form field.
+
+| Form field | What to send |
+|---|---|
+| `type` | `knowledge` |
+| `database` | The existing database that should own these sources |
+| `collection` | Your collection, or `default` |
+| `app_knowledge` | Your mapped source object or array, serialized as a JSON string |
+
+Include the same `database` and `collection` in every source and in the form fields. With an SDK, use `json.dumps(...)` in Python or `JSON.stringify(...)` in TypeScript; the SDK constructs the multipart request.
+
+The example below sends Alice's opening Slack message. The next sections show how to [map your app data to a class](#2-map-your-app-data-to-a-class) and [choose an app pattern](#3-choose-your-app-pattern). Use the same request to send those mapped sources.
+
+<Accordion title="Ingest a Slack message: JSON, cURL, Python, or TypeScript">
+
+For cURL, save the JSON in the first tab as `app-sources.json` in your current directory, then run the request in the next tab. The request reads that JSON into the `app_knowledge` form value.
+
+Set up your [SDK client](/api-reference/v2/sdks#client-setup) before running Python or TypeScript. These examples build and serialize the same message directly. The TypeScript SDK names the form property `appKnowledge`; the JSON source fields keep their snake_case names.
+
+<CodeGroup>
+```json app-sources.json
+{
+  "id": "slack_C01_1716213600_000100",
+  "database": "acme_corp",
+  "collection": "default",
+  "title": "Auth rollback discussion",
+  "kind": "message",
+  "provider": "slack",
+  "external_id": "1716213600.000100",
+  "fields": {
+    "kind": "message",
+    "body": "Disable the new token refresh path to roll back auth.",
+    "author": "alice",
+    "thread_id": "1716213600.000100"
+  }
+}
+```
+```bash cURL
+curl -X POST 'https://api.hydradb.com/context/ingest' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -F 'type=knowledge' \
+  -F 'database=acme_corp' \
+  -F 'collection=default' \
+  --form-string "app_knowledge=$(cat app-sources.json)"
+```
+```python Python SDK
+import json
+
+message = {
+    "id": "slack_C01_1716213600_000100",
+    "database": "acme_corp",
+    "collection": "default",
+    "title": "Auth rollback discussion",
+    "kind": "message",
+    "provider": "slack",
+    "external_id": "1716213600.000100",
+    "fields": {
+        "kind": "message",
+        "body": "Disable the new token refresh path to roll back auth.",
+        "author": "alice",
+        "thread_id": "1716213600.000100",
+    },
+}
+
+result = client.context.ingest(
+    type="knowledge",
+    database="acme_corp",
+    collection="default",
+    app_knowledge=json.dumps([message]),
+)
+```
+```typescript TypeScript SDK
+const message = {
+  id: "slack_C01_1716213600_000100",
+  database: "acme_corp",
+  collection: "default",
+  title: "Auth rollback discussion",
+  kind: "message",
+  provider: "slack",
+  external_id: "1716213600.000100",
+  fields: {
+    kind: "message",
+    body: "Disable the new token refresh path to roll back auth.",
+    author: "alice",
+    thread_id: "1716213600.000100",
+  },
+};
+
+const result = await client.context.ingest({
+  type: "knowledge",
+  database: "acme_corp",
+  collection: "default",
+  appKnowledge: JSON.stringify([message]),
+});
+```
+</CodeGroup>
+
+</Accordion>
+
+**For edits, use this same endpoint and add `upsert=true` to the form request.** Send the item's complete current snapshot with the same IDs. The edit example in [Incremental ingestion](#5-incremental-ingestion) shows the complete JSON and cURL request.
+
+The call returns `202 Accepted`. Check each item's entry in `data.results` for its source `id`, `status`, and any `error`. A `queued` item has been accepted for processing.
+
+Use [`GET /context/status`](/api-reference/v2/endpoint/source-status) with that ID to follow ingestion. The source is queryable when `indexing_status` reaches `graph_creation` or `completed`.
+
+At `graph_creation`, text can already be searchable while the graph is still being built. Before checking thread or relation expansion, wait for the involved sources to reach `completed`. Use the [connected subgraph endpoint](/api-reference/v2/endpoint/subgraph) to confirm that the expected source IDs and links are present.
+
+`errored` is also a terminal state. Stop waiting, inspect `error_code`, correct the source payload or address the reported failure, and retry ingestion with `upsert: true`. You can also delete a failed source for cleanup. A relation target that failed ingestion must be corrected and successfully ingested before you expect its content in results.
+
+## 2. Map your app data to a class
 
 An **app source** is one mapped item. **Choose its class with `kind`, identify its app with `provider`, and put its content in `fields`.**
 
@@ -22,12 +137,100 @@ An **app source** is one mapped item. **Choose its class with `kind`, identify i
 | `email` | Emails and email replies | `fields.subject`, `fields.body` |
 | [`custom`](#map-your-data-to-the-custom-class) | CRM records, meeting transcripts, and other app records | `fields.body`, `fields.data` |
 
-
 A connector can produce more than one class: your Jira connector sends tickets as `ticket` and their comments as `comment`. Repeat the class in `fields.kind`, matching the top-level `kind`.
 
-## Choose your app pattern
+Your connector translates the app's API response into the fields for the class you chose above. Fetch the item and extract its text, authors, timestamps, and app IDs before building the source. Extract attachment text too if you want it searched. For example, a Slack API message maps like this:
 
-These five patterns show how to map the app data your connector has fetched. Expand one, replace its example values with your app's data, and save the JSON as `app-sources.json`. Send it with the [ingestion request](#2-ingest-an-app-source). Use the same pattern for later snapshots, adding `upsert=true` to the form request when replacing an existing item.
+| Slack API value | App-source field |
+|---|---|
+| Message `ts` | `external_id` |
+| Message `text` | `fields.body` |
+| Sender `user` | `fields.author` (resolve the user ID to a name or email when available) |
+| Reply's `thread_ts`, or the root's own `ts` | `fields.thread_id` |
+| Reply's `thread_ts` | `fields.parent_id`; omit on the opening message |
+| File text extracted by your connector | `attachments[].content.text` or `attachments[].content.markdown` |
+
+Set `kind: "message"` and `fields.kind: "message"` for this mapping. For a ticket, map its title and description to `fields.title` and `fields.description`; for an email, map its subject, body, sender, and recipients to the email fields. Keep the original item's ID so later updates and relationships refer to the same item.
+
+### Map your data to the custom class
+
+**Use the `custom` class for records that do not fit another class**, such as CRM deals, contacts, invoices, meeting transcripts, or records from your internal app. Set both `kind` and `fields.kind` to `custom`. Your business record type, such as `opportunity` or `invoice`, goes in `fields.data.record_type`.
+
+Your connector maps the record's properties to `fields.data` and its readable text to `fields.body`. For a meeting transcript, put the transcript in `fields.body` and details such as participants in `fields.data`.
+
+<Accordion title="Salesforce opportunity: map to custom and link to Jira">
+
+The ingestion request still uses **`type=knowledge`**. `custom` is the source's class; `opportunity` is the business record type in this example.
+
+Map the app's properties into **`fields.data`**, a JSON object that can contain strings, numbers, booleans, arrays, and nested objects. HydraDB renders the values as text for indexing, omitting empty values, `0`, and `false`. Add **`fields.body`** for a readable description or notes, including any zero or false values that need to be searchable.
+
+Map the Salesforce opportunity's fields to these app-source fields, and connect the resulting source to its account and a Jira ticket:
+
+| App value | App-source field |
+|---|---|
+| Opportunity ID | `external_id`; derive a stable HydraDB `id` from it |
+| Opportunity name | Top-level `title` and `fields.data.name` |
+| Opportunity notes | `fields.body` |
+| Stage, amount, owner, and other business properties | Keys in `fields.data` |
+| Associated account's app ID | `fields.parent_id` |
+| Related Jira source's HydraDB ID | `relations[].target.source_id` |
+
+Save this source in `app-sources.json` and send it with the [ingestion request](#1-ingest-an-app-source). Your connector supplies the mapped text, properties, and IDs.
+
+```json Custom opportunity source
+{
+  "id": "salesforce_opp_789",
+  "database": "acme_corp",
+  "collection": "default",
+  "title": "Acme enterprise renewal",
+  "kind": "custom",
+  "provider": "salesforce",
+  "external_id": "opp_789",
+  "fields": {
+    "kind": "custom",
+    "body": "Acme is negotiating its enterprise renewal. The renewal depends on resolving the login issue in the linked Jira ticket.",
+    "parent_id": "account_456",
+    "data": {
+      "record_type": "opportunity",
+      "name": "Acme enterprise renewal",
+      "stage": "negotiation",
+      "amount": 50000,
+      "owner": "morgan"
+    }
+  },
+  "relations": [
+    {
+      "predicate": "linked_to",
+      "target": { "source_id": "jira_AUTH-123" }
+    }
+  ]
+}
+```
+
+Ingest the account as another Salesforce source with `external_id: "account_456"`. For the direct source-ID relation shown here, ingest the Jira ticket and wait for `completed` before ingesting the opportunity. HydraDB uses the account as the opportunity's parent and the ticket as a linked source.
+
+Keep connection fields outside `data`: `fields.parent_id` creates a same-provider parent connection, `fields.thread_id` groups a conversation, and top-level `relations` connects other sources, including across apps. A business property such as `fields.data.account_id` alone does not create a connection. The [connection examples](#4-connect-app-sources) include Gmail linked to Notion and a CRM field mapped to a Postgres row.
+
+For filters such as deal stage, also map the property into `metadata` and declare it in your [metadata schema](/essentials/v2/metadata) with `enable_match: true`. Keys in `fields.data` provide searchable content; they do not automatically become metadata filters.
+
+After ingestion, query with `type: "knowledge"` and `query_apps: true`, just as for other app classes. For example, ask "What is blocking Acme's renewal?" with `mode: "thinking"` to retrieve connected context. When the deal changes, send its complete updated snapshot with the same IDs and `upsert: true`; retain its relationships and other content. See [incremental ingestion](#5-incremental-ingestion).
+
+</Accordion>
+
+### Item IDs
+
+Every source has two IDs:
+
+- **`id` is your stable HydraDB source ID.** Use it to check status, replace the source, or delete it. For example, `slack_C01_1716213600_000100`.
+- **`external_id` identifies the item in the app.** For example, the Slack message timestamp `1716213600.000100` or Jira issue key `AUTH-123`. Parent and reply fields refer to this ID.
+
+Use a consistent `provider` for items that belong together. HydraDB resolves external IDs within the provider and database/collection scope. If an app's IDs are only unique within a channel, workspace, or mailbox, make your external IDs unambiguous in that scope and apply the same mapping to every parent, reply, and relation target. Adding a channel name to metadata does not change how IDs resolve.
+
+`database` and `collection` say where the source belongs. Include them in each item, matching the values on the ingestion request. `title` and `url` give the user a readable citation and a link back to the original item.
+
+## 3. Choose your app pattern
+
+These five patterns show how to map the app data your connector has fetched. Expand one, replace its example values with your app's data, and save the JSON as `app-sources.json`. Send it with the [ingestion request](#1-ingest-an-app-source). Use the same pattern for later snapshots, adding `upsert=true` to the form request when replacing an existing item.
 
 <AccordionGroup>
 <Accordion title="Slack / Teams: threads, replies, attachments">
@@ -226,222 +429,13 @@ See [Map your data to the custom class](#map-your-data-to-the-custom-class) for 
 </Accordion>
 </AccordionGroup>
 
-For example, a Slack conversation has an opening message, replies, and perhaps an attached runbook. Ingest each message as its own source, group the messages into a thread, and attach the runbook's extracted text to the message that shared it. HydraDB can then retrieve the discussion with its supporting context.
-
-Follow the steps below to map your app's response, [ingest a source](#2-ingest-an-app-source), [connect it to other sources](#3-connect-app-sources), and [send incremental changes](#4-incremental-ingestion). The final sections cover attachments, metadata, and queries.
-
-## 1. Map your app data
-
-Your connector translates the app's API response into the fields for the class you chose above. Fetch the item and extract its text, authors, timestamps, and app IDs before building the source. Extract attachment text too if you want it searched. For example, a Slack API message maps like this:
-
-| Slack API value | App-source field |
-|---|---|
-| Message `ts` | `external_id` |
-| Message `text` | `fields.body` |
-| Sender `user` | `fields.author` (resolve the user ID to a name or email when available) |
-| Reply's `thread_ts`, or the root's own `ts` | `fields.thread_id` |
-| Reply's `thread_ts` | `fields.parent_id`; omit on the opening message |
-| File text extracted by your connector | `attachments[].content.text` or `attachments[].content.markdown` |
-
-Set `kind: "message"` and `fields.kind: "message"` for this mapping. For a ticket, map its title and description to `fields.title` and `fields.description`; for an email, map its subject, body, sender, and recipients to the email fields. Keep the original item's ID so later updates and relationships refer to the same item.
-
-### Map your data to the custom class
-
-**Use the `custom` class for records that do not fit another class**, such as CRM deals, contacts, invoices, meeting transcripts, or records from your internal app. Set both `kind` and `fields.kind` to `custom`. Your business record type, such as `opportunity` or `invoice`, goes in `fields.data.record_type`.
-
-Your connector maps the record's properties to `fields.data` and its readable text to `fields.body`. For a meeting transcript, put the transcript in `fields.body` and details such as participants in `fields.data`.
-
-<Accordion title="Salesforce opportunity: map to custom and link to Jira">
-
-The ingestion request still uses **`type=knowledge`**. `custom` is the source's class; `opportunity` is the business record type in this example.
-
-Map the app's properties into **`fields.data`**, a JSON object that can contain strings, numbers, booleans, arrays, and nested objects. HydraDB renders the values as text for indexing, omitting empty values, `0`, and `false`. Add **`fields.body`** for a readable description or notes, including any zero or false values that need to be searchable.
-
-Map the Salesforce opportunity's fields to these app-source fields, and connect the resulting source to its account and a Jira ticket:
-
-| App value | App-source field |
-|---|---|
-| Opportunity ID | `external_id`; derive a stable HydraDB `id` from it |
-| Opportunity name | Top-level `title` and `fields.data.name` |
-| Opportunity notes | `fields.body` |
-| Stage, amount, owner, and other business properties | Keys in `fields.data` |
-| Associated account's app ID | `fields.parent_id` |
-| Related Jira source's HydraDB ID | `relations[].target.source_id` |
-
-Save this source in `app-sources.json` and send it with the [ingestion request](#2-ingest-an-app-source). Your connector supplies the mapped text, properties, and IDs.
-
-```json Custom opportunity source
-{
-  "id": "salesforce_opp_789",
-  "database": "acme_corp",
-  "collection": "default",
-  "title": "Acme enterprise renewal",
-  "kind": "custom",
-  "provider": "salesforce",
-  "external_id": "opp_789",
-  "fields": {
-    "kind": "custom",
-    "body": "Acme is negotiating its enterprise renewal. The renewal depends on resolving the login issue in the linked Jira ticket.",
-    "parent_id": "account_456",
-    "data": {
-      "record_type": "opportunity",
-      "name": "Acme enterprise renewal",
-      "stage": "negotiation",
-      "amount": 50000,
-      "owner": "morgan"
-    }
-  },
-  "relations": [
-    {
-      "predicate": "linked_to",
-      "target": { "source_id": "jira_AUTH-123" }
-    }
-  ]
-}
-```
-
-Ingest the account as another Salesforce source with `external_id: "account_456"`. For the direct source-ID relation shown here, ingest the Jira ticket and wait for `completed` before ingesting the opportunity. HydraDB uses the account as the opportunity's parent and the ticket as a linked source.
-
-Keep connection fields outside `data`: `fields.parent_id` creates a same-provider parent connection, `fields.thread_id` groups a conversation, and top-level `relations` connects other sources, including across apps. A business property such as `fields.data.account_id` alone does not create a connection. The [connection examples](#3-connect-app-sources) include Gmail linked to Notion and a CRM field mapped to a Postgres row.
-
-For filters such as deal stage, also map the property into `metadata` and declare it in your [metadata schema](/essentials/v2/metadata) with `enable_match: true`. Keys in `fields.data` provide searchable content; they do not automatically become metadata filters.
-
-After ingestion, query with `type: "knowledge"` and `query_apps: true`, just as for other app classes. For example, ask "What is blocking Acme's renewal?" with `mode: "thinking"` to retrieve connected context. When the deal changes, send its complete updated snapshot with the same IDs and `upsert: true`; retain its relationships and other content. See [incremental ingestion](#4-incremental-ingestion).
-
-</Accordion>
-
-### Item IDs
-
-Every source has two IDs:
-
-- **`id` is your stable HydraDB source ID.** Use it to check status, replace the source, or delete it. For example, `slack_C01_1716213600_000100`.
-- **`external_id` identifies the item in the app.** For example, the Slack message timestamp `1716213600.000100` or Jira issue key `AUTH-123`. Parent and reply fields refer to this ID.
-
-Use a consistent `provider` for items that belong together. HydraDB resolves external IDs within the provider and database/collection scope. If an app's IDs are only unique within a channel, workspace, or mailbox, make your external IDs unambiguous in that scope and apply the same mapping to every parent, reply, and relation target. Adding a channel name to metadata does not change how IDs resolve.
-
-`database` and `collection` say where the source belongs. Include them in each item, matching the values on the ingestion request. `title` and `url` give the user a readable citation and a link back to the original item.
-
-<a id="3-ingest-an-app-source"></a>
-
-## 2. Ingest an app source
-
-Send your mapped sources to [`POST /context/ingest`](/api-reference/v2/endpoint/ingest-context), using an existing [database](/api-reference/v2/endpoint/create-tenant) and collection. The request is **multipart/form-data**. `app_knowledge` is your mapped source object or array, serialized as a JSON string in one form field.
-
-| Form field | What to send |
-|---|---|
-| `type` | `knowledge` |
-| `database` | The existing database that should own these sources |
-| `collection` | Your collection, or `default` |
-| `app_knowledge` | Your mapped source object or array, serialized as a JSON string |
-
-Include the same `database` and `collection` in every source and in the form fields. With an SDK, use `json.dumps(...)` in Python or `JSON.stringify(...)` in TypeScript; the SDK constructs the multipart request.
-
-The example below sends Alice's opening Slack message. To send another app pattern, replace this JSON with the source or array you mapped above.
-
-<Accordion title="Ingest a Slack message: JSON, cURL, Python, or TypeScript">
-
-For cURL, save the JSON in the first tab as `app-sources.json` in your current directory, then run the request in the next tab. The request reads that JSON into the `app_knowledge` form value.
-
-Set up your [SDK client](/api-reference/v2/sdks#client-setup) before running Python or TypeScript. These examples build and serialize the same message directly. The TypeScript SDK names the form property `appKnowledge`; the JSON source fields keep their snake_case names.
-
-<CodeGroup>
-```json app-sources.json
-{
-  "id": "slack_C01_1716213600_000100",
-  "database": "acme_corp",
-  "collection": "default",
-  "title": "Auth rollback discussion",
-  "kind": "message",
-  "provider": "slack",
-  "external_id": "1716213600.000100",
-  "fields": {
-    "kind": "message",
-    "body": "Disable the new token refresh path to roll back auth.",
-    "author": "alice",
-    "thread_id": "1716213600.000100"
-  }
-}
-```
-```bash cURL
-curl -X POST 'https://api.hydradb.com/context/ingest' \
-  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
-  -H "API-Version: 2" \
-  -F 'type=knowledge' \
-  -F 'database=acme_corp' \
-  -F 'collection=default' \
-  --form-string "app_knowledge=$(cat app-sources.json)"
-```
-```python Python SDK
-import json
-
-message = {
-    "id": "slack_C01_1716213600_000100",
-    "database": "acme_corp",
-    "collection": "default",
-    "title": "Auth rollback discussion",
-    "kind": "message",
-    "provider": "slack",
-    "external_id": "1716213600.000100",
-    "fields": {
-        "kind": "message",
-        "body": "Disable the new token refresh path to roll back auth.",
-        "author": "alice",
-        "thread_id": "1716213600.000100",
-    },
-}
-
-result = client.context.ingest(
-    type="knowledge",
-    database="acme_corp",
-    collection="default",
-    app_knowledge=json.dumps([message]),
-)
-```
-```typescript TypeScript SDK
-const message = {
-  id: "slack_C01_1716213600_000100",
-  database: "acme_corp",
-  collection: "default",
-  title: "Auth rollback discussion",
-  kind: "message",
-  provider: "slack",
-  external_id: "1716213600.000100",
-  fields: {
-    kind: "message",
-    body: "Disable the new token refresh path to roll back auth.",
-    author: "alice",
-    thread_id: "1716213600.000100",
-  },
-};
-
-const result = await client.context.ingest({
-  type: "knowledge",
-  database: "acme_corp",
-  collection: "default",
-  appKnowledge: JSON.stringify([message]),
-});
-```
-</CodeGroup>
-
-</Accordion>
-
-**For edits, use this same endpoint and add `upsert=true` to the form request.** Send the item's complete current snapshot with the same IDs. See [Incremental ingestion](#4-incremental-ingestion) for the updated JSON and cURL request.
-
-The call returns `202 Accepted`. Check each item's entry in `data.results` for its source `id`, `status`, and any `error`. A `queued` item has been accepted for processing.
-
-Use [`GET /context/status`](/api-reference/v2/endpoint/source-status) with that ID to follow ingestion. The source is queryable when `indexing_status` reaches `graph_creation` or `completed`.
-
-At `graph_creation`, text can already be searchable while the graph is still being built. Before checking thread or relation expansion, wait for the involved sources to reach `completed`. Use the [connected subgraph endpoint](/api-reference/v2/endpoint/subgraph) to confirm that the expected source IDs and links are present.
-
-`errored` is also a terminal state. Stop waiting, inspect `error_code`, correct the source payload or address the reported failure, and retry ingestion with `upsert: true`. You can also delete a failed source for cleanup. A relation target that failed ingestion must be corrected and successfully ingested before you expect its content in results.
-
-## 3. Connect app sources
+## 4. Connect app sources
 
 Connect replies to their conversations, link records across apps, or request linked text alongside search hits. Expand a topic to see the fields and examples.
 
 <AccordionGroup>
 <a id="threads-and-replies"></a>
-<Accordion title="Threads and replies">
+<Accordion title="Threads and replies: Slack / Gmail">
 
 A **thread** groups a conversation. A **parent** identifies the specific item that a reply or comment responds to. These fields answer different questions:
 
@@ -457,7 +451,7 @@ For other apps, use their conversation IDs. Email uses `thread_id` to group the 
 
 </Accordion>
 <a id="relationships-from-fields"></a>
-<Accordion title="Relationships from fields">
+<Accordion title="Relationships from fields: Jira / Notion">
 
 HydraDB creates these connections from the fields you send:
 
@@ -474,7 +468,7 @@ Parent and reply IDs use the same provider as the source. Ingest the referenced 
 
 </Accordion>
 <a id="explicit-relations-between-sources"></a>
-<Accordion title="Explicit relations between sources">
+<Accordion title="Explicit relations: Slack → Jira">
 
 Use `relations` to describe connections beyond those fields: a Slack discussion about a Jira incident, a CRM renewal tied to a support ticket, or an issue blocking a release.
 
@@ -518,9 +512,9 @@ Keep both sources in the same database and collection. A relation connects sourc
 
 </Accordion>
 <a id="return-linked-content-with-query-results"></a>
-<Accordion title="Return linked content with query results">
+<Accordion title="Linked query context: Gmail → Notion">
 
-**Use a forceful retrieval link when linked content should accompany a search hit.** For example, a CRM contact can request its linked account row as supporting context even when only the contact matches the question.
+**Use a forceful retrieval link when linked content should accompany a search hit.** For example, a Gmail email can request a linked Notion runbook as supporting context when the email matches the question.
 
 | What you need | What to send on the app source |
 |---|---|
@@ -530,7 +524,7 @@ Keep both sources in the same database and collection. A relation connects sourc
 
 ```json Add a retrieval link to the source
 {
-  "relations": { "ids": ["postgres:public.users:123"] }
+  "relations": { "ids": ["notion_page_abc"] }
 }
 ```
 
@@ -546,7 +540,7 @@ Forceful retrieval follows direct links from the sources represented in the retu
 
 </Accordion>
 <a id="link-app-sources-across-apps"></a>
-<Accordion title="Link app sources across apps">
+<Accordion title="Across apps: Gmail → Notion">
 
 **An app source can link to another app source from a different app.** Map and ingest each item, then connect them with a relation. For example, link a Gmail email approving an auth rollback to the Notion runbook that describes the procedure.
 
@@ -554,7 +548,7 @@ Both sources must belong to the same database and collection. The target's provi
 
 For a `source_id` target, ingest the target first and wait for its ingestion to reach `completed`. Then add a `linked_to` relation to the referring source with the target's HydraDB ID as `target.source_id`. For example, link `gmail_msg_19a2b3c` to `notion_page_abc` from the patterns above.
 
-Save this source as `app-sources.json` and send it through `app_knowledge` using the [ingestion request](#2-ingest-an-app-source). If you already ingested the email from the pattern above, add `-F 'upsert=true'` to update it. Replace the example IDs and business fields with your source's actual values.
+Save this source as `app-sources.json` and send it through `app_knowledge` using the [ingestion request](#1-ingest-an-app-source). If you already ingested the email from the pattern above, add `-F 'upsert=true'` to update it. Replace the example IDs and business fields with your source's actual values.
 
 ```json Gmail source with a Notion target
 {
@@ -615,7 +609,7 @@ People and records have different connections. When sources identify people by e
 
 </Accordion>
 <a id="link-a-crm-field-to-a-postgres-row"></a>
-<Accordion title="Link a CRM field to a Postgres row">
+<Accordion title="Foreign-key links: HubSpot → Postgres">
 
 **You can represent a foreign-key link between app sources.** Suppose a HubSpot contact has a custom field `psql_user_id: "123"` referring to row `123` in your Postgres `public.users` table. Ingest the contact and the row as `custom` app sources. Your mapping code reads the field and adds a relation to the row's HydraDB source ID.
 
@@ -629,7 +623,7 @@ The source-ID format above is a convention you define in your mapping. Include t
 
 **The relation comes from your mapping, not from storing the ID in `fields.data`.** Read each non-empty `psql_user_id`, compute or look up the matching row's source ID, and declare the typed link in `app_relations` plus the retrieval link in `relations.ids`, as shown below. This creates a graph connection; it does not enforce a SQL foreign-key constraint or read from Postgres during a query.
 
-Declare `user_id` as a `VARCHAR` field with `enable_match: true` in your [database metadata schema](/essentials/v2/metadata). The array below shows both mapped snapshots. Save the row object by itself as `app-sources.json`, send it with the [ingestion request](#2-ingest-an-app-source), and wait for `completed`. Then save and send the contact object, which refers to that row.
+Declare `user_id` as a `VARCHAR` field with `enable_match: true` in your [database metadata schema](/essentials/v2/metadata). The array below shows both mapped snapshots. Save the row object by itself as `app-sources.json`, send it with the [ingestion request](#1-ingest-an-app-source), and wait for `completed`. Then save and send the contact object, which refers to that row.
 
 ```json Contact linked to a user row
 [
@@ -714,18 +708,84 @@ When the contact's `psql_user_id` changes, ingest the new target row and wait fo
 </Accordion>
 </AccordionGroup>
 
-## 4. Incremental ingestion
+## 5. Incremental ingestion
 
-Send new and changed items to the same [`POST /context/ingest`](/api-reference/v2/endpoint/ingest-context) endpoint. **A new item gets a new source ID. An edited item keeps its source ID and is sent with `upsert=true` as a form field.** You only need to send the items that changed.
+Run your connector regularly or when new app events arrive. After the initial ingestion, send the new items discovered on each sync to [`POST /context/ingest`](/api-reference/v2/endpoint/ingest-context). Each new item gets its own stable source ID.
 
-For the Slack thread above:
+For Slack, adding a reply means ingesting a **new message source in the existing thread**. Keep the shared `thread_id`, set `parent_id` to the opening message's external ID, and give the reply its own IDs and body.
 
-1. Alice posts the opening message. Ingest `slack_C01_1716213600_000100`.
-2. Carol replies. Ingest only `slack_C01_1716213700_000200`, with the same `thread_id` and the opening message's external ID as `parent_id`.
-3. Carol edits her reply. Send the complete updated reply with the same `id` and `external_id`, and `upsert: true`.
-4. Carol deletes her reply. [Delete the source](/api-reference/v2/endpoint/delete-source) using its HydraDB `id`.
+<Accordion title="Add a Slack reply to an existing thread: JSON, cURL, or Python">
 
-<Accordion title="Update a Slack reply: JSON snapshot, cURL request, and Python SDK">
+Alice's opening message is already ingested as `slack_C01_1716213600_000100`, with `external_id: "1716213600.000100"`. Bob now posts another reply. Save this new source as `new-reply.json` and send it with the cURL request in the next tab.
+
+Bob's reply has its own `id` and `external_id`. Its `thread_id` groups it with Alice's message, and its `parent_id` points to Alice's external ID. Send only this new reply on this sync.
+
+<CodeGroup>
+```json new-reply.json
+{
+  "id": "slack_C01_1716213800_000300",
+  "database": "acme_corp",
+  "collection": "default",
+  "title": "New reply to auth rollback discussion",
+  "kind": "message",
+  "provider": "slack",
+  "external_id": "1716213800.000300",
+  "fields": {
+    "kind": "message",
+    "body": "Monitoring confirms error rates are back to normal.",
+    "author": "bob",
+    "thread_id": "1716213600.000100",
+    "parent_id": "1716213600.000100",
+    "created_at": "2026-05-20T10:03:20Z"
+  }
+}
+```
+```bash cURL add reply
+curl -X POST 'https://api.hydradb.com/context/ingest' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -F 'type=knowledge' \
+  -F 'database=acme_corp' \
+  -F 'collection=default' \
+  --form-string "app_knowledge=$(cat new-reply.json)"
+```
+```python Python SDK
+import json
+
+new_reply = {
+    "id": "slack_C01_1716213800_000300",
+    "database": "acme_corp",
+    "collection": "default",
+    "title": "New reply to auth rollback discussion",
+    "kind": "message",
+    "provider": "slack",
+    "external_id": "1716213800.000300",
+    "fields": {
+        "kind": "message",
+        "body": "Monitoring confirms error rates are back to normal.",
+        "author": "bob",
+        "thread_id": "1716213600.000100",
+        "parent_id": "1716213600.000100",
+        "created_at": "2026-05-20T10:03:20Z",
+    },
+}
+
+result = client.context.ingest(
+    type="knowledge",
+    database="acme_corp",
+    collection="default",
+    app_knowledge=json.dumps([new_reply]),
+)
+```
+</CodeGroup>
+
+Check `data.results` for Bob's new source ID, then follow it with [`GET /context/status`](/api-reference/v2/endpoint/source-status). After `completed`, verify its thread connection. Handle `errored` using the recovery guidance in the ingestion section. The new reply becomes part of the existing discussion.
+
+</Accordion>
+
+Use the same approach for new emails, pages, tickets, and comments. For a new ticket comment, send a `comment` source with its own IDs and the ticket's external ID in `fields.parent_id`. Keep your sync cursor or checkpoint in your connector so subsequent runs can identify new items.
+
+<Accordion title="Edit or delete an existing item: Slack example">
 
 Wait for Carol's previous ingestion to reach `completed` or `errored` before sending another snapshot. If it errored, inspect `error_code` and correct the failure before retrying. Save the complete updated reply below as `reply-update.json`, then run the cURL request in the next tab. This replaces only Carol's source, retaining its identity and thread connections.
 
@@ -794,15 +854,11 @@ result = client.context.ingest(
 
 Check this request's `data.results`, then follow the same source ID with [`GET /context/status`](/api-reference/v2/endpoint/source-status). Wait for `completed` before verifying the edit or its connections; handle `errored` as described above.
 
-</Accordion>
-
-The same rule applies across apps:
+For edits and deletions across apps:
 
 | App event | What to send |
 |---|---|
-| New message, email, page, or ticket | A new source with its own `id` and `external_id` |
 | Ticket status or page body changes | The updated source with the same IDs and `upsert: true` |
-| New ticket or page comment | A new `comment` source with its own IDs and the parent's external ID in `fields.parent_id` |
 | Existing comment edited | The updated comment source with the same IDs and `upsert: true` |
 | Item deleted | `DELETE /context` with the item's HydraDB source ID, after ingestion reaches `completed` or `errored` |
 
@@ -810,7 +866,9 @@ The same rule applies across apps:
 
 For deletion, check the response's `data.results[].deleted` value. An HTTP 200 alone can include a failed deletion when the source is still processing; wait for `completed` or `errored` and retry. Set `X-HydraDB-Delete-Status: strict` to receive an HTTP error for a failed deletion. See [Delete source](/api-reference/v2/endpoint/delete-source).
 
-## 5. Include attachments and comments
+</Accordion>
+
+## 6. Include attachments and comments
 
 ### Attachments: the supporting file's text
 
@@ -882,7 +940,7 @@ On the next parent upsert, send the complete current comment list. A payload con
 
 Slack replies and email replies keep their `message` and `email` classes. This preserves each reply's app fields and thread connections.
 
-## 6. Add metadata for filtering and display
+## 7. Add metadata for filtering and display
 
 Use `metadata` for shared values you want to filter on, such as Slack channel, Jira project, or department. Declare those keys in the [database metadata schema](/essentials/v2/metadata) with `enable_match: true` before ingestion.
 
@@ -897,9 +955,9 @@ Use `additional_metadata` for other details you want to preserve, such as a raw 
 
 At query time, filter with `metadata_filters: { "channel": "engineering" }`. Filters on free-form values go under `metadata_filters.additional_metadata`. See [Scoping using metadata](/essentials/v2/metadata) for schema setup and complete filter examples.
 
-## 7. Query app sources with connected context
+## 8. Query app sources with connected context
 
-Use [`POST /query`](/api-reference/v2/endpoint/query) with `type: "knowledge"` (or `"all"`) and `query_apps: true`. Set `mode: "thinking"` for queries that need related items, such as a thread's replies or a ticket's comments. For explicitly declared retrieval links, also use `query_forceful_relations: true` and read `additional_context`. Expand "Return linked content with query results" under [Connect app sources](#3-connect-app-sources) for the declaration, response fields, and current limitations.
+Use [`POST /query`](/api-reference/v2/endpoint/query) with `type: "knowledge"` (or `"all"`) and `query_apps: true`. Set `mode: "thinking"` for queries that need related items, such as a thread's replies or a ticket's comments. For explicitly declared retrieval links, also use `query_forceful_relations: true` and read `additional_context`. Expand "Linked query context: Gmail → Notion" under [Connect app sources](#4-connect-app-sources) for the declaration, response fields, and current limitations.
 
 <Accordion title="Query example: retrieve the rollback discussion and its replies">
 
