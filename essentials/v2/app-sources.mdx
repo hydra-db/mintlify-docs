@@ -1,650 +1,593 @@
 ---
 title: "App Sources"
-description: "How to ingest Slack, Gmail, Jira, Notion, CRM, and other app data using the field-based app-source model."
+description: "Ingest app content with its connected context."
 ---
 
 import { Field } from "/snippets/field.jsx";
 
-App sources are pre-parsed records from business applications: emails, chat messages, tickets, wiki pages, CRM objects, comments, and attachments. Use them when your connector already extracted the item's text and structured fields.
+An **app source** is one item from an app, such as a Slack message or Jira ticket.
 
-App sources are ingested through [`POST /context/ingest`](/api-reference/v2/endpoint/ingest-context) with the `app_knowledge` multipart field. The app-source payload is **not** a generic top-level `content` object. It uses the same app-native model as v1: `kind`, `provider`, `external_id`, `fields`, metadata, attachments, comments, and typed relations.
+## Choose your app pattern
 
-<Info>
-  App sources land in the [Knowledge](/essentials/v2/knowledge) store. Query them with [`POST /query`](/api-reference/v2/endpoint/query), `type: "knowledge"` or `type: "all"`, and **`query_apps: true`**. Use `mode: "thinking"` when you want app relation expansion and connected context.
-</Info>
+Expand a pattern to see its classes and payload.
 
-## 1. What it is
+<AccordionGroup>
+<Accordion title="Slack / Teams: threads, replies, attachments">
 
-| | App source | File upload |
+**Classes: `message` for both the opening message and every reply.** A reply has its own ID and body. All messages in the thread share `fields.thread_id`; each reply also sets `fields.parent_id` to the opening message's `external_id`.
+
+In Slack, the message ID is its `ts`, and the thread root is `thread_ts`. For the opening message, use its own `ts` as `thread_id`. The example uses one channel; keep provider IDs unambiguous across the channels and workspaces you sync (see [Item IDs](#item-ids)).
+
+```json Root message and reply
+[
+  {
+    "id": "slack_C01_1716213600_000100",
+    "database": "acme_corp",
+    "collection": "default",
+    "title": "Auth rollback discussion",
+    "kind": "message",
+    "provider": "slack",
+    "external_id": "1716213600.000100",
+    "fields": {
+      "kind": "message",
+      "body": "The auth rollback notes are attached here.",
+      "author": "alice",
+      "thread_id": "1716213600.000100",
+      "created_at": "2026-05-20T10:00:00Z"
+    },
+    "attachments": [
+      {
+        "id": "F012AUTH",
+        "title": "auth-rollback-notes.md",
+        "content": { "markdown": "# Auth rollback\nDisable the new token refresh path first." }
+      }
+    ]
+  },
+  {
+    "id": "slack_C01_1716213700_000200",
+    "database": "acme_corp",
+    "collection": "default",
+    "title": "Reply to auth rollback discussion",
+    "kind": "message",
+    "provider": "slack",
+    "external_id": "1716213700.000200",
+    "fields": {
+      "kind": "message",
+      "body": "Confirmed: login works after disabling token refresh.",
+      "author": "carol",
+      "thread_id": "1716213600.000100",
+      "parent_id": "1716213600.000100",
+      "created_at": "2026-05-20T10:01:40Z"
+    }
+  }
+]
+```
+
+HydraDB derives the `reply_to` connection from `parent_id`. The root has no `parent_id`. A new reply only needs a new source; the root stays as it is. Use the same structure for other messaging apps, with their own message and conversation IDs.
+
+</Accordion>
+<Accordion title="Jira / Linear / Zendesk: tickets and comments">
+
+**Classes: `ticket` for an issue; `comment` for each independently synced comment.** The ticket's main text is `fields.description`. A comment has its own `external_id`, and its `fields.parent_id` is the ticket's `external_id` under the same provider.
+
+```json Ticket and comment
+[
+  {
+    "id": "jira_AUTH-123",
+    "database": "acme_corp",
+    "collection": "default",
+    "title": "Login page returns 500",
+    "kind": "ticket",
+    "provider": "jira",
+    "external_id": "AUTH-123",
+    "fields": {
+      "kind": "ticket",
+      "title": "Login page returns 500",
+      "description": "Invalid credentials return HTTP 500 instead of 401.",
+      "status": "open",
+      "assignee": "alice",
+      "parent_id": "AUTH-100",
+      "linked_issue_ids": ["AUTH-124"]
+    }
+  },
+  {
+    "id": "jira_comment_c123",
+    "database": "acme_corp",
+    "collection": "default",
+    "title": "Reproduction steps for AUTH-123",
+    "kind": "comment",
+    "provider": "jira",
+    "external_id": "c123",
+    "fields": {
+      "kind": "comment",
+      "body": "Reproduces on staging when the refresh token expires.",
+      "author": "carol",
+      "parent_id": "AUTH-123",
+      "created_at": "2026-05-20T11:00:00Z"
+    }
+  }
+]
+```
+
+This creates a `child_of` connection from AUTH-123 to its epic, a `linked_to` connection to AUTH-124, and a `comment_on` connection from c123 to AUTH-123. Ingest the epic and linked issue too to make their content available. For Linear or Zendesk, change the provider and use that app's item IDs.
+
+</Accordion>
+<Accordion title="Notion / Confluence: pages and parents">
+
+**Class: `knowledge_base`.** Ingest one source per page. Use `fields.parent_id` for another page's ID, and put the workspace or space in metadata.
+
+```json Wiki page
+{
+  "id": "notion_page_abc",
+  "database": "acme_corp",
+  "collection": "default",
+  "title": "Incident response runbook",
+  "kind": "knowledge_base",
+  "provider": "notion",
+  "external_id": "page_abc",
+  "fields": {
+    "kind": "knowledge_base",
+    "title": "Incident response runbook",
+    "body": "Disable token refresh, verify login, then monitor error rates.",
+    "parent_id": "page_engineering",
+    "created_by": "alice@acme.com"
+  },
+  "additional_metadata": { "space": "Engineering" }
+}
+```
+
+HydraDB derives a `child_of` connection to `page_engineering`. Ingest that parent page separately. Editing the runbook means sending its updated snapshot with the same source ID.
+
+</Accordion>
+<Accordion title="Gmail / Outlook: emails and replies">
+
+**Class: `email` for each email, including replies.** Use the shared conversation ID as `fields.thread_id`, and the email being replied to as `fields.reply_to_id`.
+
+```json Email reply
+{
+  "id": "gmail_msg_19a2b3c",
+  "database": "acme_corp",
+  "collection": "default",
+  "title": "Re: Auth rollback plan",
+  "kind": "email",
+  "provider": "gmail",
+  "external_id": "19a2b3c",
+  "fields": {
+    "kind": "email",
+    "subject": "Re: Auth rollback plan",
+    "body": "Approved. Please share the verification results after rollback.",
+    "from": "alice@acme.com",
+    "to": ["team@acme.com"],
+    "thread_id": "thread_19a2",
+    "reply_to_id": "19a1a00",
+    "created_at": "2026-05-20T11:00:00Z"
+  }
+}
+```
+
+Ingest the original email `19a1a00` separately with the same `thread_id`. HydraDB derives the `reply_to` connection. An email reply uses the `email` class, so its sender, recipients, subject, and body remain available.
+
+</Accordion>
+<Accordion title="Salesforce / HubSpot: CRM and app relations">
+
+**Class: `custom`.** Put the record's business fields in `fields.data`. Use `fields.parent_id` for the account's ID in the same CRM, and `relations` for connections to items in other apps.
+
+```json Opportunity linked to a Jira ticket
+{
+  "id": "salesforce_opp_789",
+  "database": "acme_corp",
+  "collection": "default",
+  "title": "Acme enterprise renewal",
+  "kind": "custom",
+  "provider": "salesforce",
+  "external_id": "opp_789",
+  "fields": {
+    "kind": "custom",
+    "parent_id": "account_456",
+    "data": {
+      "name": "Acme enterprise renewal",
+      "stage": "negotiation",
+      "amount": 50000,
+      "owner": "morgan"
+    }
+  },
+  "relations": [
+    {
+      "predicate": "linked_to",
+      "target": { "external_id": "AUTH-123", "provider": "jira" },
+      "properties": { "reason": "Renewal depends on the login fix" }
+    }
+  ]
+}
+```
+
+Ingest `account_456` as another CRM source. The explicit relation connects the opportunity to the Jira ticket from the ticket pattern, so a query can follow the renewal's dependency on the login fix.
+
+</Accordion>
+</AccordionGroup>
+
+For example, a Slack conversation has an opening message, replies, and perhaps an attached runbook. Ingest each message as its own source, group the messages into a thread, and attach the runbook's extracted text to the message that shared it. HydraDB can then retrieve the discussion with its supporting context.
+
+The steps below show how to choose an object class, connect items, [ingest them](#3-ingest-an-app-source), keep them updated, and query them.
+
+## 1. Choose the object's class and fields
+
+**The object class is the starting point. Set it with `kind`.** It tells HydraDB what the item represents and how to read its fields. The app name goes in `provider`: a Slack message is `kind: "message"`, `provider: "slack"`; a Jira ticket is `kind: "ticket"`, `provider: "jira"`.
+
+| Object class (`kind`) | One source represents | Main text | Useful connections |
+|---|---|---|---|
+| `message` | One Slack or Teams message, including a reply | `fields.body` | `thread_id`, `parent_id` |
+| `ticket` | One issue or support ticket | `fields.title`, `fields.description` | `parent_id`, `linked_issue_ids` |
+| `comment` | One comment on a ticket, page, or record | `fields.body` | `parent_id`, optional `thread_id` |
+| `knowledge_base` | One wiki page | `fields.title`, `fields.body` | `parent_id` |
+| `email` | One email, including a reply | `fields.subject`, `fields.body` | `thread_id`, `reply_to_id` |
+| `meeting` | One recorded meeting or call | `fields.title`, `fields.body` | `parent_id` |
+| `custom` | One CRM or other app record | `fields.data` | `parent_id`, optional `thread_id`, `relations` |
+
+Repeat the class in `fields.kind`, with the same value as the top-level `kind`. Add the fields that describe that class: an author for a message, an assignee and status for a ticket, or a sender and recipients for an email.
+
+### Item IDs
+
+Every source has two IDs:
+
+- **`id` is your stable HydraDB source ID.** Use it to check status, replace the source, or delete it. For example, `slack_C01_1716213600_000100`.
+- **`external_id` identifies the item in the app.** For example, the Slack message timestamp `1716213600.000100` or Jira issue key `AUTH-123`. Parent and reply fields refer to this ID.
+
+Use a consistent `provider` for items that belong together. HydraDB resolves external IDs within the provider and database/collection scope. If an app's IDs are only unique within a channel, workspace, or mailbox, make your external IDs unambiguous in that scope and apply the same mapping to every parent, reply, and relation target. Adding a channel name to metadata does not change how IDs resolve.
+
+`database` and `collection` say where the source belongs. Include them in each item, matching the values on the ingestion request. `title` and `url` give the user a readable citation and a link back to the original item.
+
+## 2. Connect threads, parents, and related items
+
+Connections preserve the context around an item. A reply such as "Confirmed, that fixed it" becomes useful when HydraDB can also retrieve the message describing the fix.
+
+### Threads and replies
+
+A **thread** groups a conversation. A **parent** identifies the specific item that a reply or comment responds to. These fields answer different questions:
+
+| In the Slack example | `external_id` | `fields.thread_id` | `fields.parent_id` |
+|---|---|---|---|
+| Alice's opening message | `1716213600.000100` | `1716213600.000100` | Omitted |
+| Carol's reply | `1716213700.000200` | `1716213600.000100` | `1716213600.000100` |
+| A later reply | Its own message ID | `1716213600.000100` | `1716213600.000100` |
+
+Each message keeps its own body, author, and timestamp. A thread does not need a separate source. Ingest its opening message and replies with the shared `thread_id`.
+
+For other apps, use their conversation IDs. Email uses `thread_id` to group the conversation and `reply_to_id` to identify the email being replied to. Ticket comments use `parent_id` to identify the ticket; they can also carry a `thread_id` when the app has a discussion thread.
+
+### Relationships from fields
+
+HydraDB creates these connections from the fields you send:
+
+| Field | Class | Connection |
 |---|---|---|
-| **Content** | Pre-extracted app fields: Slack message body, Jira description, Notion page body, email body, etc. | Binary or text file (PDF, DOCX, MD, CSV, TXT) |
-| **Sent in** | `app_knowledge` as a stringified JSON object or array | `documents` plus optional `document_metadata` |
-| **HydraDB does** | Normalizes app identity, extracts searchable text from `fields`, indexes attachments/comments, and builds app graph links | Parses the file, chunks extracted text, and indexes it |
-| **Best for** | Connectors and live app syncs | Documents in their original file format |
+| `thread_id` | Message, email, comment, custom | Item belongs to the thread |
+| `parent_id` | Message | Reply → parent message (`reply_to`) |
+| `reply_to_id` | Email | Reply → original email (`reply_to`) |
+| `parent_id` | Comment | Comment → ticket, page, or record (`comment_on`) |
+| `parent_id` | Ticket, page, meeting, custom | Child → parent (`child_of`) |
+| `linked_issue_ids` | Ticket | Ticket → related issues (`linked_to`) |
 
-Both paths eventually feed the same Knowledge retrieval stack, but app sources give HydraDB extra structure for app-aware recall: provider IDs, object kinds, actors, threads, parents, and explicit relations.
+Parent and reply IDs use the same provider as the source. Ingest the referenced items too so their content can be retrieved.
 
----
+### Explicit relations between sources
 
-## 2. The mental model
+Use `relations` to describe connections beyond those fields: a Slack discussion about a Jira incident, a CRM renewal tied to a support ticket, or an issue blocking a release.
 
-Every app-source item becomes one HydraDB Knowledge source. The identity of the item comes from `id`, `kind`, `provider`, and `external_id`. The searchable app content lives in `fields`.
+A relation reads as **this source → relationship → target**. On Carol's Slack reply, the following addition means "this message is linked to Jira ticket AUTH-123":
 
-| Category | Fields | Why it matters |
-|---|---|---|
-| **Ingestion envelope** | `id`, `database` (formerly `tenant_id`), `collection` (formerly `sub_tenant_id`) | Routes the item and gives it a stable upsert/delete/status ID. |
-| **Display / source metadata** | `title`, `type`, `url`, `timestamp` | Improves citations, display, chronology, and source rendering. |
-| **App identity** | `kind`, `provider`, `external_id` | Enables exact ID lookup, provider scoping, and relation resolution. |
-| **Searchable structure** | `fields` | Holds the app-native body and typed fields: message body, ticket description, email actors, status, parent IDs, etc. |
-| **Filtering / bookkeeping** | `metadata`, `additional_metadata` | Deterministic scoping and free-form display metadata. |
-| **Connected context** | `relations`, `attachments`, `comments` | Adds explicit links and extra searchable text connected to the parent app item. |
+```json Add to the message source
+{
+  "relations": [
+    {
+      "predicate": "linked_to",
+      "target": { "external_id": "AUTH-123", "provider": "jira" },
+      "properties": { "reason": "Confirms the login fix" }
+    }
+  ]
+}
+```
 
-Do **not** put the primary app text in a top-level `content` object for app-native ingestion. Top-level `content` is the older generic knowledge payload; app sources should put text in the correct typed field:
+`predicate` names the relationship. `target` identifies the other source. Optional `properties` explain the connection. The target can be identified in either of these ways:
 
-| `kind` | Main searchable text field |
+| Target | Use when |
 |---|---|
-| `email` | `fields.subject`, `fields.body` |
-| `message` | `fields.body` |
-| `ticket` | `fields.title`, `fields.description` |
-| `knowledge_base` | `fields.title`, `fields.body` |
-| `comment` | `fields.body` |
-| `custom` | `fields.data` |
+| `{ "source_id": "jira_AUTH-123" }` | You know the target's HydraDB source `id`. |
+| `{ "external_id": "AUTH-123", "provider": "jira" }` | You know its app ID and provider. Include both. |
 
----
+Choose the direction that matches the relationship:
+
+| `predicate` | Example |
+|---|---|
+| `reply_to` | Reply → original message or email |
+| `comment_on` | Comment → ticket or page |
+| `child_of` | Subtask → epic; page → parent page |
+| `linked_to` | Slack discussion → Jira ticket |
+| `blocks` | Unresolved ticket → release it blocks |
+| `caused_by` | Incident → change that caused it |
+| `forwarded_from` | Forwarded email → original email |
+| `related_to` | Item → another related item |
+
+Keep both sources in the same database and collection. A relation connects sources that you ingest; it does not import the target from its app. Query with `query_apps: true` and `mode: "thinking"` when you want HydraDB to follow connections for supporting context.
 
 ## 3. Ingest an app source
 
-Send `app_knowledge` as a **JSON-stringified** form value. Each item should include the request-level scope fields inside the item too; if supplied, they must match the form-level `database` and `collection`.
+Create the [database](/api-reference/v2/endpoint/create-tenant) first, then send your sources to [`POST /context/ingest`](/api-reference/v2/endpoint/ingest-context). `app_knowledge` is a JSON object or array, serialized as a string inside a multipart form request. The SDK handles the multipart request.
+
+Here is the smallest Slack starting point: Alice's opening message. The full thread and attachment are in the messaging pattern above.
+
+<Accordion title="Ingestion example: Python, TypeScript, or cURL">
+
+Set up your [SDK client](/api-reference/v2/sdks#client-setup) before running the Python or TypeScript example. The TypeScript SDK names the form property `appKnowledge`; the JSON source fields keep their snake_case names.
 
 <CodeGroup>
 ```python Python SDK
 import json
 
+message = {
+    "id": "slack_C01_1716213600_000100",
+    "database": "acme_corp",
+    "collection": "default",
+    "title": "Auth rollback discussion",
+    "kind": "message",
+    "provider": "slack",
+    "external_id": "1716213600.000100",
+    "fields": {
+        "kind": "message",
+        "body": "Disable the new token refresh path to roll back auth.",
+        "author": "alice",
+        "thread_id": "1716213600.000100",
+    },
+}
+
 result = client.context.ingest(
     type="knowledge",
     database="acme_corp",
     collection="default",
-    app_knowledge=json.dumps([
-        {
-            "id": "slack_C01_1716213600_000100",
-            "database": "acme_corp",
-            "collection": "default",
-            "title": "Auth rollback - thread root",
-            "type": "slack",
-            "kind": "message",
-            "provider": "slack",
-            "external_id": "1716213600.000100",
-            "url": "https://acme.slack.com/archives/C01/p1716213600000100",
-            "timestamp": "2026-05-20T10:00:00Z",
-            "fields": {
-                "kind": "message",
-                "body": "The auth rollback notes are attached here.",
-                "author": "alice",
-                "thread_id": "1716213600.000100",
-                "created_at": "2026-05-20T10:00:00Z",
-                "url": "https://acme.slack.com/archives/C01/p1716213600000100",
-            },
-            "metadata": {"channel": "engineering", "workspace": "acme"},
-            "additional_metadata": {"slack_ts": "1716213600.000100"},
-            "attachments": [
-                {
-                    "id": "F012AUTH",
-                    "title": "auth-rollback-notes.md",
-                    "url": "https://files.slack.com/files-pri/T01-F012AUTH/auth-rollback-notes.md",
-                    "content_type": "text/markdown",
-                    "content": {
-                        "markdown": "# Auth rollback\nRollback starts by disabling the new token refresh path."
-                    },
-                }
-            ],
-        }
-    ]),
+    app_knowledge=json.dumps([message]),
+    upsert="true",
 )
 ```
 ```typescript TypeScript SDK
+const message = {
+  id: "slack_C01_1716213600_000100",
+  database: "acme_corp",
+  collection: "default",
+  title: "Auth rollback discussion",
+  kind: "message",
+  provider: "slack",
+  external_id: "1716213600.000100",
+  fields: {
+    kind: "message",
+    body: "Disable the new token refresh path to roll back auth.",
+    author: "alice",
+    thread_id: "1716213600.000100",
+  },
+};
+
 const result = await client.context.ingest({
   type: "knowledge",
   database: "acme_corp",
   collection: "default",
-  appKnowledge: JSON.stringify([
-    {
-      id: "slack_C01_1716213600_000100",
-      database: "acme_corp",
-      collection: "default",
-      title: "Auth rollback - thread root",
-      type: "slack",
-      kind: "message",
-      provider: "slack",
-      external_id: "1716213600.000100",
-      url: "https://acme.slack.com/archives/C01/p1716213600000100",
-      timestamp: "2026-05-20T10:00:00Z",
-      fields: {
-        kind: "message",
-        body: "The auth rollback notes are attached here.",
-        author: "alice",
-        thread_id: "1716213600.000100",
-        created_at: "2026-05-20T10:00:00Z",
-        url: "https://acme.slack.com/archives/C01/p1716213600000100",
-      },
-      metadata: { channel: "engineering", workspace: "acme" },
-      additional_metadata: { slack_ts: "1716213600.000100" },
-      attachments: [
-        {
-          id: "F012AUTH",
-          title: "auth-rollback-notes.md",
-          url: "https://files.slack.com/files-pri/T01-F012AUTH/auth-rollback-notes.md",
-          content_type: "text/markdown",
-          content: {
-            markdown: "# Auth rollback\nRollback starts by disabling the new token refresh path.",
-          },
-        },
-      ],
-    },
-  ]),
+  appKnowledge: JSON.stringify([message]),
+  upsert: "true",
 });
 ```
 ```bash cURL
 curl -X POST 'https://api.hydradb.com/context/ingest' \
   -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
   -H "API-Version: 2" \
-  -F "type=knowledge" \
-  -F "database=acme_corp" \
-  -F "collection=default" \
-  -F 'app_knowledge=[
-    {
-      "id": "slack_C01_1716213600_000100",
-      "database": "acme_corp",
-      "collection": "default",
-      "title": "Auth rollback - thread root",
-      "type": "slack",
+  -F 'type=knowledge' \
+  -F 'database=acme_corp' \
+  -F 'collection=default' \
+  -F 'upsert=true' \
+  -F 'app_knowledge=[{
+    "id": "slack_C01_1716213600_000100",
+    "database": "acme_corp",
+    "collection": "default",
+    "title": "Auth rollback discussion",
+    "kind": "message",
+    "provider": "slack",
+    "external_id": "1716213600.000100",
+    "fields": {
       "kind": "message",
-      "provider": "slack",
-      "external_id": "1716213600.000100",
-      "url": "https://acme.slack.com/archives/C01/p1716213600000100",
-      "timestamp": "2026-05-20T10:00:00Z",
-      "fields": {
-        "kind": "message",
-        "body": "The auth rollback notes are attached here.",
-        "author": "alice",
-        "thread_id": "1716213600.000100",
-        "created_at": "2026-05-20T10:00:00Z",
-        "url": "https://acme.slack.com/archives/C01/p1716213600000100"
-      },
-      "metadata": { "channel": "engineering", "workspace": "acme" },
-      "additional_metadata": { "slack_ts": "1716213600.000100" },
-      "attachments": [
-        {
-          "id": "F012AUTH",
-          "title": "auth-rollback-notes.md",
-          "url": "https://files.slack.com/files-pri/T01-F012AUTH/auth-rollback-notes.md",
-          "content_type": "text/markdown",
-          "content": { "markdown": "# Auth rollback\nRollback starts by disabling the new token refresh path." }
-        }
-      ]
+      "body": "Disable the new token refresh path to roll back auth.",
+      "author": "alice",
+      "thread_id": "1716213600.000100"
     }
-  ]'
+  }]'
 ```
 </CodeGroup>
 
-**Response:**
+</Accordion>
 
-```json
-{
-  "success": true,
-  "data": {
-    "success": true,
-    "message": "Knowledge uploaded successfully",
-    "results": [
-      { "id": "slack_C01_1716213600_000100", "filename": null, "status": "queued", "error": null }
-    ],
-    "success_count": 1,
-    "failed_count": 0
-  },
-  "error": null,
-  "meta": { "request_id": "...", "latency_ms": 8.4 }
-}
-```
+The call returns `202 Accepted`. Check each item's entry in `data.results` for its source `id`, `status`, and any `error`. A `queued` item has been accepted for processing.
 
-The call returns `202 Accepted`; the source is not queryable until [`GET /context/status`](/api-reference/v2/endpoint/source-status) reports `indexing_status: "graph_creation"` or `"completed"`.
+Use [`GET /context/status`](/api-reference/v2/endpoint/source-status) with that ID to follow ingestion. The source is queryable when `indexing_status` reaches `graph_creation` or `completed`.
 
-<Info>
-  **Multipart, not JSON.** `app_knowledge` is nested JSON inside a `multipart/form-data` request. Stringify the object or array before sending it.
-</Info>
+## 4. Keep app sources updated
 
----
+Use the same endpoint for the first sync and later changes. **A new item gets a new source ID. An edited item keeps its source ID and is sent with `upsert: true`.**
 
-## 4. Incremental ingestion
+For the Slack thread above:
 
-Use the same endpoint for initial backfill and live updates. The important modeling choice is whether the provider event updates an existing source or creates a new source.
+1. Alice posts the opening message. Ingest `slack_C01_1716213600_000100`.
+2. Carol replies. Ingest only `slack_C01_1716213700_000200`, with the same `thread_id` and the opening message's external ID as `parent_id`.
+3. Carol edits her reply. Send the complete updated reply with the same `id` and `external_id`, and `upsert: true`.
+4. Carol deletes her reply. [Delete the source](/api-reference/v2/endpoint/delete-source) using its HydraDB `id`.
 
-| Provider event | What to send | Why |
-|---|---|---|
-| Ticket title/description/status changed | Re-ingest the same `kind: "ticket"` item with the same `id` and `external_id`, `upsert: true` | The ticket snapshot changed. |
-| New Linear/Jira/Zendesk ticket comment | Ingest a **new** `kind: "comment"` source with its own `id` and `external_id`; put the parent ticket provider ID in `fields.parent_id` | The comment is a distinct provider object. |
-| Edited ticket comment | Re-ingest the comment source with the same `id` and `external_id` | Same comment changed. |
-| Deleted ticket comment | Call [`DELETE /context`](/api-reference/v2/endpoint/delete-source) with the comment source `id` | The comment should no longer surface. |
-| New Slack/Teams message | Ingest a **new** `kind: "message"` source with `fields.thread_id` and, when available, `fields.parent_id` | Messages are standalone events linked by provider IDs. |
-| New email reply | Ingest a **new** `kind: "email"` source with `fields.thread_id` and `fields.reply_to_id` | Email replies have their own provider IDs, actors, body, and timestamp. |
-| New Notion/Confluence page | Ingest a **new** `kind: "knowledge_base"` source | A page is a standalone document; the space belongs in metadata. |
-| Existing Notion/Confluence page edited | Re-ingest the same page source with the same `id` and `external_id` | The page document changed. |
+<Accordion title="Incremental example: update Carol's reply">
 
-<Warning>
-  `upsert: true` replaces the existing source with the same `id`. Do not upsert a parent ticket/page with only a new `comments[]` item unless you intend to replace the whole snapshot. For live webhook events, model each new comment as its own `kind: "comment"` source.
-</Warning>
+The following call replaces just Carol's source. Keep its identity and connections, and send its current body and other fields.
 
----
+```python Python SDK
+import json
 
-## 5. Per-app patterns
-
-### Slack message with thread reply and attachment
-
-A Slack thread is multiple `message` sources connected by `thread_id`, `parent_id`, and optional explicit relations.
-
-```json
-{
-  "id": "slack_C01_1716213600_000100",
-  "database": "acme_corp",
-  "collection": "default",
-  "title": "Auth rollback - thread root",
-  "type": "slack",
-  "kind": "message",
-  "provider": "slack",
-  "external_id": "1716213600.000100",
-  "url": "https://acme.slack.com/archives/C01/p1716213600000100",
-  "timestamp": "2026-05-20T10:00:00Z",
-  "fields": {
+updated_reply = {
+    "id": "slack_C01_1716213700_000200",
+    "database": "acme_corp",
+    "collection": "default",
+    "title": "Reply to auth rollback discussion",
     "kind": "message",
-    "body": "The auth rollback notes are attached here.",
-    "author": "alice",
-    "thread_id": "1716213600.000100",
-    "created_at": "2026-05-20T10:00:00Z",
-    "url": "https://acme.slack.com/archives/C01/p1716213600000100"
-  },
-  "metadata": { "channel": "engineering", "workspace": "acme" },
-  "attachments": [
-    {
-      "id": "F012AUTH",
-      "title": "auth-rollback-notes.md",
-      "url": "https://files.slack.com/files-pri/T01-F012AUTH/auth-rollback-notes.md",
-      "content_type": "text/markdown",
-      "content": { "markdown": "# Auth rollback\nRollback starts by disabling the new token refresh path." }
-    }
-  ]
-}
-```
-
-For a reply, ingest a second source. `fields.parent_id` points to the parent message's provider `external_id`; an explicit relation can point to either the parent HydraDB ID or the provider ID.
-
-```json
-{
-  "id": "slack_C01_1716213700_000200",
-  "database": "acme_corp",
-  "collection": "default",
-  "title": "Re: Auth rollback - reply",
-  "type": "slack",
-  "kind": "message",
-  "provider": "slack",
-  "external_id": "1716213700.000200",
-  "timestamp": "2026-05-20T10:01:40Z",
-  "fields": {
-    "kind": "message",
-    "body": "Looking now - will pair with Bob in 10.",
-    "author": "carol",
-    "thread_id": "1716213600.000100",
-    "parent_id": "1716213600.000100",
-    "created_at": "2026-05-20T10:01:40Z"
-  },
-  "metadata": { "channel": "engineering", "workspace": "acme" },
-  "relations": [
-    {
-      "predicate": "reply_to",
-      "target": { "external_id": "1716213600.000100", "provider": "slack" }
-    }
-  ]
-}
-```
-
-### Jira ticket with linked issues
-
-The ticket body lives in `fields.description`. Workflow fields belong in `fields`; scope/filter values like project and environment belong in `metadata`.
-
-```json
-{
-  "id": "jira_AUTH-123",
-  "database": "acme_corp",
-  "collection": "default",
-  "title": "Login page returns 500",
-  "type": "jira",
-  "kind": "ticket",
-  "provider": "jira",
-  "external_id": "AUTH-123",
-  "url": "https://jira.example.com/browse/AUTH-123",
-  "timestamp": "2026-05-20T10:00:00Z",
-  "fields": {
-    "kind": "ticket",
-    "title": "Login page returns 500",
-    "description": "Invalid credentials return HTTP 500 instead of 401. Reproduces on staging and prod.",
-    "status": "open",
-    "priority": "high",
-    "assignee": "alice",
-    "reporter": "bob",
-    "parent_id": "AUTH-100",
-    "linked_issue_ids": ["AUTH-124", "AUTH-125"],
-    "created_at": "2026-05-20T10:00:00Z",
-    "url": "https://jira.example.com/browse/AUTH-123"
-  },
-  "metadata": { "project": "AUTH", "environment": "production" },
-  "relations": [
-    { "predicate": "child_of", "target": { "external_id": "AUTH-100", "provider": "jira" } },
-    { "predicate": "linked_to", "target": { "external_id": "AUTH-124", "provider": "jira" } },
-    { "predicate": "linked_to", "target": { "external_id": "AUTH-125", "provider": "jira" } }
-  ]
-}
-```
-
-### Linear ticket comment
-
-Comments are first-class app sources. Use `fields.parent_id` for the parent ticket's provider ID. Use `relations[]` when you need a cross-provider link or want to declare the relation explicitly.
-
-```json
-{
-  "id": "linear_comment_c123",
-  "database": "acme_corp",
-  "collection": "default",
-  "title": "Comment on AUTH-123",
-  "type": "linear_comment",
-  "kind": "comment",
-  "provider": "linear",
-  "external_id": "c123",
-  "url": "https://linear.app/acme/issue/AUTH-123#comment-c123",
-  "timestamp": "2026-05-25T07:00:00Z",
-  "fields": {
-    "kind": "comment",
-    "body": "I found the repro steps. Attaching HAR.",
-    "author": "alice@acme.com",
-    "parent_id": "AUTH-123",
-    "thread_id": "AUTH-123",
-    "created_at": "2026-05-25T07:00:00Z",
-    "url": "https://linear.app/acme/issue/AUTH-123#comment-c123"
-  },
-  "metadata": { "project": "AUTH" },
-  "relations": [
-    {
-      "predicate": "comment_on",
-      "target": { "external_id": "AUTH-123", "provider": "linear" }
-    }
-  ]
-}
-```
-
-### Notion / Confluence page
-
-A page is one `knowledge_base` source. Space/workspace/database values belong in metadata, not in `external_id`.
-
-```json
-{
-  "id": "notion_page_abc",
-  "database": "acme_corp",
-  "collection": "default",
-  "title": "Incident response runbook",
-  "type": "notion",
-  "kind": "knowledge_base",
-  "provider": "notion",
-  "external_id": "page_abc",
-  "url": "https://notion.so/page_abc",
-  "timestamp": "2026-05-25T07:00:00Z",
-  "fields": {
-    "kind": "knowledge_base",
-    "title": "Incident response runbook",
-    "body": "Steps to triage production incidents...",
-    "parent_id": "space_eng_root",
-    "created_by": "alice@acme.com",
-    "updated_by": "alice@acme.com",
-    "created_at": "2026-05-25T07:00:00Z",
-    "updated_at": "2026-05-25T07:00:00Z",
-    "url": "https://notion.so/page_abc"
-  },
-  "metadata": { "space": "Engineering", "doc_type": "runbook" }
-}
-```
-
-### Gmail email with reply
-
-Each email message is its own `email` source. Link replies with `fields.reply_to_id` and, when useful, a `reply_to` relation.
-
-```json
-{
-  "id": "gmail_msg_19a2b3c",
-  "database": "acme_corp",
-  "collection": "default",
-  "title": "Q4 launch plan",
-  "type": "gmail",
-  "kind": "email",
-  "provider": "gmail",
-  "external_id": "19a2b3c",
-  "url": "https://mail.google.com/mail/u/0/#inbox/19a2b3c",
-  "timestamp": "2026-05-20T09:00:00Z",
-  "fields": {
-    "kind": "email",
-    "subject": "Q4 launch plan",
-    "body": "Here is the updated plan...",
-    "from": "alice@acme.com",
-    "to": ["team@acme.com"],
-    "cc": ["pm@acme.com"],
-    "thread_id": "thread_19a2",
-    "reply_to_id": "19a1a00",
-    "created_at": "2026-05-20T09:00:00Z",
-    "url": "https://mail.google.com/mail/u/0/#inbox/19a2b3c"
-  },
-  "metadata": { "mailbox": "team@acme.com" },
-  "relations": [
-    {
-      "predicate": "reply_to",
-      "target": { "external_id": "19a1a00", "provider": "gmail" }
-    }
-  ]
-}
-```
-
-### Salesforce opportunity linked to a support ticket
-
-CRM records usually use `kind: "custom"`. Use `fields.parent_id` for same-provider hierarchy, and `relations[]` for cross-app context.
-
-```json
-{
-  "id": "salesforce_opp_789",
-  "database": "acme_corp",
-  "collection": "default",
-  "title": "Acme enterprise renewal",
-  "type": "salesforce",
-  "kind": "custom",
-  "provider": "salesforce",
-  "external_id": "opp_789",
-  "url": "https://acme.lightning.force.com/lightning/r/Opportunity/opp_789/view",
-  "timestamp": "2026-05-21T08:45:00Z",
-  "fields": {
-    "kind": "custom",
-    "parent_id": "account_456",
-    "thread_id": "opp_789_activity",
-    "data": {
-      "record_type": "opportunity",
-      "name": "Acme enterprise renewal",
-      "stage": "negotiation",
-      "amount": "50000",
-      "owner": "morgan"
-    }
-  },
-  "metadata": { "pipeline": "enterprise-renewals", "region": "north-america" },
-  "relations": [
-    {
-      "predicate": "linked_to",
-      "target": { "external_id": "AUTH-123", "provider": "linear" },
-      "properties": { "reason": "Customer renewal depends on auth fix" }
-    }
-  ]
-}
-```
-
----
-
-## 6. Relations
-
-Use `relations[]` to declare explicit source-to-source connections when the relationship matters for search and cannot be safely inferred from text alone.
-
-```json
-{
-  "relations": [
-    {
-      "predicate": "blocks",
-      "target": {
-        "external_id": "RELEASE-2026-05",
-        "provider": "jira"
-      },
-      "properties": {
-        "reason": "release blocker"
-      }
+    "provider": "slack",
+    "external_id": "1716213700.000200",
+    "fields": {
+        "kind": "message",
+        "body": "Confirmed on staging and production: login works again.",
+        "author": "carol",
+        "thread_id": "1716213600.000100",
+        "parent_id": "1716213600.000100",
+        "created_at": "2026-05-20T10:01:40Z",
+        "edited_at": "2026-05-20T10:10:00Z",
     },
-    {
-      "predicate": "related_to",
-      "target": {
-        "id": "src_existing_source"
-      }
-    }
-  ]
 }
+
+result = client.context.ingest(
+    type="knowledge",
+    database="acme_corp",
+    collection="default",
+    app_knowledge=json.dumps([updated_reply]),
+    upsert="true",
+)
 ```
 
-The target can use either shape:
+</Accordion>
 
-| Target shape | Use when |
+The same rule applies across apps:
+
+| App event | What to send |
 |---|---|
-| `{ "id": "..." }` | You already know the HydraDB ID. |
-| `{ "external_id": "...", "provider": "..." }` | You know the provider ID and want HydraDB to resolve it in the provider namespace. |
+| New message, email, page, or ticket | A new source with its own `id` and `external_id` |
+| Ticket status or page body changes | The updated source with the same IDs and `upsert: true` |
+| New ticket or page comment | A new `comment` source with its own IDs and the parent's external ID in `fields.parent_id` |
+| Existing comment edited | The updated comment source with the same IDs and `upsert: true` |
+| Item deleted | `DELETE /context` with the item's HydraDB source ID |
 
-Useful predicates include:
+`upsert: true` replaces the source snapshot. Include the current fields, metadata, attachments, comments, and relations you want to retain. For a new comment arriving on a ticket, ingest a separate `comment` source so you can update or delete that comment independently.
 
-| Predicate | Direction |
-|---|---|
-| `reply_to` | reply/message/email → parent message/email |
-| `comment_on` | comment → parent ticket/page/source |
-| `forwarded_from` | forwarded email → original email |
-| `child_of` | child ticket/page/custom record → parent |
-| `linked_to` | source → related peer source |
-| `blocks` | blocker → blocked item |
-| `caused_by` | effect → cause |
-| `related_to` | generic association |
+## 5. Include attachments and comments
 
-<Warning>
-  If you use `target.external_id`, include `target.provider`. External IDs are only unique inside a provider namespace.
-</Warning>
+### Attachments: the supporting file's text
 
-<Note>
-  For app sources, prefer the app-native `relations[]` shape above. `relations.ids` is the file/legacy forceful-relation shortcut and does not carry predicate or provider information.
-</Note>
+A message can share a runbook; a ticket comment can include a diagnostic trace. Add these to the source's `attachments` array so their extracted text is searchable and connected to the item that shared them.
 
----
+Extract the file's text in your connector and send it in `content.text` or `content.markdown`. `url` is a link back to the file; HydraDB does not download a file from that URL in an app-source payload. To upload the original file for HydraDB to parse, use the [file ingestion path](/essentials/v2/knowledge#path-a-files).
 
-## 7. Attachments and comments
+<Accordion title="Attachment example: add a diagnostic trace to a comment">
 
-Attachments and embedded `comments[]` add searchable child content connected to the app source.
+Add this fragment to the comment source from the ticket pattern:
 
-Use `attachments[].content` only when you already extracted the attachment text. HydraDB treats an attachment URL as metadata; it does not fetch arbitrary URLs from app-source payloads.
-
-```json
+```json Attachment fields
 {
   "attachments": [
     {
       "id": "att-har-1",
       "title": "staging-login.har",
-      "url": "https://...",
+      "url": "https://files.example.com/staging-login.har",
       "content_type": "application/json",
-      "content": { "text": "HAR trace shows repeated 302 redirects after token refresh." },
-      "properties": { "source": "linear", "comment_id": "c123" }
-    }
-  ],
-  "comments": [
-    {
-      "id": "c-1",
-      "author": "carol",
-      "body": "Confirmed on staging.",
-      "created_at": "2026-05-20T11:00:00Z"
+      "content": {
+        "text": "The trace shows repeated redirects after token refresh."
+      }
     }
   ]
 }
 ```
 
-Use embedded `comments[]` for full backfill snapshots. For live incremental webhooks, prefer first-class `kind: "comment"` sources so a single new/edited/deleted comment can be handled without replacing the parent ticket or page.
+The trace's text can help answer "What evidence did Carol provide for AUTH-123?" Keep the attachment ID stable when syncing the same file again.
 
----
+</Accordion>
 
-## 8. Metadata: scoping vs display
+### Comments: a snapshot or an independent source
 
-For v2 Knowledge ingestion, `metadata` is the canonical filterable metadata field and `additional_metadata` is the canonical free-form metadata field.
+There are two ways to include comments. Choose based on how your app sync works:
 
-| Use `metadata` when | Use `additional_metadata` when |
-|---|---|
-| You want deterministic query-time filtering via `metadata_filters` | The field is for display, citation, debugging, or per-source bookkeeping |
-| The key is declared in `database_metadata_schema` with `enable_match: true` | The key is unique or not worth adding to the database schema |
-| Examples: `department`, `channel`, `project`, `space`, `pipeline`, `environment`, `region` | Examples: `slack_ts`, `ticket_key`, `comment_id`, `raw_provider_payload_id`, `golden_run` |
+| Sync behavior | Representation | Example |
+|---|---|---|
+| You have the parent and its complete current comment list | Embed `comments` on the parent source | An initial Jira export containing the ticket and all comments |
+| Comments arrive, change, or disappear individually | Ingest each as a `kind: "comment"` source | A webhook announces Carol's new comment on AUTH-123 |
 
-Legacy aliases are accepted for compatibility in some request shapes:
+Embedded comments add searchable text and authors connected to the parent. They are part of its snapshot. Independent comment sources have their own HydraDB IDs, so each can be replaced or deleted without resending the parent.
 
-| Canonical v2 field | Legacy alias |
-|---|---|
-| `metadata` | `tenant_metadata` |
-| `additional_metadata` | `document_metadata` |
+<Accordion title="Snapshot example: include the ticket's current comments">
 
-Filterable database metadata keys must be declared in the database schema with `enable_match: true`. Query-time filters use top-level keys for `metadata` and nested `additional_metadata` for free-form fields:
+Add this fragment to the ticket source when sending a complete snapshot:
 
-```json
+```json Embedded comments
 {
-  "query": "auth rollback discussion",
-  "metadata_filters": {
-    "channel": "engineering",
-    "additional_metadata": { "slack_ts": "1716213600.000100" }
-  }
+  "comments": [
+    {
+      "id": "c123",
+      "author": "carol",
+      "body": "Reproduces on staging when the refresh token expires.",
+      "created_at": "2026-05-20T11:00:00Z"
+    },
+    {
+      "id": "c124",
+      "author": "alice",
+      "body": "Fixed by disabling the new token refresh path.",
+      "created_at": "2026-05-20T11:15:00Z"
+    }
+  ]
 }
 ```
 
-See [Scoping using metadata](/essentials/v2/metadata) for the full schema and filter rules.
+On the next parent upsert, send the complete current comment list. A payload containing only a new comment replaces the snapshot rather than appending to it. For separate comment sources, use the ticket-and-comment pattern above.
 
----
+</Accordion>
 
-## 9. How app sources affect query
+Slack replies and email replies keep their `message` and `email` classes. This preserves each reply's app fields and thread connections.
 
-When `query_apps: true`, HydraDB runs an app-aware retrieval lane alongside normal semantic and lexical retrieval. It can use app-specific signals that are not available from raw text alone.
+## 6. Add metadata for filtering and display
 
-| Query signal | Uses |
-|---|---|
-| `kind`, `provider` | Routes queries such as "Slack messages", "Jira tickets", or "ticket comments". |
-| `external_id` | Exact ID lookup like `AUTH-123`, `1716213600.000100`, or `page_abc`. |
-| Workflow fields | Uses `status`, `priority`, `assignee`, `reporter`, etc. when the query implies them. |
-| Actors | Answers queries like "emails from Alice", "tickets assigned to Bob", or "comments by Carol". |
-| Thread and parent fields | Expands around replies, parents, children, epics, subtasks, accounts, deals, and pages. |
-| `relations[]` | Traverses explicit links like `linked_to`, `blocks`, `comment_on`, `reply_to`, and `child_of`. |
-| Attachments / comments | Searches extracted attachment text and embedded comment bodies. |
+Use `metadata` for shared values you want to filter on, such as Slack channel, Jira project, or department. Declare those keys in the [database metadata schema](/essentials/v2/metadata) with `enable_match: true` before ingestion.
 
-### Parent and child query
+Use `additional_metadata` for other details you want to preserve, such as a raw provider event ID or a display label.
 
-Parent/child query is based on provider-scoped external IDs. When a child source has `fields.parent_id`, HydraDB can match that value to another source's `external_id` under the same `provider`.
+```json Add to a Slack source
+{
+  "metadata": { "channel": "engineering" },
+  "additional_metadata": { "workspace_name": "Acme" }
+}
+```
 
-At recall time, `query_apps: true` lets the app-aware lane find an initial source by text, exact ID, actor, provider, or kind. In `thinking` mode, hierarchy language such as "parent", "children", "epic", "subtask", "account", or "deal" can trigger expansion around the matched source.
+At query time, filter with `metadata_filters: { "channel": "engineering" }`. Filters on free-form values go under `metadata_filters.additional_metadata`. See [Scoping using metadata](/essentials/v2/metadata) for schema setup and complete filter examples.
 
-```json
+## 7. Query app sources with connected context
+
+Use [`POST /query`](/api-reference/v2/endpoint/query) with `type: "knowledge"` (or `"all"`) and `query_apps: true`. Set `mode: "thinking"` for queries that need related items, such as a thread's replies or a ticket's comments.
+
+<Accordion title="Query example: retrieve the rollback discussion and its replies">
+
+```json POST /query
 {
   "database": "acme_corp",
-  "query": "show me tickets linked to AUTH-123 and comments from Alice",
-  "mode": "thinking",
+  "collection": "default",
+  "type": "knowledge",
+  "query": "What did Alice propose for the auth rollback, and did the replies confirm it worked?",
   "query_apps": true,
+  "mode": "thinking",
   "max_results": 10
 }
 ```
 
----
+</Accordion>
 
-## 10. TLDR field reference
+The fields you supplied support different questions:
 
-### Top-level app source fields
+| Question | Relevant fields or connections |
+|---|---|
+| "Find Slack messages from Alice" | `kind`, `provider`, `fields.author` |
+| "Did the rollback work? Show the discussion" | Message bodies, `thread_id`, reply connections |
+| "What did Carol report on AUTH-123?" | Ticket `external_id`, comment author, `comment_on` |
+| "Which renewal depends on the login fix?" | The CRM record's explicit link to the Jira ticket |
+| "What do the attached rollback notes say?" | Extracted attachment text |
+
+## Field reference
+
+Expand the source fields or the object class you are implementing. `kind` chooses the class; `provider` identifies the app.
+
+<AccordionGroup>
+<Accordion title="Top-level app source fields">
 
 | Field | Why send it | Query / ingestion effect |
 |---|---|---|
@@ -652,8 +595,7 @@ At recall time, `query_apps: true` lets the app-aware lane find an initial sourc
 | <Field name="database" type="string" required /> | Database that owns the item. | Must match the form-level `database` when present. |
 | <Field name="collection" type="string" required /> | Logical partition. Use `"default"` if you do not partition. | Must match the form-level `collection` when present. |
 | <Field name="title" type="string" recommended /> | Human-readable subject, page name, ticket title, or message label. | Improves display, citations, and semantic matching. |
-| <Field name="type" type="string" recommended /> | Source category such as `slack`, `gmail`, `jira`, `notion`, `salesforce`, or `linear_comment`. | Preserved for source rendering and analytics; not the app discriminator. |
-| <Field name="kind" type="email, message, ticket, knowledge_base, comment, custom" recommended /> | App object kind. | Selects the app parser and query behavior. |
+| <Field name="kind" type="email, message, ticket, knowledge_base, comment, meeting, custom" recommended /> | App object kind. | Selects the app parser and query behavior. |
 | <Field name="provider" type="string" recommended /> | App namespace such as `slack`, `gmail`, `jira`, `notion`, `salesforce`, or `linear`. | Prevents ID collisions and scopes relation resolution. |
 | <Field name="external_id" type="string" recommended /> | Stable provider ID for this exact item. | Exact lookup and relation/hierarchy resolution. |
 | <Field name="url" type="string" /> | Canonical link back to the provider item. | Improves citations and source navigation. |
@@ -666,11 +608,12 @@ At recall time, `query_apps: true` lets the app-aware lane find an initial sourc
 | <Field name="attachments" type="Attachment[]" /> | Pre-extracted files attached to the item. | Attachment text is indexed and connected to the source. |
 | <Field name="comments" type="Comment[]" /> | Embedded snapshot/backfill comments. | Comment text and authors become searchable. |
 
-### `email` fields
+</Accordion>
+<Accordion title="email fields">
 
 | Field | Why send it | Search / ingestion effect |
 |---|---|---|
-| <Field name="kind" type="email" required /> | Discriminator inside `fields`. | Should match top-level `kind`. |
+| <Field name="kind" type="email" required /> | Object class inside `fields`. | Should match top-level `kind`. |
 | <Field name="subject" type="string" recommended /> | Email subject. | Improves title/snippet matching. |
 | <Field name="body" type="string" recommended /> | Main email content. | Primary searchable text. |
 | <Field name="from" type="string" recommended /> | Sender. | Actor queries like "emails from Alice". |
@@ -682,11 +625,12 @@ At recall time, `query_apps: true` lets the app-aware lane find an initial sourc
 | <Field name="created_at" type="ISO-8601 datetime" /> | Sent/created time. | Chronology and recency. |
 | <Field name="url" type="string" /> | Link back to the email. | Citations/navigation. |
 
-### `message` fields
+</Accordion>
+<Accordion title="message fields">
 
 | Field | Why send it | Search / ingestion effect |
 |---|---|---|
-| <Field name="kind" type="message" required /> | Discriminator inside `fields`. | Should match top-level `kind`. |
+| <Field name="kind" type="message" required /> | Object class inside `fields`. | Should match top-level `kind`. |
 | <Field name="body" type="string" recommended /> | Message text. | Primary searchable text. |
 | <Field name="author" type="string" recommended /> | Sender. | Actor queries like "messages from Alice". |
 | <Field name="thread_id" type="string" recommended /> | Thread/root conversation ID. | Same-thread expansion. |
@@ -695,11 +639,12 @@ At recall time, `query_apps: true` lets the app-aware lane find an initial sourc
 | <Field name="created_at" type="ISO-8601 datetime" /> | Message timestamp. | Chronology and recency. |
 | <Field name="url" type="string" /> | Link back to the message. | Citations/navigation. |
 
-### `ticket` fields
+</Accordion>
+<Accordion title="ticket fields">
 
 | Field | Why send it | Search / ingestion effect |
 |---|---|---|
-| <Field name="kind" type="ticket" required /> | Discriminator inside `fields`. | Should match top-level `kind`. |
+| <Field name="kind" type="ticket" required /> | Object class inside `fields`. | Should match top-level `kind`. |
 | <Field name="title" type="string" recommended /> | Ticket title. | Display and matching. |
 | <Field name="description" type="string" recommended /> | Ticket body. | Primary searchable text. |
 | <Field name="status" type="string" recommended /> | Workflow state. | Queries like "open tickets". |
@@ -712,11 +657,12 @@ At recall time, `query_apps: true` lets the app-aware lane find an initial sourc
 | <Field name="updated_at" type="ISO-8601 datetime" /> | Last update time. | Freshness. |
 | <Field name="url" type="string" /> | Link back to the ticket. | Citations/navigation. |
 
-### `knowledge_base` fields
+</Accordion>
+<Accordion title="knowledge_base fields">
 
 | Field | Why send it | Search / ingestion effect |
 |---|---|---|
-| <Field name="kind" type="knowledge_base" required /> | Discriminator inside `fields`. | Should match top-level `kind`. |
+| <Field name="kind" type="knowledge_base" required /> | Object class inside `fields`. | Should match top-level `kind`. |
 | <Field name="title" type="string" recommended /> | Page title. | Display and matching. |
 | <Field name="body" type="string" recommended /> | Page body. | Primary searchable text. |
 | <Field name="parent_id" type="string" /> | Parent page external ID. | Page hierarchy traversal. |
@@ -726,11 +672,12 @@ At recall time, `query_apps: true` lets the app-aware lane find an initial sourc
 | <Field name="updated_at" type="ISO-8601 datetime" /> | Last update time. | Freshness. |
 | <Field name="url" type="string" /> | Link back to the page. | Citations/navigation. |
 
-### `comment` fields
+</Accordion>
+<Accordion title="comment fields">
 
 | Field | Why send it | Search / ingestion effect |
 |---|---|---|
-| <Field name="kind" type="comment" required /> | Discriminator inside `fields`. | Should match top-level `kind`. |
+| <Field name="kind" type="comment" required /> | Object class inside `fields`. | Should match top-level `kind`. |
 | <Field name="body" type="string" recommended /> | Comment body. | Primary searchable text. |
 | <Field name="author" type="string" recommended /> | Comment author. | Actor queries. |
 | <Field name="parent_id" type="string" recommended /> | Parent source external ID in the same provider namespace. | `comment_on` relation derivation. |
@@ -740,26 +687,45 @@ At recall time, `query_apps: true` lets the app-aware lane find an initial sourc
 | <Field name="url" type="string" /> | Link back to the comment. | Citations/navigation. |
 | <Field name="properties" type="object" /> | Provider-specific comment details. | Preserved in payload. |
 
-### `custom` fields
+</Accordion>
+<Accordion title="meeting fields">
 
 | Field | Why send it | Search / ingestion effect |
 |---|---|---|
-| <Field name="kind" type="custom" required /> | Discriminator inside `fields`. | Should match top-level `kind`. |
+| <Field name="kind" type="meeting" required /> | Object class inside `fields`. | Should match top-level `kind`. |
+| <Field name="title" type="string" recommended /> | Meeting title. | Display and matching. |
+| <Field name="body" type="string" recommended /> | Transcript or meeting notes. | Main searchable text. |
+| <Field name="host" type="string" /> | Host or organizer. | Actor context. |
+| <Field name="participants" type="string[]" /> | Attendees. | Actor context. |
+| <Field name="started_at" type="ISO-8601 datetime" /> | Meeting start time. | Chronology. |
+| <Field name="summary" type="string" /> | Meeting summary. | Additional searchable text. |
+| <Field name="action_items" type="string[]" /> | Follow-up actions. | Additional searchable text. |
+| <Field name="parent_id" type="string" /> | Parent source's external ID. | Parent/child connection. |
+| <Field name="url" type="string" /> | Link to the recording. | Citations/navigation. |
+
+</Accordion>
+<Accordion title="custom fields">
+
+| Field | Why send it | Search / ingestion effect |
+|---|---|---|
+| <Field name="kind" type="custom" required /> | Object class inside `fields`. | Should match top-level `kind`. |
 | <Field name="parent_id" type="string" /> | Parent external ID for same-provider hierarchy. | Parent/child traversal. |
 | <Field name="thread_id" type="string" /> | Activity stream or conversation ID. | Same-thread expansion. |
 | <Field name="data" type="object" recommended /> | App-specific structured payload. | Searchable business/system details. |
 
-### Relation fields
+</Accordion>
+<Accordion title="Relation fields">
 
 | Field | Why send it | Search / ingestion effect |
 |---|---|---|
 | <Field name="predicate" type="string" required /> | Relationship name such as `linked_to`, `blocks`, `child_of`, `reply_to`, or `comment_on`. | Lets query expansion understand relation type and direction. |
-| <Field name="target.id" type="string" /> | Direct HydraDB ID target. | Connects to a known source. |
+| <Field name="target.source_id" type="string" /> | Direct HydraDB ID target. | Connects to a known source. |
 | <Field name="target.external_id" type="string" /> | Provider ID target. | Resolves by app namespace. |
 | <Field name="target.provider" type="string" /> | Provider namespace for `external_id`. | Prevents false links across apps. |
 | <Field name="properties" type="object" /> | Optional relation metadata. | Preserves why the link exists. |
 
-### Attachment fields
+</Accordion>
+<Accordion title="Attachment fields">
 
 | Field | Why send it | Search / ingestion effect |
 |---|---|---|
@@ -772,30 +738,14 @@ At recall time, `query_apps: true` lets the app-aware lane find an initial sourc
 | <Field name="content.markdown" type="string" /> | Pre-extracted Markdown. | Indexed as attachment text. |
 | <Field name="properties" type="object" /> | Provider-specific attachment metadata. | Preserved in payload. |
 
----
-
-## 11. Common mistakes
-
-| Mistake | Why it breaks | Fix |
-|---|---|---|
-| Sending a generic `content: { "text": "..." }` payload for app-native data | App-specific parsing cannot see `kind`, `provider`, `external_id`, actors, thread IDs, parent IDs, or typed body fields | Use `kind`, `provider`, `external_id`, and `fields`. |
-| Putting the main text outside `fields` | App-source extraction and query expansion lose structure | Put text in `fields.body`, `fields.description`, `fields.title`, or `fields.data` depending on `kind`. |
-| Using container IDs as `external_id` | Relations and exact lookup point to the channel/project/space instead of the item | Use the individual item ID as `external_id`; put channel/project/space in `metadata`. |
-| Omitting `provider` on a relation target | External IDs collide across apps | Include `target.provider` whenever you use `target.external_id`. |
-| Re-ingesting a whole Slack thread for every reply | Loses message-level authorship/timestamps and wastes indexing | Ingest each message as its own `kind: "message"` source with `thread_id` / `parent_id`. |
-| Sending only a new ticket comment in `comments[]` during an upsert | Replaces the parent snapshot and may drop existing content | Ingest live comments as first-class `kind: "comment"` sources. |
-| Putting filterable fields only in `additional_metadata` | Filters are slower and require nested filter syntax | Put hot filters in `metadata` and declare them in the database schema. |
-| Forgetting `query_apps: true` | You only get normal text/vector retrieval, not app-aware ID/relation expansion | Set `query_apps: true`; use `mode: "thinking"` for relation-heavy queries. |
-
----
+</Accordion>
+</AccordionGroup>
 
 ## Related
 
-- [Knowledge](/essentials/v2/knowledge) - the broader ingestion path
-- [Memories](/essentials/v2/memories) - the per-user counterpart
-- [Query](/essentials/v2/query) - retrieving app-source context
-- [Scoping using metadata](/essentials/v2/metadata) - designing filterable metadata
-- [Context Graphs](/essentials/v2/context-graphs) - graph enrichment and traversal
-- [Access Control](/essentials/v2/access-control) - restricting who may retrieve an item
-- [Ingest Content - API Reference](/api-reference/v2/endpoint/ingest-context)
-- [Ingestion Status - API Reference](/api-reference/v2/endpoint/source-status)
+- [Knowledge](/essentials/v2/knowledge): app sources and file uploads
+- [Query](/essentials/v2/query): retrieving context
+- [Scoping using metadata](/essentials/v2/metadata): database schemas and filters
+- [Access Control](/essentials/v2/access-control): restricting who may retrieve an item
+- [Ingest Content](/api-reference/v2/endpoint/ingest-context): request and response reference
+- [Ingestion Status](/api-reference/v2/endpoint/source-status): following processing progress
