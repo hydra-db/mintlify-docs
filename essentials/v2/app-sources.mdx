@@ -9,23 +9,7 @@ Use [`POST /context/ingest`](/api-reference/v2/endpoint/ingest-context) in **bri
 
 **HydraDB provides the ontology engine and retrieval:** it organizes the content and relationships, indexes the sources, and retrieves them through [`POST /query`](/api-reference/v2/endpoint/query).
 
-## Choose the class for each item
-
-An **app source** is one mapped item. **Choose its class with `kind`, identify its app with `provider`, and put its content in `fields`.**
-
-| Object class (`kind`) | Use for | Main text |
-|---|---|---|
-| `message` | Slack / Teams messages and replies | `fields.body` |
-| `ticket` | Issues and support tickets | `fields.title`, `fields.description` |
-| `comment` | Comments on tickets, pages, or records | `fields.body` |
-| `knowledge_base` | Wiki pages | `fields.title`, `fields.body` |
-| `email` | Emails and email replies | `fields.subject`, `fields.body` |
-| [`custom`](#custom-records-map-your-own-fields) | CRM records, meeting transcripts, and other app records | `fields.body`, `fields.data` |
-
-
-A connector can produce more than one class: your Jira connector sends tickets as `ticket` and their comments as `comment`. Repeat the class in `fields.kind`, matching the top-level `kind`.
-
-## Start with the API request
+## Quick start
 
 The request is **multipart/form-data**. The mapped app-source JSON is the value of one form field, `app_knowledge`.
 
@@ -36,7 +20,7 @@ The request is **multipart/form-data**. The mapped app-source JSON is the value 
 | `collection` | Your collection, or `default` |
 | `app_knowledge` | Your mapped source object or array, serialized as a JSON string |
 
-Create the [database](/api-reference/v2/endpoint/create-tenant) first if needed. Save your mapped items as `app-sources.json`, using one of the complete patterns below. Send that file's JSON as the form value:
+Create the [database](/api-reference/v2/endpoint/create-tenant) first if needed. [Choose an app pattern](#choose-your-app-pattern) below, map your app's values into its fields, and save the resulting JSON as `app-sources.json`. Send the file with this request:
 
 ```bash POST /context/ingest
 curl -X POST 'https://api.hydradb.com/context/ingest' \
@@ -48,11 +32,29 @@ curl -X POST 'https://api.hydradb.com/context/ingest' \
   -F 'app_knowledge=<app-sources.json'
 ```
 
-Here, `<app-sources.json` reads the file's contents into the form field. Each item in the file must use the same `database` and `collection` as the request. With an SDK, serialize the mapped items with `json.dumps(...)` in Python or `JSON.stringify(...)` in TypeScript; the SDK constructs the multipart request. See [SDK examples and ingestion status](#3-ingest-an-app-source).
+Here, `<app-sources.json` reads the file's contents into the form field. Each item in the file must use the same `database` and `collection` as the request. With an SDK, serialize the mapped items with `json.dumps(...)` in Python or `JSON.stringify(...)` in TypeScript; the SDK constructs the multipart request. See [SDK examples and ingestion status](#2-ingest-an-app-source).
+
+**For later edits, use the same endpoint and add `-F 'upsert=true'`.** Send the item's complete current snapshot with the same IDs. The [incremental ingestion example](#4-incremental-ingestion) shows the updated JSON and its cURL request.
+
+## Choose the class for each item
+
+An **app source** is one mapped item. **Choose its class with `kind`, identify its app with `provider`, and put its content in `fields`.**
+
+| Object class (`kind`) | Use for | Main text |
+|---|---|---|
+| `message` | Slack / Teams messages and replies | `fields.body` |
+| `ticket` | Issues and support tickets | `fields.title`, `fields.description` |
+| `comment` | Comments on tickets, pages, or records | `fields.body` |
+| `knowledge_base` | Wiki pages | `fields.title`, `fields.body` |
+| `email` | Emails and email replies | `fields.subject`, `fields.body` |
+| [`custom`](#map-your-data-to-the-custom-class) | CRM records, meeting transcripts, and other app records | `fields.body`, `fields.data` |
+
+
+A connector can produce more than one class: your Jira connector sends tickets as `ticket` and their comments as `comment`. Repeat the class in `fields.kind`, matching the top-level `kind`.
 
 ## Choose your app pattern
 
-These five patterns show how to map the app data your connector has fetched. Expand one to see the source fields and connections; send the resulting JSON using the request above.
+These five patterns show how to map the app data your connector has fetched. Expand one, replace its example values with your app's data, and save the JSON as `app-sources.json`. Send it with the [quick-start request](#quick-start). Use the same pattern for later snapshots, adding `upsert=true` to the form request when replacing an existing item.
 
 <AccordionGroup>
 <Accordion title="Slack / Teams: threads, replies, attachments">
@@ -246,14 +248,14 @@ Ingest the original email `19a1a00` separately with the same `thread_id`. HydraD
 
 Ingest `account_456` as another CRM source. The explicit relation connects the opportunity to the Jira ticket from the ticket pattern, so a query can follow the renewal's dependency on the login fix.
 
-See [Custom records](#custom-records-map-your-own-fields) for mapping your own business fields and adding searchable text.
+See [Map your data to the custom class](#map-your-data-to-the-custom-class) for mapping your own business fields and adding searchable text.
 
 </Accordion>
 </AccordionGroup>
 
 For example, a Slack conversation has an opening message, replies, and perhaps an attached runbook. Ingest each message as its own source, group the messages into a thread, and attach the runbook's extracted text to the message that shared it. HydraDB can then retrieve the discussion with its supporting context.
 
-The steps below show how to choose an object class, connect items, [ingest them](#3-ingest-an-app-source), keep them updated, and query them.
+Follow the steps below to map your app's response, [ingest a source](#2-ingest-an-app-source), [connect it to other sources](#3-connect-app-sources), and [send incremental changes](#4-incremental-ingestion). The final sections cover attachments, metadata, and queries.
 
 ## 1. Map your app data
 
@@ -270,15 +272,19 @@ Your connector translates the app's API response into the fields for the class y
 
 Set `kind: "message"` and `fields.kind: "message"` for this mapping. For a ticket, map its title and description to `fields.title` and `fields.description`; for an email, map its subject, body, sender, and recipients to the email fields. Keep the original item's ID so later updates and relationships refer to the same item.
 
-### Custom records: map your own fields
+### Map your data to the custom class
 
-**Use `kind: "custom"` for records that do not fit another class**, such as CRM deals, contacts, invoices, meeting transcripts, or records from your internal app. Your connector defines the business fields; HydraDB indexes their content and connects the record to other sources. For a meeting transcript, put the transcript in `fields.body` and details such as participants in `fields.data`.
+**Use the `custom` class for records that do not fit another class**, such as CRM deals, contacts, invoices, meeting transcripts, or records from your internal app. Set both `kind` and `fields.kind` to `custom`. Your business record type, such as `opportunity` or `invoice`, goes in `fields.data.record_type`.
 
-Set both `kind` and `fields.kind` to `custom`. The ingestion request still uses **`type=knowledge`**. Put your business record type, such as `deal` or `invoice`, in `fields.data.record_type`.
+Your connector maps the record's properties to `fields.data` and its readable text to `fields.body`. For a meeting transcript, put the transcript in `fields.body` and details such as participants in `fields.data`.
+
+<Accordion title="Salesforce opportunity: map to custom and link to Jira">
+
+The ingestion request still uses **`type=knowledge`**. `custom` is the source's class; `opportunity` is the business record type in this example.
 
 Map the app's properties into **`fields.data`**, a JSON object that can contain strings, numbers, booleans, arrays, and nested objects. HydraDB renders the values as text for indexing, omitting empty values, `0`, and `false`. Add **`fields.body`** for a readable description or notes, including any zero or false values that need to be searchable.
 
-For a Salesforce opportunity, your mapping could be:
+Map the Salesforce opportunity's fields to these app-source fields, and connect the resulting source to its account and a Jira ticket:
 
 | App value | App-source field |
 |---|---|
@@ -289,9 +295,7 @@ For a Salesforce opportunity, your mapping could be:
 | Associated account's app ID | `fields.parent_id` |
 | Related Jira source's HydraDB ID | `relations[].target.source_id` |
 
-<Accordion title="Custom record: map and ingest a Salesforce opportunity">
-
-Save this source in `app-sources.json` and send it with the [multipart request above](#start-with-the-api-request). Your connector supplies the mapped text, properties, and IDs.
+Save this source in `app-sources.json` and send it with the [quick-start request](#quick-start). Your connector supplies the mapped text, properties, and IDs.
 
 ```json Custom opportunity source
 {
@@ -323,15 +327,15 @@ Save this source in `app-sources.json` and send it with the [multipart request a
 }
 ```
 
-Ingest the account as another Salesforce source with `external_id: "account_456"`, and ingest the Jira ticket too. HydraDB uses the account as the opportunity's parent and the ticket as a linked source.
+Ingest the account as another Salesforce source with `external_id: "account_456"`. For the direct source-ID relation shown here, ingest the Jira ticket and wait for `completed` before ingesting the opportunity. HydraDB uses the account as the opportunity's parent and the ticket as a linked source.
 
-</Accordion>
-
-Keep connection fields outside `data`: `fields.parent_id` creates a same-provider parent connection, `fields.thread_id` groups a conversation, and top-level `relations` connects other sources, including [across apps](#link-app-sources-across-apps). A business property such as `fields.data.account_id` alone does not create a connection. See [Link a CRM field to a Postgres row](#link-a-crm-field-to-a-postgres-row) for mapping a foreign key into a relation.
+Keep connection fields outside `data`: `fields.parent_id` creates a same-provider parent connection, `fields.thread_id` groups a conversation, and top-level `relations` connects other sources, including across apps. A business property such as `fields.data.account_id` alone does not create a connection. The [connection examples](#3-connect-app-sources) include Gmail linked to Notion and a CRM field mapped to a Postgres row.
 
 For filters such as deal stage, also map the property into `metadata` and declare it in your [metadata schema](/essentials/v2/metadata) with `enable_match: true`. Keys in `fields.data` provide searchable content; they do not automatically become metadata filters.
 
-After ingestion, query with `type: "knowledge"` and `query_apps: true`, just as for other app classes. For example, ask "What is blocking Acme's renewal?" with `mode: "thinking"` to retrieve connected context. When the deal changes, send its complete updated snapshot with the same IDs and `upsert: true`; retain its relationships and other content. See [incremental updates](#4-keep-app-sources-updated).
+After ingestion, query with `type: "knowledge"` and `query_apps: true`, just as for other app classes. For example, ask "What is blocking Acme's renewal?" with `mode: "thinking"` to retrieve connected context. When the deal changes, send its complete updated snapshot with the same IDs and `upsert: true`; retain its relationships and other content. See [incremental ingestion](#4-incremental-ingestion).
+
+</Accordion>
 
 ### Item IDs
 
@@ -344,283 +348,9 @@ Use a consistent `provider` for items that belong together. HydraDB resolves ext
 
 `database` and `collection` say where the source belongs. Include them in each item, matching the values on the ingestion request. `title` and `url` give the user a readable citation and a link back to the original item.
 
-## 2. Connect threads, parents, and related items
+<a id="3-ingest-an-app-source"></a>
 
-Connections preserve the context around an item. A reply such as "Confirmed, that fixed it" becomes useful when HydraDB can also retrieve the message describing the fix.
-
-### Threads and replies
-
-A **thread** groups a conversation. A **parent** identifies the specific item that a reply or comment responds to. These fields answer different questions:
-
-| In the Slack example | `external_id` | `fields.thread_id` | `fields.parent_id` |
-|---|---|---|---|
-| Alice's opening message | `1716213600.000100` | `1716213600.000100` | Omitted |
-| Carol's reply | `1716213700.000200` | `1716213600.000100` | `1716213600.000100` |
-| A later reply | Its own message ID | `1716213600.000100` | `1716213600.000100` |
-
-Each message keeps its own body, author, and timestamp. A thread does not need a separate source. Ingest its opening message and replies with the shared `thread_id`.
-
-For other apps, use their conversation IDs. Email uses `thread_id` to group the conversation and `reply_to_id` to identify the email being replied to. Ticket comments use `parent_id` to identify the ticket; they can also carry a `thread_id` when the app has a discussion thread.
-
-### Relationships from fields
-
-HydraDB creates these connections from the fields you send:
-
-| Field | Class | Connection |
-|---|---|---|
-| `thread_id` | Message, email, comment, custom | Item belongs to the thread |
-| `parent_id` | Message | Reply → parent message (`reply_to`) |
-| `reply_to_id` | Email | Reply → original email (`reply_to`) |
-| `parent_id` | Comment | Comment → ticket, page, or record (`comment_on`) |
-| `parent_id` | Ticket, page, custom | Child → parent (`child_of`) |
-| `linked_issue_ids` | Ticket | Ticket → related issues (`linked_to`) |
-
-Parent and reply IDs use the same provider as the source. Ingest the referenced items too so their content can be retrieved.
-
-### Explicit relations between sources
-
-Use `relations` to describe connections beyond those fields: a Slack discussion about a Jira incident, a CRM renewal tied to a support ticket, or an issue blocking a release.
-
-A relation reads as **this source → relationship → target**. On Carol's Slack reply, the following addition means "this message is linked to Jira ticket AUTH-123":
-
-```json Add to the message source
-{
-  "relations": [
-    {
-      "predicate": "linked_to",
-      "target": { "external_id": "AUTH-123", "provider": "jira" },
-      "properties": { "reason": "Confirms the login fix" }
-    }
-  ]
-}
-```
-
-`predicate` names the relationship. `target` identifies the other source. Optional `properties` explain the connection. The target can be identified in either of these ways:
-
-| Target | Use when |
-|---|---|
-| `{ "source_id": "jira_AUTH-123" }` | You know the target's HydraDB source `id`. |
-| `{ "external_id": "AUTH-123", "provider": "jira" }` | You know its app ID and provider. Include both. |
-
-For `source_id` targets, ingest the target and wait for `completed` before submitting the relation.
-
-Choose the direction that matches the relationship:
-
-| `predicate` | Example |
-|---|---|
-| `reply_to` | Reply → original message or email |
-| `comment_on` | Comment → ticket or page |
-| `child_of` | Subtask → epic; page → parent page |
-| `linked_to` | Slack discussion → Jira ticket |
-| `blocks` | Unresolved ticket → release it blocks |
-| `caused_by` | Incident → change that caused it |
-| `forwarded_from` | Forwarded email → original email |
-| `related_to` | Item → another related item |
-
-Keep both sources in the same database and collection. A relation connects sources that you ingest; it does not import the target from its app. Query with `query_apps: true` and `mode: "thinking"` when you want HydraDB to follow connections for supporting context.
-
-### Return linked content with query results
-
-**Use a forceful retrieval link when linked content should accompany a search hit.** For example, a CRM contact can request its linked account row as supporting context even when only the contact matches the question.
-
-| What you need | What to send on the app source |
-|---|---|
-| Describe a relationship, such as `reply_to` or `linked_to` | A typed `relations` array, as above |
-| Retrieve linked content alongside a search hit | A `relations` object with `ids`, containing the targets' HydraDB source IDs |
-| Both the relationship and retrieval link | The typed array in `app_relations`, and the retrieval object in `relations` |
-
-```json Add a retrieval link to the source
-{
-  "relations": { "ids": ["postgres:public.users:123"] }
-}
-```
-
-On [`POST /query`](/api-reference/v2/endpoint/query), use `mode: "thinking"` and `query_forceful_relations: true` (the default). `query_apps: true` also enables app-specific retrieval. **Fast mode ignores `query_forceful_relations`.** The flag applies to retrieval links declared with the object form; setting it does not turn a typed relation array into a forceful link.
-
-<Warning>
-**Current limitation:** Retrieval links can be lost while ingestion rebuilds the graph. After ingestion completes, verify the links with the [connected subgraph endpoint](/api-reference/v2/endpoint/subgraph) and check the query's linked context. A `202` response or `relations_created` count alone does not prove that linked content will be returned.
-</Warning>
-
-Read linked text from `data.additional_context`, alongside the primary hits in `data.chunks`. `data.forceful_relations.declared` identifies the returned links with `via.from`, `via.to`, and each linked chunk. Include this supporting text when presenting results or building an answer.
-
-Forceful retrieval follows direct links from the sources represented in the returned primary chunks. For example, `max_results: 4` selects up to four primary chunks whose sources can supply linked context. It does not mean four traversal hops: a chain `A → B → C` can return B as context for a hit on A, but this path does not recursively fetch C. Linked context is bounded, and metadata filters, source scopes, and access controls still apply.
-
-### Link app sources across apps
-
-**An app source can link to another app source from a different app.** Map and ingest each item, then connect them with a relation. For example, link a Gmail email approving an auth rollback to the Notion runbook that describes the procedure.
-
-Both sources must belong to the same database and collection. The target's provider identifies its app; it does not need to match the source's provider.
-
-For a `source_id` target, ingest the target first and wait for its ingestion to reach `completed`. Then add a `linked_to` relation to the referring source with the target's HydraDB ID as `target.source_id`. For example, link `gmail_msg_19a2b3c` to `notion_page_abc` from the patterns above.
-
-<Accordion title="Across apps: link a Gmail email to a Notion page">
-
-Send this source through `app_knowledge`, using the ingestion request below. Replace the example IDs and business fields with your source's actual values.
-
-```json Gmail source with a Notion target
-{
-  "id": "gmail_msg_19a2b3c",
-  "database": "acme_corp",
-  "collection": "default",
-  "title": "Re: Auth rollback plan",
-  "kind": "email",
-  "provider": "gmail",
-  "external_id": "19a2b3c",
-  "fields": {
-    "kind": "email",
-    "subject": "Re: Auth rollback plan",
-    "body": "Approved. Please share the verification results after rollback.",
-    "from": "alice@acme.com",
-    "to": ["team@acme.com"],
-    "thread_id": "thread_19a2",
-    "reply_to_id": "19a1a00",
-    "created_at": "2026-05-20T11:00:00Z"
-  },
-  "relations": { "ids": ["notion_page_abc"] },
-  "app_relations": [
-    {
-      "predicate": "linked_to",
-      "target": { "source_id": "notion_page_abc" }
-    }
-  ]
-}
-```
-
-The source's own `id` identifies the Gmail email. `target.source_id` is the Notion page's HydraDB ID, which you can obtain from ingestion results or [source listing](/api-reference/v2/endpoint/list-documents). A source-ID target does not require `provider`.
-
-To add the link to an existing email, send its complete updated snapshot with `upsert: true`. Retain its current fields, metadata, attachments, comments, and other relations. Include the relation in subsequent snapshots from your sync too.
-
-</Accordion>
-
-**When you only have the app's external ID**, use `target.external_id` and the target's stored provider name. To target the Gmail email from the Notion page instead, the target would be:
-
-```json External-ID alternative for the relation target
-{
-  "external_id": "19a2b3c",
-  "provider": "google"
-}
-```
-
-Some app names are normalized when sources are stored. You can use the stored provider name for an external-ID target:
-
-| Target app | `target.provider` |
-|---|---|
-| Gmail | `google` |
-| Outlook / Teams | `microsoft` |
-| HubSpot | `hubspot` |
-| Jira | `jira` |
-
-For example, a Gmail source submitted with `provider: "gmail"` is stored under `google`. Gmail external-ID targets accept `gmail` as well as `google`; the example uses the stored name. Prefer `source_id` when you know the HydraDB ID; it avoids provider-name matching.
-
-The example declares both the typed connection and a forceful retrieval link. With `query_apps: true`, `mode: "thinking"`, and `query_forceful_relations: true`, direct linked content can accompany a hit from either side: a query about the email can retrieve the runbook, and a query about the runbook can retrieve the email. You can declare the link on one source without adding a reverse relation. Ingest both items before expecting their content in query results. To connect a whole conversation, link to an ingested email in that conversation and keep its thread fields populated.
-
-People and records have different connections. When sources identify people by email, HydraDB can recognize the same person across apps. That shared person identity does not declare that a particular email is about a particular page. Use an explicit source relation for that record-level connection.
-
-### Link a CRM field to a Postgres row
-
-**You can represent a foreign-key link between app sources.** Suppose a HubSpot contact has a custom field `psql_user_id: "123"` referring to row `123` in your Postgres `public.users` table. Ingest the contact and the row as `custom` app sources. Your mapping code reads the field and adds a relation to the row's HydraDB source ID.
-
-| Input | Your mapping |
-|---|---|
-| Postgres row `public.users`, primary key `123` | Source `id: "postgres:public.users:123"`, `provider: "postgres"`, `external_id: "public.users:123"` |
-| Contact's `psql_user_id: "123"` | `app_relations[].target.source_id: "postgres:public.users:123"` describes the link; `relations.ids` includes that same source ID for retrieval |
-| User ID for exact filtering | `metadata.user_id: "123"` on both sources |
-
-The source-ID format above is a convention you define in your mapping. Include the schema and table so rows with the same primary key in different tables remain distinct. If the row already has a HydraDB source ID, use that actual ID instead. Apply the same mapping to references from Salesforce or any other app.
-
-**The relation comes from your mapping, not from storing the ID in `fields.data`.** Read each non-empty `psql_user_id`, compute or look up the matching row's source ID, and declare the typed link in `app_relations` plus the retrieval link in `relations.ids`, as shown below. This creates a graph connection; it does not enforce a SQL foreign-key constraint or read from Postgres during a query.
-
-<Accordion title="Foreign-key example: HubSpot contact and Postgres user row">
-
-Declare `user_id` as a `VARCHAR` field with `enable_match: true` in your [database metadata schema](/essentials/v2/metadata), then save this array as `app-sources.json`. Send it with the [multipart ingestion request](#start-with-the-api-request).
-
-```json Contact linked to a user row
-[
-  {
-    "id": "postgres:public.users:123",
-    "database": "acme_corp",
-    "collection": "default",
-    "title": "User 123: Morgan Lee",
-    "kind": "custom",
-    "provider": "postgres",
-    "external_id": "public.users:123",
-    "fields": {
-      "kind": "custom",
-      "body": "Morgan Lee is Acme's renewal contact and has an enterprise account.",
-      "data": {
-        "record_type": "user",
-        "table": "public.users",
-        "user_id": "123",
-        "name": "Morgan Lee",
-        "plan": "enterprise"
-      }
-    },
-    "metadata": { "user_id": "123" }
-  },
-  {
-    "id": "hubspot_contact_456",
-    "database": "acme_corp",
-    "collection": "default",
-    "title": "Morgan Lee: renewal contact",
-    "kind": "custom",
-    "provider": "hubspot",
-    "external_id": "456",
-    "fields": {
-      "kind": "custom",
-      "body": "Morgan Lee asked for the login issue to be resolved before renewing.",
-      "data": {
-        "record_type": "contact",
-        "name": "Morgan Lee",
-        "psql_user_id": "123"
-      }
-    },
-    "metadata": { "user_id": "123" },
-    "relations": { "ids": ["postgres:public.users:123"] },
-    "app_relations": [
-      {
-        "predicate": "linked_to",
-        "target": { "source_id": "postgres:public.users:123" }
-      }
-    ]
-  }
-]
-```
-
-Keep both sources in the same database and collection. For the `source_id` link shown here, first ingest the row by itself and wait for `completed`, then ingest the contact. The array above shows both mapped payloads; it does not define ingestion order. For the typed `app_relations` target, the external-ID form is `{ "external_id": "public.users:123", "provider": "postgres" }`. The retrieval link in `relations.ids` still uses the row's HydraDB source ID.
-
-</Accordion>
-
-**For connected context**, query with `query_apps: true`, `mode: "thinking"`, and `query_forceful_relations: true`. The `relations.ids` declaration requests the user row's text in `additional_context` alongside a contact hit; read that field alongside `chunks`. Fast mode ignores this forceful retrieval flag.
-
-**For an exact user-ID constraint**, use `metadata_filters`. The shared `metadata.user_id` makes both sources eligible for the same lookup. Filters also apply to connected context, so put the value on every source you want included. Retrieval still ranks the matching content.
-
-<Accordion title="Query example: search contact and account context for user 123">
-
-Send this JSON body to [`POST /query`](/api-reference/v2/endpoint/query):
-
-```json Query linked sources with an exact user-ID filter
-{
-  "database": "acme_corp",
-  "collection": "default",
-  "type": "knowledge",
-  "query": "What is blocking Morgan Lee's renewal, and what account plan do they have?",
-  "query_apps": true,
-  "mode": "thinking",
-  "query_forceful_relations": true,
-  "max_results": 4,
-  "metadata_filters": {
-    "user_id": { "equals": "123" }
-  }
-}
-```
-
-See [Scoping using metadata](/essentials/v2/metadata) for schema setup and filter semantics.
-
-</Accordion>
-
-When the contact's `psql_user_id` changes, ingest the new target row and wait for it to complete, then send the contact's complete snapshot with `upsert: true`, updating `app_relations[].target.source_id`, `relations.ids`, and `metadata.user_id`. Keep row IDs stable when updating the row's other fields. After the contact completes, verify the changed link with the [connected subgraph endpoint](/api-reference/v2/endpoint/subgraph).
-
-## 3. Ingest an app source
+## 2. Ingest an app source
 
 Create the [database](/api-reference/v2/endpoint/create-tenant) first, then send your sources to [`POST /context/ingest`](/api-reference/v2/endpoint/ingest-context). `app_knowledge` is a JSON object or array, serialized as a string inside a multipart form request. The SDK handles the multipart request.
 
@@ -719,9 +449,288 @@ At `graph_creation`, text can already be searchable while the graph is still bei
 
 `errored` is also a terminal state. Stop waiting, inspect `error_code`, correct the source payload or address the reported failure, and retry ingestion with `upsert: true`. You can also delete a failed source for cleanup. A relation target that failed ingestion must be corrected and successfully ingested before you expect its content in results.
 
-## 4. Keep app sources updated
+## 3. Connect app sources
 
-Use the same endpoint for the first sync and later changes. **A new item gets a new source ID. An edited item keeps its source ID and is sent with `upsert: true`.**
+Connect replies to their conversations, link records across apps, or request linked text alongside search hits. Expand a topic to see the fields and examples.
+
+<AccordionGroup>
+<a id="threads-and-replies"></a>
+<Accordion title="Threads and replies">
+
+A **thread** groups a conversation. A **parent** identifies the specific item that a reply or comment responds to. These fields answer different questions:
+
+| In the Slack example | `external_id` | `fields.thread_id` | `fields.parent_id` |
+|---|---|---|---|
+| Alice's opening message | `1716213600.000100` | `1716213600.000100` | Omitted |
+| Carol's reply | `1716213700.000200` | `1716213600.000100` | `1716213600.000100` |
+| A later reply | Its own message ID | `1716213600.000100` | `1716213600.000100` |
+
+Each message keeps its own body, author, and timestamp. A thread does not need a separate source. Ingest its opening message and replies with the shared `thread_id`.
+
+For other apps, use their conversation IDs. Email uses `thread_id` to group the conversation and `reply_to_id` to identify the email being replied to. Ticket comments use `parent_id` to identify the ticket; they can also carry a `thread_id` when the app has a discussion thread.
+
+</Accordion>
+<a id="relationships-from-fields"></a>
+<Accordion title="Relationships from fields">
+
+HydraDB creates these connections from the fields you send:
+
+| Field | Class | Connection |
+|---|---|---|
+| `thread_id` | Message, email, comment, custom | Item belongs to the thread |
+| `parent_id` | Message | Reply → parent message (`reply_to`) |
+| `reply_to_id` | Email | Reply → original email (`reply_to`) |
+| `parent_id` | Comment | Comment → ticket, page, or record (`comment_on`) |
+| `parent_id` | Ticket, page, custom | Child → parent (`child_of`) |
+| `linked_issue_ids` | Ticket | Ticket → related issues (`linked_to`) |
+
+Parent and reply IDs use the same provider as the source. Ingest the referenced items too so their content can be retrieved.
+
+</Accordion>
+<a id="explicit-relations-between-sources"></a>
+<Accordion title="Explicit relations between sources">
+
+Use `relations` to describe connections beyond those fields: a Slack discussion about a Jira incident, a CRM renewal tied to a support ticket, or an issue blocking a release.
+
+A relation reads as **this source → relationship → target**. On Carol's Slack reply, the following addition means "this message is linked to Jira ticket AUTH-123":
+
+```json Add to the message source
+{
+  "relations": [
+    {
+      "predicate": "linked_to",
+      "target": { "external_id": "AUTH-123", "provider": "jira" },
+      "properties": { "reason": "Confirms the login fix" }
+    }
+  ]
+}
+```
+
+`predicate` names the relationship. `target` identifies the other source. Optional `properties` explain the connection. The target can be identified in either of these ways:
+
+| Target | Use when |
+|---|---|
+| `{ "source_id": "jira_AUTH-123" }` | You know the target's HydraDB source `id`. |
+| `{ "external_id": "AUTH-123", "provider": "jira" }` | You know its app ID and provider. Include both. |
+
+For `source_id` targets, ingest the target and wait for `completed` before submitting the relation.
+
+Choose the direction that matches the relationship:
+
+| `predicate` | Example |
+|---|---|
+| `reply_to` | Reply → original message or email |
+| `comment_on` | Comment → ticket or page |
+| `child_of` | Subtask → epic; page → parent page |
+| `linked_to` | Slack discussion → Jira ticket |
+| `blocks` | Unresolved ticket → release it blocks |
+| `caused_by` | Incident → change that caused it |
+| `forwarded_from` | Forwarded email → original email |
+| `related_to` | Item → another related item |
+
+Keep both sources in the same database and collection. A relation connects sources that you ingest; it does not import the target from its app. Query with `query_apps: true` and `mode: "thinking"` when you want HydraDB to follow connections for supporting context.
+
+</Accordion>
+<a id="return-linked-content-with-query-results"></a>
+<Accordion title="Return linked content with query results">
+
+**Use a forceful retrieval link when linked content should accompany a search hit.** For example, a CRM contact can request its linked account row as supporting context even when only the contact matches the question.
+
+| What you need | What to send on the app source |
+|---|---|
+| Describe a relationship, such as `reply_to` or `linked_to` | A typed `relations` array, as above |
+| Retrieve linked content alongside a search hit | A `relations` object with `ids`, containing the targets' HydraDB source IDs |
+| Both the relationship and retrieval link | The typed array in `app_relations`, and the retrieval object in `relations` |
+
+```json Add a retrieval link to the source
+{
+  "relations": { "ids": ["postgres:public.users:123"] }
+}
+```
+
+On [`POST /query`](/api-reference/v2/endpoint/query), use `mode: "thinking"` and `query_forceful_relations: true` (the default). `query_apps: true` also enables app-specific retrieval. **Fast mode ignores `query_forceful_relations`.** The flag applies to retrieval links declared with the object form; setting it does not turn a typed relation array into a forceful link.
+
+<Warning>
+**Current limitation:** Retrieval links can be lost while ingestion rebuilds the graph. After ingestion completes, verify the links with the [connected subgraph endpoint](/api-reference/v2/endpoint/subgraph) and check the query's linked context. A `202` response or `relations_created` count alone does not prove that linked content will be returned.
+</Warning>
+
+Read linked text from `data.additional_context`, alongside the primary hits in `data.chunks`. `data.forceful_relations.declared` identifies the returned links with `via.from`, `via.to`, and each linked chunk. Include this supporting text when presenting results or building an answer.
+
+Forceful retrieval follows direct links from the sources represented in the returned primary chunks. For example, `max_results: 4` selects up to four primary chunks whose sources can supply linked context. It does not mean four traversal hops: a chain `A → B → C` can return B as context for a hit on A, but this path does not recursively fetch C. Linked context is bounded, and metadata filters, source scopes, and access controls still apply.
+
+</Accordion>
+<a id="link-app-sources-across-apps"></a>
+<Accordion title="Link app sources across apps">
+
+**An app source can link to another app source from a different app.** Map and ingest each item, then connect them with a relation. For example, link a Gmail email approving an auth rollback to the Notion runbook that describes the procedure.
+
+Both sources must belong to the same database and collection. The target's provider identifies its app; it does not need to match the source's provider.
+
+For a `source_id` target, ingest the target first and wait for its ingestion to reach `completed`. Then add a `linked_to` relation to the referring source with the target's HydraDB ID as `target.source_id`. For example, link `gmail_msg_19a2b3c` to `notion_page_abc` from the patterns above.
+
+Save this source as `app-sources.json` and send it through `app_knowledge` using the [quick-start request](#quick-start). If you already ingested the email from the pattern above, add `-F 'upsert=true'` to update it. Replace the example IDs and business fields with your source's actual values.
+
+```json Gmail source with a Notion target
+{
+  "id": "gmail_msg_19a2b3c",
+  "database": "acme_corp",
+  "collection": "default",
+  "title": "Re: Auth rollback plan",
+  "kind": "email",
+  "provider": "gmail",
+  "external_id": "19a2b3c",
+  "fields": {
+    "kind": "email",
+    "subject": "Re: Auth rollback plan",
+    "body": "Approved. Please share the verification results after rollback.",
+    "from": "alice@acme.com",
+    "to": ["team@acme.com"],
+    "thread_id": "thread_19a2",
+    "reply_to_id": "19a1a00",
+    "created_at": "2026-05-20T11:00:00Z"
+  },
+  "relations": { "ids": ["notion_page_abc"] },
+  "app_relations": [
+    {
+      "predicate": "linked_to",
+      "target": { "source_id": "notion_page_abc" }
+    }
+  ]
+}
+```
+
+The source's own `id` identifies the Gmail email. `target.source_id` is the Notion page's HydraDB ID, which you can obtain from ingestion results or [source listing](/api-reference/v2/endpoint/list-documents). A source-ID target does not require `provider`.
+
+To add the link to an existing email, send its complete updated snapshot with `upsert: true`. Retain its current fields, metadata, attachments, comments, and other relations. Include the relation in subsequent snapshots from your sync too.
+
+**When you only have the app's external ID**, use `target.external_id` and the target's stored provider name. To target the Gmail email from the Notion page instead, the target would be:
+
+```json External-ID alternative for the relation target
+{
+  "external_id": "19a2b3c",
+  "provider": "google"
+}
+```
+
+Some app names are normalized when sources are stored. You can use the stored provider name for an external-ID target:
+
+| Target app | `target.provider` |
+|---|---|
+| Gmail | `google` |
+| Outlook / Teams | `microsoft` |
+| HubSpot | `hubspot` |
+| Jira | `jira` |
+
+For example, a Gmail source submitted with `provider: "gmail"` is stored under `google`. Gmail external-ID targets accept `gmail` as well as `google`; the example uses the stored name. Prefer `source_id` when you know the HydraDB ID; it avoids provider-name matching.
+
+The example declares both the typed connection and a forceful retrieval link. With `query_apps: true`, `mode: "thinking"`, and `query_forceful_relations: true`, direct linked content can accompany a hit from either side: a query about the email can retrieve the runbook, and a query about the runbook can retrieve the email. You can declare the link on one source without adding a reverse relation. Ingest both items before expecting their content in query results. To connect a whole conversation, link to an ingested email in that conversation and keep its thread fields populated.
+
+People and records have different connections. When sources identify people by email, HydraDB can recognize the same person across apps. That shared person identity does not declare that a particular email is about a particular page. Use an explicit source relation for that record-level connection.
+
+</Accordion>
+<a id="link-a-crm-field-to-a-postgres-row"></a>
+<Accordion title="Link a CRM field to a Postgres row">
+
+**You can represent a foreign-key link between app sources.** Suppose a HubSpot contact has a custom field `psql_user_id: "123"` referring to row `123` in your Postgres `public.users` table. Ingest the contact and the row as `custom` app sources. Your mapping code reads the field and adds a relation to the row's HydraDB source ID.
+
+| Input | Your mapping |
+|---|---|
+| Postgres row `public.users`, primary key `123` | Source `id: "postgres:public.users:123"`, `provider: "postgres"`, `external_id: "public.users:123"` |
+| Contact's `psql_user_id: "123"` | `app_relations[].target.source_id: "postgres:public.users:123"` describes the link; `relations.ids` includes that same source ID for retrieval |
+| User ID for exact filtering | `metadata.user_id: "123"` on both sources |
+
+The source-ID format above is a convention you define in your mapping. Include the schema and table so rows with the same primary key in different tables remain distinct. If the row already has a HydraDB source ID, use that actual ID instead. Apply the same mapping to references from Salesforce or any other app.
+
+**The relation comes from your mapping, not from storing the ID in `fields.data`.** Read each non-empty `psql_user_id`, compute or look up the matching row's source ID, and declare the typed link in `app_relations` plus the retrieval link in `relations.ids`, as shown below. This creates a graph connection; it does not enforce a SQL foreign-key constraint or read from Postgres during a query.
+
+Declare `user_id` as a `VARCHAR` field with `enable_match: true` in your [database metadata schema](/essentials/v2/metadata). The array below shows both mapped snapshots. Save the row object by itself as `app-sources.json`, send it with the [quick-start request](#quick-start), and wait for `completed`. Then save and send the contact object, which refers to that row.
+
+```json Contact linked to a user row
+[
+  {
+    "id": "postgres:public.users:123",
+    "database": "acme_corp",
+    "collection": "default",
+    "title": "User 123: Morgan Lee",
+    "kind": "custom",
+    "provider": "postgres",
+    "external_id": "public.users:123",
+    "fields": {
+      "kind": "custom",
+      "body": "Morgan Lee is Acme's renewal contact and has an enterprise account.",
+      "data": {
+        "record_type": "user",
+        "table": "public.users",
+        "user_id": "123",
+        "name": "Morgan Lee",
+        "plan": "enterprise"
+      }
+    },
+    "metadata": { "user_id": "123" }
+  },
+  {
+    "id": "hubspot_contact_456",
+    "database": "acme_corp",
+    "collection": "default",
+    "title": "Morgan Lee: renewal contact",
+    "kind": "custom",
+    "provider": "hubspot",
+    "external_id": "456",
+    "fields": {
+      "kind": "custom",
+      "body": "Morgan Lee asked for the login issue to be resolved before renewing.",
+      "data": {
+        "record_type": "contact",
+        "name": "Morgan Lee",
+        "psql_user_id": "123"
+      }
+    },
+    "metadata": { "user_id": "123" },
+    "relations": { "ids": ["postgres:public.users:123"] },
+    "app_relations": [
+      {
+        "predicate": "linked_to",
+        "target": { "source_id": "postgres:public.users:123" }
+      }
+    ]
+  }
+]
+```
+
+Keep both sources in the same database and collection. For the `source_id` link shown here, first ingest the row by itself and wait for `completed`, then ingest the contact. The array above shows both mapped payloads; it does not define ingestion order. For the typed `app_relations` target, the external-ID form is `{ "external_id": "public.users:123", "provider": "postgres" }`. The retrieval link in `relations.ids` still uses the row's HydraDB source ID.
+
+**For connected context**, query with `query_apps: true`, `mode: "thinking"`, and `query_forceful_relations: true`. The `relations.ids` declaration requests the user row's text in `additional_context` alongside a contact hit; read that field alongside `chunks`. Fast mode ignores this forceful retrieval flag.
+
+**For an exact user-ID constraint**, use `metadata_filters`. The shared `metadata.user_id` makes both sources eligible for the same lookup. Filters also apply to connected context, so put the value on every source you want included. Retrieval still ranks the matching content.
+
+Send this JSON body to [`POST /query`](/api-reference/v2/endpoint/query):
+
+```json Query linked sources with an exact user-ID filter
+{
+  "database": "acme_corp",
+  "collection": "default",
+  "type": "knowledge",
+  "query": "What is blocking Morgan Lee's renewal, and what account plan do they have?",
+  "query_apps": true,
+  "mode": "thinking",
+  "query_forceful_relations": true,
+  "max_results": 4,
+  "metadata_filters": {
+    "user_id": { "equals": "123" }
+  }
+}
+```
+
+See [Scoping using metadata](/essentials/v2/metadata) for schema setup and filter semantics.
+
+When the contact's `psql_user_id` changes, ingest the new target row and wait for it to complete, then send the contact's complete snapshot with `upsert: true`, updating `app_relations[].target.source_id`, `relations.ids`, and `metadata.user_id`. Keep row IDs stable when updating the row's other fields. After the contact completes, verify the changed link with the [connected subgraph endpoint](/api-reference/v2/endpoint/subgraph).
+
+</Accordion>
+</AccordionGroup>
+
+## 4. Incremental ingestion
+
+Send new and changed items to the same [`POST /context/ingest`](/api-reference/v2/endpoint/ingest-context) endpoint. **A new item gets a new source ID. An edited item keeps its source ID and is sent with `upsert=true` as a form field.** You only need to send the items that changed.
 
 For the Slack thread above:
 
@@ -730,10 +739,41 @@ For the Slack thread above:
 3. Carol edits her reply. Send the complete updated reply with the same `id` and `external_id`, and `upsert: true`.
 4. Carol deletes her reply. [Delete the source](/api-reference/v2/endpoint/delete-source) using its HydraDB `id`.
 
-<Accordion title="Incremental example: update Carol's reply">
+<Accordion title="Update a Slack reply: JSON snapshot, cURL request, and Python SDK">
 
-The following call replaces just Carol's source. Keep its identity and connections, and send its current body and other fields.
+Wait for Carol's previous ingestion to reach `completed` or `errored` before sending another snapshot. If it errored, inspect `error_code` and correct the failure before retrying. Save the complete updated reply below as `reply-update.json`, then run the cURL request in the next tab. This replaces only Carol's source, retaining its identity and thread connections.
 
+<CodeGroup>
+```json reply-update.json
+{
+  "id": "slack_C01_1716213700_000200",
+  "database": "acme_corp",
+  "collection": "default",
+  "title": "Reply to auth rollback discussion",
+  "kind": "message",
+  "provider": "slack",
+  "external_id": "1716213700.000200",
+  "fields": {
+    "kind": "message",
+    "body": "Confirmed on staging and production: login works again.",
+    "author": "carol",
+    "thread_id": "1716213600.000100",
+    "parent_id": "1716213600.000100",
+    "created_at": "2026-05-20T10:01:40Z",
+    "edited_at": "2026-05-20T10:10:00Z"
+  }
+}
+```
+```bash cURL update request
+curl -X POST 'https://api.hydradb.com/context/ingest' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -F 'type=knowledge' \
+  -F 'database=acme_corp' \
+  -F 'collection=default' \
+  -F 'upsert=true' \
+  -F 'app_knowledge=<reply-update.json'
+```
 ```python Python SDK
 import json
 
@@ -764,6 +804,9 @@ result = client.context.ingest(
     upsert="true",
 )
 ```
+</CodeGroup>
+
+Check this request's `data.results`, then follow the same source ID with [`GET /context/status`](/api-reference/v2/endpoint/source-status). Wait for `completed` before verifying the edit or its connections; handle `errored` as described above.
 
 </Accordion>
 
@@ -870,7 +913,7 @@ At query time, filter with `metadata_filters: { "channel": "engineering" }`. Fil
 
 ## 7. Query app sources with connected context
 
-Use [`POST /query`](/api-reference/v2/endpoint/query) with `type: "knowledge"` (or `"all"`) and `query_apps: true`. Set `mode: "thinking"` for queries that need related items, such as a thread's replies or a ticket's comments. For explicitly declared retrieval links, also use `query_forceful_relations: true` and read `additional_context`; see [Return linked content with query results](#return-linked-content-with-query-results).
+Use [`POST /query`](/api-reference/v2/endpoint/query) with `type: "knowledge"` (or `"all"`) and `query_apps: true`. Set `mode: "thinking"` for queries that need related items, such as a thread's replies or a ticket's comments. For explicitly declared retrieval links, also use `query_forceful_relations: true` and read `additional_context`. Expand "Return linked content with query results" under [Connect app sources](#3-connect-app-sources) for the declaration, response fields, and current limitations.
 
 <Accordion title="Query example: retrieve the rollback discussion and its replies">
 
