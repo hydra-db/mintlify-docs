@@ -419,6 +419,32 @@ Choose the direction that matches the relationship:
 
 Keep both sources in the same database and collection. A relation connects sources that you ingest; it does not import the target from its app. Query with `query_apps: true` and `mode: "thinking"` when you want HydraDB to follow connections for supporting context.
 
+### Return linked content with query results
+
+**Use a forceful retrieval link when linked content should accompany a search hit.** For example, a CRM contact can request its linked account row as supporting context even when only the contact matches the question.
+
+| What you need | What to send on the app source |
+|---|---|
+| Describe a relationship, such as `reply_to` or `linked_to` | A typed `relations` array, as above |
+| Retrieve linked content alongside a search hit | A `relations` object with `ids`, containing the targets' HydraDB source IDs |
+| Both the relationship and retrieval link | The typed array in `app_relations`, and the retrieval object in `relations` |
+
+```json Add a retrieval link to the source
+{
+  "relations": { "ids": ["postgres:public.users:123"] }
+}
+```
+
+On [`POST /query`](/api-reference/v2/endpoint/query), use `mode: "thinking"` and `query_forceful_relations: true` (the default). `query_apps: true` also enables app-specific retrieval. **Fast mode ignores `query_forceful_relations`.** The flag applies to retrieval links declared with the object form; setting it does not turn a typed relation array into a forceful link.
+
+<Warning>
+**Current limitation:** Retrieval links can be lost while ingestion rebuilds the graph. After ingestion completes, verify the links with the [connected subgraph endpoint](/api-reference/v2/endpoint/subgraph) and check the query's linked context. A `202` response or `relations_created` count alone does not prove that linked content will be returned.
+</Warning>
+
+Read linked text from `data.additional_context`, alongside the primary hits in `data.chunks`. `data.forceful_relations.declared` identifies the returned links with `via.from`, `via.to`, and each linked chunk. Include this supporting text when presenting results or building an answer.
+
+Forceful retrieval follows direct links from the sources represented in the returned primary chunks. For example, `max_results: 4` selects up to four primary chunks whose sources can supply linked context. It does not mean four traversal hops: a chain `A → B → C` can return B as context for a hit on A, but this path does not recursively fetch C. Linked context is bounded, and metadata filters, source scopes, and access controls still apply.
+
 ### Link app sources across apps
 
 **An app source can link to another app source from a different app.** Map and ingest each item, then connect them with a relation. For example, link a Gmail email approving an auth rollback to the Notion runbook that describes the procedure.
@@ -450,7 +476,8 @@ Send this source through `app_knowledge`, using the ingestion request below. Rep
     "reply_to_id": "19a1a00",
     "created_at": "2026-05-20T11:00:00Z"
   },
-  "relations": [
+  "relations": { "ids": ["notion_page_abc"] },
+  "app_relations": [
     {
       "predicate": "linked_to",
       "target": { "source_id": "notion_page_abc" }
@@ -485,7 +512,7 @@ Some app names are normalized when sources are stored. You can use the stored pr
 
 For example, a Gmail source submitted with `provider: "gmail"` is stored under `google`. Gmail external-ID targets accept `gmail` as well as `google`; the example uses the stored name. Prefer `source_id` when you know the HydraDB ID; it avoids provider-name matching.
 
-With `query_apps: true` and `mode: "thinking"`, HydraDB can follow a `linked_to` connection from either side: a query about the email can retrieve the runbook, and a query about the runbook can retrieve the email. You can declare the link on one source without adding a reverse relation. Ingest both items before expecting their content in query results. To connect a whole conversation, link to an ingested email in that conversation and keep its thread fields populated.
+The example declares both the typed connection and a forceful retrieval link. With `query_apps: true`, `mode: "thinking"`, and `query_forceful_relations: true`, direct linked content can accompany a hit from either side: a query about the email can retrieve the runbook, and a query about the runbook can retrieve the email. You can declare the link on one source without adding a reverse relation. Ingest both items before expecting their content in query results. To connect a whole conversation, link to an ingested email in that conversation and keep its thread fields populated.
 
 People and records have different connections. When sources identify people by email, HydraDB can recognize the same person across apps. That shared person identity does not declare that a particular email is about a particular page. Use an explicit source relation for that record-level connection.
 
@@ -496,12 +523,12 @@ People and records have different connections. When sources identify people by e
 | Input | Your mapping |
 |---|---|
 | Postgres row `public.users`, primary key `123` | Source `id: "postgres:public.users:123"`, `provider: "postgres"`, `external_id: "public.users:123"` |
-| Contact's `psql_user_id: "123"` | `relations[].target.source_id: "postgres:public.users:123"` |
+| Contact's `psql_user_id: "123"` | `app_relations[].target.source_id: "postgres:public.users:123"` describes the link; `relations.ids` includes that same source ID for retrieval |
 | User ID for exact filtering | `metadata.user_id: "123"` on both sources |
 
 The source-ID format above is a convention you define in your mapping. Include the schema and table so rows with the same primary key in different tables remain distinct. If the row already has a HydraDB source ID, use that actual ID instead. Apply the same mapping to references from Salesforce or any other app.
 
-**The relation comes from your mapping, not from storing the ID in `fields.data`.** Read each non-empty `psql_user_id`, compute or look up the matching row's source ID, and write a top-level `relations` entry. This creates a graph connection; it does not enforce a SQL foreign-key constraint or read from Postgres during a query.
+**The relation comes from your mapping, not from storing the ID in `fields.data`.** Read each non-empty `psql_user_id`, compute or look up the matching row's source ID, and declare the typed link in `app_relations` plus the retrieval link in `relations.ids`, as shown below. This creates a graph connection; it does not enforce a SQL foreign-key constraint or read from Postgres during a query.
 
 <Accordion title="Foreign-key example: HubSpot contact and Postgres user row">
 
@@ -548,7 +575,8 @@ Declare `user_id` as a `VARCHAR` field with `enable_match: true` in your [databa
       }
     },
     "metadata": { "user_id": "123" },
-    "relations": [
+    "relations": { "ids": ["postgres:public.users:123"] },
+    "app_relations": [
       {
         "predicate": "linked_to",
         "target": { "source_id": "postgres:public.users:123" }
@@ -558,11 +586,11 @@ Declare `user_id` as a `VARCHAR` field with `enable_match: true` in your [databa
 ]
 ```
 
-Keep both sources in the same database and collection. For the `source_id` link shown here, first ingest the row by itself and wait for `completed`, then ingest the contact. The array above shows both mapped payloads; it does not define ingestion order. If you use an external-ID target instead, it is `{ "external_id": "public.users:123", "provider": "postgres" }`.
+Keep both sources in the same database and collection. For the `source_id` link shown here, first ingest the row by itself and wait for `completed`, then ingest the contact. The array above shows both mapped payloads; it does not define ingestion order. For the typed `app_relations` target, the external-ID form is `{ "external_id": "public.users:123", "provider": "postgres" }`. The retrieval link in `relations.ids` still uses the row's HydraDB source ID.
 
 </Accordion>
 
-**For connected context**, query with `query_apps: true` and `mode: "thinking"`. A query that finds the contact can also retrieve the linked user's account details. Use thinking mode for this relation expansion; fast mode does not generally follow links from search results.
+**For connected context**, query with `query_apps: true`, `mode: "thinking"`, and `query_forceful_relations: true`. The `relations.ids` declaration requests the user row's text in `additional_context` alongside a contact hit; read that field alongside `chunks`. Fast mode ignores this forceful retrieval flag.
 
 **For an exact user-ID constraint**, use `metadata_filters`. The shared `metadata.user_id` makes both sources eligible for the same lookup. Filters also apply to connected context, so put the value on every source you want included. Retrieval still ranks the matching content.
 
@@ -578,6 +606,8 @@ Send this JSON body to [`POST /query`](/api-reference/v2/endpoint/query):
   "query": "What is blocking Morgan Lee's renewal, and what account plan do they have?",
   "query_apps": true,
   "mode": "thinking",
+  "query_forceful_relations": true,
+  "max_results": 4,
   "metadata_filters": {
     "user_id": { "equals": "123" }
   }
@@ -588,7 +618,7 @@ See [Scoping using metadata](/essentials/v2/metadata) for schema setup and filte
 
 </Accordion>
 
-When the contact's `psql_user_id` changes, ingest the new target row and wait for it to complete, then send the contact's complete snapshot with `upsert: true`, updating both the relation target and `metadata.user_id`. Keep row IDs stable when updating the row's other fields. After the contact completes, verify the changed link with the [connected subgraph endpoint](/api-reference/v2/endpoint/subgraph).
+When the contact's `psql_user_id` changes, ingest the new target row and wait for it to complete, then send the contact's complete snapshot with `upsert: true`, updating `app_relations[].target.source_id`, `relations.ids`, and `metadata.user_id`. Keep row IDs stable when updating the row's other fields. After the contact completes, verify the changed link with the [connected subgraph endpoint](/api-reference/v2/endpoint/subgraph).
 
 ## 3. Ingest an app source
 
@@ -840,7 +870,7 @@ At query time, filter with `metadata_filters: { "channel": "engineering" }`. Fil
 
 ## 7. Query app sources with connected context
 
-Use [`POST /query`](/api-reference/v2/endpoint/query) with `type: "knowledge"` (or `"all"`) and `query_apps: true`. Set `mode: "thinking"` for queries that need related items, such as a thread's replies or a ticket's comments.
+Use [`POST /query`](/api-reference/v2/endpoint/query) with `type: "knowledge"` (or `"all"`) and `query_apps: true`. Set `mode: "thinking"` for queries that need related items, such as a thread's replies or a ticket's comments. For explicitly declared retrieval links, also use `query_forceful_relations: true` and read `additional_context`; see [Return linked content with query results](#return-linked-content-with-query-results).
 
 <Accordion title="Query example: retrieve the rollback discussion and its replies">
 
@@ -889,7 +919,8 @@ Expand the source fields or the object class you are implementing. `kind` choose
 | <Field name="fields" type="object" required /> | Structured kind-specific content. | Primary app-native searchable payload. |
 | <Field name="metadata" type="object" /> | Schema-aligned filterable fields. | Queryable with top-level `metadata_filters` keys when declared in database schema. |
 | <Field name="additional_metadata" type="object" /> | Free-form display/bookkeeping metadata. | Queryable under `metadata_filters.additional_metadata`. |
-| <Field name="relations" type="Relation[]" /> | Explicit app-source links. | Enables connected-context retrieval and app graph expansion. |
+| <Field name="relations" type="Relation[] or object" /> | A typed array describes connections; `{ "ids": ["source_id"] }` declares retrieval links. | Object-form links supply `additional_context` with thinking mode and `query_forceful_relations`. |
+| <Field name="app_relations" type="Relation[]" /> | Typed app connections when `relations` uses the retrieval-object form. | Preserves predicates and targets alongside forceful retrieval links. |
 | <Field name="acl" type="string[]" /> | Who may retrieve this item. Emails, `group:<provider>:<id>`, `domain:<domain>`, or `__public__`. | Omit to leave it unrestricted. Enforcement is opt-in on the query side: a query that carries `acl` sees this item only with a matching principal, and a query without `acl` is not filtered at all. See [Access Control](/essentials/v2/access-control). |
 | <Field name="attachments" type="Attachment[]" /> | Pre-extracted files attached to the item. | Attachment text is indexed and connected to the source. |
 | <Field name="comments" type="Comment[]" /> | Embedded snapshot/backfill comments. | Comment text and authors become searchable. |
