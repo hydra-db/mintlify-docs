@@ -21,7 +21,7 @@ An **app source** is one mapped item. **Choose its class with `kind`, identify i
 | `knowledge_base` | Wiki pages | `fields.title`, `fields.body` |
 | `email` | Emails and email replies | `fields.subject`, `fields.body` |
 | `meeting` | Recorded meetings and calls | `fields.title`, `fields.body` |
-| `custom` | CRM and other app records | `fields.data` |
+| [`custom`](#custom-records-map-your-own-fields) | CRM and other app records | `fields.body`, `fields.data` |
 
 
 A connector can produce more than one class: your Jira connector sends tickets as `ticket` and their comments as `comment`. Repeat the class in `fields.kind`, matching the top-level `kind`.
@@ -247,6 +247,8 @@ Ingest the original email `19a1a00` separately with the same `thread_id`. HydraD
 
 Ingest `account_456` as another CRM source. The explicit relation connects the opportunity to the Jira ticket from the ticket pattern, so a query can follow the renewal's dependency on the login fix.
 
+See [Custom records](#custom-records-map-your-own-fields) for mapping your own business fields and adding searchable text.
+
 </Accordion>
 </AccordionGroup>
 
@@ -268,6 +270,69 @@ Your connector translates the app's API response into the fields for the class y
 | File text extracted by your connector | `attachments[].content.text` or `attachments[].content.markdown` |
 
 Set `kind: "message"` and `fields.kind: "message"` for this mapping. For a ticket, map its title and description to `fields.title` and `fields.description`; for an email, map its subject, body, sender, and recipients to the email fields. Keep the original item's ID so later updates and relationships refer to the same item.
+
+### Custom records: map your own fields
+
+**Use `kind: "custom"` for records that do not fit another class**, such as CRM deals, contacts, invoices, or records from your internal app. Your connector defines the business fields; HydraDB indexes their content and connects the record to other sources.
+
+Set both `kind` and `fields.kind` to `custom`. The ingestion request still uses **`type=knowledge`**. Put your business record type, such as `deal` or `invoice`, in `fields.data.record_type`.
+
+Map the app's properties into **`fields.data`**, a JSON object that can contain strings, numbers, booleans, arrays, and nested objects. HydraDB renders the values as text for indexing, omitting empty values, `0`, and `false`. Add **`fields.body`** for a readable description or notes, including any zero or false values that need to be searchable.
+
+For a HubSpot deal, your connector could map:
+
+| App value | App-source field |
+|---|---|
+| Deal ID | `external_id`; derive a stable HydraDB `id` from it |
+| Deal name | Top-level `title` and `fields.data.name` |
+| Deal notes | `fields.body` |
+| Stage, amount, owner, and other business properties | Keys in `fields.data` |
+| Associated account's app ID | `fields.parent_id` |
+| Related Gmail source's HydraDB ID | `relations[].target.source_id` |
+
+<Accordion title="Custom record: map and ingest a HubSpot deal">
+
+Save this source in `app-sources.json` and send it with the [multipart request above](#start-with-the-api-request). Your connector supplies the mapped text, properties, and IDs.
+
+```json Custom deal source
+{
+  "id": "hubspot_deal_789",
+  "database": "acme_corp",
+  "collection": "default",
+  "title": "Acme enterprise renewal",
+  "kind": "custom",
+  "provider": "hubspot",
+  "external_id": "789",
+  "fields": {
+    "kind": "custom",
+    "body": "Acme is negotiating its enterprise renewal. The renewal depends on resolving the login issue discussed in the linked email.",
+    "parent_id": "account_456",
+    "data": {
+      "record_type": "deal",
+      "name": "Acme enterprise renewal",
+      "stage": "negotiation",
+      "amount": 50000,
+      "owner": "morgan"
+    }
+  },
+  "relations": [
+    {
+      "predicate": "linked_to",
+      "target": { "source_id": "gmail_msg_19a2b3c" }
+    }
+  ]
+}
+```
+
+Ingest the account as another HubSpot source with `external_id: "account_456"`, and ingest the Gmail item too. HydraDB uses the account as the deal's parent and the email as a linked source.
+
+</Accordion>
+
+Keep connection fields outside `data`: `fields.parent_id` creates a same-provider parent connection, `fields.thread_id` groups a conversation, and top-level `relations` connects other sources, including [across connectors](#link-items-across-connectors). A business property such as `fields.data.account_id` alone does not create a connection.
+
+For filters such as deal stage, also map the property into `metadata` and declare it in your [metadata schema](/essentials/v2/metadata) with `enable_match: true`. Keys in `fields.data` provide searchable content; they do not automatically become metadata filters.
+
+After ingestion, query with `type: "knowledge"` and `query_apps: true`, just as for other app classes. For example, ask "What is blocking Acme's renewal?" with `mode: "thinking"` to retrieve connected context. When the deal changes, send its complete updated snapshot with the same IDs and `upsert: true`; retain its relationships and other content. See [incremental updates](#4-keep-app-sources-updated).
 
 ### Item IDs
 
@@ -819,9 +884,10 @@ Expand the source fields or the object class you are implementing. `kind` choose
 | Field | Why send it | Search / ingestion effect |
 |---|---|---|
 | <Field name="kind" type="custom" required /> | Object class inside `fields`. | Should match top-level `kind`. |
+| <Field name="body" type="string" recommended /> | Readable description or notes for the custom record. | Searchable text alongside the structured data. |
 | <Field name="parent_id" type="string" /> | Parent external ID for same-provider hierarchy. | Parent/child traversal. |
 | <Field name="thread_id" type="string" /> | Activity stream or conversation ID. | Same-thread expansion. |
-| <Field name="data" type="object" recommended /> | App-specific structured payload. | Searchable business/system details. |
+| <Field name="data" type="object" recommended /> | App-specific structured payload. | Rendered as searchable text; empty values, `0`, and `false` are omitted. |
 
 </Accordion>
 <Accordion title="Relation fields">
