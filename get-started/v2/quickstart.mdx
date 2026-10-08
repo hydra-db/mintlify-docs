@@ -1,9 +1,9 @@
 ---
 title: "Quickstart"
-description: "Save a user preference, retrieve it, and prepare it for your AI model."
+description: "Build your context layer: ingest a document and a memory, then query both in one call."
 ---
 
-Save a preference for `user_123`, search it, and use it in a model prompt. You will create a **database** (a separate workspace for your data) and write to a **collection** (a named group inside it) for this user.
+Build a small context layer end to end: create a database, ingest a knowledge document and a user memory, wait for indexing, and run one query over both. You will write to two **collections** inside the database: `company_docs` for shared knowledge and `user_123` for one customer's memory.
 
 ## 1. Install and initialize
 
@@ -41,178 +41,196 @@ curl 'https://api.hydradb.com/databases' \
 ```
 </CodeGroup>
 
-## 2. Save and retrieve a memory
+## 2. Ingest knowledge and a memory, then query both
 
-Use an unused database name, or skip the create call if you already have a database. Writing the memory creates `user_123` automatically; in a real application your backend picks the collection for the signed-in user, since the name itself does not authenticate anyone. Checking **indexing** means waiting until HydraDB has processed the memory and made it searchable.
+Use an unused database name, or skip the create call if you already have a database. Writing to a collection creates it; in a real application your backend picks the user's collection from the signed-in session, since the name itself does not authenticate anyone. Ingestion runs in the background, so the code waits until each item is indexed before querying.
 
 <CodeGroup>
 ```python Python SDK
 import json, time
 
 database = "my_first_database"
-collection = "user_123"
 
-# 1. Create a database.
+# 1. Create a database and wait until it can accept data.
 client.databases.create(database=database)
-
-# 2. Wait until the database can accept data.
-while True:
-    infra = client.databases.status(database=database).data.infra
-    if infra.ready_for_ingestion:
-        break
+while not client.databases.status(database=database).data.infra.ready_for_ingestion:
     time.sleep(5)
 
-# 3. Save one memory in the user's collection.
-ingest = client.context.ingest(
+# 2. Ingest a knowledge document into the shared collection.
+with open("refund-policy.md", "w") as f:
+    f.write("# Refund policy\n\nRefunds are available within 30 days of purchase. Annual plans are refunded pro rata.\n")
+
+with open("refund-policy.md", "rb") as f:
+    doc = client.context.ingest(
+        type="knowledge",
+        database=database,
+        collection="company_docs",
+        documents=[("refund-policy.md", f, "text/markdown")],
+        document_metadata=json.dumps([{"id": "refund_policy"}]),
+    )
+
+# 3. Save a memory about one customer in that customer's collection.
+mem = client.context.ingest(
     type="memory",
     database=database,
-    collection=collection,
+    collection="user_123",
     memories=json.dumps([
-        {"text": "User prefers detailed technical explanations and dark mode"}
+        {"text": "Customer asked for a refund on 2026-09-30 and was told to wait for the billing cycle to close."}
     ]),
 )
 
-id = ingest.data.results[0].id
+# 4. Wait until both are indexed.
+def wait_for(collection, id):
+    while True:
+        status = client.context.status(
+            database=database, collection=collection, ids=[id]
+        ).data.statuses[0]
+        if status.indexing_status == "completed":
+            return
+        if status.indexing_status == "errored":
+            raise RuntimeError(status.error_message)
+        time.sleep(2)
 
-# 4. Wait until the memory is indexed.
-while True:
-    status = client.context.status(
-        database=database,
-        collection=collection,
-        ids=[id],
-    ).data.statuses[0]
+wait_for("company_docs", doc.data.results[0].id)
+wait_for("user_123", mem.data.results[0].id)
 
-    if status.indexing_status == "completed":
-        break
-    if status.indexing_status == "errored":
-        raise RuntimeError(status.error_message)
-
-    time.sleep(2)
-
-# 5. Search memories.
+# 5. Query knowledge and the customer's memory together.
 results = client.query(
     database=database,
-    collection=collection,
-    type="memory",
-    query="What does the user prefer?",
+    collections=["company_docs", "user_123"],
+    type="all",
+    query="Can this customer get a refund, and what have we told them so far?",
 )
 
 print(build_string(results))
 ```
 ```typescript TypeScript SDK
+import { writeFileSync } from "node:fs";
+
 const database = "my_first_database";
-const collection = "user_123";
 
-// 1. Create a database.
-await client.databases.create({ database: database });
-
-// 2. Wait until the database can accept data.
+// 1. Create a database and wait until it can accept data.
+await client.databases.create({ database });
 while (true) {
-  const { data } = await client.databases.status({ database: database });
+  const { data } = await client.databases.status({ database });
   if (data?.infra?.readyForIngestion) break;
   await new Promise((resolve) => setTimeout(resolve, 5_000));
 }
 
-// 3. Save one memory in the user's collection.
-const ingest = await client.context.ingest({
+// 2. Ingest a knowledge document into the shared collection.
+writeFileSync(
+  "refund-policy.md",
+  "# Refund policy\n\nRefunds are available within 30 days of purchase. Annual plans are refunded pro rata.\n",
+);
+
+const doc = await client.context.ingest({
+  type: "knowledge",
+  database,
+  collection: "company_docs",
+  documents: [{ path: "refund-policy.md", filename: "refund-policy.md", contentType: "text/markdown" }],
+  documentMetadata: JSON.stringify([{ id: "refund_policy" }]),
+});
+
+// 3. Save a memory about one customer in that customer's collection.
+const mem = await client.context.ingest({
   type: "memory",
-  database: database,
-  collection: collection,
+  database,
+  collection: "user_123",
   memories: JSON.stringify([
-    { text: "User prefers detailed technical explanations and dark mode" },
+    { text: "Customer asked for a refund on 2026-09-30 and was told to wait for the billing cycle to close." },
   ]),
 });
 
-const id = ingest.data?.results?.[0]?.id;
-if (!id) throw new Error("Ingestion returned no memory ID");
-
-// 4. Wait until the memory is indexed.
-while (true) {
-  const status = (await client.context.status({
-    database: database,
-    collection: collection,
-    ids: [id],
-  })).data?.statuses?.[0];
-  if (!status) throw new Error("Memory status is missing");
-
-  if (status.indexingStatus === "completed") break;
-  if (status.indexingStatus === "errored") {
-    throw new Error(status.errorMessage ?? "Memory indexing failed");
+// 4. Wait until both are indexed.
+async function waitFor(collection: string, id: string | undefined) {
+  if (!id) throw new Error("Ingestion returned no id");
+  while (true) {
+    const status = (await client.context.status({ database, collection, ids: [id] })).data?.statuses?.[0];
+    if (!status) throw new Error("Status is missing");
+    if (status.indexingStatus === "completed") return;
+    if (status.indexingStatus === "errored") throw new Error(status.errorMessage ?? "Indexing failed");
+    await new Promise((resolve) => setTimeout(resolve, 2_000));
   }
-
-  await new Promise((resolve) => setTimeout(resolve, 2_000));
 }
 
-// 5. Search memories.
+await waitFor("company_docs", doc.data?.results?.[0]?.id);
+await waitFor("user_123", mem.data?.results?.[0]?.id);
+
+// 5. Query knowledge and the customer's memory together.
 const results = await client.query({
-  database: database,
-  collection: collection,
-  type: "memory",
-  query: "What does the user prefer?",
+  database,
+  collections: ["company_docs", "user_123"],
+  type: "all",
+  query: "Can this customer get a refund, and what have we told them so far?",
 });
 
 console.log(buildString(results));
 ```
 ```bash cURL
 DATABASE="my_first_database"
-COLLECTION="user_123"
+API="https://api.hydradb.com"
+AUTH=(-H "Authorization: Bearer $HYDRA_DB_API_KEY" -H "API-Version: 2")
 
-# 1. Create a database.
-curl -s -X POST 'https://api.hydradb.com/databases' \
-  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
-  -H "API-Version: 2" \
+# 1. Create a database and wait until it can accept data.
+curl -s -X POST "$API/databases" "${AUTH[@]}" \
   -H "Content-Type: application/json" \
   -d "{\"database\":\"${DATABASE}\"}"
 
-# 2. Wait until the database can accept data.
-until curl -s "https://api.hydradb.com/databases/status?database=${DATABASE}" \
-  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
-  -H "API-Version: 2" \
+until curl -s "$API/databases/status?database=${DATABASE}" "${AUTH[@]}" \
   | jq -e '.data.infra.ready_for_ingestion' > /dev/null; do
   sleep 5
 done
 
-# 3. Save one memory in the user's collection.
-ID=$(curl -s -X POST 'https://api.hydradb.com/context/ingest' \
-  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
-  -H "API-Version: 2" \
-  -F "type=memory" \
+# 2. Ingest a knowledge document into the shared collection.
+cat > refund-policy.md <<'EOF'
+# Refund policy
+
+Refunds are available within 30 days of purchase. Annual plans are refunded pro rata.
+EOF
+
+DOC_ID=$(curl -s -X POST "$API/context/ingest" "${AUTH[@]}" \
+  -F "type=knowledge" \
   -F "database=${DATABASE}" \
-  -F "collection=${COLLECTION}" \
-  -F 'memories=[{"text":"User prefers detailed technical explanations and dark mode"}]' \
+  -F "collection=company_docs" \
+  -F "documents=@refund-policy.md" \
+  -F 'document_metadata=[{"id":"refund_policy"}]' \
   | jq -r '.data.results[0].id')
 
-# 4. Wait until the memory is indexed.
-while true; do
-  STATUS=$(curl -s -G 'https://api.hydradb.com/context/status' \
-    -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
-    -H "API-Version: 2" \
-    --data-urlencode "database=${DATABASE}" \
-    --data-urlencode "collection=${COLLECTION}" \
-    --data-urlencode "ids=${ID}")
+# 3. Save a memory about one customer in that customer's collection.
+MEM_ID=$(curl -s -X POST "$API/context/ingest" "${AUTH[@]}" \
+  -F "type=memory" \
+  -F "database=${DATABASE}" \
+  -F "collection=user_123" \
+  -F 'memories=[{"text":"Customer asked for a refund on 2026-09-30 and was told to wait for the billing cycle to close."}]' \
+  | jq -r '.data.results[0].id')
 
-  INDEXING_STATUS=$(echo "$STATUS" | jq -r '.data.statuses[0].indexing_status')
+# 4. Wait until both are indexed.
+wait_for() {
+  while true; do
+    STATUS=$(curl -s -G "$API/context/status" "${AUTH[@]}" \
+      --data-urlencode "database=${DATABASE}" \
+      --data-urlencode "collection=$1" \
+      --data-urlencode "ids=$2")
+    STATE=$(echo "$STATUS" | jq -r '.data.statuses[0].indexing_status')
+    if [ "$STATE" = "completed" ]; then return; fi
+    if [ "$STATE" = "errored" ]; then
+      echo "$STATUS" | jq -r '.data.statuses[0].error_message'; exit 1
+    fi
+    sleep 2
+  done
+}
+wait_for company_docs "$DOC_ID"
+wait_for user_123 "$MEM_ID"
 
-  if [ "$INDEXING_STATUS" = "completed" ]; then break; fi
-  if [ "$INDEXING_STATUS" = "errored" ]; then
-    echo "$STATUS" | jq -r '.data.statuses[0].error_message'
-    exit 1
-  fi
-
-  sleep 2
-done
-
-# 5. Search memories.
-curl -s -X POST 'https://api.hydradb.com/query' \
-  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
-  -H "API-Version: 2" \
+# 5. Query knowledge and the customer's memory together.
+curl -s -X POST "$API/query" "${AUTH[@]}" \
   -H "Content-Type: application/json" \
   --data-binary @- <<EOF | jq -r '.data.chunks[].chunk_content'
 {
   "database": "${DATABASE}",
-  "collection": "${COLLECTION}",
-  "type": "memory",
-  "query": "What does the user prefer?"
+  "collections": ["company_docs", "user_123"],
+  "type": "all",
+  "query": "Can this customer get a refund, and what have we told them so far?"
 }
 EOF
 ```
@@ -220,41 +238,63 @@ EOF
 
 ## 3. Check the result
 
-The query returns passages from your saved memory, not a generated answer. The SDK examples print formatted context; cURL prints the passage text. Both should include the preference you stored:
+The query returns passages from your context, not a generated answer. The SDK examples print formatted context; cURL prints the passage text. Both should include the policy and the memory:
 
 ```text
-User prefers detailed technical explanations and dark mode
+Refunds are available within 30 days of purchase. Annual plans are refunded pro rata.
+Customer asked for a refund on 2026-09-30 and was told to wait for the billing cycle to close.
 ```
 
-## 4. Use the memory in a model prompt
+## 4. Use the context in a model prompt
 
 Continue from the `results` above. The SDK helper formats the returned passages and any relationships into a string, which you can add to the messages you send to your model:
 
 <CodeGroup>
 ```python Python SDK
 messages = [
-    {"role": "system", "content": "Use these saved preferences when answering:\n" + build_string(results)},
-    {"role": "user", "content": "How should I set up my editor?"},
+    {"role": "system", "content": "Use this context when answering:\n" + build_string(results)},
+    {"role": "user", "content": "The customer is asking about a refund again. What should I tell them?"},
 ]
 ```
 ```typescript TypeScript SDK
 const messages = [
-  { role: "system", content: "Use these saved preferences when answering:\n" + buildString(results) },
-  { role: "user", content: "How should I set up my editor?" },
+  { role: "system", content: "Use this context when answering:\n" + buildString(results) },
+  { role: "user", content: "The customer is asking about a refund again. What should I tell them?" },
 ];
 ```
 </CodeGroup>
 
-Send `messages` to the chat model your application uses. It now has the user's preferences available when answering the editor question. For raw HTTP response formatting and complete model-call examples, see [How to Use API Results](/essentials/v2/api-results).
+Send `messages` to the chat model your application uses. It now has the policy and this customer's history in front of it. For raw HTTP response formatting and complete model-call examples, see [How to Use API Results](/essentials/v2/api-results).
+
+## What you have built
+
+That is the full HydraDB loop: create a database, ingest context, wait for indexing, query it, and pass the result to a model. HydraDB handles parsing, chunking, embedding, graph construction, and hybrid retrieval. Your application sends the query and gets back the slice of context that fits it.
+
+```mermaid
+flowchart LR
+  A([1. Create Database]) --> B([2. Ingest Context])
+  B --> C([3. Wait for Indexing])
+  C --> D([4. Query])
+  D --> E([5. Pass to Model])
+
+  style A fill:#0f172a,stroke:#334155,stroke-width:2px,color:#f8fafc,stroke-linecap:round
+  style B fill:#0f172a,stroke:#334155,stroke-width:2px,color:#f8fafc,stroke-linecap:round
+  style C fill:#0f172a,stroke:#334155,stroke-width:2px,color:#f8fafc,stroke-linecap:round
+  style D fill:#0f172a,stroke:#334155,stroke-width:2px,color:#f8fafc,stroke-linecap:round
+  style E fill:#0f172a,stroke:#334155,stroke-width:2px,color:#f8fafc,stroke-linecap:round
+```
+
+Nothing in the code changes between one document and ten thousand, or between a Markdown file and a Slack workspace synced by a [connector](/essentials/v2/connectors). Everything else in HydraDB, such as [metadata filters](/essentials/v2/metadata), [access control](/essentials/v2/access-control), and the [context graph](/essentials/v2/context-graphs), builds on this loop.
 
 ## Where to go next
 
 | If you want to | Read |
 |---|---|
 | Understand how content gets stored and retrieved | [Architecture](/essentials/v2/architecture) |
+| Ingest files, app records, or connect an app | [Knowledge](/essentials/v2/knowledge), [App Sources](/essentials/v2/app-sources), [Connectors](/essentials/v2/connectors) |
 | Tune query behavior (`alpha`, `mode`, `recency_bias`) | [Query](/essentials/v2/query) |
 | Design a filterable metadata schema | [Metadata](/essentials/v2/metadata) |
-| Scope data per user or workspace | [Multi-Tenant](/essentials/v2/multi-tenant) |
+| Scope data per user or workspace | [Multi-tenancy](/essentials/v2/multi-tenant) |
 | Turn query results into a model prompt | [How to Use API Results](/essentials/v2/api-results) |
 | See the full endpoint reference | [API Reference](/api-reference/v2) |
 | Pick from real-world recipes | [Cookbooks](/cookbooks/v2/index) |
