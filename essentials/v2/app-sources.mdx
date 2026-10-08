@@ -1,33 +1,40 @@
 ---
-title: "Context from Apps"
+title: "App Sources"
 description: "Bring app data from your own connectors into HydraDB."
 ---
 
 import { Field } from "/snippets/field.jsx";
 
-To **bring your own connectors** to HydraDB, use [`POST /context/ingest`](/api-reference/v2/endpoint/ingest-context) to ingest data from your apps.
+To **bring your own connectors** to HydraDB, use [`POST /context/ingest`](/api-reference/v2/endpoint/ingest-context) to ingest data from your apps. Each message, ticket, page, email, meeting, or record is one **app source**.
 
-HydraDB provides an ontology engine and retrieval: it organizes your content and relationships, indexes the data, and lets you retrieve context through [`POST /query`](/api-reference/v2/endpoint/query).
+HydraDB organizes these items and their relationships, indexes them, and lets you retrieve them through [`POST /query`](/api-reference/v2/endpoint/query).
 
-<a id="1-ingest-an-app-source"></a>
+This guide builds up in order:
+
+1. [Ingest an app source](#1-ingest-an-app-source): one request, shown with a Slack message.
+2. [Classes](#2-classes-tell-hydradb-what-each-item-is): the class names, and how to map your app's data to class fields.
+3. [App patterns](#3-choose-your-app-pattern): ready-to-adapt examples for messaging, tickets, wikis, email, meetings, and CRM apps.
+4. [Connections](#4-connect-app-sources): threads, replies, comments, and links between items, including across apps.
+5. [Incremental ingestion](#5-incremental-ingestion): adding, updating, and deleting items as your app changes.
+6. [Attachments and comments](#6-include-attachments-and-comments), [metadata](#7-add-metadata-for-filtering-and-display), and [querying](#8-query-app-sources).
+
 <a id="2-ingest-an-app-source"></a>
 <a id="3-ingest-an-app-source"></a>
+<a id="1-ingest-context-from-apps"></a>
 
-## 1. Ingest context from apps
+## 1. Ingest an app source
 
-Your connectors bring knowledge from your apps into HydraDB as **context**. Each item is a message, ticket, page, email, or record from Slack, Jira, Notion, and other apps.
+The example below ingests one Slack message. Every app uses this same request; only the item inside `app_knowledge` changes. The [app patterns](#3-choose-your-app-pattern) show the item for each app.
 
-Ingest this context using an existing [database](/api-reference/v2/endpoint/create-tenant) and collection. Send one item, or a list of items, as a JSON string in the `app_knowledge` field of a **multipart/form-data** request.
+The request is **multipart/form-data** with these fields:
 
 | Form field | What to send |
 |---|---|
 | `type` | `knowledge` |
-| `database` | The existing database for this context |
+| `database` | An existing [database](/api-reference/v2/endpoint/create-tenant) |
 | `collection` | Your collection, or `default` |
 | `app_knowledge` | One item or a list of items, as a JSON string |
-| `upsert` | Set to `true` when updating an existing item. Leave it out for new items. |
-
-Start with the Slack message below. Use the same request for other app data, with the fields explained in [class mapping](#2-map-your-app-data-to-a-class) and the [app patterns](#3-choose-your-app-pattern).
+| `upsert` | Set to `true` when updating an item you already ingested. Leave it out for new items. |
 
 <a id="ingest-a-slack-message-json-curl-python-or-typescript"></a>
 <Accordion title="Ingest a Slack message: Python, TypeScript, or cURL">
@@ -117,28 +124,47 @@ curl -X POST 'https://api.hydradb.com/context/ingest' \
 
 </Accordion>
 
-**Important: to update existing context, add `upsert=true` to this request.** This replaces the saved context for that item. Send the complete item with the same IDs, including the content and links you want to keep. New items, such as replies, do not need this option. [Incremental ingestion](#5-incremental-ingestion) shows how to add a reply to a thread and update an existing reply.
+### What each property in the item means
 
-Use the `id` returned in `data.results` with [`GET /context/status`](/api-reference/v2/endpoint/source-status). Wait for `indexing_status: "completed"` before checking the ingested context and its connections.
+| Property | What it is |
+|---|---|
+| `id` | Your stable HydraDB ID for this item. Use it to check status, update, delete, or link the item. |
+| `database`, `collection` | Where the item lives. Match the request's values. |
+| `title` | A readable label shown with search results. |
+| `kind` | The item's **class**: `message` here. [Classes](#2-classes-tell-hydradb-what-each-item-is) explains the choices. |
+| `provider` | The app the item comes from, such as `slack`, `jira`, or `gmail`. |
+| `external_id` | The item's own ID inside the app. For Slack, this is the message `ts`. Thread, parent, and relation fields refer to other items by this ID. |
+| `fields` | The content for the class. A message has a `body`, an `author`, and a `thread_id`. Each class has its own fields, listed in the [field reference](#field-reference). |
 
-If the status is `errored`, read `error_code`, fix the problem, and retry with `upsert=true`.
+The [app patterns](#3-choose-your-app-pattern) show how these properties map to Slack, Jira, Notion, Gmail, Gong, and Salesforce data. [Connect app sources](#4-connect-app-sources) explains `thread_id` and the other fields that link items together.
 
-## 2. Map your app data to a class
+### Updates and status
 
-**A class tells HydraDB what kind of item you are sending.** Choose it with `kind`, name the app with `provider`, and put the item's content in `fields`.
+To change an item you already ingested, send it again with the same `id` and add `upsert=true`. This replaces the saved item, so include everything you want to keep. To add new items over time, such as new replies in a thread, follow [incremental ingestion](#5-incremental-ingestion).
+
+The response lists each item's `id` in `data.results`. Check progress with [`GET /context/status`](/api-reference/v2/endpoint/source-status), and wait for `indexing_status: "completed"` before querying the item or its connections.
+
+<a id="2-map-your-app-data-to-a-class"></a>
+
+## 2. Classes: tell HydraDB what each item is
+
+**A class tells HydraDB what kind of item you are sending.** Set it in `kind`, repeat it in `fields.kind`, name the app in `provider`, and put the item's content in `fields`. HydraDB supports seven classes:
 
 | Class (`kind`) | Use for | Main text |
 |---|---|---|
-| `message` | Messages and replies from Slack, Teams, or any messaging app | `fields.body` |
-| `ticket` | Issues and support tickets | `fields.title`, `fields.description` |
-| `comment` | Comments on tickets, pages, or records | `fields.body` |
-| `knowledge_base` | Wiki pages | `fields.title`, `fields.body` |
-| `email` | Emails and email replies | `fields.subject`, `fields.body` |
-| [`custom`](#map-your-data-to-the-custom-class) | CRM records, meeting transcripts, and other app records | `fields.body`, `fields.data` |
+| `message` | Messages and replies from Slack, Teams, Discord, or any messaging app | `fields.body` |
+| `ticket` | Issues and support tickets from Jira, Linear, GitHub, Zendesk, or a CRM such as HubSpot | `fields.title`, `fields.description` |
+| `comment` | Comments on any ticket, page, or record, from any of these apps | `fields.body` |
+| `knowledge_base` | Pages from Notion, Confluence, Guru, or any wiki | `fields.title`, `fields.body` |
+| `email` | Emails and email replies from Gmail or Outlook | `fields.subject`, `fields.body` |
+| `meeting` | Recorded calls and transcripts from Gong, Fireflies, Zoom, or any meeting app | `fields.title`, `fields.body` |
+| [`custom`](#map-your-data-to-the-custom-class) | Salesforce and HubSpot records, database rows, and anything else that does not fit above | `fields.body`, `fields.data` |
 
-A connector can produce more than one class: your Jira connector sends tickets as `ticket` and their comments as `comment`. Repeat the class in `fields.kind`, matching the top-level `kind`.
+**Your connector can produce one or more classes.** A Jira connector sends issues as `ticket` and their comments as `comment`. A Gong connector sends call recordings as `meeting` and the library items and scorecard reviews about those calls as `knowledge_base`. Each item carries its own class. The [ticket pattern](#3-choose-your-app-pattern) sends a ticket and its comment in one request, and the [meeting pattern](#3-choose-your-app-pattern) shows a Gong call.
 
-Your connector fetches and reads the app's data. Put each item's text, people, dates, and app IDs into the fields for its class. Extract attachment text too if you want to search it. For example, use these values from a Slack API message:
+### Map your app's data to the class fields
+
+Your connector fetches data from the app. For each item, put its text, people, dates, and app IDs into the fields of its class. If you want attachment text to be searchable, extract it too and send it in `attachments`. This is how a Slack API message maps to a `message` item:
 
 | Slack API value | Context field |
 |---|---|
@@ -149,21 +175,21 @@ Your connector fetches and reads the app's data. Put each item's text, people, d
 | Reply's `thread_ts` | `fields.parent_id`; omit on the opening message |
 | File text extracted by your connector | `attachments[].content.text` or `attachments[].content.markdown` |
 
-Set `kind: "message"` and `fields.kind: "message"` for this mapping. For a ticket, map its title and description to `fields.title` and `fields.description`; for an email, map its subject, body, sender, and recipients to the email fields. Keep the original item's ID so later updates and relationships refer to the same item.
+A ticket maps its title and description to `fields.title` and `fields.description`. An email maps its subject, body, sender, and recipients to the email fields. A meeting maps its transcript or notes to `fields.body` and its host and participants to the meeting fields. The [app patterns](#3-choose-your-app-pattern) show a complete item for each app, and the [field reference](#field-reference) lists every field per class. Keep the app's own ID in `external_id` so later updates and connections refer to the same item.
 
 ### Map your data to the custom class
 
-**Use the `custom` class for records that do not fit another class**, such as CRM deals, contacts, invoices, meeting transcripts, or records from your internal app. Set both `kind` and `fields.kind` to `custom`. Your business record type, such as `opportunity` or `invoice`, goes in `fields.data.record_type`.
+**Use the `custom` class for records that do not fit another class**, such as CRM deals, contacts, invoices, database rows, or records from your internal app. Set both `kind` and `fields.kind` to `custom`. Your business record type, such as `opportunity` or `invoice`, goes in `fields.data.record_type`.
 
-Your connector maps the record's properties to `fields.data` and its readable text to `fields.body`. For a meeting transcript, put the transcript in `fields.body` and details such as participants in `fields.data`.
+Your connector maps the record's properties to `fields.data` and its readable text to `fields.body`.
 
-<Accordion title="Salesforce opportunity: map to custom and link to Jira">
+<Accordion title="Salesforce opportunity: map to custom and link to a Gmail email">
 
 The ingestion request still uses **`type=knowledge`**. `custom` is the item's class; `opportunity` is the business record type in this example.
 
 Put the app's business fields in **`fields.data`** as a JSON object. HydraDB converts these values to searchable text, leaving out empty values, `0`, and `false`. Use **`fields.body`** for a readable description or notes, including zero or false values you want to search.
 
-Map the Salesforce opportunity's fields to these context fields, and connect the resulting item to its account and a Jira ticket:
+Map the Salesforce opportunity's fields to these context fields, and connect the resulting item to its account and to the Gmail email where the customer's renewal terms were discussed:
 
 | App value | Context field |
 |---|---|
@@ -172,9 +198,9 @@ Map the Salesforce opportunity's fields to these context fields, and connect the
 | Opportunity notes | `fields.body` |
 | Stage, amount, owner, and other business properties | Keys in `fields.data` |
 | Associated account's app ID | `fields.parent_id` |
-| Related Jira item's HydraDB ID | `relations[].target.source_id` |
+| Related Gmail email's HydraDB ID | `relations[].target.source_id` |
 
-Send this item with the [ingestion request](#1-ingest-context-from-apps). Your connector supplies the text, business fields, and IDs.
+Send this item with the [ingestion request](#1-ingest-an-app-source). Your connector supplies the text, business fields, and IDs.
 
 ```json Custom opportunity context expandable
 {
@@ -187,7 +213,7 @@ Send this item with the [ingestion request](#1-ingest-context-from-apps). Your c
   "external_id": "opp_789",
   "fields": {
     "kind": "custom",
-    "body": "Acme is negotiating its enterprise renewal. The renewal depends on resolving the login issue in the linked Jira ticket.",
+    "body": "Acme is negotiating its enterprise renewal. The renewal depends on the auth fix that Alice approved in the linked email.",
     "parent_id": "account_456",
     "data": {
       "record_type": "opportunity",
@@ -200,15 +226,15 @@ Send this item with the [ingestion request](#1-ingest-context-from-apps). Your c
   "relations": [
     {
       "predicate": "linked_to",
-      "target": { "source_id": "jira_AUTH-123" }
+      "target": { "source_id": "gmail_msg_19a2b3c" }
     }
   ]
 }
 ```
 
-Ingest the account as another Salesforce item with `external_id: "account_456"`. For the `target.source_id` relation shown here, ingest the Jira ticket and wait for `completed` before ingesting the opportunity. HydraDB uses the account as the opportunity's parent and the ticket as a linked item.
+Ingest the account as another Salesforce item with `external_id: "account_456"`. For the `target.source_id` relation shown here, ingest the Gmail email from the [email pattern](#3-choose-your-app-pattern) and wait for `completed` before ingesting the opportunity. HydraDB uses the account as the opportunity's parent and the email as a linked item.
 
-Keep connection fields outside `data`: `fields.parent_id` links to a parent item in the same app, `fields.thread_id` groups a conversation, and `relations` connects items, including across apps. Storing an ID in `fields.data.account_id` alone does not create a link. The [connection examples](#4-connect-context-from-apps) include Gmail linked to Notion and a CRM field linked to a Postgres row.
+Keep connection fields outside `data`: `fields.parent_id` links to a parent item in the same app, `fields.thread_id` groups a conversation, and `relations` connects items, including across apps. Storing an ID in `fields.data.account_id` alone does not create a link. [Connect app sources](#4-connect-app-sources) explains each of these.
 
 For filters such as deal stage, also map the property into `metadata` and declare it in your [metadata schema](/essentials/v2/metadata) with `enable_match: true`. Keys in `fields.data` provide searchable content; they do not automatically become metadata filters.
 
@@ -218,10 +244,10 @@ After ingestion, search with `type: "knowledge"` and `query_apps: true`, just as
 
 ### Item IDs
 
-Each item of context has two IDs:
+Each item has two IDs:
 
 - **`id` is your stable HydraDB ID.** Use it to check status, replace the item, or delete it. For example, `slack_C01_1716213600_000100`.
-- **`external_id` identifies the item in the app.** For example, the Slack message timestamp `1716213600.000100` or Jira issue key `AUTH-123`. Parent and reply fields refer to this ID.
+- **`external_id` identifies the item in the app.** For example, the Slack message timestamp `1716213600.000100` or Jira issue key `AUTH-123`. Thread, parent, and reply fields refer to this ID.
 
 Use the same `provider` for items from the same app. HydraDB matches external IDs within that provider, database, and collection. If two channels, workspaces, or mailboxes can have the same item ID, include their name or ID in `external_id` to tell the items apart. Use that same ID format in parent, reply, and relation fields. Adding a channel name to metadata does not change how IDs match.
 
@@ -229,7 +255,9 @@ Use the same `provider` for items from the same app. HydraDB matches external ID
 
 ## 3. Choose your app pattern
 
-These five patterns cover messages, tickets and comments, pages, emails, and business records. They also work for other apps with the same kinds of items. Open a pattern, replace its example values with your app's data, and send it through `app_knowledge` using the [ingestion request](#1-ingest-context-from-apps). To update an existing item later, keep its IDs and add `upsert=true`.
+These six patterns cover messages, tickets and comments, pages, emails, meetings, and business records. They also work for other apps with the same kinds of items. Open a pattern, replace its example values with your app's data, and send it through `app_knowledge` using the [ingestion request](#1-ingest-an-app-source). To update an existing item later, keep its IDs and add `upsert=true`.
+
+The connection fields used in these patterns, such as `thread_id`, `parent_id`, and `relations`, are explained in [Connect app sources](#4-connect-app-sources).
 
 <AccordionGroup>
 <Accordion title="Slack / Teams: threads, replies, attachments">
@@ -283,12 +311,12 @@ In Slack, the message ID is its `ts`, and the thread root is `thread_ts`. For th
 ]
 ```
 
-HydraDB creates the `reply_to` connection from `parent_id`. The opening message has no `parent_id`. To add a reply, send a new item without resending the opening message. Use the same fields for other messaging apps, with their own message and conversation IDs.
+HydraDB creates the `reply_to` connection from `parent_id`. The opening message has no `parent_id`. To add a reply, send a new item without resending the opening message, as shown in [incremental ingestion](#5-incremental-ingestion). Use the same fields for other messaging apps, with their own message and conversation IDs.
 
 </Accordion>
 <Accordion title="Jira / Linear / Zendesk: tickets and comments">
 
-**Classes: `ticket` for an issue; `comment` for each comment you send separately.** The ticket's main text is `fields.description`. A comment has its own `external_id`, and its `fields.parent_id` is the ticket's `external_id` with the same `provider`.
+**Classes: `ticket` for an issue; `comment` for each comment you send separately.** The ticket's main text is `fields.description`. A comment has its own `external_id`, and its `fields.parent_id` is the ticket's `external_id` with the same `provider`. This is the one-connector, two-classes case: both items below come from Jira.
 
 ```json Ticket and comment expandable
 [
@@ -329,7 +357,7 @@ HydraDB creates the `reply_to` connection from `parent_id`. The opening message 
 ]
 ```
 
-This creates a `child_of` connection from AUTH-123 to its epic, a `linked_to` connection to AUTH-124, and a `comment_on` connection from c123 to AUTH-123. Ingest the epic and linked issue too to make their content available. For Linear or Zendesk, change the provider and use that app's item IDs.
+This creates a `child_of` connection from AUTH-123 to its epic, a `linked_to` connection to AUTH-124, and a `comment_on` connection from c123 to AUTH-123. Ingest the epic and linked issue too to make their content available. For Linear, Zendesk, or GitHub issues, change the provider and use that app's item IDs.
 
 </Accordion>
 <Accordion title="Notion / Confluence: pages and parents">
@@ -390,11 +418,46 @@ Ingest the original email `19a1a00` separately with the same `thread_id`. HydraD
 For an opening email, leave out `reply_to_id`. For a forwarded email, set `fields.forwarded_from_id` to the original email's external ID in the same app, and ingest the original email too. Put any CC and BCC recipients in `fields.cc` and `fields.bcc` as lists of email addresses.
 
 </Accordion>
+<Accordion title="Gong / Fireflies / Zoom: meetings and transcripts">
+
+**Class: `meeting` for each recorded call or meeting.** Put the transcript or notes in `fields.body`, the host in `fields.host` and `fields.host_email`, and the other people in `fields.participants`. HydraDB recognizes the host and participants as people, so questions such as "What did Morgan ask for on the renewal call?" can find this item.
+
+```json Gong call with transcript expandable
+{
+  "id": "gong_call_7891",
+  "database": "acme_corp",
+  "collection": "default",
+  "title": "Acme renewal call",
+  "kind": "meeting",
+  "provider": "gong",
+  "external_id": "7891",
+  "url": "https://app.gong.io/call?id=7891",
+  "fields": {
+    "kind": "meeting",
+    "title": "Acme renewal call",
+    "body": "Morgan: We need the login issue fixed before we renew.\nAlice: The fix ships this week. We will confirm on Slack once it is verified.",
+    "host": "Alice",
+    "host_email": "alice@acme.com",
+    "participants": [
+      { "name": "Morgan Lee", "email": "morgan@example.com" },
+      { "name": "Alice", "email": "alice@acme.com" }
+    ],
+    "started_at": "2026-05-19T15:00:00Z",
+    "labels": ["renewal"]
+  }
+}
+```
+
+Each participant is an object with a `name` and `email`. Put the full transcript in `fields.body`; HydraDB indexes it as the meeting's content. Use `fields.labels` for topics or tags from the app. For Fireflies or Zoom, change the provider and use that app's meeting ID as `external_id`.
+
+A Gong connector also sends library items and scorecard reviews about a call as `knowledge_base` items, with the call's ID in `fields.parent_id`. That is the same one-connector, two-classes pattern as Jira's tickets and comments.
+
+</Accordion>
 <Accordion title="Salesforce / HubSpot: CRM and app relations">
 
-**Class: `custom`.** Put the record's business fields in `fields.data`. Use `fields.parent_id` for the account's ID in the same CRM, and `relations` for connections to items in other apps.
+**Class: `custom`.** Put the record's business fields in `fields.data`. Use `fields.parent_id` for the account's ID in the same CRM, and `relations` for connections to items in other apps. This example links the opportunity to the Gmail email from the email pattern.
 
-```json Opportunity linked to a Jira ticket expandable
+```json Opportunity linked to a Gmail email expandable
 {
   "id": "salesforce_opp_789",
   "database": "acme_corp",
@@ -405,7 +468,7 @@ For an opening email, leave out `reply_to_id`. For a forwarded email, set `field
   "external_id": "opp_789",
   "fields": {
     "kind": "custom",
-    "body": "Acme's renewal depends on resolving the login issue in Jira ticket AUTH-123.",
+    "body": "Acme's renewal depends on the auth fix that Alice approved by email.",
     "parent_id": "account_456",
     "data": {
       "record_type": "opportunity",
@@ -418,31 +481,56 @@ For an opening email, leave out `reply_to_id`. For a forwarded email, set `field
   "relations": [
     {
       "predicate": "linked_to",
-      "target": { "external_id": "AUTH-123", "provider": "jira" },
-      "properties": { "reason": "Renewal depends on the login fix" }
+      "target": { "source_id": "gmail_msg_19a2b3c" },
+      "properties": { "reason": "Renewal depends on the approved auth fix" }
     }
   ]
 }
 ```
 
-Ingest `account_456` as another CRM item. The relation links the opportunity to the Jira ticket from the ticket pattern. The description in `fields.body` makes the reason for that link searchable.
+Ingest `account_456` as another CRM item. Ingest the Gmail email first and wait for `completed`, because the relation refers to its HydraDB ID. The description in `fields.body` makes the reason for that link searchable.
 
 See [Map your data to the custom class](#map-your-data-to-the-custom-class) for mapping your own business fields and adding searchable text.
 
 </Accordion>
 </AccordionGroup>
 
-<a id="4-connect-app-sources"></a>
+<a id="4-connect-context-from-apps"></a>
 
-## 4. Connect context from apps
+## 4. Connect app sources
 
-Connect replies to conversations, define your own relationships, link records across apps, or include linked content in search results. Open a topic to see the fields and examples.
+This section explains how items connect to each other. Most connections come from fields you already send in the patterns above: `thread_id` and `parent_id` on a message, `parent_id` on a comment, `reply_to_id` on an email, and `linked_issue_ids` on a ticket. HydraDB turns these into connections when it ingests the item. For connections those fields cannot express, such as a Slack reply about a Jira ticket, add a `relations` list.
+
+Open a topic to see the fields, how HydraDB uses them, and a request you can adapt.
 
 <AccordionGroup>
 <a id="threads-and-replies"></a>
 <Accordion title="Threads and replies: Slack / Gmail">
 
-A **thread** groups a conversation. A **parent** identifies the specific item that a reply or comment responds to. These fields answer different questions:
+A **thread** is a conversation. In Slack, the opening message starts the thread, and every reply belongs to it. Two fields on each `message` item describe this:
+
+- `fields.thread_id` says which conversation the message belongs to. Every message in the thread, including the opening message, uses the opening message's `external_id` here.
+- `fields.parent_id` says which message this one replies to. A reply sets it to the opening message's `external_id`. The opening message leaves it out.
+
+Carol's reply from the [Slack pattern](#3-choose-your-app-pattern) carries both fields:
+
+```json Carol's reply: the two thread fields
+{
+  "id": "slack_C01_1716213700_000200",
+  "kind": "message",
+  "provider": "slack",
+  "external_id": "1716213700.000200",
+  "fields": {
+    "kind": "message",
+    "body": "Confirmed: login works after disabling token refresh.",
+    "author": "carol",
+    "thread_id": "1716213600.000100",
+    "parent_id": "1716213600.000100"
+  }
+}
+```
+
+Across the whole thread, the values look like this:
 
 | In the Slack example | `external_id` | `fields.thread_id` | `fields.parent_id` |
 |---|---|---|---|
@@ -450,7 +538,7 @@ A **thread** groups a conversation. A **parent** identifies the specific item th
 | Carol's reply | `1716213700.000200` | `1716213600.000100` | `1716213600.000100` |
 | A later reply | Its own message ID | `1716213600.000100` | `1716213600.000100` |
 
-Each message keeps its own body, author, and timestamp. A thread does not need a separate item. Ingest its opening message and replies with the shared `thread_id`.
+Each message keeps its own body, author, and timestamp. A thread does not need a separate item. Ingest its opening message and replies with the shared `thread_id`, and HydraDB creates a `reply_to` connection from each reply to the opening message. Searching with `mode: "thinking"` then returns a thread's replies together with its opening message. To add a reply later, send only the new reply, as shown in [incremental ingestion](#5-incremental-ingestion).
 
 For other apps, use their conversation IDs. Email uses `thread_id` to group the conversation and `reply_to_id` to identify the email being replied to. Ticket comments use `parent_id` to identify the ticket; they can also carry a `thread_id` when the app has a discussion thread.
 
@@ -458,27 +546,27 @@ For other apps, use their conversation IDs. Email uses `thread_id` to group the 
 <a id="relationships-from-fields"></a>
 <Accordion title="Relationships from fields: Jira / Notion">
 
-HydraDB creates these connections from the fields you send:
+You do not declare these connections separately. HydraDB creates them from the fields you send with each class:
 
-| Field | Class | Connection |
+| Field | Class | Connection HydraDB creates |
 |---|---|---|
-| `thread_id` | Message, email, comment, custom | Item belongs to the thread |
-| `parent_id` | Message | Reply → parent message (`reply_to`) |
-| `reply_to_id` | Email | Reply → original email (`reply_to`) |
-| `forwarded_from_id` | Email | Forwarded email → original email (`forwarded_from`) |
-| `parent_id` | Comment | Comment → ticket, page, or record (`comment_on`) |
-| `parent_id` | Ticket, page, custom | Child → parent (`child_of`) |
-| `linked_issue_ids` | Ticket | Ticket → related issues (`linked_to`) |
+| `thread_id` | Message, email, comment, custom | The item belongs to the thread |
+| `parent_id` | Message | `reply_to`, from the reply to its parent message |
+| `reply_to_id` | Email | `reply_to`, from the reply to the original email |
+| `forwarded_from_id` | Email | `forwarded_from`, from the forwarded email to the original |
+| `parent_id` | Comment | `comment_on`, from the comment to the ticket, page, or record |
+| `parent_id` | Ticket, page, custom | `child_of`, from the child to its parent |
+| `linked_issue_ids` | Ticket | `linked_to`, from the ticket to each related issue |
 
 Parent and reply IDs use the same provider as the item. Ingest the referenced items too so their content can be retrieved.
 
 </Accordion>
 <a id="explicit-relations-between-sources"></a>
-<Accordion title="Explicit relations: Slack → Jira">
+<Accordion title="Explicit relations: Slack to Jira">
 
 Use `relations` to describe connections beyond those fields: a Slack discussion about a Jira incident, a CRM renewal tied to a support ticket, or an issue blocking a release.
 
-A relation reads as **this item → relationship → target**. On Carol's Slack reply, the following addition means "this message is linked to Jira ticket AUTH-123":
+A relation reads as **this item, then the relationship, then the target**. On Carol's Slack reply, the following addition means "this message is linked to Jira ticket AUTH-123":
 
 ```json Add to the message context
 {
@@ -503,33 +591,104 @@ Identify the other item in either of these ways:
 
 When using `target.source_id`, ingest that item and wait for `completed` before adding the relation.
 
-Choose the direction that matches the relationship. These are common names; expand "Your own relations: Jira → Slack" below to define your own:
+Choose the direction that matches the relationship. These are common names; expand "Your own relations: Jira to Slack" below to define your own:
 
 | `predicate` | Example |
 |---|---|
-| `reply_to` | Reply → original message or email |
-| `comment_on` | Comment → ticket or page |
-| `child_of` | Subtask → epic; page → parent page |
-| `linked_to` | Slack discussion → Jira ticket |
-| `blocks` | Unresolved ticket → release it blocks |
-| `caused_by` | Incident → change that caused it |
-| `forwarded_from` | Forwarded email → original email |
-| `related_to` | Item → another related item |
+| `reply_to` | From a reply to the original message or email |
+| `comment_on` | From a comment to its ticket or page |
+| `child_of` | From a subtask to its epic; from a page to its parent page |
+| `linked_to` | From a Slack discussion to a Jira ticket |
+| `blocks` | From an unresolved ticket to the release it blocks |
+| `caused_by` | From an incident to the change that caused it |
+| `forwarded_from` | From a forwarded email to the original email |
+| `related_to` | From an item to another related item |
 
 Keep both items in the same database and collection, and ingest both. Search with `query_apps: true` and `mode: "thinking"` to include related items.
 
 </Accordion>
 <a id="define-your-own-relations"></a>
-<Accordion title="Your own relations: Jira → Slack">
+<Accordion title="Your own relations: Jira to Slack">
 
 **Use your own `predicate` to name a relationship from your business data.** For example, use `verified_by` to connect a Jira ticket to a Slack verification message, or `renews` to connect a new contract to an earlier contract. You do not need to register a relation type first.
 
-A custom relationship works with any class. The Jira ticket below is still `kind: "ticket"`; you do not need the `custom` class to use your own relation name. Use the same non-empty name on each sync, such as `verified_by`. In this example, the direction is **ticket → verified by → message**.
+A custom relationship works with any class. The Jira ticket below is still `kind: "ticket"`; you do not need the `custom` class to use your own relation name. Use the same non-empty name on each sync, such as `verified_by`. In this example, the direction is from the ticket to the message: the ticket is verified by the message.
 
 First ingest Carol's Slack reply from the [messaging pattern](#3-choose-your-app-pattern) and wait for `completed`. Then send the complete Jira ticket below with the new relationship. Use `upsert=true` because the ticket from the ticket pattern already exists.
 
 <CodeGroup>
-```bash cURL add the custom relation
+```python Python SDK expandable
+import json
+
+ticket = {
+    "id": "jira_AUTH-123",
+    "database": "acme_corp",
+    "collection": "default",
+    "title": "Login page returns 500",
+    "kind": "ticket",
+    "provider": "jira",
+    "external_id": "AUTH-123",
+    "fields": {
+        "kind": "ticket",
+        "title": "Login page returns 500",
+        "description": "Invalid credentials return HTTP 500 instead of 401. Carol's Slack reply confirms that login works after disabling token refresh.",
+        "status": "open",
+        "assignee": "alice",
+        "parent_id": "AUTH-100",
+        "linked_issue_ids": ["AUTH-124"],
+    },
+    "relations": [
+        {
+            "predicate": "verified_by",
+            "target": {"source_id": "slack_C01_1716213700_000200"},
+        }
+    ],
+}
+
+result = client.context.ingest(
+    type="knowledge",
+    database="acme_corp",
+    collection="default",
+    app_knowledge=json.dumps([ticket]),
+    upsert="true",
+)
+```
+```typescript TypeScript SDK expandable
+const ticket = {
+  id: "jira_AUTH-123",
+  database: "acme_corp",
+  collection: "default",
+  title: "Login page returns 500",
+  kind: "ticket",
+  provider: "jira",
+  external_id: "AUTH-123",
+  fields: {
+    kind: "ticket",
+    title: "Login page returns 500",
+    description:
+      "Invalid credentials return HTTP 500 instead of 401. Carol's Slack reply confirms that login works after disabling token refresh.",
+    status: "open",
+    assignee: "alice",
+    parent_id: "AUTH-100",
+    linked_issue_ids: ["AUTH-124"],
+  },
+  relations: [
+    {
+      predicate: "verified_by",
+      target: { source_id: "slack_C01_1716213700_000200" },
+    },
+  ],
+};
+
+const result = await client.context.ingest({
+  type: "knowledge",
+  database: "acme_corp",
+  collection: "default",
+  appKnowledge: JSON.stringify([ticket]),
+  upsert: "true",
+});
+```
+```bash cURL
 # Save the JSON tab as custom-relations.json, then send its contents in app_knowledge.
 curl -X POST 'https://api.hydradb.com/context/ingest' \
   -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
@@ -568,15 +727,15 @@ curl -X POST 'https://api.hydradb.com/context/ingest' \
 ```
 </CodeGroup>
 
-Replace the IDs with your own. Both items must be in the same database and collection. You can also identify the target by `external_id` and `provider`, as shown in "Explicit relations: Slack → Jira" above.
+Replace the IDs with your own. Both items must be in the same database and collection. You can also identify the target by `external_id` and `provider`, as shown in "Explicit relations: Slack to Jira" above.
 
 When updating the item, send the complete item. Keep its other fields, metadata, attachments, comments, and relations. Include your custom relation on later syncs too.
 
-**Search:** Use `query_apps: true` and `mode: "thinking"` to include related items. A custom name describes the link; it does not create a search filter or guarantee that a question will follow that link. To request the message's text with a ticket result, put the message's HydraDB ID in `relations.ids` and your named relationships in `app_relations`. See "Linked query context: Gmail → Notion" below for the request, response, and current limitation.
+**Search:** Use `query_apps: true` and `mode: "thinking"` to include related items. A custom name describes the link; it does not create a search filter or guarantee that a question will follow that link. To request the message's text with a ticket result, put the message's HydraDB ID in `relations.ids` and your named relationships in `app_relations`. See "Linked query context: Gmail to Notion" below for the request, response, and current limitation.
 
 </Accordion>
 <a id="return-linked-content-with-query-results"></a>
-<Accordion title="Linked query context: Gmail → Notion">
+<Accordion title="Linked query context: Gmail to Notion">
 
 **Use `relations.ids` to request linked content with a search result.** For example, when a Gmail email matches a question, include the linked Notion runbook's text too.
 
@@ -600,19 +759,19 @@ On [`POST /query`](/api-reference/v2/endpoint/query), use `mode: "thinking"` and
 
 The response contains matching text in `data.chunks` and linked text in `data.additional_context`. Read both when showing results or building an answer. `data.forceful_relations.declared` shows which items were linked, using `via.from` and `via.to`.
 
-This option follows one link from each item found in the main search results. `max_results: 4` limits the main results to four text chunks, or pieces of item text; it does not follow four links in a row. With `A → B → C`, a result from A can include B's text, but does not fetch C through B. Linked results also have size limits and follow the request's filters, database, collection, and access-control settings.
+This option follows one link from each item found in the main search results. `max_results: 4` limits the main results to four text chunks, or pieces of item text; it does not follow four links in a row. If A links to B and B links to C, a result from A can include B's text, but does not fetch C through B. Linked results also have size limits and follow the request's filters, database, collection, and access-control settings.
 
 </Accordion>
 <a id="link-app-sources-across-apps"></a>
-<Accordion title="Across apps: Gmail → Notion">
+<Accordion title="Across apps: Gmail to Notion">
 
-**Context from one app can link to context from another app.** Map and ingest each item, then connect them with a relation. For example, link a Gmail email approving an auth rollback to the Notion runbook that describes the procedure.
+**An app source from one app can link to an app source from another app.** Map and ingest each item, then connect them with a relation. For example, link a Gmail email approving an auth rollback to the Notion runbook that describes the procedure.
 
 Both items must belong to the same database and collection. The target's provider identifies its app; it does not need to match the item's provider.
 
 For a `source_id` target, ingest the target first and wait for its ingestion to reach `completed`. Then add a `linked_to` relation to the referring item with the target's HydraDB ID as `target.source_id`. For example, link `gmail_msg_19a2b3c` to `notion_page_abc` from the patterns above.
 
-Send this email through `app_knowledge` using the [ingestion request](#1-ingest-context-from-apps). If you already ingested it, add `upsert=true` to update it. Replace the example IDs and fields with the email's actual values.
+Send this email through `app_knowledge` using the [ingestion request](#1-ingest-an-app-source). If you already ingested it, add `upsert=true` to update it. Replace the example IDs and fields with the email's actual values.
 
 ```json Gmail context with a Notion target expandable
 {
@@ -673,7 +832,7 @@ When items identify people by email address, HydraDB can recognize the same pers
 
 </Accordion>
 <a id="link-a-crm-field-to-a-postgres-row"></a>
-<Accordion title="Foreign-key links: HubSpot → Postgres">
+<Accordion title="Foreign-key links: HubSpot to Postgres">
 
 **You can represent a foreign-key link between items from different apps.** Suppose a HubSpot contact has a custom field `psql_user_id: "123"` referring to row `123` in your Postgres `public.users` table. Ingest the contact and the row with the `custom` class. Your mapping code reads the field and adds a relation to the row's HydraDB ID.
 
@@ -687,7 +846,7 @@ You choose the HydraDB ID format above. Include the schema and table so rows wit
 
 **Your connector must add the link.** Read each non-empty `psql_user_id`, find the row's HydraDB ID or build it using the ID format above, and put it in `app_relations` and `relations.ids`, as shown below. Storing the user ID in `fields.data` alone does not create a link. Search uses the data you ingested; it does not read from Postgres or check a database foreign-key rule.
 
-Declare `user_id` as a `VARCHAR` field with `enable_match: true` in your [database metadata schema](/essentials/v2/metadata). The example below shows both items. Ingest the row by itself with the [ingestion request](#1-ingest-context-from-apps) and wait for `completed`. Then ingest the contact that links to it.
+Declare `user_id` as a `VARCHAR` field with `enable_match: true` in your [database metadata schema](/essentials/v2/metadata). The example below shows both items. Ingest the row by itself with the [ingestion request](#1-ingest-an-app-source) and wait for `completed`. Then ingest the contact that links to it.
 
 ```json Contact linked to a user row expandable
 [
@@ -743,7 +902,7 @@ Declare `user_id` as a `VARCHAR` field with `enable_match: true` in your [databa
 
 Keep both items in the same database and collection. Send the row first and wait for `completed`, then send the contact; putting them together in a list does not ensure this order. To link by external ID instead, use `{ "external_id": "public.users:123", "provider": "postgres" }` in `app_relations[].target`. `relations.ids` still uses the row's HydraDB ID.
 
-**To include the linked row**, search with `query_apps: true`, `mode: "thinking"`, and `query_forceful_relations: true`. Read `additional_context` for the row's text, along with the contact result in `chunks`. Fast mode ignores `query_forceful_relations`. The link limitation described in "Linked query context: Gmail → Notion" also applies here.
+**To include the linked row**, search with `query_apps: true`, `mode: "thinking"`, and `query_forceful_relations: true`. Read `additional_context` for the row's text, along with the contact result in `chunks`. Fast mode ignores `query_forceful_relations`. The link limitation described in "Linked query context: Gmail to Notion" also applies here.
 
 **To search only for user 123**, use `metadata_filters`. Put `metadata.user_id` on both items so both can pass the filter. Filters also apply to linked content. Search returns the best matches among the items that pass.
 
@@ -776,10 +935,10 @@ When the contact's `psql_user_id` changes, ingest the new row and wait for `comp
 
 Run your connector regularly or when new app events arrive. After the initial ingestion, send the new items discovered on each sync to [`POST /context/ingest`](/api-reference/v2/endpoint/ingest-context). Each new item gets its own stable HydraDB ID.
 
-For Slack, adding a reply means ingesting a **new message item in the existing thread**. Keep the shared `thread_id`, set `parent_id` to the opening message's external ID, and give the reply its own IDs and body.
+For Slack, adding a reply means ingesting a **new message item in the existing thread**. Keep the shared `thread_id`, set `parent_id` to the opening message's external ID, and give the reply its own IDs and body. These are the same two fields explained under "Threads and replies" in [Connect app sources](#4-connect-app-sources).
 
 <a id="add-a-slack-reply-to-an-existing-thread-json-curl-or-python"></a>
-<Accordion title="Add a Slack reply to an existing thread: Python or cURL">
+<Accordion title="Add a Slack reply to an existing thread: Python, TypeScript, or cURL">
 
 Alice's opening message is already ingested as `slack_C01_1716213600_000100`, with `external_id: "1716213600.000100"`. Bob now posts another reply. Ingest it using the request below.
 
@@ -814,7 +973,33 @@ result = client.context.ingest(
     app_knowledge=json.dumps([new_reply]),
 )
 ```
-```bash cURL add reply
+```typescript TypeScript SDK expandable
+const newReply = {
+  id: "slack_C01_1716213800_000300",
+  database: "acme_corp",
+  collection: "default",
+  title: "New reply to auth rollback discussion",
+  kind: "message",
+  provider: "slack",
+  external_id: "1716213800.000300",
+  fields: {
+    kind: "message",
+    body: "Monitoring confirms error rates are back to normal.",
+    author: "bob",
+    thread_id: "1716213600.000100",
+    parent_id: "1716213600.000100",
+    created_at: "2026-05-20T10:03:20Z",
+  },
+};
+
+const result = await client.context.ingest({
+  type: "knowledge",
+  database: "acme_corp",
+  collection: "default",
+  appKnowledge: JSON.stringify([newReply]),
+});
+```
+```bash cURL
 # Save the JSON tab as new-reply.json, then send its contents in app_knowledge.
 curl -X POST 'https://api.hydradb.com/context/ingest' \
   -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
@@ -845,15 +1030,15 @@ curl -X POST 'https://api.hydradb.com/context/ingest' \
 ```
 </CodeGroup>
 
-Check `data.results` for Bob's new HydraDB ID, then check its progress with [`GET /context/status`](/api-reference/v2/endpoint/source-status). After `completed`, check its thread connection. If it is `errored`, fix and retry as described in the ingestion section. The new reply becomes part of the existing discussion.
+Check `data.results` for Bob's new HydraDB ID, then check its progress with [`GET /context/status`](/api-reference/v2/endpoint/source-status). After `completed`, the new reply is part of the existing discussion and its thread connection is in place.
 
 </Accordion>
 
-Use the same approach for new emails, pages, tickets, and comments. For a new ticket comment, send a `comment` item with its own IDs and the ticket's external ID in `fields.parent_id`. Your connector keeps track of what it has already sent, using the app's last-seen event ID, page token, or update time. HydraDB does not fetch the next set of items for you.
+Use the same approach for new emails, pages, tickets, meetings, and comments. For a new ticket comment, send a `comment` item with its own IDs and the ticket's external ID in `fields.parent_id`. Your connector keeps track of what it has already sent, using the app's last-seen event ID, page token, or update time. HydraDB does not fetch the next set of items for you.
 
 <Accordion title="Edit or delete an existing item: Slack example">
 
-Wait for Carol's previous ingestion to reach `completed` or `errored` before sending another update. If it errored, read `error_code` and fix the problem first. Send the complete updated reply below with `upsert=true`. This replaces Carol's saved context, keeping the same IDs and thread connections.
+Wait for Carol's previous ingestion to reach `completed` or `errored` before sending another update. Send the complete updated reply below with `upsert=true`. This replaces Carol's saved context, keeping the same IDs and thread connections.
 
 <CodeGroup>
 ```python Python SDK expandable
@@ -886,7 +1071,35 @@ result = client.context.ingest(
     upsert="true",
 )
 ```
-```bash cURL update request
+```typescript TypeScript SDK expandable
+const updatedReply = {
+  id: "slack_C01_1716213700_000200",
+  database: "acme_corp",
+  collection: "default",
+  title: "Reply to auth rollback discussion",
+  kind: "message",
+  provider: "slack",
+  external_id: "1716213700.000200",
+  fields: {
+    kind: "message",
+    body: "Confirmed on staging and production: login works again.",
+    author: "carol",
+    thread_id: "1716213600.000100",
+    parent_id: "1716213600.000100",
+    created_at: "2026-05-20T10:01:40Z",
+    edited_at: "2026-05-20T10:10:00Z",
+  },
+};
+
+const result = await client.context.ingest({
+  type: "knowledge",
+  database: "acme_corp",
+  collection: "default",
+  appKnowledge: JSON.stringify([updatedReply]),
+  upsert: "true",
+});
+```
+```bash cURL
 # Save the JSON tab as reply-update.json, then send its contents in app_knowledge.
 curl -X POST 'https://api.hydradb.com/context/ingest' \
   -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
@@ -919,7 +1132,7 @@ curl -X POST 'https://api.hydradb.com/context/ingest' \
 ```
 </CodeGroup>
 
-Check this request's `data.results`, then follow the same HydraDB ID with [`GET /context/status`](/api-reference/v2/endpoint/source-status). Wait for `completed` before verifying the edit or its connections; handle `errored` as described above.
+Check this request's `data.results`, then follow the same HydraDB ID with [`GET /context/status`](/api-reference/v2/endpoint/source-status). Wait for `completed` before verifying the edit or its connections.
 
 For edits and deletions across apps:
 
@@ -929,7 +1142,7 @@ For edits and deletions across apps:
 | Existing comment edited | The complete updated comment item with the same IDs and `upsert=true` |
 | Item deleted | `DELETE /context` with the item's HydraDB ID, after ingestion reaches `completed` or `errored` |
 
-**Important: `upsert=true` replaces the saved context for that item.** Include all fields, metadata, attachments, comments, and relations you want to keep. Send updates for the same item one at a time: wait for `completed` or `errored` before sending the next update. If it errored, fix the reported problem first. Send each new ticket comment as a separate `comment` item if you want to update or delete it without resending the ticket.
+`upsert=true` replaces the saved context for that item, so include all fields, metadata, attachments, comments, and relations you want to keep. Send updates for the same item one at a time: wait for `completed` or `errored` before sending the next update. If it errored, read `error_code` and fix the item before retrying. Send each new ticket comment as a separate `comment` item if you want to update or delete it without resending the ticket.
 
 For deletion, check the response's `data.results[].deleted` value. An HTTP 200 alone can include a failed deletion when the item is still processing; wait for `completed` or `errored` and retry. Set `X-HydraDB-Delete-Status: strict` to receive an HTTP error for a failed deletion. See [Delete item](/api-reference/v2/endpoint/delete-source).
 
@@ -1024,7 +1237,7 @@ At query time, filter with `metadata_filters: { "channel": "engineering" }`. Fil
 
 <Accordion title="Private app data: set who can see each item">
 
-For a private Slack message or restricted page, put the allowed people or groups in the item's `acl` field. For example, add this to a item Alice may read:
+For a private Slack message or restricted page, put the allowed people or groups in the item's `acl` field. For example, add this to an item Alice may read:
 
 ```json Add permissions to the context
 {
@@ -1040,15 +1253,16 @@ When Alice searches, also include her identity in the `POST /query` request:
 }
 ```
 
-**Permissions are checked only when the query includes `acl`.** A query without it is not filtered by item permissions. A item without `acl` is unrestricted; an empty permission list, `"acl": []`, allows nobody when permissions are checked. Your connector supplies the item's allowed people and groups, and your application supplies the caller's identity on each query. See [Access Control](/essentials/v2/access-control) for groups, domains, and updating permissions.
+**Permissions are checked only when the query includes `acl`.** A query without it is not filtered by item permissions. An item without `acl` is unrestricted; an empty permission list, `"acl": []`, allows nobody when permissions are checked. Your connector supplies the item's allowed people and groups, and your application supplies the caller's identity on each query. See [Access Control](/essentials/v2/access-control) for groups, domains, and updating permissions.
 
 </Accordion>
 
 <a id="8-query-app-sources-with-connected-context"></a>
+<a id="8-query-context-from-apps"></a>
 
-## 8. Query context from apps
+## 8. Query app sources
 
-Search with [`POST /query`](/api-reference/v2/endpoint/query), using `type: "knowledge"` (or `"all"`) and `query_apps: true`. Set `mode: "thinking"` to include related items, such as a thread's replies or a ticket's comments. For links in `relations.ids`, also use `query_forceful_relations: true` and read `additional_context`. Open "Linked query context: Gmail → Notion" under [Connect context from apps](#4-connect-context-from-apps) for the fields and current limitation.
+Search with [`POST /query`](/api-reference/v2/endpoint/query), using `type: "knowledge"` (or `"all"`) and `query_apps: true`. Set `mode: "thinking"` to include related items, such as a thread's replies or a ticket's comments. For links in `relations.ids`, also use `query_forceful_relations: true` and read `additional_context`. Open "Linked query context: Gmail to Notion" under [Connect app sources](#4-connect-app-sources) for the fields and current limitation.
 
 <Accordion title="Query example: retrieve the rollback discussion and its replies">
 
@@ -1073,7 +1287,8 @@ The fields you supplied support different questions:
 | "Find Slack messages from Alice" | `kind`, `provider`, `fields.author` |
 | "Did the rollback work? Show the discussion" | Message bodies, `thread_id`, reply connections |
 | "What did Carol report on AUTH-123?" | Ticket `external_id`, comment author, `comment_on` |
-| "Which renewal depends on the login fix?" | The CRM record's explicit link to the Jira ticket |
+| "What did Morgan ask for on the renewal call?" | Meeting transcript in `fields.body`, `fields.participants` |
+| "Which renewal depends on the login fix?" | The CRM record's explicit link to the approval email |
 | "What do the attached rollback notes say?" | Extracted attachment text |
 
 ## Field reference
@@ -1089,8 +1304,8 @@ Open the fields for the class you are using. `kind` chooses the class; `provider
 | <Field name="database" type="string" required /> | Database that owns the item. | Must match the request's `database` when present. |
 | <Field name="collection" type="string" required /> | A group of items in the database. Use `"default"` if you do not need separate groups. | Must match the request's `collection` when present. |
 | <Field name="title" type="string" recommended /> | A readable subject, page name, ticket title, or message label. | Used to display and match the item in search results. |
-| <Field name="kind" type="email, message, ticket, knowledge_base, comment, custom" recommended /> | The item's class. | Tells HydraDB how to read and search this item. |
-| <Field name="provider" type="string" recommended /> | App name such as `slack`, `gmail`, `jira`, `notion`, `salesforce`, or `linear`. | Keeps IDs from different apps separate when linking items. |
+| <Field name="kind" type="email, message, ticket, knowledge_base, comment, meeting, custom" recommended /> | The item's class. | Tells HydraDB how to read and search this item. |
+| <Field name="provider" type="string" recommended /> | App name such as `slack`, `gmail`, `jira`, `notion`, `gong`, `salesforce`, or `linear`. | Keeps IDs from different apps separate when linking items. |
 | <Field name="external_id" type="string" recommended /> | This item's ID in the app, kept the same on each sync. | Used to find the item and link to its parent or replies. |
 | <Field name="url" type="string" /> | Link to the original item in the app. | Lets users open the original item. |
 | <Field name="timestamp" type="ISO-8601 datetime" /> | Creation, sent, or last-updated time. | Shows when the item was created or changed and helps search find recent content. |
@@ -1185,6 +1400,22 @@ Open the fields for the class you are using. `kind` chooses the class; `provider
 | <Field name="properties" type="object" /> | Extra comment details from the app. | Accepted with the item. |
 
 </Accordion>
+<Accordion title="meeting fields">
+
+| Field | Why send it | Search / ingestion effect |
+|---|---|---|
+| <Field name="kind" type="meeting" required /> | The class, repeated inside `fields`. | Should match top-level `kind`. |
+| <Field name="title" type="string" recommended /> | Meeting or call title. | Display and matching. |
+| <Field name="body" type="string" recommended /> | Transcript, notes, or summary text. | Main text to search. |
+| <Field name="host" type="string" recommended /> | Host or organizer's name. | Helps find meetings this person hosted. |
+| <Field name="host_email" type="string" /> | Host or organizer's email. | Lets HydraDB match the host to the same person in other apps. |
+| <Field name="participants" type="object[]" /> | People on the call, each as `{ "name", "email" }`. | Helps find meetings involving these people. |
+| <Field name="started_at" type="ISO-8601 datetime" /> | When the meeting started. | Helps find items by date. |
+| <Field name="updated_at" type="ISO-8601 datetime" /> | Last update time. | Shows when the item last changed. |
+| <Field name="labels" type="string[]" /> | Topics or tags from the app. | Helps find meetings about these topics. |
+| <Field name="url" type="string" /> | Link back to the recording or notes. | Link to the original item. |
+
+</Accordion>
 <Accordion title="custom fields">
 
 | Field | Why send it | Search / ingestion effect |
@@ -1225,7 +1456,7 @@ Open the fields for the class you are using. `kind` chooses the class; `provider
 
 ## Related
 
-- [Knowledge](/essentials/v2/knowledge): context from apps and file uploads
+- [Knowledge](/essentials/v2/knowledge): app sources and file uploads
 - [Query](/essentials/v2/query): retrieving context
 - [Scoping using metadata](/essentials/v2/metadata): database schemas and filters
 - [Access Control](/essentials/v2/access-control): restricting who may retrieve an item
