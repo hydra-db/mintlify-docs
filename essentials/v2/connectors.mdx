@@ -21,11 +21,11 @@ This guide builds up in order:
 
 ## 1. Set up a connector
 
-Setting up a connector takes four calls, made once. Every connector endpoint takes your HydraDB API key and `API-Version: 2`, the same as the rest of the API. The example connects one Slack workspace; every provider follows the same four calls, and only the credentials and the resource types change.
+Setting up a connector takes four calls, made once. The example connects one Slack workspace; every provider follows the same four calls, and only the credentials and the resource types change.
 
 ### Step 1: Pick a provider
 
-[`GET /connectors/providers`](/api-reference/v2/endpoint/list-connector-providers) returns the catalog. Use an entry's `provider` value in the next call. Called with `?id={provider}`, the same endpoint describes one provider: `credential_schema`, the JSON Schema for the credentials it needs, plus the record types it indexes and the fields you can search and filter on. Providers that need extra setup, such as a token with specific scopes, include a `setup_guide` and `token_scopes`.
+[`GET /connectors/providers`](/api-reference/v2/endpoint/list-connector-providers) returns the catalog; use an entry's `provider` value in the next call. With `?id={provider}`, it describes one provider, including `credential_schema`, the credentials it needs.
 
 <Accordion title="List providers and describe one: cURL">
 
@@ -96,13 +96,13 @@ curl -X POST 'https://api.hydradb.com/connectors' \
 ```
 </CodeGroup>
 
-The full response also repeats `database` and `collection` under their deprecated names `tenant_id` and `sub_tenant_id`. Read the new names. Keep `connector_id`: every later call uses it as `{id}`.
+Keep `connector_id`: every later call uses it as `{id}`.
 
 </Accordion>
 
 ### Step 3: Discover what the credentials can reach
 
-[`GET /connectors/{id}/discover`](/api-reference/v2/endpoint/discover-connector-resources) asks Slack which channels the token can see. For other providers it returns repositories, teams and projects, databases and pages, tables, folders, and so on. Each entry has an `id`, a `name`, and a `resource_type`; you pass all three to the next call. Providers that sync a whole account rather than individual resources return one entry with `id` `all` and `resource_type` `workspace`.
+[`GET /connectors/{id}/discover`](/api-reference/v2/endpoint/discover-connector-resources) asks Slack which channels the token can see; for GitHub it returns repositories, for Notion pages and databases. Each entry has an `id`, a `name`, and a `resource_type`, which you pass to the next call. Providers that sync a whole account return one entry with `id` `all`.
 
 <Accordion title="Discover Slack channels: cURL">
 
@@ -246,16 +246,11 @@ curl 'https://api.hydradb.com/connectors/{id}/status' \
 
 </Accordion>
 
-Read two fields:
-
-- **`status`** is the overall health, the worst of the credential state and every resource's state: `healthy`, `degraded` (at least one resource is failing, or the last sync failed and is being retried), `failed` (only you can fix it, and `error.action` says how, for example by reconnecting), `checking` (resources were just configured and are being tested), `paused`, or `capped` (a plan limit is pausing syncs).
-- **`lifecycle`** is what the connector is doing right now: `pending_setup` before any resources are configured, `ingesting` until the first sync has landed data, then `syncing` or `active`, and `paused` or `reconnect` when it needs you.
-
-Each entry in `resources` carries the result of that resource's last sync (`ok`, `empty`, `failed`, `checking`, or `unknown`) with a `message` and an `action` when it failed. `retryable: false` means waiting will not help.
+`status` is the overall health, such as `healthy`, `degraded`, or `failed`, and `lifecycle` is what the connector is doing: `ingesting` until the first sync lands data, then `active`. Each resource reports its own result, with an `action` when it failed. [Get Connector Status](/api-reference/v2/endpoint/get-connector-status) explains every value.
 
 From then on, HydraDB syncs every active resource every `sync_interval_seconds` (one hour by default). Each sync fetches only what changed since the resource's saved position, its cursor, and ingests it as app sources. Call [`POST /connectors/{id}/sync`](/api-reference/v2/endpoint/sync-connector) when you need data sooner; a `202` means the sync was started, not that it finished.
 
-Once `lifecycle` is `active`, query the data with [`POST /query`](/api-reference/v2/endpoint/query). `query_apps` defaults to `true`, so connector content is searched without any extra setting. [Section 4](#4-filter-on-what-hydradb-writes) shows how to scope a query to one connector or one channel.
+Once `lifecycle` is `active`, query the data with [`POST /query`](/api-reference/v2/endpoint/query) like any other knowledge. [Section 4](#4-filter-on-what-hydradb-writes) shows how to scope a query to one connector or one channel.
 
 <a id="changing-a-connector-after-setup"></a>
 
@@ -274,7 +269,7 @@ Use the endpoint that matches what you want to change. The update endpoints chan
   Do not use `POST /connectors/{id}/resources` to edit a resource that already exists. It replaces the whole resource: every field you leave out, including its display name and collection, is cleared, and the resource syncs again from the beginning.
 </Warning>
 
-Custom instructions are the usual reason to come back to a connector, for example after a product rename. Set a connector-wide default with Update Connector and override it per resource; changes apply from the next sync. [Custom Ingestion Instructions](/essentials/v2/connector-instructions) covers both levels with examples.
+Custom instructions are the usual reason to come back, for example after a product rename; [Custom Ingestion Instructions](/essentials/v2/connector-instructions) covers them.
 
 <a id="metadata-on-synced-objects"></a>
 <a id="inspect-what-a-connector-stores"></a>
@@ -307,17 +302,13 @@ Filter on `resource_id` the same way to scope to one channel, repository, or tab
 
 </Accordion>
 
-To see which provider-native fields a connector writes, call [`GET /connectors/providers?id={provider}`](/api-reference/v2/endpoint/list-connector-providers). It lists `indexed_object_types` (the record types that become searchable), `searchable_fields` (values written into each document's text), and `filterable_fields`, each with the `filter_key` to use in `metadata_filters`. Read it instead of relying on a fixed list: it covers the whole catalog and stays current as providers change.
-
-<Note>
-  You cannot search one searchable field on its own. All of a document's searchable fields are combined into its indexed text, and search runs over that text as a whole. To narrow results by a field, use one of the provider's `filterable_fields` in `metadata_filters`.
-</Note>
+To see which provider-native fields a connector writes, call [`GET /connectors/providers?id={provider}`](/api-reference/v2/endpoint/list-connector-providers). Its `filterable_fields` each carry the `filter_key` to use in `metadata_filters`. Its `searchable_fields` are combined into each document's searchable text, so you search them together, not one at a time.
 
 <a id="permissions-on-synced-content"></a>
 
 ## 5. Permissions on synced content
 
-For supported providers, HydraDB reads the source app's permissions on every sync and applies them as document access rules. That way a query made on behalf of one user cannot surface a private channel, a restricted Drive file, or a repository they cannot see. Slack, Google Drive, GitHub, Confluence, and Jira are among the supported providers; [Access Control](/essentials/v2/access-control) lists what is captured for each.
+For supported providers, HydraDB reads the source app's permissions on every sync and applies them as document access rules, so a query made on someone's behalf cannot surface a private channel, a restricted Drive file, or a repository they cannot see. Slack, Google Drive, GitHub, Confluence, and Jira are among the supported providers; [Access Control](/essentials/v2/access-control) lists what is captured for each.
 
 You can also set your own rule per resource, either at configure time with `acl` or afterwards, on its own:
 
@@ -333,7 +324,7 @@ curl -X PATCH 'https://api.hydradb.com/connectors/{id}/resources/C_LEADERSHIP' \
 
 </Accordion>
 
-The change applies to every already-synced document from that resource on the next query, with no re-sync. For providers whose permissions HydraDB reads, the provider's own permissions take over again at the next sync, and your rule applies whenever the provider reports the resource as public or its permissions cannot be read. [Access Control](/essentials/v2/access-control) has the full rules.
+The change applies to already-synced documents on the next query, with no re-sync. Where HydraDB reads the provider's permissions, those take over again at the next sync; [Access Control](/essentials/v2/access-control) explains which wins when they disagree.
 
 If HydraDB cannot read a resource's permissions from the provider, [Get Connector Status](/api-reference/v2/endpoint/get-connector-status) reports an `acl_warning` on it until the next successful read. Meanwhile your own rule on the resource still applies; a resource with no rule is readable by everyone.
 
@@ -359,6 +350,6 @@ To split one connector's resources across collections instead, set `collection` 
 - [Custom Ingestion Instructions](/essentials/v2/connector-instructions): steering how synced content is interpreted
 - [App Sources](/essentials/v2/app-sources): the ingestion model connector objects use, and how to bring your own connector
 - [Metadata](/essentials/v2/metadata): attributes and custom attributes in depth
-- [Multi-Tenant](/essentials/v2/multi-tenant): routing resources to databases and collections
+- [Multi-tenancy](/essentials/v2/multi-tenant): routing resources to databases and collections
 - [Query](/essentials/v2/query): querying connector-synced data
 - [Access Control](/essentials/v2/access-control): restricting who can retrieve synced content

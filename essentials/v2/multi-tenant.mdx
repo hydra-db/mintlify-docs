@@ -1,23 +1,57 @@
 ---
 title: "Multi-tenancy"
-description: "Keep each customer's and each user's data separate with databases and collections, and send the same scope on every write and read."
+description: "Choose how to scope your data with databases and collections: one collection for a company brain, and separate scopes only where data must never meet."
 ---
 
-HydraDB scopes every write and every read with two fields: `database`, a separate workspace for a customer or an environment, and `collection`, a partition inside a database for one user, workspace, or team. Your backend picks both from the authenticated session; the end user never chooses them.
+HydraDB scopes every write and every read with two fields: `database`, a separate workspace for a customer or an environment, and `collection`, an optional group inside a database. Most products need one database and a single collection; your backend picks both from the signed-in session, and the end user never chooses them.
 
 This guide builds up in order:
 
-1. [Put each user in their own collection](#1-put-each-user-in-their-own-collection): one write and one read that carry the same `collection`.
-2. [Choose a pattern for your app](#2-choose-a-pattern-for-your-app): B2C, B2B, and shared knowledge with personal memories.
+1. [Choose how to scope your data](#1-choose-how-to-scope-your-data): one collection for a company brain, and when to split.
+2. [Write and read with the same scope](#2-write-and-read-with-the-same-scope): one write and one read that name the same collection.
 3. [How writes and reads scope](#3-how-writes-and-reads-scope): the default collection, reading several collections, and deleting one.
 4. [Migrate from the legacy tenant and sub-tenant fields](#4-migrate-from-the-legacy-tenant-and-sub-tenant-fields): `tenant_id`, `sub_tenant_id`, and the deprecation signals.
 5. [Common mistakes](#common-mistakes) and [related pages](#related).
 
-## 1. Put each user in their own collection
+<a id="2-when-to-use-each"></a>
+<a id="3-recommended-patterns"></a>
 
-The example below saves a memory for the user `user_123` and then runs a personalized search for the same user. Both requests name the database `acme_corp` and the collection `user_123`. That is the whole mechanism: data written under a collection is read back only by requests that name that collection.
+## 1. Choose how to scope your data
 
-<Accordion title="Write and read one user's data: Python, TypeScript, or cURL">
+Pick the scope by what must never meet in one search:
+
+| Goal | Use |
+|---|---|
+| A company brain: one search across all your documents and connectors | One `database` and one collection for everything. Isolate results inside it with metadata filters and access control |
+| Separate customers on your platform | A different `database` per customer |
+| Separate environments (`prod` vs `staging`) | A different `database` per environment |
+| Keep each person's memories apart | One `database`, and a collection per person, such as `user_123` |
+
+### Company brain
+
+Building a company brain? Put everything in one collection: connect all your connectors and ingest all your files and app sources there, so one query can search across all of it. When some results must stay out of reach for some people, keep the single collection and isolate inside it. Put a team, region, or user id in [metadata](/essentials/v2/metadata) and filter on it, and let [access control](/essentials/v2/access-control), captured from the source app's permissions or set by you, decide who may retrieve each document. HydraDB enforces both inside one search.
+
+### B2C application
+
+Use one database for the application. Keep shared knowledge in one collection, and give each end user a collection for their memories, for example `collection = "user_123"`. Write each user's preferences and conversation history with that collection, and query with the same one.
+
+### B2B SaaS
+
+Use one database per customer organization, for example `database = "acme_corp"`. Inside it, keep the organization's knowledge in one collection and isolate teams with metadata filters and access control. Give each user a collection only for their memories.
+
+### Shared knowledge plus personal memories
+
+For answers grounded in shared knowledge and personalized with the user's memories, send `type: "all"` on [`POST /query`](/api-reference/v2/endpoint/query). It reads both from the same collections and returns one ranked list, so name the knowledge collection and the user's with `collections: ["company_docs", "user_123"]`. Every listed collection must already exist, and you can list up to 100. When your prompt needs the two formatted differently, call `POST /query` twice, once with `type: "knowledge"` and once with `type: "memory"`.
+
+Do not use `collection` to separate production from staging; environments belong in separate databases.
+
+<a id="1-put-each-user-in-their-own-collection"></a>
+
+## 2. Write and read with the same scope
+
+The example below saves a memory for `user_123` and then runs a search for the same user. Both requests name the database `acme_corp` and the collection `user_123`. That is the whole mechanism: data written under a collection is read back only by requests that name that collection.
+
+<Accordion title="Save a memory and query it with the same scope: Python, TypeScript, or cURL">
 
 Set up your [SDK client](/api-reference/v2/sdks#client-setup) before running the Python or TypeScript example.
 
@@ -44,12 +78,12 @@ client.context.ingest(
     ]),
 )
 
-# 2. Search knowledge and memories together, in the same collection.
+# 2. Search the memories in the same collection.
 result = client.query(
     database="acme_corp",
     collection="user_123",
-    query="refund policy",
-    type="all",
+    query="How does this user like answers written?",
+    type="memory",
 )
 ```
 
@@ -74,12 +108,12 @@ await client.context.ingest({
   ]),
 });
 
-// 2. Search knowledge and memories together, in the same collection.
+// 2. Search the memories in the same collection.
 const result = await client.query({
   database: "acme_corp",
   collection: "user_123",
-  query: "refund policy",
-  type: "all",
+  query: "How does this user like answers written?",
+  type: "memory",
 });
 ```
 
@@ -99,7 +133,7 @@ curl -X POST 'https://api.hydradb.com/context/ingest' \
     }
   ]'
 
-# 2. Search knowledge and memories together, in the same collection.
+# 2. Search the memories in the same collection.
 curl -X POST 'https://api.hydradb.com/query' \
   -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
   -H "API-Version: 2" \
@@ -107,8 +141,8 @@ curl -X POST 'https://api.hydradb.com/query' \
   -d '{
     "database": "acme_corp",
     "collection": "user_123",
-    "query": "refund policy",
-    "type": "all"
+    "query": "How does this user like answers written?",
+    "type": "memory"
   }'
 ```
 
@@ -121,55 +155,22 @@ curl -X POST 'https://api.hydradb.com/query' \
 | Property | What it is |
 |---|---|
 | `database` | The customer's or environment's workspace. Create it first with [`POST /databases`](/api-reference/v2/endpoint/create-tenant). |
-| `collection` | The partition for this user inside the database. Both requests name the same one, so the query reads what the write stored. Leave it out and HydraDB uses the database's default collection, which is created on the first write. |
-| `type` | On ingest, `memory` saves a [memory](/essentials/v2/memories). On query, `all` searches [knowledge](/essentials/v2/knowledge) and memories together and returns one ranked list; `knowledge` or `memory` searches one store. |
+| `collection` | The group inside the database. Both requests name the same one, so the query reads what the write stored. Leave it out and HydraDB uses the database's default collection, which is created on the first write. |
+| `type` | `memory` on both: the write saves a [memory](/essentials/v2/memories) and the query searches memories. `knowledge` and `all` work the same way with the same scope. |
 | `memories` | The memory items, as a JSON string. |
 | `query` | The user's question. HydraDB ranks results inside the collection you named. |
 
 Use stable internal IDs for both fields, such as `user_123`, `workspace_42`, or `org_acme`. Display names, emails, and user-typed labels change, and a changed scope name orphans the data written under the old one.
 
-<a id="2-when-to-use-each"></a>
-<a id="3-recommended-patterns"></a>
-
-## 2. Choose a pattern for your app
-
-Pick the scope by what you need to keep apart:
-
-| Goal | Use |
-|---|---|
-| Separate customers on your platform | A different `database` per customer |
-| Separate environments (`prod` vs `staging`) | A different `database` per environment |
-| Separate per-user state within one customer | One `database`, `collection = user_id` |
-| Separate per-workspace data within one customer | One `database`, `collection = workspace_id` |
-| Store broadly shared knowledge | Omit `collection` to use the database's default collection |
-
-Do not use `collection` to separate production from staging. Environments belong in separate databases.
-
-### B2C application
-
-Use one database for the application, and one collection per end user, for example `database = "acme_app"` and `collection = "user_123"`. Write each user's memories, preferences, and conversation history with that user's collection, and query with the same one. Keep shared knowledge outside the user collections.
-
-### B2B SaaS
-
-Use one database per customer organization, and collections for the workspaces, teams, projects, or users inside it, for example `database = "acme_corp"` and `collection = "workspace_42"`. Customer-wide knowledge goes in the customer's database. Workspace runbooks go in the workspace's collection. One user's memories go in that user's collection.
-
-### Shared knowledge plus personal memories
-
-For answers grounded in shared knowledge and personalized with the user's memories, send `type: "all"` on [`POST /query`](/api-reference/v2/endpoint/query). HydraDB searches the knowledge store (`vectorstore_status.knowledge`) and the memories store (`vectorstore_status.memories`) in parallel and returns one merged, re-ranked list. Section 1 does this.
-
-`type: "all"` reads both stores from the same scope. If the shared knowledge lives in its own collection, such as `company_docs`, name both collections with `collections: ["company_docs", "user_123"]` instead of `collection`. HydraDB runs the query in each collection and merges the results. Every listed collection must already exist, and you can list up to 100.
-
-When your prompt needs shared context and personal context formatted differently, call `POST /query` twice, once with `type: "knowledge"` and once with `type: "memory"`, and combine them in your application.
-
 ## 3. How writes and reads scope
 
 Every write and read names a `database`, and may name a `collection`.
 
-**Writes:** Send `collection` when the data belongs to one user, workspace, or team. Omit it only when you want the data in the database's default collection. A memory about John goes in John's collection. A workspace's runbooks go in that workspace's collection. Shared knowledge goes in whichever scope you will query it from.
+**Writes:** Send the `collection` you will query the data from. Omit it to use the database's default collection. A memory about John goes in John's collection; shared knowledge goes in the shared one.
 
 **Reads:** A query that names one `collection` reads only that collection. It does not read the default collection or any other collection. To read several at once, send `collections` as a list, or as an object that maps each collection to a relative ranking weight, as in `{"company_docs": 1.5, "user_123": 0.8}`. Prefer one call with `collections` over several calls unless you need to format each scope's results differently.
 
-**Filters inside a scope:** `collection` partitions the data. [Metadata filters](/essentials/v2/metadata) narrow results inside the partition, for example to one department or one status. Filters are not a replacement for choosing the right database and collection.
+**Isolation inside a collection:** [metadata filters](/essentials/v2/metadata) narrow results to one team, department, or status, and [access control](/essentials/v2/access-control) limits each document to the people allowed to see it. Together they let one collection serve many teams.
 
 **Deleting a collection:** [`DELETE /databases/collections`](/api-reference/v2/endpoint/delete-collection) permanently removes one collection and everything in it. The parent database and its other collections stay. Confirm the name with [List Collections](/api-reference/v2/endpoint/list-sub-tenants) first. On the dashboard, open a database to see its collections and delete from the list.
 
@@ -247,7 +248,7 @@ Knowledge written with one user's `collection` is invisible to every other user.
 
 ## Related
 
-- [Memories](/essentials/v2/memories): user-scoped context
+- [Memories](/essentials/v2/memories): preferences, decisions, and past conversations
 - [Knowledge](/essentials/v2/knowledge): shared document context
 - [Query](/essentials/v2/query): how scoping is applied at query time
 - [Access Control](/essentials/v2/access-control): restricting who can retrieve a document inside a collection
