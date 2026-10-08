@@ -1,76 +1,60 @@
 ---
 title: "Context Graphs"
-description: "How HydraDB models relationships between chunks using triplets to improve query quality."
+description: "Get the relationships between people, teams, and topics back with your search results, so your agent can answer questions that span several documents."
 ---
 
-## 1. What it is
+A context graph records how the things in your content relate: which team owns which service, which policy governs which process, which decision replaced which. [`POST /query`](/api-reference/v2/endpoint/query) returns the relevant part of it next to the matching passages, so your model can answer "What team owns the service that failed?" when no single passage says so.
 
-A context graph records how the things in your content relate: which team owns which service, which policy governs which process, which decision replaced which.
+HydraDB builds the graph while it indexes your content. The named things are **entities**. One relationship between two of them is a **triplet** of `source`, `relation`, and `target`, such as `Payments team`, `owns`, `billing service`. Following relationships from one entity to the next is **traversal**; each step is a **hop**, and a question that needs two or more is **multi-hop**.
 
-The named things are **entities**. A relationship connects two of them, for example `Payments team → owns → billing service`. That three-part statement is a **triplet**: `source`, `relation`, and `target`.
+This guide builds up in order:
 
-Following these connections is **graph traversal**. A **hop** is one connection; following two or more is called **multi-hop** retrieval. Search results can include these relationships alongside the matching passages (chunks).
+1. [Get relationships with your results](#1-get-relationships-with-your-results): `graph_context`, shown with a billing question.
+2. [Turn the graph off](#2-turn-the-graph-off): when you only need chunks.
+3. [Where the relationships come from](#3-where-the-relationships-come-from): extraction, declared links, and your own graph.
+4. [Walk the items around one result](#4-walk-the-items-around-one-result): the Connected Subgraph endpoint.
+5. [Put graph context in your prompt](#5-put-graph-context-in-your-prompt).
 
----
+## 1. Get relationships with your results
 
-## 2. What it does
+`graph_context` is on by default, so the request below is an ordinary knowledge query. It sets `mode: "thinking"` because thinking mode does the most graph work; in `"fast"` mode the graph slice is shallower.
 
-When `graph_context: true` is set on a query call (the default), HydraDB returns relationship data alongside the retrieved chunks, showing how those chunks connect to each other and to your query. Set `graph_context: false` to drop the graph slice when you only need ranked chunks. This takes effect only in `fast` mode: `thinking` mode (including `auto` routed to thinking) always returns the graph.
-
-This helps your LLM answer questions that connect information across chunks or sources. Similarity search finds the relevant content; the graph shows how it fits together.
-
----
-
-## 3. When to use it
-
-Use context graphs when:
-
-- Answers require synthesising information across multiple chunks.
-- Relational context matters for correctness: cause and effect, ownership, sequence, dependency.
-- You need multi-hop reasoning ("What team owns the service that failed?", "What depends on this API?").
-
-Skip them for direct factual lookups. Graph traversal adds response size and can add latency, so reserve it for queries where relational structure materially improves the answer.
-
----
-
-## 4. How it works
-
-Context graphs are hybrid: relationships are extracted at ingestion time and traversed at query time.
-
-**At ingestion**, HydraDB extracts relationships from your data and stores them in the graph. Sources can also declare explicit relationships to other sources via a `relations` payload at ingestion. Or skip extraction for a document and supply the entities and relations yourself with [Bring Your Own Graph](/essentials/v2/bring-your-own-graph).
-
-**At query**, when `graph_context: true` is set (the default):
-
-1. HydraDB runs hybrid retrieval to find relevant chunks.
-2. It follows graph connections to find relationships relevant to the retrieved passages.
-3. It returns multi-hop paths from the query (`query_paths`), relationship paths between retrieved chunks (`chunk_relations`), and a chunk-to-path-group mapping (`chunk_id_to_group_ids`).
-
-When no relevant relationships are found, the graph fields are empty. That is not an error; there is simply no structure to show for that query.
-
----
-
-## 5. Key concepts
-
-**Triplets:** The unit of the graph. Each triplet is a `source`, a `relation`, and a `target`, where `source` and `target` are entity objects and `relation` describes the connection between them.
-
-Example: `billing_policy` (source) `governs` (relation) `failed_payment_handling` (target)
-
-**`query_paths`:** Multi-hop chains of triplets connecting the query to retrieved chunks. Each path carries a relevancy score and the chunk IDs whose traversal produced it.
-
-**`chunk_relations`:** Paths describing how returned chunks relate to one another. Same shape as `query_paths`; the difference is the anchor: query-driven vs chunk-to-chunk.
-
-**`chunk_id_to_group_ids`:** Maps each chunk ID to the path-group identifiers (e.g. `p_0`, `p_1`) it belongs to. Use it to group retrieved chunks by which graph path produced them.
-
-**Connected subgraph:** The graph also holds relations between *items* rather than between entities: a Slack reply and the message it answers, a page and the pages it links to, a comment and its ticket. Given one item's id, [Connected Subgraph](/api-reference/v2/endpoint/subgraph) follows those links, visiting nearby items first, and returns connected items up to the requested depth and result limit (the rest of the thread, the hierarchy above and below, the items it references) with the relations among them. Reach for it when one query result is not enough and you need what surrounds it; it is also what the dashboard's **Subgraph** button opens.
-
-For full field schemas, see the [Query API Reference](/api-reference/v2/endpoint/query-overview).
-
----
-
-## 6. Minimal working example
+<Accordion title="Query with graph context: Python, TypeScript, or cURL">
 
 <CodeGroup>
+```python Python SDK
+result = client.query(
+    database="acme_corp",
+    query="How does the billing system handle failed payments?",
+    type="knowledge",
+    query_by="hybrid",
+    mode="thinking",
+    graph_context=True,
+)
 
+if result.data.graph_context:
+    for path in result.data.graph_context.query_paths:
+        for t in path.triplets:
+            print(t.source.name, t.relation.canonical_predicate, t.target.name)
+```
+```typescript TypeScript SDK
+const result = await client.query({
+  database: "acme_corp",
+  query: "How does the billing system handle failed payments?",
+  type: "knowledge",
+  queryBy: "hybrid",
+  mode: "thinking",
+  graphContext: true,
+});
+
+if (result.data?.graphContext) {
+  for (const path of result.data.graphContext.queryPaths) {
+    for (const t of path.triplets) {
+      console.log(t.source.name, t.relation.canonicalPredicate, t.target.name);
+    }
+  }
+}
+```
 ```bash cURL
 curl -X POST 'https://api.hydradb.com/query' \
   -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
@@ -85,53 +69,9 @@ curl -X POST 'https://api.hydradb.com/query' \
     "graph_context": true
   }'
 ```
-
-```typescript TypeScript SDK
-const result = await client.query({
-  database: "acme_corp",
-  query: "How does the billing system handle failed payments?",
-  type: "knowledge",
-  queryBy: "hybrid",
-  mode: "thinking",
-  graphContext: true,
-});
-
-if (result.data?.graphContext) {
-  for (const path of result.data.graphContext.queryPaths) {
-    for (const t of path.triplets) {
-      console.log(
-        `${t.source.name} - ${t.relation.canonicalPredicate} → ${t.target.name}`,
-      );
-    }
-  }
-}
-```
-
-```python Python SDK
-result = client.query(
-    database="acme_corp",
-    query="How does the billing system handle failed payments?",
-    type="knowledge",
-    query_by="hybrid",
-    mode="thinking",
-    graph_context=True,
-)
-
-if result.data.graph_context:
-    for path in result.data.graph_context.query_paths:
-        for t in path.triplets:
-            print(
-                t.source.name,
-                " - ",
-                t.relation.canonical_predicate,
-                "→",
-                t.target.name,
-            )
-```
-
 </CodeGroup>
 
-The `data` payload of a response with graph context looks like:
+The `data` payload of a response with graph context looks like this (chunks trimmed):
 
 ```text
 {
@@ -157,35 +97,49 @@ The `data` payload of a response with graph context looks like:
 }
 ```
 
----
+The full schema is on the [Query API reference](/api-reference/v2/endpoint/query).
 
-## 7. Using graph context in your prompt
+</Accordion>
 
-To include graph relationships in your LLM prompt, use the `buildContextString` / `build_context_string` helper from [How to Use API Results](/essentials/v2/api-results). It handles `query_paths`, `chunk_relations`, and `chunk_id_to_group_ids` automatically.
+### What each field in `graph_context` means
 
-The helper formats triplets as:
+| Field | What it is |
+|---|---|
+| `query_paths` | Chains of triplets that connect your query to the retrieved chunks. Each path carries a `relevancy_score`, a `group_id`, and the `source_chunk_ids` whose traversal produced it. |
+| `chunk_relations` | Paths that describe how the returned chunks relate to one another. Same shape as `query_paths`; the anchor is a chunk rather than the query. |
+| `chunk_id_to_group_ids` | Maps each chunk id to the path groups (`p_0`, `p_1`) it belongs to, so you can attach the right relationships to each passage. |
+| `source`, `relation`, `target` | The three parts of a triplet. Each is an object, not a string: an entity has a `name` and `type`, and the relation has a `canonical_predicate` plus the `context` sentence it was extracted from. |
 
-```
-[billing_policy] -> governs -> [failed_payment_handling]: policy covering retry logic
-  ↳ [failed_payment_handling] -> triggers -> [notification_service]: sends customer alert
-```
+Empty arrays mean no relationships were found for that query. That is not an error; there is simply no structure to show.
 
----
+## 2. Turn the graph off
 
-## 8. Common mistakes
+Set `graph_context: false` when your code only reads `chunks`; the response gets smaller and the traversal is skipped. This takes effect only in `"fast"` mode (explicit, or `"auto"` routed to fast). `"thinking"` always includes the graph.
 
-**Forgetting to disable when you don't need it:** Graph context adds response size and a small traversal cost. If your code path only consumes `chunks`, set `graph_context: false` to drop it (this takes effect only in `fast` mode).
+Direct factual lookups rarely need the graph. Questions about ownership, cause and effect, sequence, or dependencies usually do, and so does anything that needs to combine information across several chunks.
 
-**Treating triplets as flat strings:** `source`, `relation`, and `target` are objects with their own fields. Read them as structured data.
+## 3. Where the relationships come from
 
----
+- **Extracted at ingestion:** HydraDB reads each source, finds the entities and the relationships between them, and stores the triplets. A source is searchable at the `graph_creation` status; `completed` means its graph work is done too, which is what full traversal needs. See [Knowledge](/essentials/v2/knowledge#3-wait-for-indexing).
+- **Declared by you:** links between whole sources that belong together but whose text does not say so, set with `relations.ids` at ingest. A query in thinking mode returns the linked text in `additional_context`. [Knowledge](/essentials/v2/knowledge#6-link-documents-that-belong-together) shows how. App sources also connect through fields such as `thread_id` and `parent_id`; see [App Sources](/essentials/v2/app-sources#4-relate-messages-tickets-and-records).
+- **Supplied by you:** [Bring Your Own Graph](/essentials/v2/bring-your-own-graph) replaces extraction for a source with the entities and relations you send. They appear in `graph_context` exactly like extracted ones.
+
+## 4. Walk the items around one result
+
+The graph also holds relations between *items* rather than between entities: a Slack reply and the message it answers, a page and the pages it links to, a comment and its ticket. Given one item's id, [Connected Subgraph](/api-reference/v2/endpoint/subgraph) follows those links, visiting nearby items first, and returns the connected items up to the requested depth and result limit (the rest of the thread, the hierarchy above and below, the items it references) with the relations among them. Reach for it when one query result is not enough and you need what surrounds it; it is also what the dashboard's **Subgraph** button opens.
+
+## 5. Put graph context in your prompt
+
+Pass the whole query result to `build_string` (Python) or `buildString` (TypeScript). After the chunks, the helper renders each path as one line per triplet: the source entity, the predicate, the target entity, and the relation's context sentence. It reads `query_paths`, `chunk_relations`, and `chunk_id_to_group_ids` for you. [How to Use API Results](/essentials/v2/api-results) shows the full flow.
+
+If you format the graph yourself, read `source`, `relation`, and `target` as objects with their own fields, not as flat strings.
 
 ## Related
 
 - [Query](/essentials/v2/query): how chunks and graph context are retrieved together
-- [Bring Your Own Graph: per source](/essentials/v2/bring-your-own-graph): supply your own entities and relations instead of auto-extraction
-- [Memories](/essentials/v2/memories): user-scoped context for personalization
-- [Knowledge](/essentials/v2/knowledge): document-level context for shared retrieval
-- [How to Use API Results](/essentials/v2/api-results): formatting graph context for LLM prompts
-- [Query API Reference](/api-reference/v2/endpoint/query-overview): full graph response schema
-- [Connected Subgraph](/api-reference/v2/endpoint/subgraph): everything connected to one item, walked breadth-first
+- [Bring Your Own Graph](/essentials/v2/bring-your-own-graph): supply your own entities and relations instead of auto-extraction
+- [Knowledge](/essentials/v2/knowledge): ingesting the documents the graph is built from, and linking the ones that belong together
+- [App Sources](/essentials/v2/app-sources): threads, replies, and relations between app items
+- [How to Use API Results](/essentials/v2/api-results): formatting graph context for model prompts
+- [Query API Reference](/api-reference/v2/endpoint/query): full graph response schema
+- [Connected Subgraph](/api-reference/v2/endpoint/subgraph): everything connected to one item

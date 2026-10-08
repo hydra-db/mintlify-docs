@@ -1,98 +1,209 @@
 ---
 title: "Access Control"
-description: "Restrict who can retrieve a document. Declare permissions yourself, or let connectors capture them from the source app."
+description: "Restrict which people can retrieve a document, by declaring permissions yourself or letting connectors copy them from the source app."
 ---
 
-By default every document in a collection is retrievable by every query against it. Access control changes that: a document can carry an **access-control list (ACL)**: the identities allowed to retrieve it, and a query can carry the identity it is running on behalf of. HydraDB returns only the documents that identity is allowed to see.
+By default every document in a collection comes back for every query against it. Access control changes that: a document carries an `acl`, the list of people allowed to retrieve it, and a query carries an `acl` naming who is asking. HydraDB returns only the documents that person is allowed to see. This is how an internal search product keeps one employee's query from surfacing a private Slack channel or a restricted Drive file that belongs to someone else.
 
-This is what you need to build an internal search product where a query by one employee must not surface a private Slack channel or a restricted Drive file belonging to another.
+ACLs apply to knowledge sources. You set one at ingest on an [app source](/essentials/v2/app-sources) item, or later on any existing source with the edit in [section 4](#4-change-or-revoke-access); [connectors](/essentials/v2/connectors) set them on everything they sync. [Memories](/essentials/v2/memories) are scoped per user with `collection` instead.
 
-<Note>
-Access control is **opt-in per request**. A query without an `acl` field is not filtered. Adding ACLs to your documents changes nothing until your queries start declaring who is asking.
-</Note>
+This guide builds up in order:
 
----
+1. [Set an ACL on an item and query as someone](#1-set-an-acl-on-an-item-and-query-as-someone): one ingest and one query, shown with a Slack message.
+2. [Principals](#2-principals): the five identity forms, and what a query's `acl` list can contain.
+3. [Let connectors capture permissions](#3-let-connectors-capture-permissions): which providers copy their own permissions, and how your own rule per resource fits in.
+4. [Change or revoke access](#4-change-or-revoke-access): editing an ACL without re-ingesting, and when each change takes effect.
+5. [Common mistakes](#common-mistakes) and [related pages](#related).
 
-## 1. The two halves
+## 1. Set an ACL on an item and query as someone
 
-Access control only works when both halves are in place. Either half alone is a no-op.
+The example below ingests one Slack message that only Grace and the members of channel `C0123` may retrieve, then runs a query on Grace's behalf. Every app source takes the same `acl` list; only the item changes.
 
-| Half | What it means | Where |
-|---|---|---|
-| **Stamping** | The document carries an allow-list. | Ingest, a metadata edit, a connector resource rule, or automatic capture from the source app. |
-| **Enforcement** | The query declares who is asking. | The `acl` field on `POST /query` and `POST /context/list`. |
+<Accordion title="Ingest a restricted message and query as Grace: Python, TypeScript, or cURL">
 
----
+Set up your [SDK client](/api-reference/v2/sdks#client-setup) before running the Python or TypeScript example.
 
-## 2. Principals
+<CodeGroup>
 
-A **principal** is an identity represented by a string: a user, a group, or everyone in a domain. These are the five supported forms:
+```python Python SDK
+import json
+import os
+from hydra_db import HydraDB
 
-| Principal | Meaning |
-|---|---|
-| `user_email:grace@acme.com` | One person, by email. A bare `grace@acme.com` is accepted and normalized to this form. |
-| `domain:acme.com` | Everyone whose email is under that domain. Matches automatically for any caller who queries with an email at that domain; you do not have to declare it on the query side. |
-| `group:<provider>:<id>` | A group in the source app, for example `group:slack:C0123` or `group:google:eng@acme.com`. |
-| `__public__` | Every identified caller in the collection. |
-| `__private__` | Nobody. The stored form of an explicitly empty allow-list. |
+client = HydraDB(token=os.environ["HYDRA_DB_API_KEY"])
 
-Principals are lowercased, trimmed, and deduplicated on the way in. `__public__` overrides everything else in the same list: a document that is public is public. A list containing `__private__` alongside real principals keeps the real principals and drops the sentinel; `__private__` only means something on its own.
-
-<Warning>
-**An absent ACL and an empty ACL are not the same thing.** A document with no `acl` is *unrestricted*. That is how every document ingested before you adopted access control behaves, and it is why adopting it never silently hides your existing content. A document you explicitly restrict to nobody is stored as `__private__`. Sending `"acl": []` means "nobody", not "everybody".
-</Warning>
-
-Limits: 1000 principals per document, 256 characters per principal. For larger groups, use a `group:` or `domain:` principal.
-
----
-
-## 3. Set an ACL
-
-### At ingest, on an app source
-
-Each item in `app_knowledge` accepts an `acl` list:
-
-```json
-{
-  "id": "slack-C0123-1712345678",
-  "kind": "message",
-  "provider": "slack",
-  "external_id": "1712345678.000100",
-  "fields": { "kind": "message", "body": "Q3 comp bands are attached." },
-  "acl": ["user_email:grace@acme.com", "group:slack:C0123"]
+message = {
+    "id": "slack-C0123-1712345678",
+    "database": "acme_corp",
+    "collection": "engineering",
+    "title": "Q3 comp bands",
+    "kind": "message",
+    "provider": "slack",
+    "external_id": "1712345678.000100",
+    "fields": {"kind": "message", "body": "Q3 comp bands are attached."},
+    "acl": ["user_email:grace@acme.com", "group:slack:C0123"],
 }
+
+# 1. Ingest the message with its allow-list.
+client.context.ingest(
+    type="knowledge",
+    database="acme_corp",
+    collection="engineering",
+    app_knowledge=json.dumps([message]),
+)
+
+# 2. Query as Grace. Only documents she may see come back.
+result = client.query(
+    database="acme_corp",
+    collection="engineering",
+    query="what are the Q3 comp bands",
+    acl=["grace@acme.com"],
+)
 ```
 
-Omit `acl` and the document is unrestricted. A malformed principal rejects the whole request with `400` rather than ingesting the document unprotected.
+```typescript TypeScript SDK
+import { HydraDBClient } from "@hydradb/sdk";
 
-### On an existing source, without re-ingesting
+const client = new HydraDBClient({
+  token: process.env.HYDRA_DB_API_KEY,
+});
 
-`PATCH /context/{id}/metadata` accepts `acl` and **replaces** the stored list:
+const message = {
+  id: "slack-C0123-1712345678",
+  database: "acme_corp",
+  collection: "engineering",
+  title: "Q3 comp bands",
+  kind: "message",
+  provider: "slack",
+  external_id: "1712345678.000100",
+  fields: { kind: "message", body: "Q3 comp bands are attached." },
+  acl: ["user_email:grace@acme.com", "group:slack:C0123"],
+};
 
-```bash
-curl -X PATCH 'https://api.hydradb.com/context/slack-C0123-1712345678/metadata' \
+// 1. Ingest the message with its allow-list.
+await client.context.ingest({
+  type: "knowledge",
+  database: "acme_corp",
+  collection: "engineering",
+  appKnowledge: JSON.stringify([message]),
+});
+
+// 2. Query as Grace. Only documents she may see come back.
+const result = await client.query({
+  database: "acme_corp",
+  collection: "engineering",
+  query: "what are the Q3 comp bands",
+  acl: ["grace@acme.com"],
+});
+```
+
+```bash cURL
+# 1. Ingest the message with its allow-list.
+curl -X POST 'https://api.hydradb.com/context/ingest' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -F "type=knowledge" \
+  -F "database=acme_corp" \
+  -F "collection=engineering" \
+  -F 'app_knowledge=[
+    {
+      "id": "slack-C0123-1712345678",
+      "database": "acme_corp",
+      "collection": "engineering",
+      "title": "Q3 comp bands",
+      "kind": "message",
+      "provider": "slack",
+      "external_id": "1712345678.000100",
+      "fields": { "kind": "message", "body": "Q3 comp bands are attached." },
+      "acl": ["user_email:grace@acme.com", "group:slack:C0123"]
+    }
+  ]'
+
+# 2. Query as Grace. Only documents she may see come back.
+curl -X POST 'https://api.hydradb.com/query' \
   -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
   -H "API-Version: 2" \
   -H "Content-Type: application/json" \
   -d '{
+    "database": "acme_corp",
     "collection": "engineering",
-    "acl": ["user_email:grace@acme.com", "user_email:hopper@acme.com"]
+    "query": "what are the Q3 comp bands",
+    "acl": ["grace@acme.com"]
   }'
 ```
 
-Replace, not merge: to add a third person, send all three. The three wire states are distinct and all meaningful:
+</CodeGroup>
 
-| You send | Result |
+</Accordion>
+
+### What each property means
+
+| Property | What it is |
 |---|---|
-| No `acl` key | The stored ACL is left untouched. |
-| `"acl": [...]` | Replaced with exactly that list. |
-| `"acl": []` or `"acl": null` | Revoked. Nobody can retrieve it. |
+| `acl` on the item | Who may retrieve this document, as a list of [principals](#2-principals). Omit it and the document is unrestricted. A malformed entry rejects the whole request with `400` rather than ingesting the document unprotected. |
+| `acl` on the query | Who is asking. Usually the caller's email; HydraDB adds the matching `domain:` principal and `__public__` for you. Send `group:` principals explicitly when the caller belongs to a group. |
+| `id`, `kind`, `provider`, `external_id`, `fields` | The app source itself. [App Sources](/essentials/v2/app-sources) explains them. |
 
-An `acl`-only body is a valid edit; you do not have to send metadata alongside it.
+A document is returned when any of these holds: its stored ACL is absent (unrestricted), it is `__public__`, or its ACL contains one of the caller's principals. Access control composes with [metadata filters](/essentials/v2/metadata) and is independent of them: filters say what you are looking for, ACLs say what you are allowed to find, and a caller cannot widen their own visibility with a filter.
 
-### On a connector resource
+`POST /context/list` takes the same `acl` field with the same meaning. The `GET /context/chunks`, `GET /context/relations`, and `GET /context/subgraph` endpoints take it as a query parameter, repeated (`acl=a&acl=b`) or comma-separated.
 
-Every object synced from a resource inherits the resource's rule. Set it when you configure the connector:
+<Warning>
+Access control is opt-in per request. A query without an `acl` field is not filtered and returns everything in scope. Adding ACLs to your documents changes nothing until your queries declare who is asking.
+</Warning>
+
+## 2. Principals
+
+A principal is an identity written as a string: one person, a group, or everyone in a domain. These are the five forms:
+
+| Principal | Meaning |
+|---|---|
+| `user_email:grace@acme.com` | One person, by email. A bare `grace@acme.com` is accepted and stored in this form. |
+| `domain:acme.com` | Everyone whose email is under that domain. A query as `grace@acme.com` matches it automatically; you do not declare it on the query side. |
+| `group:<provider>:<id>` | A group in the source app, for example `group:slack:C0123` or `group:google:eng@acme.com`. Both parts are required. |
+| `__public__` | Every identified caller in the collection. |
+| `__private__` | Nobody. The stored form of an explicitly empty allow-list. |
+
+Principals are lowercased, trimmed, and deduplicated on the way in. `__public__` overrides everything else in the same list: a public document is public. `__private__` only means something on its own; alongside real principals it is dropped. A document holds at most 1000 principals of at most 256 characters each. For larger audiences use a `group:` or `domain:` principal.
+
+<Warning>
+An absent ACL and an empty ACL are not the same thing. A document with no `acl` is unrestricted. That is how every document ingested before you adopted access control behaves, and it is why adopting it never hides existing content. A document you explicitly restrict to nobody is stored as `__private__`. On an item, `"acl": []` means nobody, not everybody.
+</Warning>
+
+### What the query's `acl` list can contain
+
+| You send | Behavior |
+|---|---|
+| No `acl` field | No filtering. Everything in scope is retrievable. |
+| `"acl": []` | Same as omitting it. On a query, an empty list does not mean nobody. |
+| `"acl": ["*"]` | Same as omitting it. An explicit "search as an administrator". |
+| `"acl": ["grace@acme.com"]` | Filtered to what Grace may see: her own documents, anything shared with `domain:acme.com`, public documents, and unrestricted documents. |
+| `"acl": ["grace@acme.com", "group:slack:C0123"]` | Grace's view plus everything shared with that group. Group membership is never derived from an email; declare it. |
+| `"acl": ["__private__"]` | Public and unrestricted content only. |
+
+Several emails in one list see the union of their views. An entry that is neither an email nor a recognized principal is kept as-is and matches nothing but public and unrestricted content. A typo narrows results; it never widens them. If a caller sees less than you expect, check the principal spelling first.
+
+## 3. Let connectors capture permissions
+
+For supported providers, HydraDB reads the source app's own permissions on every sync and applies them as ACLs, so you do not maintain a parallel permission model:
+
+| Provider | What is captured |
+|---|---|
+| **Slack** | Public channels are visible workspace-wide; private channels only to their members, resolved to member emails. |
+| **Google Drive** | Per-file sharing: user, group, domain, and public grants. Permission-only changes (a share with no edit to the file) are picked up through the Drive changes feed, which content sync alone cannot see. |
+| **GitHub** | Repository visibility. Private repos additionally capture the collaborator list when every collaborator has a visible public email; otherwise your resource rule governs. |
+| **Confluence** | Space-level view permissions, with groups expanded to member emails, plus per-page view restrictions. |
+| **Jira** | Who holds Browse access per project, plus per-issue security levels. |
+
+Capture is also built for GitLab, Linear, Dropbox, Zendesk, PagerDuty, Typeform, Attio, LaunchDarkly, ServiceNow, Microsoft Teams, and Outlook, and is switched on per provider. [List Connector Providers](/api-reference/v2/endpoint/list-connector-providers) reports `rbac_support` for each provider, with a one-line `rbac_description` of what is captured. For any other provider, set a rule per resource, as described next.
+
+### Set your own rule on a resource
+
+Every object synced from a resource inherits the resource's rule. Set it when you [configure the connector](/api-reference/v2/endpoint/configure-connector), or change it later on its own with [Update Connector Resource](/api-reference/v2/endpoint/update-connector-resource). The change applies to every already-synced document from that resource on the next query, with no re-sync and no re-index. Use `["__public__"]` to open a resource back up.
+
+<Accordion title="Set a resource rule at configure time or afterwards: JSON, Python, TypeScript, or cURL">
+
+At configure time, each entry in `resources` can carry its own `acl`:
 
 ```json
 {
@@ -107,107 +218,109 @@ Every object synced from a resource inherits the resource's rule. Set it when yo
 }
 ```
 
-Or change it later, on its own, without touching anything else:
+Afterwards, change the rule on its own without touching anything else:
 
-```bash
-curl -X PATCH 'https://api.hydradb.com/connectors/{id}/resources/C_LEADERSHIP' \
+<CodeGroup>
+
+```python Python SDK
+client.connectors.update_resource_acl(
+    id="conn_123",
+    resource_id="C_LEADERSHIP",
+    request={"acl": ["user_email:grace@acme.com"]},
+)
+```
+
+```typescript TypeScript SDK
+await client.connectors.updateResourceAcl({
+  id: "conn_123",
+  resourceId: "C_LEADERSHIP",
+  body: { acl: ["user_email:grace@acme.com"] },
+});
+```
+
+```bash cURL
+curl -X PATCH 'https://api.hydradb.com/connectors/conn_123/resources/C_LEADERSHIP' \
   -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
   -H "API-Version: 2" \
   -H "Content-Type: application/json" \
   -d '{ "acl": ["user_email:grace@acme.com"] }'
 ```
 
-This takes effect on **every already-synced document from that resource, on the next query**. There is no re-sync and no re-index, however many documents the resource has. Use `["__public__"]` to open a resource back up.
+</CodeGroup>
 
----
+</Accordion>
 
-## 4. Let connectors capture permissions for you
+### When the provider's permissions and your rule disagree
 
-For supported providers, HydraDB reads the source app's own permissions on every sync and applies them as ACLs, so you do not maintain a parallel permission model.
+- **A per-document permission from the provider wins over everything:** a Drive file's own sharing decides that file.
+- **A provider verdict of "this resource is public" does not override a rule you set:** restricting a public channel is a deliberate act, and enabling capture never widens it back.
+- **Otherwise the provider's resource-level verdict wins over your rule:** the provider is the fresher source of truth.
 
-| Provider | What is captured |
-|---|---|
-| **Slack** | Public channels are visible workspace-wide; private channels only to their members, resolved to member emails. |
-| **Google Drive** | Per-file sharing: user, group, domain, and public grants. Permission-only changes (a share with no edit to the file) are picked up through the Drive changes feed, which content sync alone cannot see. |
-| **GitHub** | Repository visibility. Private repos additionally capture the collaborator list when every collaborator has a visible public email; otherwise your resource rule governs. |
-| **Confluence** | Space-level view permissions, with groups expanded to member emails, plus per-page view restrictions. |
-| **Jira** | Who holds Browse access per project, plus per-issue security levels. |
+If HydraDB cannot read a resource's permissions from the provider, a resource with no rule of yours is readable by everyone until the next successful read, while a rule you set still applies. [Get Connector Status](/api-reference/v2/endpoint/get-connector-status) reports an `acl_warning` on the resource meanwhile, and a `page_acl_warning` when restrictions on some individual pages, for example in Confluence, could not be read.
 
-Capture is also built for other providers, including GitLab, Linear, Dropbox, Zendesk and PagerDuty, and is switched on per provider. For any other provider, set a rule per resource with `acl`, as described [above](#on-a-connector-resource).
+## 4. Change or revoke access
 
-If HydraDB cannot read a resource's permissions from the provider, a resource with no rule of yours is readable by everyone until the next successful read, while a rule you set still applies. [Get Connector Status](/api-reference/v2/endpoint/get-connector-status) reports an `acl_warning` on the resource meanwhile.
+To change who may retrieve a document you already ingested, send `acl` to [`PATCH /context/{id}/metadata`](/api-reference/v2/endpoint/update-source-metadata). Unlike the metadata fields on that endpoint, `acl` replaces the stored list rather than merging into it: to add a third person, send all three. An `acl`-only body is a valid edit; you do not have to send metadata alongside it.
 
-Precedence, when both exist:
+<Accordion title="Replace a document's ACL without re-ingesting: Python, TypeScript, or cURL">
 
-- A **per-document** permission from the provider (a Drive file's own sharing) wins over everything.
-- A provider verdict of "this resource is public" will **not** override a rule you set. Restricting a public channel is a deliberate act, and enabling capture never widens it back.
-- Otherwise the provider's resource-level verdict wins over your rule, because the provider is the fresher source of truth.
+<CodeGroup>
 
-<Note>
-Capture can be turned off per provider without a deploy.
-</Note>
+```python Python SDK
+client.context.update_source_metadata(
+    "slack-C0123-1712345678",
+    database="acme_corp",
+    collection="engineering",
+    acl=["user_email:grace@acme.com", "user_email:hopper@acme.com"],
+)
+```
 
----
+```typescript TypeScript SDK
+await client.context.updateSourceMetadata({
+  id: "slack-C0123-1712345678",
+  database: "acme_corp",
+  collection: "engineering",
+  acl: ["user_email:grace@acme.com", "user_email:hopper@acme.com"],
+});
+```
 
-## 5. Query on behalf of someone
-
-Pass the caller's identity as `acl` on `POST /query` (and `POST /context/list`, which takes the same field with the same meaning):
-
-```bash
-curl -X POST 'https://api.hydradb.com/query' \
+```bash cURL
+curl -X PATCH 'https://api.hydradb.com/context/slack-C0123-1712345678/metadata' \
   -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
   -H "API-Version: 2" \
   -H "Content-Type: application/json" \
   -d '{
-    "query": "what are the Q3 comp bands",
     "database": "acme_corp",
     "collection": "engineering",
-    "acl": ["grace@acme.com"]
+    "acl": ["user_email:grace@acme.com", "user_email:hopper@acme.com"]
   }'
 ```
 
-A document is returned when **any** of these holds:
+</CodeGroup>
 
-- its stored ACL is absent (unrestricted),
-- it is `__public__`,
-- its ACL contains one of the caller's principals.
+</Accordion>
 
-Two conveniences mean you rarely send more than an email:
+The three wire states are distinct and all meaningful:
 
-- **`__public__` is added for you:** You never have to ask for public content.
-- **The domain principal is derived from the email:** Querying as `grace@acme.com` automatically matches anything shared with `domain:acme.com`.
-
-Send group principals explicitly when you want them: `"acl": ["grace@acme.com", "group:slack:C0123"]`.
-
-| You send | Behavior |
+| You send | Result |
 |---|---|
-| No `acl` field | No filtering. Everything in scope is retrievable. |
-| `"acl": []` | Same as omitting it. On a query, an empty list does not mean "nobody". |
-| `"acl": ["*"]` | Same as omitting it. Explicit "search as an administrator". |
-| `"acl": ["grace@acme.com"]` | Filtered to what Grace may see. |
-| `"acl": ["__private__"]` | Public and unrestricted content only. |
+| No `acl` key | The stored ACL is left untouched. |
+| `"acl": [...]` | Replaced with exactly that list. |
+| `"acl": []` or `"acl": null` | Revoked. Nobody can retrieve it. |
 
-<Warning>
-An entry that is neither an email nor a recognized principal is kept as-is and matches nothing but public content. A typo narrows results; it never widens them. If a caller sees less than you expect, check the principal spelling first.
-</Warning>
+The response carries `acl_updated: true`. If `vector_acl_synced` is missing from it, the new list is still enforced, but a newly added person may miss this document in results until it is re-indexed.
 
-Access control composes with, and is independent of, [metadata filters](/essentials/v2/metadata): filters express *what you are looking for*, ACLs express *what you are allowed to find*. A caller cannot widen their own visibility with a filter.
-
----
-
-## 6. Revoking access
+### When a change takes effect
 
 | Change | When it takes effect |
 |---|---|
 | `PATCH /context/{id}/metadata` with a new `acl` | Immediately, on the next query. |
 | `PATCH /connectors/{id}/resources/{resource_id}` with a new `acl` | Immediately, on the next query, for every document from that resource. |
-| A permission change in the source app (channel goes private, a Drive share is removed) | On the connector's next sync cycle. |
+| A permission change in the source app (a channel goes private, a Drive share is removed) | On the connector's next sync cycle. |
 
-Deleting a rule does **not** widen access on its own: visibility only ever widens from a value you positively set. To open a restricted resource back up, set its ACL to `["__public__"]` rather than clearing it.
+Deleting a rule does not widen access on its own: visibility only ever widens from a value you positively set. To open a restricted resource back up, set its ACL to `["__public__"]` rather than clearing it.
 
----
-
-## 7. Common mistakes
+## Common mistakes
 
 <AccordionGroup>
 <Accordion title="ACLs are set but every query still returns everything">
@@ -219,13 +332,12 @@ Check the principal forms on both sides. `group:slack:C0123` on the document onl
 </Accordion>
 </AccordionGroup>
 
----
-
 ## Related
 
 - [Connectors](/essentials/v2/connectors): syncing app data, and per-resource ACL rules
 - [App Sources](/essentials/v2/app-sources): the ingest shape that carries `acl`
 - [Query](/essentials/v2/query): the `acl` field alongside every other retrieval parameter
 - [Metadata](/essentials/v2/metadata): filtering by attributes, a different question from permission
-- [Multi-Tenant Support](/essentials/v2/multi-tenant): databases and collections, the isolation boundary ACLs work inside
+- [Multi-tenancy](/essentials/v2/multi-tenant): databases and collections, the isolation boundary ACLs work inside
 - [Update Source Metadata (API Reference)](/api-reference/v2/endpoint/update-source-metadata): the `acl` replacement contract
+- [Update Connector Resource (API Reference)](/api-reference/v2/endpoint/update-connector-resource): the per-resource rule

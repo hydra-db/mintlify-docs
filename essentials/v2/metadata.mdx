@@ -1,85 +1,283 @@
 ---
 title: "Metadata and Filters"
-description: "How HydraDB uses metadata to scope query results with schema-backed fields, free-form additional metadata, source metadata edits, and exact metadata filters."
+description: "Declare metadata fields on a database, attach values when you ingest, and filter queries to the sources that match."
 ---
 
-Metadata is structured data attached to [Knowledge](/essentials/v2/knowledge) and [Memories](/essentials/v2/memories). Use it to require a matching field before results are ranked, such as `department=legal`, `region=us`, `status=published`, or `author=alice`.
+Metadata is structured data attached to each [knowledge](/essentials/v2/knowledge) source and [memory](/essentials/v2/memories). You send it at ingest, and at query time `metadata_filters` on [`POST /query`](/api-reference/v2/endpoint/query) keeps only the sources whose values match, such as `department = legal` or `status = published`, before ranking runs.
 
-HydraDB has two metadata layers:
+This guide builds up in order:
+
+1. [Declare a field and filter on it](#1-declare-a-field-and-filter-on-it): create the schema, ingest with metadata, and query with a filter.
+2. [The two layers](#2-the-two-layers): `metadata` and `additional_metadata`, and how a filter runs.
+3. [Filter operators](#3-filter-operators): `equals`, `contains`, and `contains_any`, and how to store several values in one field.
+4. [Size limits](#4-size-limits): caps on stored metadata and on the filter you send.
+5. [Add schema fields later](#5-add-schema-fields-later), [update metadata without re-ingesting](#6-update-metadata-without-re-ingesting), and [list sources with filters](#7-list-sources-with-metadata-filters).
+6. [Schema field reference](#schema-field-reference), [common mistakes](#common-mistakes), and [related pages](#related).
+
+## 1. Declare a field and filter on it
+
+Three requests: create the database with a metadata schema, ingest a source that carries values for those fields, then query with `metadata_filters`. The example declares `department`, `priority`, and a `summary_label` field that is also searchable as text.
+
+<Accordion title="Create the database with a metadata schema: Python, TypeScript, or cURL">
+
+Set up your [SDK client](/api-reference/v2/sdks#client-setup) before running the Python or TypeScript example.
+
+<CodeGroup>
+```python Python SDK
+import os
+from hydra_db import HydraDB
+
+client = HydraDB(token=os.environ["HYDRA_DB_API_KEY"])
+
+client.databases.create(
+    database="acme_corp",
+    database_metadata_schema=[
+        {"name": "department", "data_type": "VARCHAR"},
+        {"name": "priority", "data_type": "INT64"},
+        {
+            "name": "summary_label",
+            "data_type": "VARCHAR",
+            "enable_dense_embedding": True,
+            "enable_sparse_embedding": True,
+        },
+    ],
+)
+```
+```typescript TypeScript SDK
+import { HydraDBClient } from "@hydradb/sdk";
+
+const client = new HydraDBClient({
+  token: process.env.HYDRA_DB_API_KEY,
+});
+
+await client.databases.create({
+  database: "acme_corp",
+  databaseMetadataSchema: [
+    { name: "department", dataType: "VARCHAR" },
+    { name: "priority", dataType: "INT64" },
+    {
+      name: "summary_label",
+      dataType: "VARCHAR",
+      enableDenseEmbedding: true,
+      enableSparseEmbedding: true,
+    },
+  ],
+});
+```
+```bash cURL
+curl -X POST 'https://api.hydradb.com/databases' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "database": "acme_corp",
+    "database_metadata_schema": [
+      { "name": "department", "data_type": "VARCHAR" },
+      { "name": "priority", "data_type": "INT64" },
+      {
+        "name": "summary_label",
+        "data_type": "VARCHAR",
+        "enable_dense_embedding": true,
+        "enable_sparse_embedding": true
+      }
+    ]
+  }'
+```
+</CodeGroup>
+
+</Accordion>
+
+<Accordion title="Ingest a source with metadata: Python, TypeScript, or cURL">
+
+Send `metadata` and `additional_metadata` on each `app_knowledge[]` item, or on each `document_metadata[]` item when you upload files. For `type=memory`, the `memories` field is already a JSON string, and each memory item's `metadata` and `additional_metadata` are plain objects inside it; do not stringify them a second time.
+
+<CodeGroup>
+```python Python SDK
+import json
+
+client.context.ingest(
+    type="knowledge",
+    database="acme_corp",
+    collection="default",
+    app_knowledge=json.dumps([
+        {
+            "database": "acme_corp",
+            "collection": "default",
+            "id": "auth-controls-001",
+            "kind": "knowledge_base",
+            "fields": {
+                "title": "Authentication controls",
+                "body": "Authentication controls are reviewed quarterly for SOC2.",
+            },
+            "metadata": {
+                "department": "security",
+                "priority": 7,
+                "summary_label": "quarterly access control review",
+            },
+            "additional_metadata": {"author": "alice", "doc_version": 3},
+        }
+    ]),
+)
+```
+```typescript TypeScript SDK
+await client.context.ingest({
+  type: "knowledge",
+  database: "acme_corp",
+  collection: "default",
+  appKnowledge: JSON.stringify([
+    {
+      database: "acme_corp",
+      collection: "default",
+      id: "auth-controls-001",
+      kind: "knowledge_base",
+      fields: {
+        title: "Authentication controls",
+        body: "Authentication controls are reviewed quarterly for SOC2.",
+      },
+      metadata: {
+        department: "security",
+        priority: 7,
+        summary_label: "quarterly access control review",
+      },
+      additional_metadata: { author: "alice", doc_version: 3 },
+    },
+  ]),
+});
+```
+```bash cURL
+curl -X POST 'https://api.hydradb.com/context/ingest' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -F "type=knowledge" \
+  -F "database=acme_corp" \
+  -F "collection=default" \
+  -F 'app_knowledge=[
+    {
+      "database": "acme_corp",
+      "collection": "default",
+      "id": "auth-controls-001",
+      "kind": "knowledge_base",
+      "fields": {
+        "title": "Authentication controls",
+        "body": "Authentication controls are reviewed quarterly for SOC2."
+      },
+      "metadata": {
+        "department": "security",
+        "priority": 7,
+        "summary_label": "quarterly access control review"
+      },
+      "additional_metadata": {
+        "author": "alice",
+        "doc_version": 3
+      }
+    }
+  ]'
+```
+</CodeGroup>
+
+</Accordion>
+
+<Accordion title="Query with metadata filters: Python, TypeScript, or cURL">
+
+Top-level keys filter on `metadata`. Keys nested under `additional_metadata` filter on the free-form layer. Both can appear in one request.
+
+<CodeGroup>
+```python Python SDK
+result = client.query(
+    database="acme_corp",
+    collection="default",
+    query="How do access control reviews work?",
+    type="knowledge",
+    metadata_filters={
+        "department": {"equals": "security"},
+        "priority": {"equals": 7},
+        "additional_metadata": {"author": "alice"},
+    },
+)
+```
+```typescript TypeScript SDK
+const result = await client.query({
+  database: "acme_corp",
+  collection: "default",
+  query: "How do access control reviews work?",
+  type: "knowledge",
+  metadataFilters: {
+    department: { equals: "security" },
+    priority: { equals: 7 },
+    additional_metadata: { author: "alice" },
+  },
+});
+```
+```bash cURL
+curl -X POST 'https://api.hydradb.com/query' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "database": "acme_corp",
+    "collection": "default",
+    "query": "How do access control reviews work?",
+    "type": "knowledge",
+    "metadata_filters": {
+      "department": { "equals": "security" },
+      "priority": { "equals": 7 },
+      "additional_metadata": { "author": "alice" }
+    }
+  }'
+```
+</CodeGroup>
+
+</Accordion>
+
+### What each property means
+
+| Property | What it is |
+|---|---|
+| `database_metadata_schema` | The fields a source's `metadata` may carry, each with a `name` and a `data_type`. The [schema field reference](#schema-field-reference) lists every option. |
+| `enable_dense_embedding`, `enable_sparse_embedding` | Make a `VARCHAR` field searchable as text: dense adds semantic search, sparse adds keyword (BM25) search. Put the concept in `query`, not in `metadata_filters`. |
+| `metadata` on the item | Values for the declared fields. Each value must match the declared type, and an undeclared key is rejected when the database has a schema. Up to 16 KiB per item. |
+| `additional_metadata` on the item | Free-form fields with no schema. Up to 1 KiB per item. |
+| `metadata_filters` | Hard constraints applied before ranking. Top-level keys take an operator object such as `{"equals": "security"}`; keys under `additional_metadata` take a bare value. Every key must match. [Filter operators](#3-filter-operators) covers the forms. |
+
+A valid filter that matches no source returns an empty result. HydraDB does not widen it into an unfiltered search.
+
+<a id="1-choose-the-right-metadata-layer"></a>
+
+## 2. The two layers
 
 | Layer | Sent at ingest as | Query filter shape | Best for |
 | --- | --- | --- | --- |
-| Database metadata | `metadata` | Top-level keys in `metadata_filters` | Fields you filter on often, such as department or region. Declare their names and types in `database_metadata_schema`. |
-| Additional metadata | `additional_metadata` | Nested under `metadata_filters.additional_metadata` | Free-form per-source fields for display, citations, debugging, external IDs, or occasional filters. |
+| Database metadata | `metadata` | Top-level keys in `metadata_filters` | Fields you filter on often, such as department, region, plan, customer, or status. Declare their names and types in `database_metadata_schema`. |
+| Additional metadata | `additional_metadata` | Nested under `metadata_filters.additional_metadata` | Free-form per-source fields for display, citations, debugging, external IDs, or occasional filters. No schema. |
 
-If you will filter on a field in most queries, it belongs in `metadata` and the [database schema](/api-reference/v2/endpoint/create-tenant). If it's ad-hoc or unique to one document, use `additional_metadata` instead.
+A field you filter on in most queries belongs in `metadata` and the schema. An author, a Slack timestamp, or a document version belongs in `additional_metadata`.
 
-```json
-{
-  "metadata_filters": {
-    "department": "legal",
-    "additional_metadata": {
-      "author": "alice"
-    }
-  }
-}
-```
+A filter runs in three steps. HydraDB first resolves the `metadata` and `additional_metadata` filters to the matching source IDs, then runs vector and keyword retrieval only over those sources, then rechecks every retrieved passage against the filter. The recheck also keeps graph expansion and retry paths from leaking excluded sources. Top-level `metadata` filters are resolved up front. An `additional_metadata` filter that cannot be resolved up front is checked after retrieval, with about 3x over-fetch to compensate, so move a field you filter on in most queries into `metadata`.
 
----
+A few fields worth declaring from the start:
 
-## 1. Choose the right metadata layer
+- **`status`:** tag every source `draft` or `published`, and send `{"status": {"equals": "published"}}` on user-facing queries to keep work in progress out of customer answers.
+- **`language`:** route each query to its language with a filter on the detected language.
+- **A `VARCHAR` field with `enable_dense_embedding`:** to search a short label or summary semantically, put the concept in `query`. A filter never expands to related values.
 
-| I want to… | Put it in… | Filter with… | Notes |
-| --- | --- | --- | --- |
-| Scope most queries by a field like department, region, plan, customer, or status | `metadata` | `metadata_filters: { "department": "legal" }` | Declare the field in `database_metadata_schema`. |
-| Store source-specific fields like author, Slack timestamp, external ID, document version | `additional_metadata` | `metadata_filters: { "additional_metadata": { "author": "alice" } }` | No schema required. Better for occasional filters and display metadata. |
-| Combine hard scoping with semantic search | Both | `metadata_filters` plus your natural-language `query` | Filters narrow candidates; ranking still uses the query. |
-| Search semantically over a metadata text field | `metadata` with `enable_dense_embedding: true` | Put the desired concept in `query` | Only supported for `VARCHAR` fields. Do not put fuzzy concepts in `metadata_filters`. |
-| Search by keyword over a metadata text field | `metadata` with `enable_sparse_embedding: true` | Use normal `/query` text/BM25 behavior | Only supported for `VARCHAR` fields. |
-| Partition by user, workspace, or team | `collection` | Send `collection` on every request | Use metadata filters inside that partition, not as a replacement for it. |
+Partitioning by user, workspace, or team is a different job: use [`collection`](/essentials/v2/multi-tenant#2-choose-a-pattern-for-your-app) for that, and filters to narrow inside the partition.
 
-When to send `database` and `collection`: [Multi-tenant](/essentials/v2/multi-tenant#2-when-to-use-each). The older names `tenant_id` and `sub_tenant_id` still work as deprecated aliases.
+<a id="2-how-metadata-filters-run"></a>
+<a id="filter-operators"></a>
 
----
+## 3. Filter operators
 
-## 2. How metadata filters run
-
-HydraDB applies `metadata_filters` in three steps:
-
-1. **Prefilter:** `metadata` and `additional_metadata` filters are resolved to matching source IDs in MongoDB.
-2. **Scoped retrieval:** vector and BM25 retrieval search only those source IDs.
-3. **Recheck:** the retrieved passages are checked again against the requested metadata. This also protects graph expansion and fallback/retry paths from leaking excluded sources.
-
-That means a valid filter with no matching sources returns an empty result set; HydraDB does not silently widen it into an unfiltered search.
-
-### Filter semantics
-
-| Behavior | Contract |
-| --- | --- |
-| Multiple keys | AND logic. Every provided key/value must match. |
-| Database + additional metadata | AND logic across both layers. |
-| Operators | Each `metadata` (top-level key) takes `{"equals": value}`, `{"contains": value}`, or `{"contains_any": [values]}`. Not available inside `additional_metadata`; use the bare forms there. `contains` and `contains_any` need a `VARCHAR` field; `equals` works on any type. See [Filter operators](#filter-operators). |
-| Values | `equals` is exact equality against the **whole** stored value. |
-| Lists | **ANY, not ALL.** A list matches a source holding **any one** of the listed values (OR/IN), so `tags: ["alpha", "beta"]` matches a source tagged `"alpha"` and a source tagged `"beta"`. Write it as `{"contains_any": [...]}` in `metadata` (top-level key), or as a bare list in `additional_metadata`. Adding values widens the result set; there is no ALL/AND operator inside a single key. Lists are supported on `VARCHAR` fields only; a list passed for a declared field of another type is rejected with `400`. |
-| Null values | Rejected with `400` (`metadata_filters values cannot be null`). |
-| Range / fuzzy | Not supported in user `metadata_filters`. Put fuzzy concepts in `query`, use semantic metadata fields, or post-process client-side. |
-| OR | Within one key, use `contains_any`. Across different keys, run multiple queries and union client-side. |
-| Graph context | Respects metadata filters; graph paths from excluded sources are removed. |
-| Size | Each list holds at most **500** values, and the whole `metadata_filters` object is capped at **64 KiB**. See [Filter size limits](#filter-size-limits). |
-
-<Warning>
-  `metadata_filters` are hard constraints, not semantic hints. A filter like `{ "mood": "happy" }` requires an exact stored value; it does not expand to related values like "joyful" or "cheerful". To search metadata text semantically, declare a `VARCHAR` field with `enable_dense_embedding` and include the concept in the main `query`.
-</Warning>
-
-### Filter operators
-
-Each `metadata` (top-level) key in `metadata_filters` takes an operator object naming the comparison you want.
+Each top-level key in `metadata_filters` takes an operator object naming the comparison:
 
 | Operator | Value | Matches |
 | --- | --- | --- |
-| `equals` | a single value | sources whose field is **exactly** that value |
-| `contains` | a single value | sources whose field **holds** that value, at any position in a multi-value field |
-| `contains_any` | an array | sources holding **any one** of the listed values (OR/IN) |
+| `equals` | a single value | sources whose field is exactly that value |
+| `contains` | a single value | sources whose field holds that value, at any position in a multi-value field |
+| `contains_any` | an array | sources holding any one of the listed values (OR, like IN) |
+
+`equals` works on every declared type, so `{"priority": {"equals": 7}}` is valid on an `INT64` field. `contains`, `contains_any`, and arrays need a `VARCHAR` field; passed for a declared field of another type they are rejected with `400`.
+
+<Accordion title="Operator forms, and what each returns">
 
 ```json
 {
@@ -108,33 +306,56 @@ Given four sources with these `emails` values:
 
 `contains` is position-independent: it matches whether the value is the only one, the first, or in the middle.
 
-Operators apply to `metadata` (top-level keys) only. Inside `additional_metadata`, use a bare scalar for an exact match or a bare array to match any listed value.
+</Accordion>
+
+| Behavior | Contract |
+| --- | --- |
+| Multiple keys | AND. Every key you send must match, across both layers. |
+| `equals` | Exact equality against the whole stored value. |
+| Lists | ANY, not ALL. `{"contains_any": ["alpha", "beta"]}` matches a source tagged `alpha` and a source tagged `beta`. Adding values widens the result set; there is no ALL operator inside a single key. |
+| OR | Within one key, use `contains_any`. Across different keys, run several queries and union the results yourself. |
+| Null values | Rejected with `400` (`metadata_filters values cannot be null`). |
+| Range and fuzzy | Not supported. Put the concept in `query`, use a searchable `VARCHAR` field, or post-process in your application. |
+| Graph context | Respects the filter; graph paths from excluded sources are removed. |
+| Size | At most 500 values per list, and 64 KiB for the whole `metadata_filters` object. See [filter size limits](#filter-size-limits). |
 
 <Warning>
-  An operator used inside `additional_metadata` is **not** rejected. It is read as an exact-match filter against a stored object, so on a normal field it matches nothing and the request returns `200` with an empty result rather than an error.
+`metadata_filters` are hard constraints, not semantic hints. `{"mood": {"equals": "happy"}}` requires that exact stored value; it does not expand to "joyful" or "cheerful". To search metadata text by meaning, declare a `VARCHAR` field with `enable_dense_embedding` and put the concept in `query`.
 </Warning>
 
-A known operator given the wrong operand type, or several operators in one object, is rejected with `400` rather than silently returning no results. A **misspelled** operator is not: `{"contian": "x"}` is indistinguishable from a filter for a stored object with that key, so it is left alone and matches nothing.
+Operators apply to top-level keys only. Inside `additional_metadata`, use a bare scalar for an exact match or a bare array to match any listed value.
 
 <Warning>
-  **`contains`, `contains_any` and `equals` are reserved key names:** An object built only from them is read as an operator, so it can no longer be used to exact-match a stored object:
+An operator used inside `additional_metadata` is not rejected. It is read as an exact-match filter against a stored object, so on a normal field it matches nothing and the request returns `200` with an empty result rather than an error.
+</Warning>
 
-  | Filter value | Read as |
-  | --- | --- |
-  | `{"contains": "x"}` | the `contains` operator |
-  | `{"contains": "a", "equals": "b"}` | rejected with `400` (every key is an operator name) |
-  | `{"contains": "a", "other": 1}` | an exact-match object filter, unchanged |
+A known operator given the wrong operand type, or several operators in one object, is rejected with `400` rather than silently returning nothing. A misspelled operator is not: `{"contian": "x"}` is indistinguishable from a filter for a stored object with that key, so it is left alone and matches nothing.
 
-  This only affects a `JSON`-typed field storing an object whose keys are all drawn from those three words. If you need to match such an object, rename the nested key or the field.
+<Warning>
+`contains`, `contains_any`, and `equals` are reserved key names. An object built only from them is read as an operator, so it can no longer be used to exact-match a stored object:
+
+| Filter value | Read as |
+| --- | --- |
+| `{"contains": "x"}` | the `contains` operator |
+| `{"contains": "a", "equals": "b"}` | rejected with `400` (every key is an operator name) |
+| `{"contains": "a", "other": 1}` | an exact-match object filter, unchanged |
+
+This only affects a `JSON`-typed field storing an object whose keys are all drawn from those three words. If you need to match such an object, rename the nested key or the field.
 </Warning>
 
 <Note>
-  The bare forms still work and are unchanged, but are **deprecated** in favour of the operators, because the comparison they perform is inferred from the JSON shape rather than stated. A bare scalar behaves as `equals`, a bare array as `contains_any`, and a bare single-element array as `contains`, so `{"emails": "a@x"}` and `{"emails": ["a@x"]}` differ by one character and return different results.
+The bare forms still work, but are deprecated in favour of the operators, because the comparison they perform is inferred from the JSON shape rather than stated. A bare scalar behaves as `equals`, a bare array as `contains_any`, and a bare single-element array as `contains`, so `{"emails": "a@x"}` and `{"emails": ["a@x"]}` differ by one character and return different results. `document_metadata` is still accepted as a legacy alias for the nested `additional_metadata` key; when both are present and both are objects, `additional_metadata` wins on conflicts.
 </Note>
 
-### Storing multiple values in one field
+<a id="storing-multiple-values-in-one-field"></a>
 
-A declared schema field holds a single value. To store several values in one field, declare it as `VARCHAR` and join the values with commas:
+### Store several values in one field
+
+A declared schema field holds a single value. To store several values in one field, declare it as `VARCHAR` and join the values with commas, then filter for one member with `contains`.
+
+<Accordion title="Store comma-joined values and filter for one member">
+
+At ingest:
 
 ```json
 {
@@ -144,7 +365,7 @@ A declared schema field holds a single value. To store several values in one fie
 }
 ```
 
-Then filter for one member with `contains`:
+At query:
 
 ```json
 {
@@ -154,157 +375,49 @@ Then filter for one member with `contains`:
 }
 ```
 
-Points to know:
+</Accordion>
 
-- `data_type: "array"` is **not** accepted on a declared field. Declaring one is rejected with `400`.
-- Sending an array **value** for a declared `VARCHAR` field is also rejected: `metadata field "attendee_emails" must be of type string, got array`. Join the values yourself.
-- The comma is the separator, so a value that itself contains a comma will not match as expected. Use a field per value, or a different value format, if your values can contain commas.
-- Size the field for the whole joined string. `max_length` defaults to `1024` and its maximum is `65535`, and it **cannot be raised after the field is created**, so declare it large enough up front.
-- `equals` compares the entire joined string, so it is rarely what you want on a multi-value field. Use `contains`.
+- **`data_type: "array"` is not accepted on a declared field:** declaring one is rejected with `400`.
+- **An array value for a declared `VARCHAR` field is also rejected:** `metadata field "attendee_emails" must be of type string, got array`. Join the values yourself.
+- **The comma is the separator:** a value that itself contains a comma will not match as expected. Use a field per value, or a different value format, if your values can contain commas.
+- **Size the field for the whole joined string:** `max_length` defaults to `1024`, its maximum is `65535`, and it cannot be raised after the field is created, so declare it large enough up front.
+- **`equals` compares the entire joined string:** it is rarely what you want on a multi-value field. Use `contains`.
 
----
+<a id="size-limits"></a>
 
-## 3. Plan the metadata schema
+## 4. Size limits
 
-Before your first ingest:
+### Stored metadata
 
-- **Plan scoping fields before first ingest:** [`PATCH /databases/{database}/metadata-schema`](/api-reference/v2/endpoint/update-metadata-schema) can add fields later, but existing fields cannot be renamed, retyped, reflagged, or deleted. Undeclared scope keys are not ignored at query time: they match no sources, because a database with a schema rejects undeclared keys on ingest and edit. The exception is `connector_id` and `provider`, which [connectors](/essentials/v2/connectors#metadata-on-synced-objects) write on every synced object. If you'll scope on it more than once, declare it.
-- **Pick `metadata` for hot paths, `additional_metadata` for cold ones:** Top-level `metadata` filters are prefiltered; `additional_metadata` filters that cannot be prefiltered need a post-retrieval pass with over-fetch.
-- **Keep keys stable:** Renaming a metadata key requires re-ingesting affected sources.
-- **Ingested metadata is editable in place:** Once a source is indexed, [`PATCH /context/{id}/metadata`](/api-reference/v2/endpoint/update-source-metadata) merges new `metadata` and `additional_metadata` values into it without re-ingesting. See [section 7](#7-update-metadata-without-re-ingesting).
-- **Don't substitute `metadata_filters` for `collection`:** `metadata_filters` scopes results *inside* a partition. For partitioning by user, team, or workspace, use [`collection`](/essentials/v2/multi-tenant).
-
----
-
-## 4. Minimal working example
-
-Two phases: **set up metadata** (declare the schema, then attach values at ingest), then **scope at query**.
-
-### Step 1: Create metadata
-
-The schema lives at the database level; values land on each source at ingest time. Both happen before any query.
-
-#### Step 1a: Declare the schema at database creation
-
-<CodeGroup>
-```bash cURL
-curl -X POST 'https://api.hydradb.com/databases' \
-  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
-  -H "API-Version: 2" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "database": "acme_corp",
-    "database_metadata_schema": [
-      {
-        "name": "department",
-        "data_type": "VARCHAR"
-      },
-      {
-        "name": "priority",
-        "data_type": "INT64"
-      },
-      {
-        "name": "summary_label",
-        "data_type": "VARCHAR",
-        "enable_dense_embedding": true,
-        "enable_sparse_embedding": true
-      }
-    ]
-  }'
-```
-```python Python SDK
-client.databases.create(
-    database="acme_corp",
-    database_metadata_schema=[
-        {"name": "department", "data_type": "VARCHAR"},
-        {"name": "priority", "data_type": "INT64"},
-        {
-            "name": "summary_label",
-            "data_type": "VARCHAR",
-            "enable_dense_embedding": True,
-            "enable_sparse_embedding": True,
-        },
-    ],
-)
-```
-```typescript TypeScript SDK
-await client.databases.create({
-  database: "acme_corp",
-  databaseMetadataSchema: [
-    { name: "department", dataType: "VARCHAR" },
-    { name: "priority", dataType: "INT64" },
-    {
-      name: "summary_label",
-      dataType: "VARCHAR",
-      enableDenseEmbedding: true,
-      enableSparseEmbedding: true,
-    },
-  ],
-});
-```
-</CodeGroup>
-
-### Schema field options
-
-| Field | Type / values | Purpose |
-| --- | --- | --- |
-| `name` | string | Metadata key. Must start with a letter, contain only letters/numbers/underscores, and not use reserved system names such as `source_id`, `chunk_id`, or `metadata`. |
-| `data_type` | `VARCHAR`, `BOOL`, `INT8`, `INT16`, `INT32`, `INT64`, `FLOAT`, `DOUBLE`, `JSON` or friendly aliases `string`, `boolean`, `integer`, `float`, `object` | Defaults to `VARCHAR`. `ARRAY` is **not** supported and is rejected with `400`; for multi-value fields see [Storing multiple values in one field](#storing-multiple-values-in-one-field). |
-| `max_length` | integer | Max length for `VARCHAR`. Default `1024`, maximum `65535`. This sizes one declared schema field, and is **not** the limit on how much metadata you can send per request (for that see [Size limits](#size-limits)). |
-| `enable_dense_embedding` | boolean | Adds a dense semantic-search lane for a `VARCHAR` metadata field. |
-| `enable_sparse_embedding` | boolean | Adds a sparse/BM25 keyword-search lane for a `VARCHAR` metadata field. |
-| `searchable` | boolean | Backward-compatible input accepted by the API, but do not rely on it to replace explicit `enable_dense_embedding` / `enable_sparse_embedding`. Set those flags directly. |
-
-Limits and guardrails:
-
-- Up to 32 custom metadata fields.
-- Up to **6 embedding-enabled** fields per database. `enable_dense_embedding` and `enable_sparse_embedding` each count as one, so a field with both set counts as two. Exceeding the limit fails database creation with `400` before anything is provisioned.
-- Field names are unique case-insensitively.
-- Dense/sparse embedding flags are only valid on `VARCHAR` fields.
-- Runtime `metadata` values must match the declared type when the database has a schema.
-- Unknown `metadata` keys are rejected on ingest and edit when the database has a non-empty schema.
-- Each metadata layer has a byte budget per request. See [Size limits](#size-limits).
-
-### Size limits
-
-Every request that attaches metadata is checked against two caps, on ingest and on
-metadata edit alike:
+Every request that attaches metadata is checked against two caps, on ingest and on metadata edit alike:
 
 | Layer | Send as | Cap |
 | --- | --- | --- |
-| Database metadata | `metadata` at ingest, `database_metadata` on edit | **16 KiB** (16,384 bytes) |
-| Document metadata | `additional_metadata` | **1 KiB** (1,024 bytes) |
+| Database metadata | `metadata` at ingest, `database_metadata` on edit | 16 KiB (16,384 bytes) |
+| Document metadata | `additional_metadata` | 1 KiB (1,024 bytes) |
 
-Older spellings are still accepted, but **not uniformly**. Which one works
-depends on the endpoint:
+Older spellings are still accepted, but not uniformly. Which one works depends on the endpoint:
 
 | Alias | On `/context/ingest` | On `PATCH /context/{id}/metadata` |
 | --- | --- | --- |
 | `tenant_metadata` | accepted | accepted (`database_metadata` wins if both are sent) |
-| `document_metadata` | accepted | **rejected with `400`**: send `additional_metadata` |
+| `document_metadata` | accepted | rejected with `400`: send `additional_metadata` |
 
 Accepted aliases have the same cap as the canonical field.
 
-The cap applies to the **whole map**, not to any one value, and it is measured on
-the map's compact JSON encoding in UTF-8 bytes. Three consequences worth planning
-around:
+The cap applies to the whole map, not to any one value, and it is measured on the map's compact JSON encoding in UTF-8 bytes. Three consequences worth planning around:
 
-- **Keys and punctuation count:** Quotes, colons, commas and braces all count toward
-  the byte limit.
-- **Bytes, not characters:** Accented Latin characters cost 2 bytes, most CJK
-  characters 3, and emoji 4.
-- **Budget in bytes from the start:** A 950-character summary sounds comfortably
-  under a 1 KiB cap, but with two small sibling keys it serializes to 1,015
-  bytes (65 bytes of that is structure alone). Push the summary to 1,000
-  characters and the request is rejected at 1,065 bytes.
+- **Keys and punctuation count:** quotes, colons, commas, and braces all count toward the byte limit.
+- **Bytes, not characters:** accented Latin characters cost 2 bytes, most CJK characters 3, and emoji 4.
+- **Budget in bytes from the start:** a 950-character summary sounds comfortably under a 1 KiB cap, but with two small sibling keys it serializes to 1,015 bytes (65 bytes of that is structure alone). Push the summary to 1,000 characters and the request is rejected at 1,065 bytes.
+
+Exceeding either cap fails the whole request with `400` before anything is ingested. The message names the offending field and reports both numbers, so you can see how far over you are. On [`PATCH /context/{id}/metadata`](/api-reference/v2/endpoint/update-source-metadata) the same message is prefixed with `invalid metadata edit:`.
+
+<Accordion title="A map just inside the 1 KiB cap, and the 400 it returns when it grows">
 
 ```json Document metadata: 1,015 bytes, just inside the 1 KiB cap
 {"title":"Q3 Board Deck","author":"ada@example.com","summary":"<950 characters>"}
 ```
-
-Exceeding either cap fails the whole request with `400` before anything is
-ingested. The message names the offending field and reports both numbers, so you
-can see exactly how far over you are:
 
 ```json
 {
@@ -317,322 +430,240 @@ can see exactly how far over you are:
 }
 ```
 
-On [`PATCH /context/{id}/metadata`](/api-reference/v2/endpoint/update-source-metadata)
-the same message is prefixed with `invalid metadata edit:`.
+</Accordion>
 
-<Tip>
-  If a document needs more than 1 KiB of descriptive metadata, put the long text
-  in the document body where it gets chunked and embedded, and keep
-  `additional_metadata` for the short values you actually filter on.
-</Tip>
+If a document needs more than 1 KiB of descriptive metadata, put the long text in the document body, where it gets chunked and embedded, and keep `additional_metadata` for the short values you filter on.
 
 ### Filter size limits
 
-The caps above bound the metadata you **store**. `metadata_filters` on
-[`/query`](/api-reference/v2/endpoint/query) has its own, separate pair. These
-bound what you **send at query time** and are unrelated to how much metadata a
-source carries:
+The caps above bound the metadata you store. `metadata_filters` on [`/query`](/api-reference/v2/endpoint/query) has its own, separate pair. These bound what you send at query time and are unrelated to how much metadata a source carries:
 
 | Limit | Cap |
 | --- | --- |
-| Values in any one list | **500** |
-| Whole `metadata_filters` object | **64 KiB** (65,536 bytes) |
+| Values in any one list | 500 |
+| Whole `metadata_filters` object | 64 KiB (65,536 bytes) |
 
-Measured the same way (compact JSON, UTF-8 bytes, field names and punctuation
-counted), and the object total includes the nested `additional_metadata` dict.
+Both are measured the same way as the stored caps: compact JSON, UTF-8 bytes, field names and punctuation counted. The object total includes the nested `additional_metadata` object, and it is measured after operator objects are reduced to their values, so `{"contains": "x"}` counts as `["x"]` and the operator keyword costs nothing. Both spellings of the same filter cost the same.
 
-The object total is measured **after** operator objects are reduced to their
-values, so `{"contains": "x"}` counts as `["x"]` and the operator keyword itself
-costs nothing. Both spellings of the same filter cost the same, because the cap
-bounds the expression sent to the vector store, which the spelling does not
-change.
+Both limits exist because every value in a list is expanded into the filter expression sent to the vector store. The per-list cap catches one runaway list; the object cap catches many individually legal lists adding up. Twenty lists of 500 values are each within the element cap but total roughly 127 KiB, so the object cap is what rejects them.
 
-Both exist because every value in a list is expanded into the filter expression
-sent to the vector store. The per-list cap catches one runaway list; the object
-cap catches many individually-legal lists adding up. Twenty lists of 500 values
-are each within the element cap but total roughly 127 KiB, so the object cap is
-what rejects them.
+Over either limit returns `400` before the query runs, naming the offending key or the actual byte count.
 
-Over either limit returns `400` before the query runs, naming the offending key
-or the actual byte count:
+<Accordion title="The 400 messages for an oversized filter">
 
-```
+```text
 metadata_filters.customer_id (got 743) must contain at most 500 values
 
 metadata_filters is too large (130251 bytes when serialized; the maximum is 65536).
 Reduce the number or size of filter values.
 ```
 
-<Tip>
-  Needing far more than 500 values in one filter usually means the constraint
-  belongs in the data rather than the query: add a metadata field that groups
-  those values (a segment, tier, or cohort key) and filter on that instead.
-</Tip>
+</Accordion>
 
-### Add schema fields later
+Needing far more than 500 values in one filter usually means the constraint belongs in the data rather than the query: add a metadata field that groups those values (a segment, tier, or cohort key) and filter on that instead.
 
-You can add database metadata fields after database creation with [`PATCH /databases/{database}/metadata-schema`](/api-reference/v2/endpoint/update-metadata-schema). This is additive only:
+<a id="add-schema-fields-later"></a>
+<a id="3-plan-the-metadata-schema"></a>
 
-- add new fields: yes
-- delete fields: no
-- change type/flags of existing fields: no
+## 5. Add schema fields later
 
-<Warning>
-  Fields added this way cannot turn on dense or sparse search lanes: the endpoint rejects `enable_dense_embedding` and `enable_sparse_embedding`. Declare semantic or keyword metadata fields when you create the database.
-</Warning>
+[`PATCH /databases/{database}/metadata-schema`](/api-reference/v2/endpoint/update-metadata-schema) adds fields to an existing database. It is additive only: you can add new fields, but you cannot delete a field or change an existing field's type or flags. The response returns `added_fields` directly, without the `success` and `data` envelope, and a field you resend with an identical definition is skipped.
 
----
-
-## 5. Attach metadata at ingest
-
-For knowledge ingestion, send `metadata` and `additional_metadata` on each `document_metadata[]` item or `app_knowledge[]` item.
+<Accordion title="Add a status field to an existing database: Python, TypeScript, or cURL">
 
 <CodeGroup>
-```bash cURL
-curl -X POST 'https://api.hydradb.com/context/ingest' \
-  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
-  -H "API-Version: 2" \
-  -F "type=knowledge" \
-  -F "database=acme_corp" \
-  -F 'app_knowledge=[
-    {
-      "database": "acme_corp",
-      "collection": "default",
-      "id": "auth-controls-001",
-      "kind": "knowledge_base",
-      "fields": {
-        "title": "Authentication controls",
-        "body": "Authentication controls are reviewed quarterly for SOC2."
-      },
-      "metadata": {
-        "department": "security",
-        "priority": 7,
-        "summary_label": "quarterly access control review"
-      },
-      "additional_metadata": {
-        "author": "alice",
-        "doc_version": 3
-      }
-    }
-  ]'
-```
 ```python Python SDK
-import json
-
-client.context.ingest(
-    type="knowledge",
-    database="acme_corp",
-    app_knowledge=json.dumps([
-        {
-            "database": "acme_corp",
-            "collection": "default",
-            "id": "auth-controls-001",
-            "kind": "knowledge_base",
-            "fields": {
-                "title": "Authentication controls",
-                "body": "Authentication controls are reviewed quarterly for SOC2.",
-            },
-            "metadata": {
-                "department": "security",
-                "priority": 7,
-                "summary_label": "quarterly access control review",
-            },
-            "additional_metadata": {"author": "alice", "doc_version": 3},
-        }
-    ]),
+client.databases.update_metadata_schema(
+    "acme_corp",
+    add_fields=[{"name": "status", "data_type": "VARCHAR", "max_length": 32}],
 )
 ```
 ```typescript TypeScript SDK
-await client.context.ingest({
-  type: "knowledge",
+await client.databases.updateMetadataSchema({
   database: "acme_corp",
-  appKnowledge: JSON.stringify([
-    {
-      database: "acme_corp",
-      collection: "default",
-      id: "auth-controls-001",
-      kind: "knowledge_base",
-      fields: {
-        title: "Authentication controls",
-        body: "Authentication controls are reviewed quarterly for SOC2.",
-      },
-      metadata: {
-        department: "security",
-        priority: 7,
-        summary_label: "quarterly access control review",
-      },
-      additional_metadata: { author: "alice", doc_version: 3 },
-    },
-  ]),
+  addFields: [{ name: "status", dataType: "VARCHAR", maxLength: 32 }],
 });
+```
+```bash cURL
+curl -X PATCH 'https://api.hydradb.com/databases/acme_corp/metadata-schema' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "add_fields": [
+      { "name": "status", "data_type": "VARCHAR", "max_length": 32 }
+    ]
+  }'
 ```
 </CodeGroup>
 
+</Accordion>
+
 <Warning>
-  For `type=memory`, the `memories` multipart field is already JSON-stringified, and each memory item's `metadata` and `additional_metadata` are plain objects inside it. Do not stringify them a second time.
+Fields added this way cannot turn on dense or sparse search: the endpoint rejects `enable_dense_embedding` and `enable_sparse_embedding`. Declare searchable metadata fields when you create the database.
 </Warning>
 
----
+Plan the schema before your first ingest:
 
-## 6. Query with metadata filters
+- **Existing fields are fixed:** a field cannot be renamed, retyped, reflagged, or deleted. Renaming a key means re-ingesting the affected sources, or creating a new database with the corrected schema.
+- **Undeclared keys match nothing:** a database with a schema rejects undeclared `metadata` keys on ingest and on edit, so no source ever holds them, and a filter on such a key returns nothing. The exception is `connector_id` and `provider`, which [connectors](/essentials/v2/connectors#metadata-on-synced-objects) write on every synced object. If you will filter on a field more than once, declare it.
 
-Mix database-level (top-level) and document-level (nested) scopes in the same `metadata_filters` object:
+<a id="7-update-metadata-without-re-ingesting"></a>
+
+## 6. Update metadata without re-ingesting
+
+Use [`PATCH /context/{id}/metadata`](/api-reference/v2/endpoint/update-source-metadata) when you know the source ID and need to change its metadata in place. The body uses `database_metadata` for the schema-backed layer (the shorter `metadata` spelling from ingest is not accepted here) and `additional_metadata` for the free-form layer.
+
+<Accordion title="Change a source's department and author: Python, TypeScript, or cURL">
 
 <CodeGroup>
+```python Python SDK
+client.context.update_source_metadata(
+    "auth-controls-001",
+    database="acme_corp",
+    collection="default",
+    database_metadata={"department": "legal"},
+    additional_metadata={"author": "grace"},
+)
+```
+```typescript TypeScript SDK
+await client.context.updateSourceMetadata({
+  id: "auth-controls-001",
+  database: "acme_corp",
+  collection: "default",
+  databaseMetadata: { department: "legal" },
+  additionalMetadata: { author: "grace" },
+});
+```
 ```bash cURL
-curl -X POST 'https://api.hydradb.com/query' \
+curl -X PATCH 'https://api.hydradb.com/context/auth-controls-001/metadata' \
   -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
   -H "API-Version: 2" \
   -H "Content-Type: application/json" \
   -d '{
     "database": "acme_corp",
     "collection": "default",
-    "query": "How do access control reviews work?",
-    "type": "knowledge",
-    "query_by": "hybrid",
-    "metadata_filters": {
-      "department": "security",
-      "priority": 7,
-      "additional_metadata": {
-        "author": "alice"
-      }
-    }
+    "database_metadata": { "department": "legal" },
+    "additional_metadata": { "author": "grace" }
   }'
-```
-```python Python SDK
-result = client.query(
-    database="acme_corp",
-    collection="default",
-    query="How do access control reviews work?",
-    type="knowledge",
-    query_by="hybrid",
-    metadata_filters={
-        "department": "security",
-        "priority": 7,
-        "additional_metadata": {"author": "alice"},
-    },
-)
-```
-```typescript TypeScript SDK
-const result = await client.query({
-  database: "acme_corp",
-  collection: "default",
-  query: "How do access control reviews work?",
-  type: "knowledge",
-  queryBy: "hybrid",
-  metadataFilters: {
-    department: "security",
-    priority: 7,
-    additional_metadata: { author: "alice" },
-  },
-});
 ```
 </CodeGroup>
 
-Use the legacy alias only when maintaining older clients:
+</Accordion>
 
-```json
-{
-  "metadata_filters": {
-    "document_metadata": { "author": "alice" }
-  }
-}
+- **The source must already exist:** this endpoint does not create sources, and `collection` is required.
+- **At least one of `database_metadata`, `additional_metadata`, or `acl` is required:** `tenant_metadata` is a deprecated alias for `database_metadata`; `document_metadata` is rejected.
+- **Metadata merges:** sent keys are inserted or overwritten, omitted keys are preserved. `acl` is the exception: when sent, it replaces the stored list, and an `acl`-only body is a valid edit. See [Access Control](/essentials/v2/access-control).
+- **The edit is visible to filters and listing right away:** if no edited field has an embedding flag, the vector store is untouched and the response reports `vector_sync_required: false`.
+- **Searchable fields sync synchronously:** if an edited field has `enable_dense_embedding` or `enable_sparse_embedding`, HydraDB refreshes that field's search lane and reports `vector_sync_required` and `vector_synced` in the response (the `milvus_sync_required` and `milvus_synced` aliases are still emitted, deprecated). Such a field rejects `null`, because it would leave stale metadata vectors behind.
+
+To replace a source's content as well as its metadata, re-ingest it with `upsert: true` and the same source `id`. Upsert replaces the source payload and the metadata supplied by ingestion.
+
+<a id="8-listing-with-metadata-filters"></a>
+
+## 7. List sources with metadata filters
+
+Use [`POST /context/list`](/api-reference/v2/endpoint/list-documents) when you want to browse or page sources rather than run semantic retrieval. Its `filters` object takes `metadata`, `additional_metadata`, and `source_fields`, each as bare key-value pairs. `source_fields` filters on the source's own fields: `title`, `type`, `description`, `url`, `timestamp`, and for app sources `app_provider`, `app_kind`, `app_external_id`, and `app_parent_id`. Pair `app_external_id` or `app_parent_id` with `app_provider`, because a Jira issue key and a Linear ID can collide.
+
+<Accordion title="List legal sources by Alice from Slack: Python, TypeScript, or cURL">
+
+<CodeGroup>
+```python Python SDK
+from hydra_db import ListContentFilter
+
+result = client.context.list(
+    database="acme_corp",
+    collection="default",
+    type="knowledge",
+    filters=ListContentFilter(
+        metadata={"department": "legal"},
+        additional_metadata={"author": "alice"},
+        source_fields={"app_provider": "slack"},
+    ),
+)
 ```
-
-If both aliases are present and both are objects, `additional_metadata` wins on conflicts.
-
----
-
-## 7. Update metadata without re-ingesting
-
-Use [`PATCH /context/{id}/metadata`](/api-reference/v2/endpoint/update-source-metadata) when you know the source ID and need to update metadata in place.
-
-```json
-{
-  "database": "acme_corp",
-  "collection": "default",
-  "database_metadata": {
-    "department": "legal"
+```typescript TypeScript SDK
+const result = await client.context.list({
+  database: "acme_corp",
+  collection: "default",
+  type: "knowledge",
+  filters: {
+    metadata: { department: "legal" },
+    additionalMetadata: { author: "alice" },
+    sourceFields: { app_provider: "slack" },
   },
-  "additional_metadata": {
-    "author": "grace"
-  }
-}
+});
 ```
-
-Behavior:
-
-- The source must already exist.
-- `collection` is required.
-- At least one of `database_metadata` (deprecated alias `tenant_metadata`), `additional_metadata`, or `acl` is required.
-- The update is a merge/upsert: sent keys are inserted or overwritten; omitted keys are preserved.
-- `document_metadata` is not accepted on this endpoint; use `additional_metadata`.
-- The same endpoint accepts `acl` to change who may retrieve the source. Unlike metadata, `acl` **replaces** rather than merges, and an `acl`-only body is a valid edit. See [Access Control](/essentials/v2/access-control).
-- Updates to database metadata fields without an embedding flag are MongoDB-only and take effect for filters and listing.
-- If an edited database metadata field has `enable_dense_embedding` or `enable_sparse_embedding`, HydraDB synchronously syncs the relevant vector store lane and reports `vector_sync_required` / `vector_synced` in the response (the `milvus_sync_required` / `milvus_synced` aliases are still emitted, deprecated).
-
-For full document/content replacement, re-ingest with `upsert: true` and the same source `id`. Upsert replaces the source payload and metadata supplied by ingestion.
-
----
-
-## 8. Listing with metadata filters
-
-Use [`POST /context/list`](/api-reference/v2/endpoint/list-documents) when you want to browse or page sources rather than run semantic retrieval:
-
-```json
-{
-  "database": "acme_corp",
-  "collection": "default",
-  "type": "knowledge",
-  "filters": {
-    "metadata": { "department": "legal" },
-    "additional_metadata": { "author": "alice" },
-    "source_fields": { "type": "slack" }
-  }
-}
+```bash cURL
+curl -X POST 'https://api.hydradb.com/context/list' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "database": "acme_corp",
+    "collection": "default",
+    "type": "knowledge",
+    "filters": {
+      "metadata": { "department": "legal" },
+      "additional_metadata": { "author": "alice" },
+      "source_fields": { "app_provider": "slack" }
+    }
+  }'
 ```
+</CodeGroup>
 
-`/context/list` also accepts legacy aliases `tenant_metadata` for `metadata` and `document_metadata` for `additional_metadata`.
+</Accordion>
 
----
+`/context/list` also accepts the legacy aliases `tenant_metadata` for `metadata` and `document_metadata` for `additional_metadata`; the current name wins on conflicts. It takes the same `acl` field as `/query` to list as one person. See [Access Control](/essentials/v2/access-control).
 
-## 9. Common mistakes
+<a id="step-1a-declare-the-schema-at-database-creation"></a>
+<a id="schema-field-options"></a>
+
+## Schema field reference
+
+Each entry in `database_metadata_schema` on [Create Database](/api-reference/v2/endpoint/create-tenant), and in `add_fields` on [Update Metadata Schema](/api-reference/v2/endpoint/update-metadata-schema), takes these options:
+
+| Field | Type / values | Purpose |
+| --- | --- | --- |
+| `name` | string | Metadata key. Must start with a letter, contain only letters, numbers, and underscores, and not use a reserved system name such as `source_id`, `chunk_id`, or `metadata`. |
+| `data_type` | `VARCHAR`, `BOOL`, `INT8`, `INT16`, `INT32`, `INT64`, `FLOAT`, `DOUBLE`, `JSON`, or the friendly aliases `string`, `boolean`, `integer`, `float`, `object` | Defaults to `VARCHAR`. `ARRAY` is not supported and is rejected with `400`; for multi-value fields see [Store several values in one field](#store-several-values-in-one-field). |
+| `max_length` | integer | Maximum length for a `VARCHAR` value. Default `1024`, maximum `65535`. This sizes one declared field; it is not the limit on how much metadata you can send per request, which is in [Size limits](#4-size-limits). |
+| `enable_dense_embedding` | boolean | Adds semantic search over a `VARCHAR` field. |
+| `enable_sparse_embedding` | boolean | Adds keyword (BM25) search over a `VARCHAR` field. |
+
+Limits:
+
+- **Up to 32 custom metadata fields per database:**
+- **Up to 6 embedding-enabled fields per database:** `enable_dense_embedding` and `enable_sparse_embedding` each count as one, so a field with both set counts as two. Exceeding the limit fails database creation with `400` before anything is provisioned.
+- **Field names are unique case-insensitively:**
+- **Embedding flags are only valid on `VARCHAR` fields:**
+- **Values must match the declared type when the database has a schema:**
+- **Unknown `metadata` keys are rejected on ingest and edit when the database has a non-empty schema:**
+- **Each metadata layer has a byte budget per request:** See [Size limits](#4-size-limits).
+
+## Common mistakes
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
-| `metadata_filters` returns no results | Key isn't declared in `database_metadata_schema`, so no source holds it (undeclared keys are not ignored) | Add the field with [`PATCH /databases/{database}/metadata-schema`](/api-reference/v2/endpoint/update-metadata-schema) and ingest or edit sources with a value, or move the field to `additional_metadata` and nest the scope under `additional_metadata`. |
-| Scope on an `additional_metadata` key returns nothing | Scope passed as top-level key, so it is matched against `metadata` | Nest it: `metadata_filters: { additional_metadata: { author: "alice" } }`. |
-| Schema field changes don't take effect | Existing schema fields cannot be renamed, retyped, reflagged, or deleted; you can only add fields | Create a new database with the corrected schema. There's no in-place migration for existing fields. |
-| Query returns 0 results after adding a scope | Over-scoping: combined constraints exclude everything | Start with the minimum hard constraints; add scopes one at a time and re-check counts. |
-| Range / fuzzy scope doesn't work | `metadata_filters` supports only `equals`, `contains`, and `contains_any` | Move that constraint into the `query` text, use a different `query_by`, or apply it in your own post-scoping. |
-| `additional_metadata` scope feels slow | It can be: when it cannot be prefiltered, it over-fetches about 3x to compensate for post-retrieval matching | Move the hot field into `metadata` and declare it in the schema. |
-| Metadata edit returns 400 | Unknown key, wrong type, over-size payload (16 KiB database metadata / 1 KiB document metadata), too-deep nesting, reserved key, or missing `collection` | Check schema and [size limits](#size-limits); send only `database_metadata` / `additional_metadata` / `acl`. |
-| Dense/sparse metadata edit rejects `null` | Null would leave stale semantic metadata vectors | Set a non-null value or re-ingest with the desired metadata. |
+| `metadata_filters` returns no results | The key is not declared in `database_metadata_schema`, so no source holds it (undeclared keys are not ignored) | Add the field with [`PATCH /databases/{database}/metadata-schema`](/api-reference/v2/endpoint/update-metadata-schema) and ingest or edit sources with a value, or move the field to `additional_metadata` and nest the filter under `additional_metadata`. |
+| A filter on an `additional_metadata` key returns nothing | The key was sent top-level, so it was matched against `metadata` | Nest it: `metadata_filters: { additional_metadata: { author: "alice" } }`. |
+| Schema field changes do not take effect | Existing schema fields cannot be renamed, retyped, reflagged, or deleted; you can only add fields | Create a new database with the corrected schema. There is no in-place migration for existing fields. |
+| Query returns 0 results after adding a filter | Over-filtering: the combined constraints exclude everything | Start with the minimum hard constraints; add filters one at a time and re-check counts. |
+| A range or fuzzy filter does not work | `metadata_filters` supports only `equals`, `contains`, and `contains_any` | Move that constraint into the `query` text, or apply it in your own post-processing. |
+| An `additional_metadata` filter feels slow | When it cannot be resolved up front, it over-fetches about 3x to compensate for post-retrieval matching | Move the hot field into `metadata` and declare it in the schema. |
+| Metadata edit returns `400` | Unknown key, wrong type, oversized payload (16 KiB database metadata or 1 KiB document metadata), too-deep nesting, reserved key, or missing `collection` | Check the schema and [size limits](#4-size-limits); send only `database_metadata`, `additional_metadata`, or `acl`. |
+| A dense or sparse metadata edit rejects `null` | Null would leave stale semantic metadata vectors | Set a non-null value or re-ingest with the desired metadata. |
 | Need a semantic or keyword metadata field after creation | The schema update endpoint rejects dense and sparse flags | Declare those fields at database creation, or re-ingest into a new database with the final schema. |
-
----
-
-## 10. Advanced patterns
-
-**Stacked scopes with collection partitioning:** Use `collection` for the partition (per-user, per-workspace), and use `metadata_filters` to scope *inside* that partition. They're complementary, not interchangeable. See [Multi-Tenant](/essentials/v2/multi-tenant).
-
-**Published vs draft:** Add a `status` field to your schema; tag every source with `metadata.status = "draft" | "published"`; pass `metadata_filters: { status: "published" }` on user-facing queries. Keeps work-in-progress out of customer answers automatically.
-
-**Multi-language corpora:** Add a `language` field; route each query to the right language by passing `metadata_filters: { language: detect_language(query) }`.
-
-**Review schema changes:** Treat `database_metadata_schema` as a data contract. Existing field definitions are immutable, so changing them requires re-ingestion.
-
----
 
 ## Related
 
 - [Knowledge](/essentials/v2/knowledge): what attaches to knowledge sources
 - [Memories](/essentials/v2/memories): metadata fields on memory items
-- [Multi-Tenant Support](/essentials/v2/multi-tenant): partitioning vs scoping
+- [Multi-tenancy](/essentials/v2/multi-tenant): partitioning with collections, which filters do not replace
 - [Query](/essentials/v2/query): how `metadata_filters` interact with ranking
+- [Access Control](/essentials/v2/access-control): restricting who may retrieve a document, which is not a metadata filter
 - [Create Database (API Reference)](/api-reference/v2/endpoint/create-tenant): full `database_metadata_schema` reference
 - [Query (API Reference)](/api-reference/v2/endpoint/query): full `metadata_filters` reference
-- [List Context](/api-reference/v2/endpoint/list-documents): source browsing filters
-- [Access Control](/essentials/v2/access-control): restricting who may retrieve a document, which is not a metadata filter
-- [Update Source Metadata](/api-reference/v2/endpoint/update-source-metadata): point metadata edits
-- [Update Metadata Schema](/api-reference/v2/endpoint/update-metadata-schema): additive database schema changes
+- [List Context (API Reference)](/api-reference/v2/endpoint/list-documents): source browsing filters
+- [Update Source Metadata (API Reference)](/api-reference/v2/endpoint/update-source-metadata): point metadata edits
+- [Update Metadata Schema (API Reference)](/api-reference/v2/endpoint/update-metadata-schema): additive database schema changes
