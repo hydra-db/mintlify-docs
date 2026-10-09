@@ -1,0 +1,234 @@
+---
+title: "Agent frameworks"
+description: "Give Hermes, OpenClaw, CrewAI, and LangChain agents long-term memory with HydraDB."
+---
+
+These integrations give agents built on a framework or agent runtime memory that lasts across runs: relevant context is recalled before each turn or task, and completed work is saved back to HydraDB. Each needs an API key and a database ID from the [HydraDB dashboard](https://app.hydradb.com/keys).
+
+<CardGroup cols={2}>
+  <Card title="Hermes" icon="feather" href="#hermes" />
+  <Card title="OpenClaw" icon="/images/plugins/openclaw.svg" href="#openclaw" />
+  <Card title="CrewAI" icon="/images/plugins/crewai.svg" href="#crewai" />
+  <Card title="LangChain" icon="/images/plugins/langchain.svg" href="#langchain" />
+</CardGroup>
+
+To use HydraDB from any other MCP client, connect the [MCP server](/plugins/mcp) instead.
+
+## Hermes
+
+HydraDB is a native [Hermes Agent](https://hermes-agent.nousresearch.com/docs/)
+**memory provider**: relevant context is recalled before each turn and completed
+turns are persisted automatically. This is the proper, native way to make HydraDB
+Hermes' long-term memory (alongside providers like supermemory, retaindb, and
+ham). It uses the HydraDB public API only (recall + knowledge ingest); no HydraDB
+SDK is required.
+
+<Steps>
+  <Step title="Install the provider">
+    <Tabs>
+      <Tab title="Catalog (recommended)">
+        HydraDB is a first-party entry in the curated Hermes plugin catalog:
+
+        ```bash
+        hermes plugins install hydradb
+        hermes memory setup hydradb
+        ```
+      </Tab>
+      <Tab title="Directory (drop-in)">
+        Clone the repo and copy the `hydradb_hermes/` folder (it contains
+        `__init__.py` and `plugin.yaml`) into your Hermes memory plugins
+        directory:
+
+        ```bash
+        git clone https://github.com/hydra-db/hydradb-hermes-plugin.git
+        mkdir -p ~/.hermes/plugins/memory/hydradb/
+        cp -r hydradb-hermes-plugin/hydradb_hermes/. ~/.hermes/plugins/memory/hydradb/
+        ```
+      </Tab>
+      <Tab title="pip (entry point)">
+        ```bash
+        pip install hydradb-hermes
+        ```
+
+        Registered via the `hermes_agent.memory_providers` entry point.
+      </Tab>
+    </Tabs>
+
+    <Note>
+      Requires **Python 3.10+** and a Hermes Agent install.
+    </Note>
+  </Step>
+
+  <Step title="Get credentials">
+    - Create an API key from the [HydraDB dashboard](https://app.hydradb.com/keys)
+    - Create or copy your database ID from the [HydraDB dashboard](https://app.hydradb.com/databases)
+  </Step>
+
+  <Step title="Set environment variables">
+    ```bash
+    export HYDRADB_API_KEY="your-api-key"
+    export HYDRADB_DATABASE="your-database"
+    ```
+  </Step>
+
+  <Step title="Enable it in `config.yaml`">
+    Memory providers are single-select:
+
+    ```yaml
+    memory:
+      provider: hydradb
+    ```
+  </Step>
+</Steps>
+
+### How it works
+
+The integration implements Hermes' `MemoryProvider` contract:
+
+| Method | Role | HydraDB |
+| ------ | ---- | ------- |
+| `prefetch(query, *, session_id)` | **Auto-recall**: context injected before the API call | Hybrid `POST /query` (prefers the server-built `llm_prompt`) |
+| `sync_turn(user, assistant, ...)` | Persist the completed turn (**non-blocking**, off-thread) | `POST /context/ingest` |
+| `is_available()` | Provider availability | `bool(HYDRADB_API_KEY)` |
+| `get_config_schema()` / `save_config()` | Setup wizard (API key, database) | |
+| `name` | Provider name | `"hydradb"` |
+
+- **Auto-recall**: Before each turn, Hermes calls `prefetch`, which queries
+  HydraDB and returns graph-enriched context to inject into the request.
+- **Auto-retain**: After each turn, `sync_turn` persists the user/assistant
+  exchange off-thread so the model is never blocked on a write.
+
+### MCP alternative
+
+For pull-style recall (agent-invoked tools) instead of automatic memory, point
+Hermes at the HydraDB [MCP server](/plugins/mcp). The memory provider already
+gives automatic recall and retain, so MCP is optional.
+
+## OpenClaw
+
+Automatically captures conversations, recalls relevant context with
+knowledge-graph connections, and injects it before every AI turn.
+
+<Steps>
+  <Step title="Install">
+    Clone the repo and install from the local checkout:
+
+    ```bash
+    git clone https://github.com/hydra-db/hydradb-openclaw-plugin.git
+    openclaw plugins install ./hydradb-openclaw-plugin
+    ```
+
+    <Note>
+      Requires **OpenClaw 2026.6.0 or later** (`openclaw --version`).
+    </Note>
+  </Step>
+
+  <Step title="Configure">
+    Set credentials in the environment (or in the plugin config block
+    `plugins.entries.hydradb.config`), then restart the gateway:
+
+    ```bash
+    export HYDRADB_API_KEY="your-api-key"
+    export HYDRADB_DATABASE="your-database"
+    openclaw gateway restart
+    ```
+
+    Optional: `HYDRADB_COLLECTION` (collection scope) and `HYDRADB_BASE_URL`.
+    Turn capture reads conversation messages, which OpenClaw gates for
+    non-bundled plugins; enable it with
+    `plugins.entries.hydradb.hooks.allowConversationAccess: true`.
+  </Step>
+</Steps>
+
+**Lifecycle hooks:** `before_prompt_build` recalls relevant memory and prepends
+it to the prompt, `after_tool_call` syncs edited files, `agent_end` captures the
+completed turn, and `session_start` syncs workspace docs.
+
+**Manual actions** come from the shipped skills: `query`, `ingest`, `doctor`,
+`setup`, and `last-recall`.
+
+Repo:
+[`hydradb-openclaw-plugin`](https://github.com/hydra-db/hydradb-openclaw-plugin).
+
+OpenClaw runs on the same engine as the [coding agent plugins](/plugins/coding-agents), so its config keys and capture, search, and ingest modes match the [config variables](/plugins/coding-agents#config-variables) there.
+
+## CrewAI
+
+HydraDB as external memory for [CrewAI](https://crewai.com) agents. Crews recall
+relevant history on each task and persist their outputs into HydraDB, so memory
+survives across runs.
+
+```bash
+pip install crewai-hydradb
+```
+
+```python
+from crewai import Crew
+from crewai.memory.external.external_memory import ExternalMemory
+from hydradb_crewai import HydraDBClient, HydraDBStorage
+
+client = HydraDBClient(api_key="sk_live_...", tenant_id="your-database")
+
+crew = Crew(
+    agents=[...],
+    tasks=[...],
+    external_memory=ExternalMemory(storage=HydraDBStorage(client)),
+)
+crew.kickoff()
+```
+
+<Note>
+  Implements CrewAI's `Storage` interface via `ExternalMemory`, available in
+  **CrewAI 1.0-1.10**. On **1.11+** (which restructured memory around an
+  embedding-based `StorageBackend`), use HydraDB over [MCP](/plugins/mcp)
+  instead. Outputs are stored as knowledge via the public `/context/ingest` path;
+  `search` uses `POST /query`.
+</Note>
+
+Repo: [`hydradb-crewai-plugin`](https://github.com/hydra-db/hydradb-crewai-plugin). Package: [`crewai-hydradb`](https://pypi.org/project/crewai-hydradb/).
+
+## LangChain
+
+HydraDB integration for [LangChain](https://langchain.com): persistent,
+cross-session memory and retrieval for your chains and agents.
+
+```bash
+pip install langchain-hydradb
+```
+
+```python
+from langchain_hydradb import HydraDBClient, HydraDBRetriever
+
+client = HydraDBClient(api_key="sk_live_...", tenant_id="your-database")
+
+# Use HydraDB as a retriever in any chain
+retriever = HydraDBRetriever(client=client, kind="both", max_results=6)
+docs = retriever.invoke("what did we decide about auth?")
+
+# Write durable memory
+client.add_text("We deploy on Fridays only.", infer=True)
+```
+
+| Class | Role |
+| ----- | ---- |
+| `HydraDBClient` | Thin HTTP client, public API only (`POST /query`, `POST /context/ingest`, `DELETE /context`) |
+| `HydraDBRetriever` | `BaseRetriever` over memory, knowledge, or both |
+| `HydraDBChatMessageHistory` | `BaseChatMessageHistory` that persists and recalls turns |
+
+<Note>
+  Requires `langchain-core >= 0.3`. Writes use the public knowledge path, so
+  `add_text`/`add_conversation` store as knowledge; recall `kind` may be
+  `"memory"`, `"knowledge"`, or `"both"`. Ingestion is asynchronous, so recall a
+  source only after it finishes indexing.
+</Note>
+
+Repo: [`hydradb-langchain-plugin`](https://github.com/hydra-db/hydradb-langchain-plugin). Package: [`langchain-hydradb`](https://pypi.org/project/langchain-hydradb/).
+
+---
+
+## Source code
+
+- [`hydradb-hermes-plugin`](https://github.com/hydra-db/hydradb-hermes-plugin)
+- [`hydradb-openclaw-plugin`](https://github.com/hydra-db/hydradb-openclaw-plugin)
+- [`hydradb-crewai-plugin`](https://github.com/hydra-db/hydradb-crewai-plugin)
+- [`hydradb-langchain-plugin`](https://github.com/hydra-db/hydradb-langchain-plugin)
