@@ -189,9 +189,14 @@ Limit: 100 submissions per minute per organization, far above what reporting onl
 ### Do not mix scopes accidentally
 
 - `database` (formerly `tenant_id`) is the hard isolation boundary.
-- `collection` (formerly `sub_tenant_id`) is a logical partition inside a database, typically user/workspace/team.
-- Use the same `collection` on writes and reads. Data written under one collection should not be expected to appear from another.
-- Do not use `metadata_filters` as a substitute for `collection`.
+- `collection` (formerly `sub_tenant_id`) is an optional group inside a database. For a company brain, keep all knowledge and connectors in one collection and isolate results with `metadata_filters` and `acl`. Use separate collections only for data that must never meet in one search, such as each user's memories.
+- Use the same `collection` on writes, status checks, and reads. Data written under one collection does not appear in a query that names another.
+
+### Send `acl` for end users
+
+- If your app answers on behalf of signed-in users, send the caller's identity as `acl` on every `POST /query`, for example `"acl": ["grace@acme.com"]`.
+- A query without `acl` is not filtered: it returns everything in scope, including documents restricted to other people.
+- Derive `acl` from your authenticated session, never from client input. See [Access control](#access-control).
 
 ---
 
@@ -205,24 +210,24 @@ Recommended patterns:
 
 | Use case | Pattern |
 |---|---|
-| B2B SaaS | one `database` per customer; `collection` for workspace/team/user |
-| B2C app | one app/customer database; `collection = user_id` |
+| Company brain | one `database`, one collection for all documents and connectors; isolate with `metadata_filters` and `acl` |
+| B2B SaaS | one `database` per customer; one collection for that customer's knowledge; isolate teams with `metadata_filters` and `acl` |
+| B2C app | one `database`; shared knowledge in one collection; `collection = user_id` for each user's memories |
 | Environment isolation | separate `database`s for prod/staging |
-| Shared knowledge | database-wide/default collection or consistent shared scope |
-| User memories | `collection = user_id` |
+| User memories | `collection = user_id`, and the same collection on every read |
 
 ### Knowledge
 
-Knowledge is shared context: documents, PDFs, Markdown, CSVs, Slack threads, Notion pages, Gmail threads, tickets, webpages, etc.
+Knowledge is the documents, app sources, and facts your AI reasons over: PDFs, Markdown, CSVs, Slack threads, Notion pages, Gmail threads, tickets, webpages, etc.
 
 - Ingest with `POST /context/ingest`, `type=knowledge`.
 - Search with `POST /query`, `type: "knowledge"`.
-- Use for content that should be reusable across users.
+- It can be private: restrict documents with `acl` (see [Access control](#access-control)).
 - Mutability is explicit: re-ingest with the same ID and `upsert: true`, edit metadata in place with `PATCH /context/{id}/metadata`, or delete.
 
 ### Memories
 
-Memories are user/workspace/session-scoped context: preferences, conversation history, behavioral signals, decisions, inferred traits.
+Memories are preferences, decisions, past conversations, behavioral signals, and inferred traits, saved in the collection you will query them from.
 
 - Ingest with `POST /context/ingest`, `type=memory`.
 - Search with `POST /query`, `type: "memory"` or `type: "all"`.
@@ -296,6 +301,78 @@ Rules:
 - Forceful relation expansion only takes effect in `mode: "thinking"`.
 - Use `ids`.
 - Declared relations link knowledge sources (`relations` on `document_metadata[]` and `app_knowledge[]` items). Memory items do not take `relations`.
+
+### Access control
+
+A document's `acl` lists who may retrieve it; a query's `acl` says who is asking.
+
+- Set `acl` on `app_knowledge[]` items at ingest, or on any existing source with `PATCH /context/{id}/metadata`, where it replaces the stored list.
+- Connectors copy permissions from Slack, Google Drive, GitHub, Confluence, Jira, and other providers on every sync.
+- Principals: an email (`grace@acme.com`), `domain:acme.com`, `group:<provider>:<id>`, or `__public__`.
+- On a query, the caller's email also matches its `domain:` principal and `__public__` automatically. Group membership is never derived from an email; send `group:` principals yourself.
+- A document with no `acl` is unrestricted. A query with no `acl`, `[]`, or `["*"]` is not filtered.
+
+Example: a document with `"acl": ["grace@acme.com"]` comes back for a query with `"acl": ["grace@acme.com"]` and stays hidden from `"acl": ["bob@acme.com"]`. A document with `"acl": ["domain:acme.com"]` comes back for both.
+
+### Connectors
+
+Connectors sync data from 70 apps, including Slack, Gmail, Google Drive, Notion, Jira, Confluence, GitHub, Linear, HubSpot, and Zendesk, into a database on a schedule, with no ingestion code. Prefer a connector over hand-written `app_knowledge` ingestion when the app is in the catalog; `GET /connectors/providers` lists it.
+
+Setup is four calls, made once:
+
+1. `GET /connectors/providers?id={provider}`: read `credential_schema`, the credentials it needs.
+2. `POST /connectors`: store the credentials, with `database` and `collection`.
+3. `GET /connectors/{id}/discover`: list the channels, repositories, or pages the credentials reach.
+4. `POST /connectors/{id}/configure`: choose resources; the first sync starts right away.
+
+Then poll `GET /connectors/{id}/status` until `lifecycle` is `active`, and query as usual. Syncs repeat every `sync_interval_seconds` (one hour by default).
+
+```python
+connector = client.connectors.create(
+    provider="slack",
+    database="acme_corp",
+    collection="company_docs",
+    provider_account_scope="T12345ACME",
+    credentials={"access_token": "xoxp-..."},
+)
+found = client.connectors.discover(connector.connector_id)
+client.connectors.configure(
+    connector.connector_id,
+    resources=[
+        {"resource_id": r.id, "resource_type": r.resource_type, "name": r.name}
+        for r in found.resources
+    ],
+)
+status = client.connectors.status(connector.connector_id)
+```
+
+```ts
+const connector = await client.connectors.create({
+  provider: "slack",
+  database: "acme_corp",
+  collection: "company_docs",
+  providerAccountScope: "T12345ACME",
+  credentials: { access_token: "xoxp-..." },
+});
+const id = connector.connectorId!;
+const found = await client.connectors.discover({ id });
+await client.connectors.configure({
+  id,
+  resources: (found.resources ?? []).map((r) => ({
+    resourceId: r.id!,
+    resourceType: r.resourceType,
+    name: r.name,
+  })),
+});
+const status = await client.connectors.status({ id });
+```
+
+Rules:
+
+- Connector endpoints return their body directly, without the `{ success, data }` envelope.
+- To change one resource, use `PATCH /connectors/{id}/resources/{resource_id}`. `POST /connectors/{id}/resources` on an existing resource replaces it and syncs it again from the beginning.
+- Every synced object carries `connector_id` and `provider` in `metadata`, and `connector_id` and `resource_id` in `additional_metadata`; filter on them to scope a query.
+- `custom_instructions` on the connector or one resource tells HydraDB how to read its documents, from the next sync on.
 
 ---
 
@@ -815,7 +892,7 @@ Rules:
 | Field | Values | Notes |
 |---|---|---|
 | `database` | string | required |
-| `collection` | string/null | required for per-user memory searches |
+| `collection` | string/null | the collection the content was saved in; default collection if omitted |
 | `query` | string | required |
 | `type` | `knowledge`, `memory`, `all` | store selector for knowledge, memories, or both |
 | `query_by` | `hybrid`, `text` | default hybrid |
@@ -1225,6 +1302,8 @@ There is no `INVALID_PARAMETERS` and no `SOURCE_NOT_FOUND`. Earlier revisions of
 
 Retry only `429`, `500`, `502`, and `503`, with bounded exponential backoff and jitter.
 
+The SDKs already retry `408`, `429`, and `5xx` responses twice with exponential backoff before raising, and the Python SDK also retries `409`. Raise the count with `request_options={"max_retries": 5}` on a Python call or `maxRetries` on the TypeScript client or call, rather than wrapping SDK calls in a second retry loop.
+
 SDK errors:
 
 ```python
@@ -1310,7 +1389,10 @@ Common architecture across cookbooks:
 - [ ] Using `??` on `errorMessage`, which is `""` rather than null on some failures, so the fallback never fires.
 - [ ] Omitting `collection` for user memories.
 - [ ] Writing with one `collection` and reading with another.
-- [ ] Using metadata filters for user partitioning instead of `collection`.
+- [ ] Splitting a company brain into many collections instead of one collection with `metadata_filters` and `acl`.
+- [ ] Querying on behalf of an end user without `acl`, which returns everything in scope.
+- [ ] Hand-writing `app_knowledge` ingestion for an app a connector already syncs.
+- [ ] Editing an existing connector resource with `POST /connectors/{id}/resources`, which replaces it.
 - [ ] Using undeclared `tenant_metadata` keys in `metadata_filters`.
 - [ ] Putting hot filters in free-form metadata instead of database schema.
 - [ ] Expecting `query_forceful_relations` to work in `mode: "fast"`.
@@ -1324,43 +1406,56 @@ Common architecture across cookbooks:
 
 ## 15. SDK Method Reference
 
-### 15.1 TypeScript SDK
+Every method is on the client: `client.<method>` in both SDKs. Python takes snake_case arguments; TypeScript takes camelCase request fields. Connector methods, `list_providers()`, and `update_metadata_schema()` return the body directly; every other method returns the envelope, so read `.data`.
 
-| Method | Endpoint | Purpose |
-|---|---|---|
-| `client.context.ingest()` | `POST /context/ingest` | Ingest documents, app sources, or memories |
-| `client.context.status()` | `GET /context/status` | Check processing status of ingested items |
-| `client.context.inspect()` | `GET /context/inspect` | Inspect original source content or get a presigned URL |
-| `client.context.list()` | `POST /context/list` | Browse knowledge or memories |
-| `client.context.delete()` | `DELETE /context` | Delete sources or memories |
-| `client.context.relations()` | `GET /context/relations` | Inspect graph relationships |
-| `client.query()` | `POST /query` | Unified search over knowledge, memories, or both |
-| `client.databases.create()` | `POST /databases` | Create a new isolated workspace |
-| `client.databases.list()` | `GET /databases` | List all databases registered for the organization |
-| `client.databases.delete()` | `DELETE /databases` | Permanently remove a database |
-| `client.databases.status()` | `GET /databases/status` | Check provisioning readiness of a database's infrastructure |
-| `client.databases.collections()` | `GET /databases/collections` | List active collections |
-| `client.databases.stats()` | `GET /databases/stats` | Get database usage stats |
+| Group | Python | TypeScript | Endpoint | Purpose |
+|---|---|---|---|---|
+| Databases | `databases.create()` | `databases.create()` | `POST /databases` | Create a database |
+| Databases | `databases.status()` | `databases.status()` | `GET /databases/status` | Check provisioning readiness |
+| Databases | `databases.list()` | `databases.list()` | `GET /databases` | List databases |
+| Databases | `databases.stats()` | `databases.stats()` | `GET /databases/stats` | Row counts for a database |
+| Databases | `databases.get_metadata_schema()` | `databases.getMetadataSchema()` | `GET /databases/{database}/metadata-schema` | Read the metadata schema |
+| Databases | `databases.update_metadata_schema()` | `databases.updateMetadataSchema()` | `PATCH /databases/{database}/metadata-schema` | Add metadata schema fields |
+| Databases | `databases.collections()` | `databases.collections()` | `GET /databases/collections` | List collections |
+| Databases | `databases.delete_collection()` | `databases.deleteCollection()` | `DELETE /databases/collections` | Delete a collection |
+| Databases | `databases.delete()` | `databases.delete()` | `DELETE /databases` | Delete a database |
+| Context | `context.ingest()` | `context.ingest()` | `POST /context/ingest` | Ingest documents, app sources, or memories |
+| Context | `context.status()` | `context.status()` | `GET /context/status` | Check indexing status |
+| Context | `context.list()` | `context.list()` | `POST /context/list` | Browse knowledge or memories |
+| Context | `context.inspect()` | `context.inspect()` | `GET /context/inspect` | Original content or a presigned URL |
+| Context | `context.update_source_metadata()` | `context.updateSourceMetadata()` | `PATCH /context/{id}/metadata` | Edit metadata or `acl` without re-ingesting |
+| Context | `context.relations()` | `context.relations()` | `GET /context/relations` | Graph relations for a source or collection |
+| Context | `context.subgraph()` | `context.subgraph()` | `GET /context/{id}/subgraph` | Items connected to one source |
+| Context | `context.delete()` | `context.delete()` | `DELETE /context` | Delete sources or memories |
+| Query | `query()` | `query()` | `POST /query` | Search knowledge, memories, or both |
+| Query | `feedback.submit()` | `feedback.submit()` | `POST /feedback` | Report how a query performed |
+| Connectors | `list_providers()` | `listProviders()` | `GET /connectors/providers` | Provider catalog, or one provider's credentials |
+| Connectors | `connectors.create()` | `connectors.create()` | `POST /connectors` | Store credentials for one account |
+| Connectors | `connectors.discover()` | `connectors.discover()` | `GET /connectors/{id}/discover` | Resources the credentials reach |
+| Connectors | `connectors.configure()` | `connectors.configure()` | `POST /connectors/{id}/configure` | Choose resources and start syncing |
+| Connectors | `connectors.status()` | `connectors.status()` | `GET /connectors/{id}/status` | Connector and per-resource health |
+| Connectors | `connectors.list()` | `connectors.list()` | `GET /connectors` | List connectors |
+| Connectors | `connectors.get()` | `connectors.get()` | `GET /connectors/{id}` | One connector's settings |
+| Connectors | `connectors.list_resources()` | `connectors.listResources()` | `GET /connectors/{id}/resources` | Configured resources |
+| Connectors | `connectors.sync()` | `connectors.sync()` | `POST /connectors/{id}/sync` | Sync now |
+| Connectors | `connectors.pause()` | `connectors.pause()` | `POST /connectors/{id}/pause` | Stop scheduled syncs |
+| Connectors | `connectors.resume()` | `connectors.resume()` | `POST /connectors/{id}/resume` | Restart scheduled syncs |
+| Connectors | `connectors.update()` | `connectors.update()` | `PATCH /connectors/{id}` | Instructions, sync interval, or credentials |
+| Connectors | `connectors.update_resource_acl()` | `connectors.updateResourceAcl()` | `PATCH /connectors/{id}/resources/{resource_id}` | One resource's instructions or `acl` |
+| Connectors | `connectors.create_resource()` | `connectors.createResource()` | `POST /connectors/{id}/resources` | Add a new resource (replaces an existing one) |
+| Connectors | `connectors.delete_resource()` | `connectors.deleteResource()` | `DELETE /connectors/{id}/resources/{resource_id}` | Stop syncing one resource |
+| Connectors | `connectors.delete()` | `connectors.delete()` | `DELETE /connectors/{id}` | Remove a connector |
+| Webhooks | `webhooks.register()` | `webhooks.register()` | `POST /webhooks/indexing` | Register or replace the webhook |
+| Webhooks | `webhooks.get()` | `webhooks.get()` | `GET /webhooks/indexing` | Current registration |
+| Webhooks | `webhooks.test()` | `webhooks.test()` | `POST /webhooks/indexing/test` | Send a test delivery |
+| Webhooks | `webhooks.list_deliveries()` | `webhooks.listDeliveries()` | `GET /webhooks/indexing/deliveries` | Delivery history |
+| Webhooks | `webhooks.get_delivery()` | `webhooks.getDelivery()` | `GET /webhooks/indexing/deliveries/{delivery_id}` | One delivery |
+| Webhooks | `webhooks.retry_delivery()` | `webhooks.retryDelivery()` | `POST /webhooks/indexing/deliveries/{delivery_id}/retry` | Retry a failed delivery |
+| Webhooks | `webhooks.set_signing_secret()` | `webhooks.setSigningSecret()` | `POST /webhooks/indexing/signing-secret` | Generate or set the signing secret |
+| Webhooks | `webhooks.clear_signing_secret()` | `webhooks.clearSigningSecret()` | `DELETE /webhooks/indexing/signing-secret` | Turn signing off |
+| Webhooks | `webhooks.delete()` | `webhooks.delete()` | `DELETE /webhooks/indexing` | Remove the webhook |
 
-### 15.2 Python SDK
-
-| Group | Method | Endpoint | Description |
-|---|---|---|---|
-| Context | `client.context.ingest()` | `POST /context/ingest` | Ingest documents, app sources, or memories |
-| Context | `client.context.status()` | `GET /context/status` | Check processing status of ingested items |
-| Context | `client.context.inspect()` | `GET /context/inspect` | Inspect original source content or get a presigned URL |
-| Context | `client.context.list()` | `POST /context/list` | Browse knowledge or memories |
-| Context | `client.context.delete()` | `DELETE /context` | Delete sources or memories |
-| Context | `client.context.relations()` | `GET /context/relations` | Inspect graph relationships |
-| Search | `client.query()` | `POST /query` | Unified search over knowledge, memories, or both |
-| Databases | `client.databases.create()` | `POST /databases` | Create a new isolated workspace |
-| Databases | `client.databases.list()` | `GET /databases` | List all databases registered for the organization |
-| Databases | `client.databases.delete()` | `DELETE /databases` | Permanently remove a database |
-| Databases | `client.databases.status()` | `GET /databases/status` | Check provisioning readiness of a database's infrastructure |
-| Databases | `client.databases.collections()` | `GET /databases/collections` | List active collections |
-| Databases | `client.databases.stats()` | `GET /databases/stats` | Get database usage stats |
-
-### 15.3 Minimal cURL example
+### 15.1 Minimal cURL example
 
 Use `type` on raw `/query` requests to select `knowledge`, `memory`, or `all`. The raw API response is wrapped; read payloads from `.data`.
 
@@ -1409,7 +1504,7 @@ curl -s -X POST 'https://api.hydradb.com/query' \
   | jq '.data.chunks'
 ```
 
-### 15.4 Raw HTTP: ingest app-source knowledge
+### 15.2 Raw HTTP: ingest app-source knowledge
 
 Use this for connector output where your app already extracted the text. `app_knowledge` must be a JSON string in multipart form data.
 
