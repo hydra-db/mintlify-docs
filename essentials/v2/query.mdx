@@ -1,228 +1,253 @@
 ---
 title: "Query"
-description: "How HydraDB retrieves the right context for each query  -  Knowledge, Memories, and the context graph, all behind a single /query endpoint."
----
-Query turns stored context into the *right* context for a specific query. One endpoint  -  `POST /query`  -  queries [Knowledge](/essentials/v2/knowledge) (documents and app sources), [Memories](/essentials/v2/memories) (user preferences, conversation history, inferred content), or both. Three signals drive relevance: dense-vector similarity, BM25 keyword matching, and [context-graph](/essentials/v2/context-graphs) traversal. The parameters below control all of it.
-
-For the full request and response schema, see [Query - API Reference](/api-reference/v2/endpoint/query-overview).
-
+description: "Retrieve the right context from knowledge, memories, or both with one request, and tune what comes back."
 ---
 
-## 1. Use-case recipes
+[`POST /query`](/api-reference/v2/endpoint/query) searches your [knowledge](/essentials/v2/knowledge), your [memories](/essentials/v2/memories), or both, and returns ranked passages, called **chunks**, with their source details and the context graph around them. Your application puts them in the model's prompt; the model writes the answer.
 
-Pick the row that matches your goal and use the parameters as a starting point:
+The defaults work without tuning. This guide builds up in order:
 
-| I want to… | `type` | `query_by` | `mode` | Notes |
-| --- | --- | --- | --- | --- |
-| Document Q&A / RAG | `"knowledge"` | `"hybrid"` | `"thinking"` | Set `graph_context: true` for a richer context graph as part of the API response |
-| Exact keyword match | `"knowledge"` | `"text"` |  -  | Optionally set `operator: "and"` or `"or"` to control BM25 term matching |
-| Personalized response | `"memory"` | `"hybrid"` | `"thinking"` |  |
-| Personalized + grounded | `"all"` | `"hybrid"` | `"thinking"` | One call merges both stores |
-| Query over apps | `"knowledge"` | `"hybrid"` | `"thinking"` | Set `query_apps: true` to enable the app-aware retrieval lane (IDs, actors, thread & parent traversal) while still querying the full selected knowledge scope |
+1. [Run a query](#1-run-a-query): one request and what comes back.
+2. [Pick a recipe](#2-pick-a-recipe): starting parameters for the common cases.
+3. [Tune the ranking](#3-tune-the-ranking): `mode`, `alpha`, `recency_bias`, and `max_results`.
+4. [Choose what to search](#4-choose-what-to-search): several collections, knowledge and memories together, and metadata filters.
+5. [Add relationships](#5-add-relationships): the context graph, linked sources, and app-aware search.
+6. [Query on behalf of a user](#6-query-on-behalf-of-a-user): the `acl` field.
+7. [Common mistakes](#common-mistakes).
 
----
+## 1. Run a query
 
-## 2. Parameter reference
+The example below searches the `acme_corp` database for knowledge about rotating API keys. Every query uses this same request; the later sections only add fields. The body is JSON, unlike ingestion, which is multipart.
 
-[Follow this for when to use `database` and `collection`](./multi-tenant#2-when-to-use-each)
+<Accordion title="Run a query: Python, TypeScript, or cURL">
 
-The `database` field was formerly `tenant_id` and `collection` was formerly `sub_tenant_id`; the old names remain accepted as deprecated aliases.
+Set up your [SDK client](/api-reference/v2/sdks#client-setup) before running the Python or TypeScript example.
 
-### Scope
+<CodeGroup>
+```python Python SDK
+result = client.query(
+    database="acme_corp",
+    collection="company_docs",
+    query="How do I rotate API keys?",
+    type="knowledge",
+    max_results=5,
+)
 
-| Parameter | Type / values | Purpose |
-| --- | --- | --- |
-| `collections` | `string[]` or `{ [collection]: positive number (max one decimal place) }` | Preferred query-time scope selector. Use a single-item list for one user/workspace, a longer list to fan out with equal normalized weights, or an object to provide relative ranking weights with at most one decimal place. Maximum 100 collections. |
-| `collection` | string | Single-scope query selector; also used at ingest. Send one collection ID to scope the query to it. |
-
-### Graph
-
-| Parameter | Type / values | Purpose |
-| --- | --- | --- |
-| `graph_context` | boolean | When `true` (default), includes the entity/relation graph slice in the response. Pair with `mode: "thinking"` for richer multi-hop traversals. See [Context Graphs](/essentials/v2/context-graphs). Set to `false` to drop it when you only need ranked chunks. Default: `true`. |
-| `query_forceful_relations` | boolean | Whether to fetch author-declared related sources (see [`relations` on ingest](/api-reference/v2/endpoint/ingest-context)) into `additional_context`. **Only takes effect in** `mode: "thinking"`**.** Default: `true`. |
-
-### Shaping results
-
-| Parameter | Type / values | Purpose |
-| --- | --- | --- |
-| `max_results` | integer | Maximum chunks to return. Default `10`; maximum `50`. Start with `10`, reduce for tight context windows, increase only when you rerank or summarize downstream. |
-| `recency_bias` | float `0.0`–`1.0` | Boost for newer content. Default: `0.0` (no boost). |
-| `query_apps` | boolean | Set `true` to enable the app-aware retrieval lane alongside normal retrieval (reconstructed threads, parent/child traversal, exact ID/actor lookups). This improves app-source query but does not restrict the query to only app sources; HydraDB still queries the full selected knowledge scope. See [App Sources](/essentials/v2/app-sources). Default: `false`. |
-| `additional_context` | string | Request-time hint to guide retrieval (e.g., "user is on the billing page"). This is different from the response `additional_context`, which carries forceful-relation results. Default: `null`. |
-| `metadata_filters` | object | Deterministic narrowing before ranking. See [Metadata](/essentials/v2/metadata). Default: `null`. |
-
-### Access control
-
-| Parameter | Type / values | Purpose |
-| --- | --- | --- |
-| `acl` | `string[]` | Query on behalf of an identity: results are restricted to documents that identity may retrieve. Send the caller's email (`["grace@acme.com"]`); `__public__` and the caller's `domain:` principal are added automatically. Omitted, empty, or `["*"]` disables filtering entirely, which is the default. See [Access Control](/essentials/v2/access-control). Default: `null`. |
-
----
-
-## 3. Tuning heuristics
-
-Most of the time the defaults are right. When they aren't, here's where to start:
-
-- `mode`  -  If omitted, defaults to `"auto"`: it scores the query before retrieval and routes to `"fast"` or `"thinking"` (defaulting to `"thinking"` when the signal is inconclusive), and overrides `graph_context` to match whichever it picks. Pick `"fast"` or `"thinking"` explicitly instead when you know your traffic shape and want a deterministic pipeline.
-- `alpha`  -  Start at `0.8`. Lower toward `0.3–0.5` when the query contains literal tokens (error codes, SKUs, product names). Raise toward `0.9` for conceptual questions. Use `"auto"` when query shape varies across calls.
-- `max_results`  -  Start at `10`. Drop to `5` for tight context windows; raise to `20` if you rerank downstream.
-- `additional_context`  -  Use it when the query alone is ambiguous. Keep it short and factual.
-- `graph_context`  -  Set to `true` when answers benefit from entity relationships (multi-hop questions, "how does X relate to Y"). Pair with `mode: "thinking"`  -  in `"fast"` mode the graph slice is shallow.
-- `query_apps`  -  Set to `true` when querying ingested app data (Slack, Gmail, Confluence, Jira, Salesforce) to activate exact ID and actor lookups, same-thread expansion, and parent/child hierarchy traversal. This adds better app-aware retrieval on top of the normal knowledge query; it does not filter out non-app knowledge. Pair with `mode: "thinking"`.
-
----
-
-## 4. Minimal working example
-
-The canonical personalized-answer flow takes a single call: `POST /query` with `type: "all"` returns merged knowledge and per-user memory in one ranked result set.
-
-### Setup
-
-```bash
-# Set your key as an environment variable - used in every request below
-export HYDRA_DB_API_KEY="your_api_key"
-# All requests: -H "Authorization: Bearer $HYDRA_DB_API_KEY" -H "API-Version: 2"
+for chunk in result.data.chunks:
+    print(chunk.source_title, chunk.chunk_content)
 ```
-
-```typescript
-import { HydraDBClient } from "@hydradb/sdk";
-
-const client = new HydraDBClient({
-  token: process.env.HYDRA_DB_API_KEY,
+```typescript TypeScript SDK
+const result = await client.query({
+  database: "acme_corp",
+  collection: "company_docs",
+  query: "How do I rotate API keys?",
+  type: "knowledge",
+  maxResults: 5,
 });
+
+for (const chunk of result.data.chunks) {
+  console.log(chunk.sourceTitle, chunk.chunkContent);
+}
 ```
-
-```python
-import os
-from hydra_db import HydraDB
-
-client = HydraDB(token=os.environ["HYDRA_DB_API_KEY"])
-```
-
-### One call  -  Knowledge and Memories together
-
-```bash
+```bash cURL
 curl -X POST 'https://api.hydradb.com/query' \
   -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
   -H "API-Version: 2" \
   -H "Content-Type: application/json" \
   -d '{
     "database": "acme_corp",
-    "collection": "user_john_123",
-    "query": "How do I reset my password?",
-    "type": "all",
-    "query_by": "hybrid",
-    "mode": "thinking",
-    "max_results": 8,
-    "graph_context": true
+    "collection": "company_docs",
+    "query": "How do I rotate API keys?",
+    "type": "knowledge",
+    "max_results": 5
   }'
 ```
+</CodeGroup>
 
-```typescript
-const result = await client.query({
-  database: "acme_corp",
-  collection: "user_john_123",
-  query: "How do I reset my password?",
-  type: "all",
-  queryBy: "hybrid",
-  mode: "thinking",
-  maxResults: 8,
-  graphContext: true,
-});
-```
-
-```python
-result = client.query(
-    database="acme_corp",
-    collection="user_john_123",
-    query="How do I reset my password?",
-    type="all",
-    query_by="hybrid",
-    mode="thinking",
-    max_results=8,
-    graph_context=True,
-)
-```
-
-### Merge into the LLM prompt
-
-The response is a single `RetrievalResult` containing `chunks[]`, `sources[]`, and  -  when applicable  -  `graph_context` and `additional_context`. Chunks from Knowledge and Memories are already interleaved and ranked by relevance, so no manual merging is required. Pass the result through the helper in [How to Use API Results](/essentials/v2/api-results) to turn it into a context string for your prompt:
-
-```typescript
-const context = buildContextString(result);
-
-const completion = await openai.chat.completions.create({
-  model: "gpt-4o",
-  messages: [
-    {
-      role: "system",
-      content: "Answer using only the provided context. Match the user's preferred style.",
-    },
-    {
-      role: "user",
-      content: `${context}\n\nQuestion: How do I reset my password?`,
-    },
-  ],
-});
-```
-
-If you need to query several users, teams, or workspaces at once, pass `collections`. A list gives every scope equal normalized weight; an object applies relative ranking weights with at most one decimal place before the final merged ranking. When `max_results` is set, it caps the final merged response across all selected collections:
+The response is wrapped in the standard envelope, so read the result from `data`. Trimmed to the fields you use most, it looks like this:
 
 ```json
 {
-  "database": "acme_corp",
-  "collections": {
-    "workspace_42": 2,
-    "user_john_123": 1
+  "success": true,
+  "data": {
+    "chunks": [
+      {
+        "chunk_uuid": "runbook_keys_chunk_2",
+        "id": "runbook_keys",
+        "chunk_content": "Rotate API keys from Settings, then Security. The old key stays valid for 24 hours.",
+        "source_title": "API key runbook",
+        "relevancy_score": 0.91,
+        "metadata": { "document_type": "runbook" }
+      }
+    ],
+    "sources": [
+      { "id": "runbook_keys", "title": "API key runbook", "type": "pdf", "url": "" }
+    ],
+    "graph_context": {
+      "query_paths": [],
+      "chunk_relations": [],
+      "chunk_id_to_group_ids": {}
+    },
+    "additional_context": {}
   },
-  "query": "What context matters for this renewal?",
-  "type": "all"
+  "error": null,
+  "meta": {
+    "request_id": "9d13aef4-02f4-4e73-8c62-4c2601d04f9d",
+    "latency_ms": 412.0
+  }
 }
 ```
 
-If you need to keep Knowledge and Memories formatted differently in the prompt, call `/query` twice in parallel with `type: "knowledge"` and `type: "memory"`, then merge client-side.
+The full response schema is on the [Query API reference](/api-reference/v2/endpoint/query).
 
-### Production checklist
+</Accordion>
 
-- **Default to** `type: "all"` for personalized answers  -  one call instead of two, scoped with `collections`.
-- **Set per-call timeouts.** Generous for `thinking` (3–5 s), tight for `fast` (≤500 ms). For `mode: "auto"`, size the timeout for the `thinking` case  -  it can resolve to either pipeline and defaults toward `thinking` when the routing signal is inconclusive.
-- **Enable `query_apps: true`** when querying app sources to activate app-aware retrieval and thread/relation traversal.
-- **Pass** `additional_context` with known session state (page, feature, role). It sharpens retrieval without extra calls.
+### What each property means
 
----
+| Property | What it is |
+|---|---|
+| `database` | The [database](/api-reference/v2/endpoint/create-tenant) to search. Required on every call. A query never reads another database. |
+| `collection` | The collection to search, the same one you ingested into. Leave it out to search the database's default collection. [Section 4](#4-choose-what-to-search) covers searching several at once. |
+| `query` | The question or search terms, in natural language. Cannot be empty. |
+| `type` | What to search: `"knowledge"` (the default) for documents and app sources, `"memory"` for saved preferences and conversations, or `"all"` for both. |
+| `max_results` | How many chunks to return. Default `10`, maximum `250`. |
 
-## 5. Common mistakes
+### What comes back
+
+- **`data.chunks`:** the matching passages, ranked by relevance, each with its `chunk_content`, `source_title`, `relevancy_score`, and `metadata`. Keep the order.
+- **`data.sources`:** one entry per source, with its `id`, `title`, and `url` for citations.
+- **`data.graph_context`** and **`data.additional_context`:** relationships and linked passages, covered in [section 5](#5-add-relationships).
+
+Pass the whole result to `build_string` (Python) or `buildString` (TypeScript) for a prompt-ready string; [How to Use API Results](/essentials/v2/api-results) walks through it. New content is searchable once its [indexing status](/api-reference/v2/endpoint/source-status) reaches `graph_creation`.
+
+## 2. Pick a recipe
+
+Pick the row that matches your goal and use its parameters as a starting point. Everything else can stay at its default.
+
+| I want to | `type` | `query_by` | `mode` | Notes |
+| --- | --- | --- | --- | --- |
+| Answer questions from documents | `"knowledge"` | `"hybrid"` | `"thinking"` | Keep `graph_context` on (the default) to include relationships between the people, topics, or services the documents mention |
+| Match an exact keyword or phrase | `"knowledge"` | `"text"` | Not used | Set `operator` to `"and"` or `"phrase"` to control how the keywords must match. [Semantic Search](/essentials/v2/semantic-search) has the example |
+| Personalize a response | `"memory"` | `"hybrid"` | `"thinking"` | Search the collection the memories were saved in |
+| Personalize and ground in documents | `"all"` | `"hybrid"` | `"thinking"` | One call reads both stores from the same scope. If the documents live in another collection, list both in `collections` |
+| Search Slack, Jira, Gmail, and other app data | `"knowledge"` | `"hybrid"` | `"thinking"` | Leave `query_apps` on (the default) so threads, replies, and linked records expand along with the matching item |
+| Serve mixed traffic with one setting | `"knowledge"` | `"hybrid"` | `"auto"` | HydraDB scores each query and routes it to `"fast"` or `"thinking"`. This is also what you get when `mode` is omitted |
+
+`query_by` picks how the text is matched: `"hybrid"` (the default) matches by meaning and by keyword together, and `"text"` matches keywords only. `mode` picks how much work the query does. [Section 3](#3-tune-the-ranking) explains both.
+
+## 3. Tune the ranking
+
+Most of the time the defaults are right. When they are not, start here:
+
+- **`mode`:** `"fast"` is one retrieval pass, for chat and autocomplete. `"thinking"` expands the query, reranks, and pulls in [linked sources](#5-add-relationships), for answers where quality matters more than latency. `"auto"`, the default, scores each query and routes it to one of the two, choosing thinking when unsure; the response does not say which it chose. Applies to `query_by: "hybrid"` only.
+- **`alpha`:** the balance between meaning (`1.0`) and keywords (`0.0`) in a hybrid query. Default `0.8`, which `"auto"` also resolves to. Lower it toward `0.3` to `0.5` for error codes, SKUs, and product names; raise it toward `0.9` for conceptual questions. [Semantic Search](/essentials/v2/semantic-search) has the full table.
+- **`recency_bias`:** how much newer content is favored, from `0.0` to `1.0`. Default `0.4`, a mild tilt that only reorders close results. Send `0` for policies and other content that rarely changes, and `0.6` to `0.8` for changelogs and status updates.
+- **`max_results`:** default `10`, maximum `250`. Drop to `5` for tight context windows; raise to `20` when you rerank downstream.
+- **`additional_context`:** a short factual hint, such as `"user is on the billing page"`, that sharpens retrieval. It is not a filter.
+
+In production:
+
+- **Timeouts:** 3 to 5 s for thinking, 500 ms or less for fast. Budget `"auto"` like thinking.
+- **Literal token plus intent:** run `query_by: "hybrid"` and `query_by: "text"` in parallel, dedupe by `chunk_uuid`, and keep the text hits.
+- **Recall, then rerank:** ask for `max_results: 20` and apply your own rules before picking the final set.
+- **Caching:** key on the database, the collections, the caller's `acl`, and every query parameter, and expire entries when content or permissions change.
+
+## 4. Choose what to search
+
+A query reads the collection you send in `collection`, or the database's default collection if you send none. To search more than that:
+
+- **Several collections:** send `collections` instead, as a list, or as an object of weights to rank one above another. Up to 100; every listed collection must exist, or the call returns `400`. `max_results` caps the merged list.
+- **Knowledge and memories together:** `type: "all"` reads both from the same collections and ranks them together. When shared documents and memories live in different collections, list both.
+- **A slice you already know:** `metadata_filters` narrows results before ranking, such as only runbooks or only one team's documents. [Metadata](/essentials/v2/metadata) covers the operators.
+
+<Accordion title="Search shared documents and a user's memories together: Python, TypeScript, or cURL">
+
+<CodeGroup>
+```python Python SDK
+result = client.query(
+    database="acme_corp",
+    collections=["company_docs", "user_john_123"],
+    query="How do I reset my password?",
+    type="all",
+    mode="thinking",
+    max_results=8,
+)
+```
+```typescript TypeScript SDK
+const result = await client.query({
+  database: "acme_corp",
+  collections: ["company_docs", "user_john_123"],
+  query: "How do I reset my password?",
+  type: "all",
+  mode: "thinking",
+  maxResults: 8,
+});
+```
+```bash cURL
+curl -X POST 'https://api.hydradb.com/query' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "database": "acme_corp",
+    "collections": ["company_docs", "user_john_123"],
+    "query": "How do I reset my password?",
+    "type": "all",
+    "mode": "thinking",
+    "max_results": 8
+  }'
+```
+</CodeGroup>
+
+Knowledge and memories come back together in `data.chunks`, ranked as one list. To let the user's memories outrank the shared documents, send weights instead of a list:
+
+```json
+{
+  "collections": {
+    "user_john_123": 2,
+    "company_docs": 1
+  }
+}
+```
+
+</Accordion>
+
+## 5. Add relationships
+
+Three fields bring in context beyond the passages that matched. All three are on by default.
+
+- **`graph_context`:** the relationships HydraDB extracted from your content, such as "Payments team owns billing service", in `data.graph_context`. `false` drops it, but only in fast mode; thinking always includes it. [Context Graphs](/essentials/v2/context-graphs) explains how to read it.
+- **`query_forceful_relations`:** sources linked at ingest with `relations.ids`, such as a contract and its addendum, returned in `data.additional_context`. Thinking mode only; fast mode skips it without an error. [Knowledge](/essentials/v2/knowledge#6-link-documents-that-belong-together) shows how to declare the links.
+- **`query_apps`:** for [app sources](/essentials/v2/app-sources), an extra lane that rebuilds Slack threads, follows ticket and parent links, and matches exact ids and people. It still searches everything else, and has no effect on memories.
+
+## 6. Query on behalf of a user
+
+Send the caller's email in `acl`, such as `"acl": ["grace@acme.com"]`, and results are limited to documents that person may retrieve, plus public and unrestricted ones. Without `acl` the query is not filtered, so derive it from your signed-in session, never from the client. [Access Control](/essentials/v2/access-control) covers setting ACLs on documents and the principal forms.
+
+Every parameter, with its type and default, is on the [Query API reference](/api-reference/v2/endpoint/query).
+
+## Common mistakes
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
-| Empty `query_paths` / `chunk_relations` | `graph_context` not set, or no relations exist for the result set | Set `graph_context: true`. Empty arrays are normal when there's nothing to return  -  see [Context Graphs](/essentials/v2/context-graphs). |
-| Recent uploads don't appear in results | Indexing not finished | Poll `GET /context/status?ids=...&database=...`  -  chunks are invisible until processing reaches at least `graph_creation`. |
-| `metadata_filters` doesn't narrow results | Filter key is in the wrong namespace, the value doesn't match exactly, or the hot top-level field was not declared with `enable_match` | Top-level keys match `metadata`; free-form per-document fields must be nested under `additional_metadata`. Declare hot filter keys in `database_metadata_schema` with `enable_match: true` before production ingest. |
+| Empty `query_paths` or `chunk_relations` | `graph_context` set to `false`, or no relationships exist for the result set | Leave `graph_context` on (the default). Empty arrays are normal when there is nothing to return. See [Context Graphs](/essentials/v2/context-graphs). |
+| Recent uploads do not appear in results | Indexing not finished | Poll [`GET /context/status`](/api-reference/v2/endpoint/source-status) with the source ids. Chunks are invisible until processing reaches at least `graph_creation`. |
+| `metadata_filters` does not narrow results | Filter key is in the wrong namespace, the value does not match exactly, or the top-level field was not declared in the database schema | Top-level keys match `metadata`; free-form per-document fields must be nested under `additional_metadata`. Declare hot filter keys in `database_metadata_schema` before production ingest. |
 | Memories missing from a `type: "knowledge"` query | Wrong store selected | Use `type: "memory"` or `type: "all"`. |
-| Recency doesn't seem to matter | `recency_bias` defaults to `0` | Set it explicitly between `0.1` and `1.0`. |
-| `operator: "phrase"` ignored | `query_by` not set to `"text"` | `operator` only applies to BM25 text query  -  switch `query_by` to `"text"`. |
-| `query_forceful_relations` ignored | Request uses `mode: "fast"` | Forceful-relation context is fetched only in `mode: "thinking"`. |
-| `graph_context` value ignored | Request uses `mode: "auto"` (or `mode` was omitted) | `auto` overrides `graph_context` to match whichever pipeline it routes to; set `graph_context` explicitly only under `mode: "fast"` or `"thinking"`. |
-| Expected a deterministic `fast`/`thinking` pipeline, got auto-routed instead | `mode` was omitted | Omitting `mode` now defaults to `"auto"`  -  set `mode` explicitly to `"fast"` or `"thinking"` if you don't want automatic routing. |
-
----
-
-## 6. Advanced patterns
-
-**Hybrid + text in two parallel calls.** When a query mixes a literal token (error code, SKU, function name) with natural-language intent, run `query_by: "hybrid"` and `query_by: "text"` in parallel, dedupe by chunk ID, and treat text hits as a "must include" floor.
-
-**Recall-then-rerank.** Ask for more chunks than you actually need (`max_results: 20`) and apply your own reranker  -  recency windows, compliance filters, business rules  -  before picking the final top-k for the prompt.
-
-**Cache the prompt context.** If the same query repeats inside a session, cache the `RetrievalResult` keyed by `(database, collection, query, type, query_by)`. Recall is fast, but skipping it entirely is faster.
-
----
+| Knowledge missing from a `type: "all"` query | The documents live in a different collection from the one you sent | List both collections in `collections`. |
+| Recency does not seem to matter | `recency_bias` was sent as `0`, or the default `0.4` tilt is too mild | Raise it toward `1.0`. |
+| `operator: "phrase"` returns `400` | `query_by` not set to `"text"` | `"and"` and `"phrase"` only apply to BM25 text queries: switch `query_by` to `"text"`. |
+| `query_forceful_relations` ignored | Request runs in `mode: "fast"` (or `auto` routed to fast) | Linked sources are fetched only in thinking mode. Set `mode: "thinking"`. |
+| `graph_context: false` ignored | Request runs in thinking mode (`mode: "thinking"`, or `auto` routed to thinking) | Thinking always includes the graph slice; `false` takes effect only in fast mode. Set `mode: "fast"` to drop it. |
+| Expected a deterministic `fast` or `thinking` pipeline, got auto-routed instead | `mode` was omitted | Omitting `mode` means `"auto"`. Set `mode` explicitly to `"fast"` or `"thinking"`. |
 
 ## Related
 
-- [Knowledge](/essentials/v2/knowledge)  -  shared document context
-- [Memories](/essentials/v2/memories)  -  user-scoped dynamic context
-- [Metadata](/essentials/v2/metadata)  -  designing filterable fields
-- [Context Graphs](/essentials/v2/context-graphs)  -  how graph traversal enriches recall
-- [How to Use API Results](/essentials/v2/api-results)  -  turning `RetrievalResult` into an LLM prompt
-- [Query - API Reference](/api-reference/v2/endpoint/query)  -  full parameter and response schema
+- [Knowledge](/essentials/v2/knowledge): the documents and app records a query searches
+- [Memories](/essentials/v2/memories): preferences, decisions, and past conversations
+- [How to Use API Results](/essentials/v2/api-results): turning the response into a model prompt
+- [Semantic Search](/essentials/v2/semantic-search): how meaning and keyword matching combine, and the `alpha` table
+- [Context Graphs](/essentials/v2/context-graphs): reading and using `graph_context`
+- [Metadata](/essentials/v2/metadata): designing filterable fields
+- [Access Control](/essentials/v2/access-control): giving documents ACLs and querying as a caller
+- [Query: API Reference](/api-reference/v2/endpoint/query): the full parameter and response schema

@@ -1,77 +1,46 @@
 ---
 title: "Knowledge"
-description: "What Knowledge is, how it differs from Memories, and how to ingest it correctly."
+description: "Ingest the documents, app sources, and facts your AI reasons over, and retrieve them with one query."
 ---
 
 import { Field } from "/snippets/field.jsx";
 
-## 1. What it is
+<a id="1-what-it-is"></a>
 
-Knowledge is the shared, database-wide context that every user and agent in a database can query  -  product documents, internal wikis, policy PDFs, Slack threads, Notion pages, CSVs, emails, and anything else that ought to be reusable across the workspace.
+Knowledge is the documents, app sources, and facts your AI reasons over: product docs, policy PDFs, runbooks, wiki pages, Slack threads, tickets, and emails. You send it to [`POST /context/ingest`](/api-reference/v2/endpoint/ingest-context) with `type=knowledge`, either as **files** that HydraDB reads for you or as **app sources**, records your application already parsed from an app. Each file or record is a **source**; HydraDB splits it into searchable passages called **chunks**, builds a context graph from it, and returns the relevant chunks through [`POST /query`](/api-reference/v2/endpoint/query).
 
-Knowledge is the counterpart to [Memories](/essentials/v2/memories), which holds per-user context. Both are retrievable through the same [`POST /query`](/api-reference/v2/endpoint/query) endpoint, but they live in separate stores; you pick which one to query via the `type` parameter (see [Query](/essentials/v2/query)).
+Preferences, decisions, and past conversations are [memories](/essentials/v2/memories). Knowledge can still be private: [access control](/essentials/v2/access-control) decides who may retrieve each document. For a company brain, ingest everything into one collection and use [metadata filters](/essentials/v2/metadata) and access control to keep results apart.
 
-| | Knowledge | Memories |
-|---|---|---|
-| **Content** | Documents, files, app-generated content | User preferences, conversations, inferred traits |
-| **Scope** | Shared across all users in a database | Per-user, scoped by `collection` (formerly `sub_tenant_id`) |
-| **Mutability** | Versioned  -  replaced or deleted explicitly | Dynamic  -  evolves with every interaction |
-| **Query via** | [`POST /query`](/api-reference/v2/endpoint/query) with `type: "knowledge"` | [`POST /query`](/api-reference/v2/endpoint/query) with `type: "memory"` |
-| **`vectorstore_status`** | `vectorstore_status.knowledge` | `vectorstore_status.memories` |
+This guide builds up in order:
 
-<Info>
-  **One endpoint, two stores.** Knowledge and memories are stored separately, but a single [`POST /query`](/api-reference/v2/endpoint/query) call can hit both via `type: "all"`  -  results are merged and re-ranked together. Pick `type: "knowledge"` for shared-doc RAG, `type: "memory"` for per-user context, or `type: "all"` for personalized answers grounded in both. See [Query](/essentials/v2/query) for the full picture.
-</Info>
+1. [Upload files](#1-upload-files): one request, shown with two PDFs.
+2. [Ingest app sources](#2-ingest-app-sources): records from Slack, Jira, Notion, Gmail, and other apps.
+3. [Wait for indexing](#3-wait-for-indexing): polling until a source is searchable.
+4. [Retrieve knowledge](#4-retrieve-knowledge): querying what you ingested.
+5. [Add metadata for filtering](#5-add-metadata-for-filtering).
+6. [Link documents that belong together](#6-link-documents-that-belong-together).
+7. [Field reference](#field-reference) and [common mistakes](#common-mistakes).
 
----
+<a id="path-a-files"></a>
 
-## 2. What it does
+## 1. Upload files
 
-When you call [`POST /context/ingest`](/api-reference/v2/endpoint/ingest-context) with `type=knowledge`, HydraDB walks each source through a pipeline:
+The example below uploads two PDFs. HydraDB parses each file (PDF, DOCX, Markdown, CSV, or TXT), splits it into chunks, and indexes it.
 
-1. **Parses** the input  -  PDF, DOCX, Markdown, CSV, plain text, or app-source JSON.
-2. **Chunks** the content into semantically coherent segments.
-3. **Extracts entities and relationships**, building graph nodes and edges (see [Context Graphs](/essentials/v2/context-graphs)).
-4. **Embeds** every chunk into the dense and sparse vector stores.
-5. **Indexes** the result so it becomes queryable via [`POST /query`](/api-reference/v2/endpoint/query).
+The request is **multipart/form-data** with these fields:
 
-The pipeline runs **asynchronously**. The ingest call returns `202 Accepted` with `id`s; the content isn't queryable until `indexing_status` reaches at least `graph_creation`. Poll [`GET /context/status`](/api-reference/v2/endpoint/source-status) to track progress  -  see the full status table at [Ingestion Status](/api-reference/v2/endpoint/source-status).
-
----
-
-## 3. When to use it
-
-Reach for Knowledge ingestion when the content is:
-
-- **Shared across all users** in your database  -  product docs, policy PDFs, runbooks, wikis, internal tooling.
-- **Static or infrequently updated**  -  versioned by replacing the source rather than appending.
-- **Document-structured** rather than conversational  -  files, threads, pages, articles.
-
-Reach for [Memories](/essentials/v2/memories) instead when the content is:
-
-- User preferences or behavioral signals tied to one person.
-- Per-user conversation history that should shape future answers for that user.
-- Anything that should personalize a single user's experience.
-
-| If the content is… | Store it as… |
+| Form field | What to send |
 |---|---|
-| Shared across all users | Knowledge |
-| Specific to one user or session | [Memory](/essentials/v2/memories) |
+| `type` | `knowledge` |
+| `database` | An existing [database](/api-reference/v2/endpoint/create-tenant) |
+| `collection` | Optional. Leave it out to use the database's default collection. A query that names another collection does not read the default one. |
+| `documents` | One or more files |
+| `document_metadata` | One item per file, in the same order, as a JSON string. Optional, but this is where a file's `id` and `metadata` go. |
+| `upsert` | Leave it out. It defaults to `true`, so a file sent again with the same `id` replaces the saved one. |
 
-When in doubt, ask "would a different user benefit from seeing this?"  -  if yes, Knowledge; if no, Memory.
+<Accordion title="Upload files: Python, TypeScript, or cURL">
 
----
-
-## 4. Two ingestion paths
-
-[`POST /context/ingest`](/api-reference/v2/endpoint/ingest-context) with `type=knowledge` accepts two content formats in the same request  -  you can send either, or both at once. Pick the path that matches what you have on hand:
-
-- **Path A** when you have **binary files** HydraDB should parse for you.
-- **Path B** when you have **pre-extracted text** from an app or connector and want to skip parsing.
-
-### Path A  -  Files
-
-Binary files HydraDB should parse and chunk: PDF, DOCX, Markdown, CSV, TXT.
+Set up your [SDK client](/api-reference/v2/sdks#client-setup) before running the Python or TypeScript example.
 
 <CodeGroup>
 ```python Python SDK
@@ -120,10 +89,48 @@ curl -X POST 'https://api.hydradb.com/context/ingest' \
 ```
 </CodeGroup>
 
-### Path B  -  App sources
+The response lists each file in `data.results` with its `id` and a `status` of `queued`. The payload is wrapped in the standard envelope, so read it from `response.data`:
 
-Pre-parsed records from connected apps. You supply app-native fields (`kind`, `provider`, `external_id`, and `fields`), [metadata](/essentials/v2/metadata), and optional attachments/comments. Use this when your application already extracts content from Slack messages, Notion pages, Gmail messages, tickets, or CRM records and you want HydraDB to preserve app structure instead of treating the item as generic text.
+```json
+{
+  "success": true,
+  "data": {
+    "success": true,
+    "message": "Knowledge uploaded successfully",
+    "results": [
+      { "id": "policy_v2", "filename": "policy.pdf", "status": "queued", "error": null }
+    ],
+    "success_count": 1,
+    "failed_count": 0
+  },
+  "error": null,
+  "meta": {
+    "request_id": "9d13aef4-02f4-4e73-8c62-4c2601d04f9d",
+    "latency_ms": 12.3
+  }
+}
+```
 
+</Accordion>
+
+### What each property in `document_metadata` means
+
+| Property | What it is |
+|---|---|
+| `id` | Your stable ID for the file. Send the same `id` later to replace the file, or use it to check status and delete. Leave it out to have one generated; the response returns it either way. |
+| `metadata` | Values you filter on at query time, such as `document_type`. Declare the keys in the [database metadata schema](/essentials/v2/metadata). Up to 16 KiB as compact JSON. |
+| `additional_metadata` | Free-form values for display and bookkeeping. Up to 1 KiB as compact JSON. |
+| `relations` | Other sources this file belongs with, as `{ "ids": [...] }`. [Section 6](#6-link-documents-that-belong-together) explains it. |
+
+The key list is closed. Any other key, including `title`, `type`, `url`, and `timestamp`, returns `400`.
+
+## 2. Ingest app sources
+
+When your application already has an item's text and fields, such as a Slack message, a Jira ticket, a Notion page, or a CRM record, send it as an **app source** instead of a file. HydraDB keeps the app's structure: the author, the thread, the ticket's status, and the links between items. [App Sources](/essentials/v2/app-sources) is the full guide, with the classes and a ready-to-adapt pattern for each app.
+
+The request is the same endpoint, with `app_knowledge` in place of `documents`. You can send both in one request.
+
+<Accordion title="Ingest a Slack message: Python, TypeScript, or cURL">
 <CodeGroup>
 ```python Python SDK
 import json
@@ -133,11 +140,8 @@ result = client.context.ingest(
     database="acme_corp",
     app_knowledge=json.dumps([
         {
-            "database": "acme_corp",
-            "collection": "default",
             "id": "slack_C01_1716213600_000100",
             "title": "Pricing discussion - Slack #product",
-            "type": "slack",
             "kind": "message",
             "provider": "slack",
             "external_id": "1716213600.000100",
@@ -160,11 +164,8 @@ const result = await client.context.ingest({
   database: "acme_corp",
   appKnowledge: JSON.stringify([
     {
-      database: "acme_corp",
-      collection: "default",
       id: "slack_C01_1716213600_000100",
       title: "Pricing discussion - Slack #product",
-      type: "slack",
       kind: "message",
       provider: "slack",
       external_id: "1716213600.000100",
@@ -189,11 +190,8 @@ curl -X POST 'https://api.hydradb.com/context/ingest' \
   -F "database=acme_corp" \
   -F 'app_knowledge=[
     {
-      "database": "acme_corp",
-      "collection": "default",
       "id": "slack_C01_1716213600_000100",
       "title": "Pricing discussion - Slack #product",
-      "type": "slack",
       "kind": "message",
       "provider": "slack",
       "external_id": "1716213600.000100",
@@ -211,40 +209,17 @@ curl -X POST 'https://api.hydradb.com/context/ingest' \
 ```
 </CodeGroup>
 
-<Info>
-Both paths are available. Use Path A for original documents that need parsing. Use Path B for app objects when you already have structured fields and want app-aware query behavior.
-</Info>
+The response has the same shape as a file upload, with one entry per item in `data.results`.
 
-**Response (both paths):**
+</Accordion>
 
-```json
-{
-  "success": true,
-  "data": {
-    "success": true,
-    "message": "Knowledge uploaded successfully",
-    "results": [
-      { "id": "policy_v2", "filename": "policy.pdf", "status": "queued", "error": null }
-    ],
-    "success_count": 1,
-    "failed_count": 0
-  },
-  "error": null,
-  "meta": {
-    "request_id": "9d13aef4-02f4-4e73-8c62-4c2601d04f9d",
-    "latency_ms": 12.3
-  }
-}
-```
+<a id="5-verifying-processing"></a>
 
-All endpoints return this envelope shape. Access the payload via `response.data` (e.g. `response.data.results`), not at the top level.
+## 3. Wait for indexing
 
----
+Ingestion runs in the background: HydraDB parses each source, splits it into chunks, finds the people, teams, and topics it mentions and how they relate (see [Context Graphs](/essentials/v2/context-graphs)), and builds the search indexes. The response returns `202 Accepted` with each source's `id`. Poll [`GET /context/status`](/api-reference/v2/endpoint/source-status) with those ids and the same `collection` until every source reaches `completed` or `errored`.
 
-## 5. Verifying processing
-
-Ingestion is async, so you need to confirm each source actually finished before it'll show up in [query](/essentials/v2/query). Poll [`GET /context/status`](/api-reference/v2/endpoint/source-status) with the `id`s you got back from ingestion. The snippets below loop until every item reaches a terminal state (`completed` or `errored`):
-
+<Accordion title="Poll until indexed: Python, TypeScript, or cURL">
 <CodeGroup>
 ```python Python SDK
 import time
@@ -301,6 +276,8 @@ done
 ```
 </CodeGroup>
 
+Each status in the `data` payload looks like this:
+
 ```json
 {
   "statuses": [
@@ -313,172 +290,63 @@ done
 }
 ```
 
-Status values move forward through `queued` → `processing` → `graph_creation` → `completed` (or land in `errored` on failure). Poll every few seconds; most documents complete in 1–5 minutes. The full table  -  including the `success` alias that occasionally appears for `completed`  -  is on [Ingestion Status](/api-reference/v2/endpoint/source-status).
+</Accordion>
 
-<Info>
-**`graph_creation` is already queryable.** Items in this state are retrievable via [`POST /query`](/api-reference/v2/endpoint/query). Wait for `completed` only when you specifically need full graph traversal (`graph_context: true`).
-</Info>
+Status values move forward through `queued`, `processing`, `graph_creation`, and `completed`, or land in `errored` on failure. A source is already searchable at `graph_creation`; wait for `completed` only when you need full graph traversal (`graph_context: true`). Poll every few seconds; most documents complete in 1 to 5 minutes. The full table is on [Ingestion Status](/api-reference/v2/endpoint/source-status). If you would rather not poll, [register a webhook](/essentials/v2/webhooks).
 
----
+## 4. Retrieve knowledge
 
-## 6. Key parameters
+Search with [`POST /query`](/api-reference/v2/endpoint/query), using `type: "knowledge"`. Use `type: "all"` to search a user's memories in the same call; both stores are read from the same collection, so if the documents live in their own collection, list it next to the user's in `collections`. App sources are searched too, because `query_apps` defaults to `true`.
 
-The full schema lives on [`POST /context/ingest`](/api-reference/v2/endpoint/ingest-context). Below are the fields you'll touch most often, grouped by where they live in the request.
-
-### File metadata (`document_metadata` array items)
-
-| Field | Description |
-|---|---|
-| <Field name="id" type="string" /> | Optional stable identifier. Used as upsert key when `upsert: true`. |
-| <Field name="metadata" type="object" /> | Filterable fields. Keys must match the database metadata schema. |
-| <Field name="additional_metadata" type="object" /> | Free-form fields for display and bookkeeping. Filterable only when nested under `additional_metadata` in `metadata_filters`. |
-| <Field name="title" type="string" /> | Override the source title shown in query results. |
-| <Field name="type" type="string" /> | Override the source type shown in query results. |
-| <Field name="url" type="string" /> | Override the canonical URL. |
-| <Field name="timestamp" type="ISO-8601 datetime" /> | Override the source timestamp. |
-| <Field name="relations" type="object" /> | Forcefully connect this source to others with `{ "ids": [...] }`. |
-
-### App source model (`app_knowledge` array items)
-
-| Field | Description |
-|---|---|
-| <Field name="id" type="string" recommended /> | Stable ID. Used as the upsert/delete/status key. |
-| <Field name="database" type="string" recommended /> | Database that owns the item. Must match form-level `database` (formerly `tenant_id`) when present. |
-| <Field name="collection" type="string" recommended /> | Logical partition. Must match form-level `collection` when present. |
-| <Field name="title" type="string" recommended /> | Short title, subject, ticket title, or page name. |
-| <Field name="type" type="string" recommended /> | Source category for display/analytics, such as `slack`, `notion`, `gmail`, or `jira`. |
-| <Field name="kind" type="email, message, ticket, knowledge_base, comment, custom" recommended /> | App object kind. Selects the app parser for `fields`. |
-| <Field name="provider" type="string" recommended /> | App namespace such as `slack`, `gmail`, `jira`, `notion`, `salesforce`, or `linear`. |
-| <Field name="external_id" type="string" recommended /> | Stable provider ID for this exact item. Enables exact lookup and relation resolution. |
-| <Field name="fields" type="object" required /> | App-native content and structure. Put primary text here (`body`, `description`, `title`, or `data` depending on `kind`). |
-| <Field name="url" type="string" /> | Canonical URL or reference link. |
-| <Field name="timestamp" type="ISO-8601 datetime" /> | Creation, sent, or last-updated time. |
-| <Field name="metadata" type="object" /> | Filterable fields matching the database schema. |
-| <Field name="additional_metadata" type="object" /> | Free-form fields. Filterable only when nested under `additional_metadata` in `metadata_filters`. |
-| <Field name="attachments" type="array" /> | Optional related attachments. Include extracted text in `attachments[].content.text` or `.markdown`. |
-| <Field name="comments" type="array" /> | Optional embedded snapshot comments. For live incremental comments, prefer a first-class `kind: "comment"` source. |
-| <Field name="relations" type="array" /> | App-native relation array: `[{ "predicate": "linked_to", "target": { "external_id": "AUTH-123", "provider": "jira" } }]`. |
-
-### Request-level fields
-
-| Field | Default | Description |
-|---|---|---|
-| <Field name="database" type="string" required /> |  -  | Target database. |
-| <Field name="collection" type="string" /> | none | Scope this knowledge to a collection. If omitted, knowledge is available to all collections. |
-| <Field name="upsert" type="boolean" /> | `true` | Replace existing items with the same `id`. |
-
----
-
-## 7. Forceful relations
-
-Forceful relations let you **declare** links between Knowledge sources at ingestion time. When a query matches a source that has forceful relations attached, HydraDB pulls the linked sources into the `additional_context` field of the query response alongside the primary chunks.
-
-This is separate from the entity and relationship [context graph](/essentials/v2/context-graphs) HydraDB builds automatically. Graph extraction is *derived* from content; forceful relations are *declared* by you  -  useful when you know two documents belong together (a contract and its addendum, a runbook and its troubleshooting guide) but the text doesn't make the connection explicit. Forceful relations link whole **sources**; to declare the full entity/relation graph *within* a single document (replacing extraction for it), use [Bring Your Own Graph](/essentials/v2/bring-your-own-graph).
-
-For file uploads, set `relations.ids` on the matching `document_metadata` item. For app sources, prefer the app-native `relations[]` shape so each link can carry a predicate and provider-aware target:
-
-```json
-{
-  "relations": [
-    {
-      "predicate": "linked_to",
-      "target": {
-        "id": "auth-troubleshooting"
-      }
-    },
-    {
-      "predicate": "related_to",
-      "target": {
-        "external_id": "AUTH-FAQ",
-        "provider": "notion"
-      }
-    }
-  ]
-}
-```
-
+<Accordion title="Query knowledge: Python, TypeScript, or cURL">
 <CodeGroup>
 ```python Python SDK
-client.context.ingest(
-    type="knowledge",
+result = client.query(
     database="acme_corp",
-    app_knowledge=json.dumps([
-        {
-            "database": "acme_corp",
-            "collection": "default",
-            "id": "auth-guide",
-            "title": "Authentication Guide",
-            "type": "notion",
-            "kind": "knowledge_base",
-            "provider": "notion",
-            "external_id": "AUTH-GUIDE",
-            "fields": {"kind": "knowledge_base", "title": "Authentication Guide", "body": "..."},
-            "relations": [
-                {"predicate": "linked_to", "target": {"id": "auth-troubleshooting"}},
-                {"predicate": "related_to", "target": {"external_id": "AUTH-FAQ", "provider": "notion"}},
-            ],
-        }
-    ]),
+    query="How do I rotate API keys?",
+    type="knowledge",
 )
+
+for chunk in result.data.chunks:
+    print(chunk.source_title, chunk.chunk_content)
 ```
 ```typescript TypeScript SDK
-await client.context.ingest({
-  type: "knowledge",
+const result = await client.query({
   database: "acme_corp",
-  appKnowledge: JSON.stringify([
-    {
-      id: "auth-guide",
-      title: "Authentication Guide",
-      type: "notion",
-      kind: "knowledge_base",
-      provider: "notion",
-      external_id: "AUTH-GUIDE",
-      fields: { kind: "knowledge_base", title: "Authentication Guide", body: "..." },
-      relations: [
-        { predicate: "linked_to", target: { id: "auth-troubleshooting" } },
-        { predicate: "related_to", target: { external_id: "AUTH-FAQ", provider: "notion" } },
-      ],
-    },
-  ]),
+  query: "How do I rotate API keys?",
+  type: "knowledge",
 });
+
+for (const chunk of result.data.chunks) {
+  console.log(chunk.sourceTitle, chunk.chunkContent);
+}
 ```
 ```bash cURL
-curl -X POST 'https://api.hydradb.com/context/ingest' \
+curl -X POST 'https://api.hydradb.com/query' \
   -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
   -H "API-Version: 2" \
-  -F "type=knowledge" \
-  -F "database=acme_corp" \
-  -F 'app_knowledge=[
-    {
-      "id": "auth-guide",
-      "title": "Authentication Guide",
-      "type": "notion",
-      "kind": "knowledge_base",
-      "provider": "notion",
-      "external_id": "AUTH-GUIDE",
-      "fields": { "kind": "knowledge_base", "title": "Authentication Guide", "body": "..." },
-      "relations": [
-        { "predicate": "linked_to", "target": { "id": "auth-troubleshooting" } },
-        { "predicate": "related_to", "target": { "external_id": "AUTH-FAQ", "provider": "notion" } }
-      ]
-    }
-  ]'
+  -H "Content-Type: application/json" \
+  -d '{
+    "database": "acme_corp",
+    "query": "How do I rotate API keys?",
+    "type": "knowledge"
+  }'
 ```
 </CodeGroup>
 
-At query time, linked sources are returned in the `additional_context` field of the [query response](/api-reference/v2/endpoint/query). `query_forceful_relations` defaults to `true`  -  you only need to set it explicitly if you want to disable forceful-relation expansion.
+Matching chunks come back in `data.chunks`, ranked by relevance, each with its `source_title` and text. [How to Use API Results](/essentials/v2/api-results) shows how to turn the response into a prompt. [Query](/essentials/v2/query) covers `mode`, `alpha`, and `recency_bias`.
 
-<Warning>
-**Knowledge items only.** Forceful relations work within the same store. Pointing a Knowledge item at a Memory ID (or vice versa) will silently return nothing at query time.
-</Warning>
+</Accordion>
 
-<Warning>
-**`thinking` mode only.** Forceful-relation context is fetched only when `mode: "thinking"` is set on the query request. In `fast` mode, `query_forceful_relations` is ignored even if set to `true`.
-</Warning>
+<a id="8-metadata-on-knowledge"></a>
 
-## 8. Metadata on knowledge
+## 5. Add metadata for filtering
 
-[Metadata](/essentials/v2/metadata) is how you bridge structured filters and semantic search. Attach `metadata` at ingestion to enable deterministic narrowing at query time:
+[Metadata](/essentials/v2/metadata) is how you bridge structured filters and semantic search. Attach `metadata` at ingestion, and narrow a query to matching sources with `metadata_filters`.
+
+<Accordion title="Filter by metadata: ingest, then query">
+
+On the `document_metadata` item or app source:
 
 ```json
 {
@@ -495,30 +363,144 @@ Then at query time:
 }
 ```
 
-For hot, supported top-level filters, declare `metadata` keys in the database metadata schema with `enable_match: true`  -  undeclared keys are silently ignored at query time. `additional_metadata` is stored alongside the source for display and bookkeeping; to filter on it, nest the keys under `additional_metadata` in `metadata_filters` (e.g. `{"metadata_filters": {"additional_metadata": {"author": "Alice"}}}`). `document_metadata` is accepted only as a legacy alias for that nested filter namespace.
+</Accordion>
 
-See [Metadata](/essentials/v2/metadata) for schema design, filter examples, and the `metadata` vs `additional_metadata` decision rule. See [Create Database](/api-reference/v2/endpoint/create-tenant) for the schema field configuration (`enable_match`, `enable_dense_embedding`, `enable_sparse_embedding`).
+Declare the `metadata` keys you filter on in the database metadata schema. In a database with a schema, ingest rejects undeclared keys, so filtering on one returns nothing. `additional_metadata` is stored alongside the source for display and bookkeeping; to filter on it, nest the keys under `additional_metadata` in `metadata_filters`, for example `{"metadata_filters": {"additional_metadata": {"author": "Alice"}}}`. `document_metadata` is accepted only as a legacy alias for that nested filter namespace.
 
----
+See [Metadata](/essentials/v2/metadata) for schema design, filter examples, and the `metadata` vs `additional_metadata` decision rule. See [Create Database](/api-reference/v2/endpoint/create-tenant) for the schema field configuration (`enable_dense_embedding`, `enable_sparse_embedding`).
 
-## 9. Common mistakes
+<a id="7-forceful-relations"></a>
+
+## 6. Link documents that belong together
+
+Forceful relations let you **declare** links between Knowledge sources at ingestion time. When a query matches a source that has forceful relations attached, HydraDB pulls the linked sources into the `additional_context` field of the query response alongside the primary chunks.
+
+This is separate from the entity and relationship [context graph](/essentials/v2/context-graphs) HydraDB builds automatically. Graph extraction is *derived* from content; forceful relations are *declared* by you, which is useful when you know two documents belong together (a contract and its addendum, a runbook and its troubleshooting guide) but the text does not make the connection explicit. Forceful relations link whole **sources**; to declare the full entity and relation graph *within* a single document (replacing extraction for it), use [Bring Your Own Graph](/essentials/v2/bring-your-own-graph#using-byog-without-cypher).
+
+On a file, set `relations.ids` on its `document_metadata` item. On an app source, set `relations.ids` the same way, and name the relationship in `app_relations` so the link also carries a predicate. `relations.ids` is what makes the linked text come back with query results; a named relationship alone connects the items without requesting their text. [App Sources](/essentials/v2/app-sources#4-relate-messages-tickets-and-records) covers typed targets in full.
+
+<Accordion title="Link a runbook to its troubleshooting guide: Python, TypeScript, or cURL">
+
+The Notion guide below links to a troubleshooting page you already ingested with the HydraDB `id` `auth-troubleshooting`. Ingest that page first and wait for `completed`.
+
+<CodeGroup>
+```python Python SDK
+client.context.ingest(
+    type="knowledge",
+    database="acme_corp",
+    app_knowledge=json.dumps([
+        {
+            "id": "auth-guide",
+            "title": "Authentication Guide",
+            "kind": "knowledge_base",
+            "provider": "notion",
+            "external_id": "AUTH-GUIDE",
+            "fields": {"kind": "knowledge_base", "title": "Authentication Guide", "body": "..."},
+            "relations": {"ids": ["auth-troubleshooting"]},
+            "app_relations": [
+                {"predicate": "linked_to", "target": {"source_id": "auth-troubleshooting"}},
+            ],
+        }
+    ]),
+)
+```
+```typescript TypeScript SDK
+await client.context.ingest({
+  type: "knowledge",
+  database: "acme_corp",
+  appKnowledge: JSON.stringify([
+    {
+      id: "auth-guide",
+      title: "Authentication Guide",
+      kind: "knowledge_base",
+      provider: "notion",
+      external_id: "AUTH-GUIDE",
+      fields: { kind: "knowledge_base", title: "Authentication Guide", body: "..." },
+      relations: { ids: ["auth-troubleshooting"] },
+      app_relations: [
+        { predicate: "linked_to", target: { source_id: "auth-troubleshooting" } },
+      ],
+    },
+  ]),
+});
+```
+```bash cURL
+curl -X POST 'https://api.hydradb.com/context/ingest' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -F "type=knowledge" \
+  -F "database=acme_corp" \
+  -F 'app_knowledge=[
+    {
+      "id": "auth-guide",
+      "title": "Authentication Guide",
+      "kind": "knowledge_base",
+      "provider": "notion",
+      "external_id": "AUTH-GUIDE",
+      "fields": { "kind": "knowledge_base", "title": "Authentication Guide", "body": "..." },
+      "relations": { "ids": ["auth-troubleshooting"] },
+      "app_relations": [
+        { "predicate": "linked_to", "target": { "source_id": "auth-troubleshooting" } }
+      ]
+    }
+  ]'
+```
+</CodeGroup>
+
+</Accordion>
+
+At query time, linked sources are returned in the `additional_context` field of the [query response](/api-reference/v2/endpoint/query). `query_forceful_relations` defaults to `true`, so you only need to set it explicitly if you want to disable forceful-relation expansion.
+
+<Warning>
+**Knowledge items, thinking mode only.** Forceful relations work within the same store, so pointing a Knowledge item at a Memory ID silently returns nothing. Linked context is fetched only when `mode: "thinking"` is set on the query, or when `mode: "auto"` routes to thinking. In `fast` mode, `query_forceful_relations` is ignored even if set to `true`.
+</Warning>
+
+## Field reference
+
+<AccordionGroup>
+<Accordion title="Request fields">
+
+| Field | Default | Description |
+|---|---|---|
+| <Field name="type" type="knowledge" required /> | None | Selects the Knowledge store. |
+| <Field name="database" type="string" required /> | None | Target database. |
+| <Field name="collection" type="string" /> | default collection | Scope this knowledge to a collection. If omitted, knowledge goes to the database's default collection, which a query naming another `collection` does not read. |
+| <Field name="documents" type="file[]" /> | None | Files for HydraDB to parse: PDF, DOCX, Markdown, CSV, TXT. |
+| <Field name="document_metadata" type="string (JSON array)" /> | None | One item per file in `documents`, in the same order. The item count must match the file count. |
+| <Field name="app_knowledge" type="string (JSON array)" /> | None | App source items. See the [App Sources field reference](/essentials/v2/app-sources#field-reference). |
+| <Field name="upsert" type="boolean" /> | `true` | Replace existing items with the same `id`. |
+
+</Accordion>
+<Accordion title="document_metadata item fields">
+
+| Field | Description |
+|---|---|
+| <Field name="id" type="string" /> | Optional stable identifier. Used as upsert key when `upsert: true`. |
+| <Field name="metadata" type="object" /> | Filterable fields. Keys must match the database metadata schema. Up to 16 KiB as compact JSON. |
+| <Field name="additional_metadata" type="object" /> | Free-form fields for display and bookkeeping. Filterable only when nested under `additional_metadata` in `metadata_filters`. Up to 1 KiB as compact JSON. |
+| <Field name="relations" type="object" /> | Forcefully connect this source to others with `{ "ids": [...] }`. |
+
+Any other key, including `title`, `type`, `url`, and `timestamp`, returns `400`. App sources accept `title`, `url`, and `timestamp`.
+
+</Accordion>
+</AccordionGroup>
+
+## Common mistakes
 
 | Mistake | What goes wrong | Fix |
 |---|---|---|
-| Querying Knowledge with `type: "memory"` | Nothing returned  -  wrong store | Use `type: "knowledge"` (or `"all"`) on [`POST /query`](/api-reference/v2/endpoint/query). |
-| Using `additional_metadata` for hot filterable fields | Filters work only with nested syntax and are less efficient than schema-backed metadata filters | Put hot filter keys in `metadata` and declare them in the [database schema](/api-reference/v2/endpoint/create-tenant), or filter under `metadata_filters: {"additional_metadata": {...}}` for occasional/free-form fields  -  see [Metadata](/essentials/v2/metadata). |
-| Not polling [`/context/status`](/api-reference/v2/endpoint/source-status) before querying | Chunks aren't indexed yet  -  empty query results | Wait for `indexing_status: completed` (or `graph_creation` for partial availability). |
+| Querying Knowledge with `type: "memory"` | Nothing returned: wrong store | Use `type: "knowledge"` (or `"all"`) on [`POST /query`](/api-reference/v2/endpoint/query). |
+| Using `additional_metadata` for hot filterable fields | Filters work only with nested syntax and are less efficient than schema-backed metadata filters | Put hot filter keys in `metadata` and declare them in the [database schema](/api-reference/v2/endpoint/create-tenant), or filter under `metadata_filters: {"additional_metadata": {...}}` for occasional/free-form fields. See [Metadata](/essentials/v2/metadata). |
+| Not polling [`/context/status`](/api-reference/v2/endpoint/source-status) before querying | Chunks aren't indexed yet, so query results are empty | Wait for `indexing_status: completed` (or `graph_creation` for partial availability). |
 | Sending `document_metadata` as a JSON object instead of a JSON string | `multipart/form-data` validation fails | Stringify `document_metadata` before sending in the `-F` field. |
-| Omitting `database` | `422` validation error | Required on every call. |
-| Pointing forceful relations at memory IDs from a knowledge source | Silently returns nothing at query | Forceful relations work **within the same store**  -  knowledge→knowledge, memory→memory. |
-
----
+| Omitting `database` | `400` error (`database is required`) | Required on every call. |
 
 ## Related
 
-- [Memories](/essentials/v2/memories)  -  the per-user counterpart to Knowledge
-- [Query](/essentials/v2/query)  -  how [`POST /query`](/api-reference/v2/endpoint/query) retrieves Knowledge
-- [Metadata](/essentials/v2/metadata)  -  designing filterable schemas
-- [Context Graphs](/essentials/v2/context-graphs)  -  how the graph layer enriches retrieval
-- [Ingest Content  -  API Reference](/api-reference/v2/endpoint/ingest-context)
-- [Ingestion Status  -  API Reference](/api-reference/v2/endpoint/source-status)
+- [App Sources](/essentials/v2/app-sources): the full guide to ingesting records from apps
+- [Memories](/essentials/v2/memories): the per-user counterpart to Knowledge
+- [Query](/essentials/v2/query): how [`POST /query`](/api-reference/v2/endpoint/query) retrieves Knowledge
+- [Metadata](/essentials/v2/metadata): designing filterable schemas
+- [Context Graphs](/essentials/v2/context-graphs): how the graph layer enriches retrieval
+- [Ingest Content: API Reference](/api-reference/v2/endpoint/ingest-context)
+- [Ingestion Status: API Reference](/api-reference/v2/endpoint/source-status)
