@@ -3,8 +3,6 @@ title: "AI Travel Planner"
 description: "Learn how to build an intelligent travel planning platform that understands natural language queries and provides personalized recommendations using HydraDB's AI search and memory capabilities."
 ---
 
-This guide demonstrates how to build a revolutionary AI-powered travel planning platform that transforms how travelers discover, plan, and book their trips. Instead of traditional keyword searches and manual browsing, your platform will understand natural language queries and provide intelligent, personalized travel recommendations using HydraDB's advanced AI capabilities.
-
 > **Note**: All code in this guide uses the official HydraDB TypeScript SDK. Base URL: `https://api.hydradb.com`. Get your API key at [app.hydradb.com](https://app.hydradb.com).
 
 ## Prerequisites
@@ -19,7 +17,7 @@ This guide demonstrates how to build a revolutionary AI-powered travel planning 
 
 By the end of this cookbook, you'll be able to:
 - Upload hotel, flight, restaurant, and activity data into HydraDB with correct database scoping
-- Answer complex natural language travel queries like "Plan a 5-day romantic trip to Italy for $3000" using `fullRecall` with `mode: "thinking"`
+- Answer complex natural language travel queries like "Plan a 5-day romantic trip to Italy for $3000" using `query` with `mode: "thinking"`
 - Store per-user travel preferences and booking history as AI memories for personalized recommendations
 - Build family, business, and adventure trip planning flows using semantic search
 
@@ -39,7 +37,7 @@ With HydraDB, travelers can plan naturally and get personalized recommendations:
 
 - **“Plan a 5-day romantic trip to Italy for my anniversary in September with a budget of \$3000”**
 - **“Find me a family-friendly resort in Bali with a kids club and water sports activities”**
-- **“I want to experience authentic local cuisine in Bangkok - suggest restaurants and food tours”**
+- **“I want to experience authentic local cuisine in Bangkok: suggest restaurants and food tours”**
 - **“Plan a solo backpacking trip through Southeast Asia for 3 weeks, focusing on cultural experiences”**
 - **“Find pet-friendly accommodations in San Francisco with easy access to dog parks”**
 
@@ -67,7 +65,7 @@ graph TD
 
 ### 1.1 Hotel and Accommodation Data
 
-Start by uploading comprehensive hotel and accommodation data using HydraDB's knowledge upload API:
+Start by uploading hotel and accommodation data as app knowledge:
 
 
 ```javascript
@@ -92,6 +90,7 @@ const uploadHotelData = async (hotels, database, collection) => {
              Room types: ${hotel.roomTypes.join(', ')}.`,
     },
     additional_metadata: {
+      category: "accommodation",
       location: hotel.coordinates,
       priceRange: hotel.priceRange,
       rating: hotel.rating,
@@ -104,7 +103,7 @@ const uploadHotelData = async (hotels, database, collection) => {
     database: database,
     collection: collection,
     appKnowledge: JSON.stringify(hotelSources),
-    upsert: true,
+    upsert: "true",
   });
 };
 ```
@@ -133,6 +132,7 @@ const uploadFlightData = async (flights, database, collection) => {
              Arrival: ${flight.arrivalTime}.`,
     },
     additional_metadata: {
+      category: "transportation",
       origin: flight.origin,
       destination: flight.destination,
       airline: flight.airline,
@@ -146,7 +146,7 @@ const uploadFlightData = async (flights, database, collection) => {
     database: database,
     collection: collection,
     appKnowledge: JSON.stringify(flightSources),
-    upsert: true,
+    upsert: "true",
   });
 };
 ```
@@ -176,6 +176,7 @@ const uploadRestaurantData = async (restaurants, database, collection) => {
              Specialties: ${restaurant.specialties.join(', ')}.`,
     },
     additional_metadata: {
+      category: "dining",
       cuisine: restaurant.cuisine,
       priceRange: restaurant.priceRange,
       rating: restaurant.rating,
@@ -188,7 +189,7 @@ const uploadRestaurantData = async (restaurants, database, collection) => {
     database: database,
     collection: collection,
     appKnowledge: JSON.stringify(restaurantSources),
-    upsert: true,
+    upsert: "true",
   });
 };
 ```
@@ -218,7 +219,8 @@ const uploadActivityData = async (activities, database, collection) => {
              Price: ${activity.price}.`,
     },
     additional_metadata: {
-      category: activity.category,
+      category: "activity",
+      activityType: activity.category,
       duration: activity.duration,
       difficulty: activity.difficulty,
       price: activity.price,
@@ -230,7 +232,7 @@ const uploadActivityData = async (activities, database, collection) => {
     database: database,
     collection: collection,
     appKnowledge: JSON.stringify(activitySources),
-    upsert: true,
+    upsert: "true",
   });
 };
 ```
@@ -264,7 +266,7 @@ class TravelAssistant {
   }
 
   async processResponse(response) {
-    // Generate structured itinerary from AI response
+    // Return the ranked chunks and graph context; pass them to your LLM to draft the itinerary
     return {
       chunks: response.data?.chunks,
       graphRelations: response.data?.graphContext?.chunkRelations,
@@ -288,13 +290,13 @@ class PersonalizationEngine {
 
   async generateUserMemory(userInteraction) {
     // Generate memories based on user's travel preferences and booking patterns
-    await client.context.ingest({
+    await this.client.context.ingest({
       type: 'memory',
       database: userInteraction.database,
       collection: userInteraction.userId,
-      upsert: true,
       memories: JSON.stringify([{
-        id: `user_${userInteraction.userId}`,
+        // A unique id per interaction, so each one adds a memory instead of replacing the last
+        id: `interaction_${userInteraction.userId}_${Date.now()}`,
         text: `User searched for: ${userInteraction.query}.
                    They showed interest in: ${userInteraction.clickedItems.join(', ')}.
                    They booked: ${userInteraction.bookedItems.join(', ')}.`,
@@ -391,13 +393,13 @@ const planFamilyVacation = async (query, userProfile) => {
     maxResults: 20
   });
 
-  // Filter chunks by type to build a structured itinerary.
-  // response.data.chunks are ranked by AI relevance — filter by metadata type to categorize.
+  // Group chunks by the `category` each item carries in additional_metadata.
+  // response.data.chunks are ranked by relevance, and each group keeps that order.
   const itinerary = {
-    accommodation: response.data.chunks.filter(c => c.metadata?.type === "accommodation"),
-    activities:    response.data.chunks.filter(c => c.metadata?.type === "activity"),
-    dining:        response.data.chunks.filter(c => c.metadata?.type === "dining"),
-    transportation: response.data.chunks.filter(c => c.metadata?.type === "transportation")
+    accommodation: response.data.chunks.filter(c => c.additionalMetadata?.category === "accommodation"),
+    activities:    response.data.chunks.filter(c => c.additionalMetadata?.category === "activity"),
+    dining:        response.data.chunks.filter(c => c.additionalMetadata?.category === "dining"),
+    transportation: response.data.chunks.filter(c => c.additionalMetadata?.category === "transportation")
   };
 
   return itinerary;
@@ -420,7 +422,7 @@ const planBusinessTravel = async (query, userProfile) => {
     maxResults: 10
   });
 
-  // Return ranked chunks directly. Filter by metadata.amenities or metadata.location as needed.
+  // Return ranked chunks directly. Filter by additionalMetadata.amenities or additionalMetadata.location as needed.
   return response.data.chunks;
 };
 ```
@@ -441,7 +443,7 @@ const planAdventureTravel = async (query, userProfile) => {
     maxResults: 15
   });
 
-  // Return ranked chunks directly. Sort or filter by metadata.difficulty for hiking-specific results.
+  // Return ranked chunks directly. Sort or filter by additionalMetadata.difficulty for hiking-specific results.
   return response.data.chunks;
 };
 ```
@@ -503,9 +505,9 @@ const analyzeBookingPatterns = async (database, collection, bookingData) => {
     type: 'memory',
     database: database,
     collection: collection,
-    upsert: true,
+    upsert: "true",
     memories: JSON.stringify([{
-      id: `booking_${database}`,
+      id: `booking_${collection}`,
       text: analysisText,
       infer: true,
       user_name: bookingData[0].userName
@@ -559,17 +561,18 @@ const handleMultiLanguageQuery = async (query, language, destination, database, 
 
 ### Real-Time Price Monitoring
 
+HydraDB does not watch prices. Store the alert rule as a memory so later queries find it, and run the price checks in your own scheduled job.
 
 ```javascript
 const monitorPriceChanges = async (travelPlan) => {
   const priceText = `Monitor price changes for: ${travelPlan.description}. Alert if prices drop by 10% or more.`;
 
-  // Set up monitoring using HydraDB memories
+  // Save the alert rule as a memory; your scheduled job does the price checks
   await client.context.ingest({
     type: 'memory',
     database: travelPlan.database,
     collection: travelPlan.userId,
-    upsert: true,
+    upsert: "true",
     memories: JSON.stringify([{
       id: `price_${travelPlan.userId}`,
       text: priceText,
@@ -611,13 +614,15 @@ const monitorPriceChanges = async (travelPlan) => {
 
 **AI Response**: Your month-long Southeast Asia adventure:
 
-- **Route**: Thailand → Vietnam → Cambodia → Laos
+- **Route**: Thailand to Vietnam to Cambodia to Laos
 - **Budget**: \$2,000-2,500 total
 - **Accommodation**: Mix of hostels and homestays
 - **Cultural experiences**: Cooking classes, temple visits, local festivals
 - **Transportation**: Buses and trains for authentic experience
 
 ## Integration with Booking Systems
+
+HydraDB returns only what you ingested and does not call booking APIs. Use these queries to find matching listings, then get live availability and prices from your booking provider.
 
 ### Real-Time Availability Checking
 
@@ -661,13 +666,13 @@ const getDynamicPricing = async (searchResults, userProfile) => {
 
 ## Conclusion
 
-Building an AI travel planner with HydraDB transforms the travel planning experience from a tedious research process into an intelligent, conversational journey. By leveraging HydraDB's AI memories, multi-step reasoning, and semantic search capabilities, you can create a platform that truly understands traveler intent and provides personalized recommendations.
+An AI travel planner built on HydraDB turns hours of research into a conversation. With memories, thinking-mode retrieval, and semantic search, your platform can understand what a traveler is asking for and personalize what it returns.
 
 Key benefits of this approach:
 
 - **Natural Language Understanding**: Users can express complex travel desires in natural language
 - **Personalized Recommendations**: AI memories ensure recommendations improve over time
 - **Contextual Awareness**: Multi-step reasoning considers all aspects of travel planning
-- **Seamless Integration**: Easy integration with existing booking systems and travel APIs
+- **Booking Integration**: Pair HydraDB results with live availability and prices from your booking provider
 
-The result is a travel planning platform that feels more like having a knowledgeable travel advisor than using a search engine, creating higher user satisfaction and better conversion rates for travel businesses.
+The result feels more like talking to a knowledgeable travel advisor than using a search engine.
