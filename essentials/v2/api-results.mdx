@@ -3,9 +3,130 @@ title: "How to Use API Results"
 description: "Turn a query response into an LLM prompt."
 ---
 
-`POST /query` returns structured JSON. Before you can pass it to an LLM, you need to convert the retrieval payload into a plain string. This page shows how.
+HydraDB can hand you a prompt that is ready for your LLM. A `POST /query` response includes `data.llm_prompt`, the full result written out as one string. Use it as it is, or build your own prompt from the structured fields when you want full control. This page covers both.
 
-The same pattern works regardless of whether you set `type: "knowledge"`, `type: "memory"`, or `type: "all"` - the response shape is identical.
+The response shape is the same whether you set `type: "knowledge"`, `type: "memory"`, or `type: "all"`.
+
+---
+
+## The quickest path
+
+By default, a successful `POST /query` response includes `data.llm_prompt`: everything HydraDB found for the query, written as one Markdown string. Send it to your model as it is. There is no formatting code to write.
+
+The string carries the ranked results, the facts that connect them, dated facts, and the list of sources. Every result has a label and an id your model can cite. Text from your source document is labeled apart from the context HydraDB added during enrichment, so the model can tell the two apart.
+
+```python Python SDK
+result = client.query(
+    database="acme_corp",
+    query="who owns refunds?",
+    type="all",
+    query_by="hybrid",
+    mode="thinking",
+)
+
+context = result.data.llm_prompt
+```
+
+### Example
+
+A populated `llm_prompt` looks like this:
+
+````markdown
+# Instructions
+
+This is the response markdown for the query: who owns refunds?
+
+Each result below has one or both of these parts:
+- **Original content:** text from the original source document.
+- **Enriched content:** extra context added by enrichment on top of the original content, when there is any. It is not part of the source document.
+
+Results labelled R1, R2 … are forceful relations: documents the user linked to these results when adding their data. They may contain related information the user wanted. They are not ranked by relevance.
+
+**Found:** 2 results across 2 sources · 1 related fact · 1 temporal fact
+
+## Results
+
+The results for this query. R1, R2 … are forceful relations; 1, 2 … are the best matches, in order. Refer to them by label, e.g. [R1] or [1].
+
+### R1. Refund FAQ
+- **Id:** faq-1
+- _linked via declared relation policy-1 → faq-1_
+
+**Original content:**
+Card refunds take 5 to 7 days.
+
+---
+
+### 1. Refund policy
+- **Relevance:** 0.91 · **Collection:** support · **Type:** file
+- **Id:** policy-1 · **Last updated:** 2026-07-02
+
+**Original content:**
+Refunds are accepted within 30 days of purchase.
+
+**Enriched content:** The refund window is 30 days. Finance approves refunds.
+
+---
+
+### 2. Support chat
+- **Relevance:** 0.84 · **Collection:** support · **Type:** message
+- **Id:** chat-9 · **Uploaded:** 2026-08-14
+
+**Original content:**
+user: Who signs off on a refund over $500?
+agent: Finance does.
+
+## Related facts
+
+Facts from the knowledge graph that connect entities in the results.
+
+- **Refunds** —managed_by→ **Finance**; **Finance** —reports_to→ **CFO** (relevance 0.81)
+  - evidence: "Finance approves refunds."
+
+## Temporal facts
+
+Dated facts relevant to this query: when things happened, started or ended.
+
+- **Refund policy** — *effective_from* → **June 2026** (from 2026-06, precision: month, status: ongoing, evidence: "from June")
+
+## Sources
+
+The documents the results above came from, each listed once.
+
+1. **Refund policy** (file, id: policy-1) — https://docs.acme.com/refunds — updated 2026-07-02
+2. **Support chat** (message, id: chat-9)
+````
+
+### How to read it
+
+- **Instructions header.** The prompt opens with `# Instructions`: the query it answers and a short guide to the content labels. When the result has forceful relations, one more line explains the `R` labels.
+- **Found line.** A one-line summary of what was retrieved.
+- **Results.** One section holds everything the query returned. Forceful relations come first, labeled `R1`, `R2`, and so on. You linked these when you added the data, so they are not ranked and carry no relevance score. The best matches follow in relevance order, numbered `1`, `2`, and so on. Each one shows its relevance, collection, type, id, and the date it was last updated or uploaded.
+- **Original and enriched content.** Each result shows `**Original content:**`, the text from your source document. When enrichment added anything, an `**Enriched content:**` line follows. Enriched content is not part of the source document.
+- **Citations.** The Results section tells the model to refer to a result by its label, such as `[R1]` or `[1]`. Each label maps to an id you can use to fetch or link the document.
+- **Related facts.** Facts from the knowledge graph that connect the entities in the results. Each shows its relevance and, when available, the passage it came from.
+- **Temporal facts.** Dated statements with a normalized date, precision, status, and the phrase they came from.
+- **Sources.** The documents behind the results, each listed once, with a link when the source has a web URL.
+
+Each section opens with a one-line description and appears only when it has something in it.
+
+When a query matches nothing, `llm_prompt` is not empty. It returns the instructions header and "No results found for this query." When a filter narrowed the search, the message names it.
+
+### Control the response with `response_format`
+
+Set `response_format` on the request to choose what the response returns:
+
+| `response_format` | What `data` holds | When to use it |
+|---|---|---|
+| omitted (default) | The structured fields plus `llm_prompt` | You want the ready-made prompt and the raw fields. |
+| `"structured"` | The structured fields only, with no `llm_prompt` | You build your own prompt. |
+| `"markdown"` | The prompt string itself | You only need the prompt. |
+
+With `"markdown"`, `data` is the string, so read it from `data` directly. There is no `data.llm_prompt` field in that shape. Any other value returns a `400` error.
+
+<Tip>
+The SDK `build_string` / `buildString` helper returns `data.llm_prompt` for you, so `build_string(result)` and `result.data.llm_prompt` give the same string. On older self-hosted servers that predate the field, the helper formats the structured fields instead.
+</Tip>
 
 ---
 
@@ -86,7 +207,7 @@ The raw object has too much noise for an LLM - IDs, timestamps, metadata. Sectio
 
 ## 2. Transforming the response into LLM context
 
-Use `build_string` / `buildString` from the SDK. It takes any `POST /query` result and returns a formatted plain string.
+Use `build_string` / `buildString` from the SDK. It takes any `POST /query` result and returns a formatted string. It returns [`data.llm_prompt`](#the-quickest-path) when the response includes it, and formats the structured fields itself otherwise.
 
 <CodeGroup>
 ```python Python SDK
