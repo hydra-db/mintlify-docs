@@ -14,8 +14,7 @@ In this guide:
 5. [Add schema fields later](#5-add-schema-fields-later).
 6. [Update metadata without re-ingesting](#6-update-metadata-without-re-ingesting).
 7. [List sources with metadata filters](#7-list-sources-with-metadata-filters).
-
-The [schema field reference](#schema-field-reference), [common mistakes](#common-mistakes), and [related pages](#related) close the page.
+8. [Schema field reference](#schema-field-reference), [common mistakes](#common-mistakes), and [related pages](#related).
 
 ## 1. Declare a field and filter on it
 
@@ -256,9 +255,13 @@ A valid filter that matches no source returns an empty result. HydraDB does not 
 | Database metadata | `metadata` | Top-level keys in `metadata_filters` | Fields you filter on often, such as department, region, plan, customer, or status. Declare their names and types in `database_metadata_schema`. |
 | Additional metadata | `additional_metadata` | Nested under `metadata_filters.additional_metadata` | Free-form per-source fields for display, citations, debugging, external IDs, or occasional filters. No schema. |
 
-A field you filter on in most queries belongs in `metadata` and the schema. An author, a Slack timestamp, or a document version belongs in `additional_metadata`.
+A filter runs in three steps:
 
-A filter runs in three steps. HydraDB first resolves the `metadata` and `additional_metadata` filters to the matching source IDs, then runs vector and keyword retrieval only over those sources, then rechecks every retrieved passage against the filter. The recheck also keeps graph expansion and retry paths from leaking excluded sources. An `additional_metadata` filter that cannot be resolved up front is checked after retrieval, with about 3x over-fetch to compensate.
+1. HydraDB resolves the `metadata` and `additional_metadata` filters to the matching source IDs.
+2. It runs vector and keyword retrieval only over those sources.
+3. It rechecks every retrieved passage against the filter. The recheck also keeps graph expansion and retry paths from leaking excluded sources.
+
+An `additional_metadata` filter that cannot be resolved up front is checked after retrieval, with about 3x over-fetch to compensate.
 
 A few fields worth declaring from the start:
 
@@ -309,8 +312,6 @@ Given four sources with these `attendee_emails` values:
 | `{"contains": "a@company.com"}` | A, B, D |
 | `{"contains_any": ["a@company.com", "c@company.com"]}` | A, B, C, D |
 
-`contains` is position-independent: it matches whether the value is the only one, the first, or in the middle.
-
 </Accordion>
 
 | Behavior | Contract |
@@ -323,8 +324,6 @@ Given four sources with these `attendee_emails` values:
 | Range and fuzzy | Not supported. Put the concept in `query`, use a searchable `VARCHAR` field, or post-process in your application. |
 | Graph context | Respects the filter; graph paths from excluded sources are removed. |
 | Size | At most 500 values per list, and 64 KiB for the whole `metadata_filters` object. See [filter size limits](#filter-size-limits). |
-
-Filters are exact. `{"mood": {"equals": "happy"}}` matches only sources whose stored value is `happy`; it does not expand to "joyful" or "cheerful". To search metadata text by meaning, declare a `VARCHAR` field with `enable_dense_embedding` and put the concept in `query`.
 
 **Filtering `additional_metadata`:** operators apply to top-level keys only. Inside `additional_metadata`, use a bare value for an exact match or an array to match any listed value. An operator placed there is not rejected; it is read as an exact match against a stored object, so the query returns `200` with an empty result.
 
@@ -383,7 +382,7 @@ Every request that attaches metadata is checked against two caps, on ingest and 
 | `metadata` | `metadata` at ingest, `database_metadata` on edit | 16 KiB (16,384 bytes) |
 | `additional_metadata` | `additional_metadata` | 1 KiB (1,024 bytes) |
 
-Older spellings are still accepted, but not uniformly. Which one works depends on the endpoint:
+Older spellings are still accepted, but which one works depends on the endpoint:
 
 | Alias | On `/context/ingest` | On `PATCH /context/{id}/metadata` |
 | --- | --- | --- |
@@ -392,13 +391,13 @@ Older spellings are still accepted, but not uniformly. Which one works depends o
 
 Accepted aliases have the same cap as the canonical field.
 
-The cap applies to the whole map, not to any one value, and it is measured on the map's compact JSON encoding in UTF-8 bytes. Three consequences worth planning around:
+The cap applies to the whole map, not to any one value, and it is measured on the map's compact JSON encoding in UTF-8 bytes. Three consequences:
 
 - **Keys and punctuation count:** quotes, colons, commas, and braces all count toward the byte limit.
 - **Bytes, not characters:** accented Latin characters cost 2 bytes, most CJK characters 3, and emoji 4.
 - **Budget in bytes from the start:** a 950-character summary sounds comfortably under a 1 KiB cap, but with two small sibling keys it serializes to 1,015 bytes (65 bytes of that is structure alone). Push the summary to 1,000 characters and the request is rejected at 1,065 bytes.
 
-Exceeding either cap fails the whole request with `400` before anything is ingested. The message names the offending field and reports both numbers, so you can see how far over you are. On [`PATCH /context/{id}/metadata`](/api-reference/v2/endpoint/update-source-metadata) the same message is prefixed with `invalid metadata edit:`.
+Exceeding either cap fails the whole request with `400` before anything is ingested. The message names the offending field and reports both numbers. On [`PATCH /context/{id}/metadata`](/api-reference/v2/endpoint/update-source-metadata) the same message is prefixed with `invalid metadata edit:`.
 
 <Accordion title="A map just inside the 1 KiB cap, and the 400 it returns when it grows">
 
@@ -423,14 +422,14 @@ If a document needs more than 1 KiB of descriptive metadata, put the long text i
 
 ### Filter size limits
 
-The caps above bound the metadata you store. `metadata_filters` on [`/query`](/api-reference/v2/endpoint/query) has its own, separate pair. These bound what you send at query time and are unrelated to how much metadata a source carries:
+`metadata_filters` on [`/query`](/api-reference/v2/endpoint/query) has its own pair of caps. They bound what you send at query time, not how much metadata a source carries:
 
 | Limit | Cap |
 | --- | --- |
 | Values in any one list | 500 |
 | Whole `metadata_filters` object | 64 KiB (65,536 bytes) |
 
-Both are measured the same way as the stored caps: compact JSON, UTF-8 bytes, field names and punctuation counted. The object total includes the nested `additional_metadata` object, and it is measured after operator objects are reduced to their values, so `{"contains": "x"}` counts as `["x"]` and the operator keyword costs nothing. Both spellings of the same filter cost the same.
+Both are measured the same way as the stored caps: compact JSON, UTF-8 bytes, field names and punctuation counted. The object total includes the nested `additional_metadata` object, and it is measured after operator objects are reduced to their values, so `{"contains": "x"}` counts as `["x"]` and the operator keyword costs nothing.
 
 Both limits exist because every value in a list is expanded into the filter expression sent to the vector store. The per-list cap catches one runaway list; the object cap catches many individually legal lists adding up. Twenty lists of 500 values are each within the element cap but total roughly 127 KiB, so the object cap is what rejects them.
 
@@ -454,7 +453,7 @@ Needing far more than 500 values in one filter usually means the constraint belo
 
 ## 5. Add schema fields later
 
-[`PATCH /databases/{database}/metadata-schema`](/api-reference/v2/endpoint/update-metadata-schema) adds fields to an existing database. It is additive only: you can add new fields, but you cannot delete a field or change an existing field's type or flags. The response returns `added_fields` directly, without the `success` and `data` envelope, and a field you resend with an identical definition is skipped.
+[`PATCH /databases/{database}/metadata-schema`](/api-reference/v2/endpoint/update-metadata-schema) adds fields to an existing database. It is additive only: fields are added, never deleted, retyped, or reflagged. The response returns `added_fields` directly, without the `success` and `data` envelope, and a field you resend with an identical definition is skipped.
 
 <Accordion title="Add a status field to an existing database: Python, TypeScript, or cURL">
 
@@ -489,7 +488,7 @@ curl -X PATCH 'https://api.hydradb.com/databases/acme_corp/metadata-schema' \
 Plan the schema before your first ingest:
 
 - **Searchable fields are declared at creation:** fields added later cannot turn on dense or sparse search; the endpoint rejects `enable_dense_embedding` and `enable_sparse_embedding`.
-- **Existing fields are fixed:** Renaming a key means re-ingesting the affected sources, or creating a new database with the corrected schema.
+- **Existing fields are fixed:** renaming a key means re-ingesting the affected sources, or creating a new database with the corrected schema.
 - **Undeclared keys match nothing:** a database with a schema rejects undeclared `metadata` keys on ingest and on edit, so no source ever holds them, and a filter on such a key returns nothing. The exceptions are `connector_id` and `provider`, which [connectors](/essentials/v2/connectors#metadata-on-synced-objects) write on every synced object. If you will filter on a field more than once, declare it.
 
 <a id="7-update-metadata-without-re-ingesting"></a>
@@ -547,7 +546,7 @@ To replace a source's content as well as its metadata, re-ingest it with `upsert
 
 ## 7. List sources with metadata filters
 
-Use [`POST /context/list`](/api-reference/v2/endpoint/list-documents) when you want to browse or page sources rather than run semantic retrieval. Its `filters` object takes `metadata`, `additional_metadata`, and `source_fields`, each as bare key-value pairs. `source_fields` filters on the source's own fields: `title`, `type`, `description`, `url`, `timestamp`, and for app sources `app_provider`, `app_kind`, `app_external_id`, and `app_parent_id`. Pair `app_external_id` or `app_parent_id` with `app_provider`, because a Jira issue key and a Linear ID can collide.
+Use [`POST /context/list`](/api-reference/v2/endpoint/list-documents) to browse or page sources rather than run semantic retrieval. Its `filters` object takes `metadata`, `additional_metadata`, and `source_fields`, each as bare key-value pairs. `source_fields` filters on the source's own fields: `title`, `type`, `description`, `url`, `timestamp`, and for app sources `app_provider`, `app_kind`, `app_external_id`, and `app_parent_id`. Pair `app_external_id` or `app_parent_id` with `app_provider`, because a Jira issue key and a Linear ID can collide.
 
 <Accordion title="List legal sources by Alice from Slack: Python, TypeScript, or cURL">
 
@@ -617,13 +616,13 @@ Each entry in `database_metadata_schema` on [Create Database](/api-reference/v2/
 
 Limits:
 
-- **Up to 32 custom metadata fields per database.**
-- **Up to 6 embedding-enabled fields per database:** `enable_dense_embedding` and `enable_sparse_embedding` each count as one, so a field with both set counts as two. Exceeding the limit fails database creation with `400` before anything is provisioned.
-- **Field names are unique case-insensitively.**
-- **Embedding flags are only valid on `VARCHAR` fields.**
-- **Values must match the declared type when the database has a schema.**
-- **Unknown `metadata` keys are rejected on ingest and edit when the database has a non-empty schema.**
-- **Each metadata layer has a byte budget per request:** See [Size limits](#4-size-limits).
+- Up to 32 custom metadata fields per database.
+- Up to 6 embedding-enabled fields per database: `enable_dense_embedding` and `enable_sparse_embedding` each count as one, so a field with both set counts as two. Exceeding the limit fails database creation with `400` before anything is provisioned.
+- Field names are unique case-insensitively.
+- Embedding flags are only valid on `VARCHAR` fields.
+- Values must match the declared type when the database has a schema.
+- Unknown `metadata` keys are rejected on ingest and edit when the database has a non-empty schema.
+- Each metadata layer has a byte budget per request; see [Size limits](#4-size-limits).
 
 ## Common mistakes
 
