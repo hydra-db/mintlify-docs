@@ -5,14 +5,17 @@ description: "Declare metadata fields on a database, attach values when you inge
 
 Metadata is structured data attached to each [knowledge](/essentials/v2/knowledge) source and [memory](/essentials/v2/memories). You send it at ingest, and at query time `metadata_filters` on [`POST /query`](/api-reference/v2/endpoint/query) keeps only the sources whose values match, such as `department = legal` or `status = published`, before ranking runs.
 
-This guide builds up in order:
+In this guide:
 
 1. [Declare a field and filter on it](#1-declare-a-field-and-filter-on-it): create the schema, ingest with metadata, and query with a filter.
 2. [The two layers](#2-the-two-layers): `metadata` and `additional_metadata`, and how a filter runs.
 3. [Filter operators](#3-filter-operators): `equals`, `contains`, and `contains_any`, and how to store several values in one field.
 4. [Size limits](#4-size-limits): caps on stored metadata and on the filter you send.
-5. [Add schema fields later](#5-add-schema-fields-later), [update metadata without re-ingesting](#6-update-metadata-without-re-ingesting), and [list sources with filters](#7-list-sources-with-metadata-filters).
-6. [Schema field reference](#schema-field-reference), [common mistakes](#common-mistakes), and [related pages](#related).
+5. [Add schema fields later](#5-add-schema-fields-later).
+6. [Update metadata without re-ingesting](#6-update-metadata-without-re-ingesting).
+7. [List sources with metadata filters](#7-list-sources-with-metadata-filters).
+
+The [schema field reference](#schema-field-reference), [common mistakes](#common-mistakes), and [related pages](#related) close the page.
 
 ## 1. Declare a field and filter on it
 
@@ -255,13 +258,12 @@ A valid filter that matches no source returns an empty result. HydraDB does not 
 
 A field you filter on in most queries belongs in `metadata` and the schema. An author, a Slack timestamp, or a document version belongs in `additional_metadata`.
 
-A filter runs in three steps. HydraDB first resolves the `metadata` and `additional_metadata` filters to the matching source IDs, then runs vector and keyword retrieval only over those sources, then rechecks every retrieved passage against the filter. The recheck also keeps graph expansion and retry paths from leaking excluded sources. Top-level `metadata` filters are resolved up front. An `additional_metadata` filter that cannot be resolved up front is checked after retrieval, with about 3x over-fetch to compensate, so move a field you filter on in most queries into `metadata`.
+A filter runs in three steps. HydraDB first resolves the `metadata` and `additional_metadata` filters to the matching source IDs, then runs vector and keyword retrieval only over those sources, then rechecks every retrieved passage against the filter. The recheck also keeps graph expansion and retry paths from leaking excluded sources. An `additional_metadata` filter that cannot be resolved up front is checked after retrieval, with about 3x over-fetch to compensate.
 
 A few fields worth declaring from the start:
 
 - **`status`:** tag every source `draft` or `published`, and send `{"status": {"equals": "published"}}` on user-facing queries to keep work in progress out of customer answers.
 - **`language`:** route each query to its language with a filter on the detected language.
-- **A `VARCHAR` field with `enable_dense_embedding`:** to search a short label or summary semantically, put the concept in `query`. A filter never expands to related values.
 
 For a company brain, filters do the isolation inside one collection: put a team, region, or user id in `metadata` and filter on it in each query. Use separate [collections](/essentials/v2/multi-tenant#1-choose-how-to-scope-your-data) only for data that must never meet in one search.
 
@@ -278,7 +280,7 @@ Each top-level key in `metadata_filters` takes an operator object naming the com
 | `contains` | a single value | sources whose field holds that value, at any position in a multi-value field |
 | `contains_any` | an array | sources holding any one of the listed values (OR, like IN) |
 
-`equals` works on every declared type, so `{"priority": {"equals": 7}}` is valid on an `INT64` field. `contains`, `contains_any`, and arrays need a `VARCHAR` field; passed for a declared field of another type they are rejected with `400`.
+`equals` works on every declared type, so `{"priority": {"equals": 7}}` is valid on an `INT64` field. `contains`, `contains_any`, and arrays need a `VARCHAR` field; sent for a declared field of another type, they are rejected with `400`.
 
 <Accordion title="Operator forms, and what each returns">
 
@@ -292,9 +294,9 @@ Each top-level key in `metadata_filters` takes an operator object naming the com
 }
 ```
 
-Given four sources with these `emails` values:
+Given four sources with these `attendee_emails` values:
 
-| Source | `emails` |
+| Source | `attendee_emails` |
 | --- | --- |
 | A | `a@company.com` |
 | B | `a@company.com,b@company.com` |
@@ -378,8 +380,8 @@ Every request that attaches metadata is checked against two caps, on ingest and 
 
 | Layer | Send as | Cap |
 | --- | --- | --- |
-| Database metadata | `metadata` at ingest, `database_metadata` on edit | 16 KiB (16,384 bytes) |
-| Document metadata | `additional_metadata` | 1 KiB (1,024 bytes) |
+| `metadata` | `metadata` at ingest, `database_metadata` on edit | 16 KiB (16,384 bytes) |
+| `additional_metadata` | `additional_metadata` | 1 KiB (1,024 bytes) |
 
 Older spellings are still accepted, but not uniformly. Which one works depends on the endpoint:
 
@@ -432,7 +434,7 @@ Both are measured the same way as the stored caps: compact JSON, UTF-8 bytes, fi
 
 Both limits exist because every value in a list is expanded into the filter expression sent to the vector store. The per-list cap catches one runaway list; the object cap catches many individually legal lists adding up. Twenty lists of 500 values are each within the element cap but total roughly 127 KiB, so the object cap is what rejects them.
 
-Over either limit returns `400` before the query runs, naming the offending key or the actual byte count.
+Exceeding either limit returns `400` before the query runs, naming the offending key or the actual byte count.
 
 <Accordion title="The 400 messages for an oversized filter">
 
@@ -487,8 +489,8 @@ curl -X PATCH 'https://api.hydradb.com/databases/acme_corp/metadata-schema' \
 Plan the schema before your first ingest:
 
 - **Searchable fields are declared at creation:** fields added later cannot turn on dense or sparse search; the endpoint rejects `enable_dense_embedding` and `enable_sparse_embedding`.
-- **Existing fields are fixed:** a field cannot be renamed, retyped, reflagged, or deleted. Renaming a key means re-ingesting the affected sources, or creating a new database with the corrected schema.
-- **Undeclared keys match nothing:** a database with a schema rejects undeclared `metadata` keys on ingest and on edit, so no source ever holds them, and a filter on such a key returns nothing. The exception is `connector_id` and `provider`, which [connectors](/essentials/v2/connectors#metadata-on-synced-objects) write on every synced object. If you will filter on a field more than once, declare it.
+- **Existing fields are fixed:** Renaming a key means re-ingesting the affected sources, or creating a new database with the corrected schema.
+- **Undeclared keys match nothing:** a database with a schema rejects undeclared `metadata` keys on ingest and on edit, so no source ever holds them, and a filter on such a key returns nothing. The exceptions are `connector_id` and `provider`, which [connectors](/essentials/v2/connectors#metadata-on-synced-objects) write on every synced object. If you will filter on a field more than once, declare it.
 
 <a id="7-update-metadata-without-re-ingesting"></a>
 
@@ -535,7 +537,7 @@ curl -X PATCH 'https://api.hydradb.com/context/auth-controls-001/metadata' \
 
 - **The source must already exist:** this endpoint does not create sources, and `collection` is required.
 - **At least one of `database_metadata`, `additional_metadata`, or `acl` is required:** `tenant_metadata` is a deprecated alias for `database_metadata`; `document_metadata` is rejected.
-- **Metadata merges:** sent keys are inserted or overwritten, omitted keys are preserved. `acl` is the exception: when sent, it replaces the stored list, and an `acl`-only body is a valid edit. See [Access Control](/essentials/v2/access-control).
+- **Metadata merges:** sent keys are inserted or overwritten; omitted keys are preserved. `acl` is the exception: when sent, it replaces the stored list, and an `acl`-only body is a valid edit. See [Access Control](/essentials/v2/access-control).
 - **The edit is visible to filters and listing right away:** if no edited field has an embedding flag, the vector store is untouched and the response reports `vector_sync_required: false`.
 - **Searchable fields sync synchronously:** if an edited field has `enable_dense_embedding` or `enable_sparse_embedding`, HydraDB refreshes that field's search lane and reports `vector_sync_required` and `vector_synced` in the response (the `milvus_sync_required` and `milvus_synced` aliases are still emitted, deprecated). Such a field rejects `null`, because it would leave stale metadata vectors behind.
 
@@ -615,12 +617,12 @@ Each entry in `database_metadata_schema` on [Create Database](/api-reference/v2/
 
 Limits:
 
-- **Up to 32 custom metadata fields per database:**
+- **Up to 32 custom metadata fields per database.**
 - **Up to 6 embedding-enabled fields per database:** `enable_dense_embedding` and `enable_sparse_embedding` each count as one, so a field with both set counts as two. Exceeding the limit fails database creation with `400` before anything is provisioned.
-- **Field names are unique case-insensitively:**
-- **Embedding flags are only valid on `VARCHAR` fields:**
-- **Values must match the declared type when the database has a schema:**
-- **Unknown `metadata` keys are rejected on ingest and edit when the database has a non-empty schema:**
+- **Field names are unique case-insensitively.**
+- **Embedding flags are only valid on `VARCHAR` fields.**
+- **Values must match the declared type when the database has a schema.**
+- **Unknown `metadata` keys are rejected on ingest and edit when the database has a non-empty schema.**
 - **Each metadata layer has a byte budget per request:** See [Size limits](#4-size-limits).
 
 ## Common mistakes
@@ -642,7 +644,7 @@ Limits:
 - [Knowledge](/essentials/v2/knowledge): what attaches to knowledge sources
 - [Memories](/essentials/v2/memories): metadata fields on memory items
 - [Multi-tenancy](/essentials/v2/multi-tenant): partitioning with collections, which filters do not replace
-- [Query](/essentials/v2/query): how `metadata_filters` interact with ranking
+- [Query](/essentials/v2/query): how `metadata_filters` interacts with ranking
 - [Access Control](/essentials/v2/access-control): restricting who may retrieve a document, which is not a metadata filter
 - [Create Database (API Reference)](/api-reference/v2/endpoint/create-tenant): full `database_metadata_schema` reference
 - [Query (API Reference)](/api-reference/v2/endpoint/query): full `metadata_filters` reference
