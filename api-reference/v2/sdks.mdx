@@ -7,7 +7,7 @@ The SDKs wrap every endpoint in the [API Reference](/api-reference/v2) with type
 
 ## Installation
 
-The SDKs ship as major-version bumps of the same packages used for v1. Pin to `>=2.0.0` to use the latest method surface.
+Install version 2 of the Python or TypeScript SDK:
 
 <CodeGroup>
 ```bash Python SDK
@@ -42,7 +42,7 @@ const client = new HydraDBClient({
 ```
 </CodeGroup>
 
-**Python:** Both synchronous (`HydraDB`) and asynchronous (`AsyncHydraDB`) clients are available. They share an identical surface; choose based on your application's concurrency model.
+**Python:** Both synchronous (`HydraDB`) and asynchronous (`AsyncHydraDB`) clients are available. They expose the same methods; use `AsyncHydraDB` with `await`.
 
 ## Naming conventions
 
@@ -77,7 +77,7 @@ SDK methods are grouped under top-level namespaces, one per `/api-reference/v2` 
 
 ### Context
 
-`client.context.*` covers every flow around content lifecycle: document uploads, app sources, memories, polling, fetching, listing, deletion, and graph inspection.
+`client.context.*` manages your stored context: document uploads, app sources, memories, polling, fetching, listing, deletion, and graph inspection.
 
 | Method | Endpoint |
 |---|---|
@@ -150,12 +150,14 @@ A single method covers all retrieval. Pick `type` (`"knowledge"`, `"memory"`, `"
 | `client.webhooks.list_deliveries()` | `GET /webhooks/indexing/deliveries` |
 | `client.webhooks.get_delivery()` | `GET /webhooks/indexing/deliveries/{delivery_id}` |
 | `client.webhooks.retry_delivery()` | `POST /webhooks/indexing/deliveries/{delivery_id}/retry` |
+| `client.webhooks.set_signing_secret()` | `POST /webhooks/indexing/signing-secret` |
+| `client.webhooks.clear_signing_secret()` | `DELETE /webhooks/indexing/signing-secret` |
 
 The tables above use the Python method names. TypeScript camelCases multi-word ones (`list_resources()` is `listResources()`).
 
 ## Migrating from v1
 
-The v2 SDKs are a deliberate consolidation. A few common v1 to v2 method swaps:
+Common method changes from v1 to v2:
 
 | v1 | v2 |
 |---|---|
@@ -199,7 +201,10 @@ import asyncio
 
 
 async def create_database():
-    return await async_client.databases.create(database="my_first_database")
+    return await async_client.databases.create(
+        database="my_first_database",
+        database_metadata_schema=[{"name": "department", "data_type": "VARCHAR"}],
+    )
 
 
 response = asyncio.run(create_database())
@@ -250,6 +255,7 @@ with open("contract.pdf", "rb") as f1, open("policy.pdf", "rb") as f2:
     result = client.context.ingest(
         type="knowledge",
         database="my_first_database",
+        collection="company_docs",
         documents=[
             ("contract.pdf", f1, "application/pdf"),
             ("policy.pdf", f2, "application/pdf"),
@@ -272,6 +278,7 @@ with open("contract.pdf", "rb") as f1, open("policy.pdf", "rb") as f2:
 const result = await client.context.ingest({
   type: "knowledge",
   database: "my_first_database",
+  collection: "company_docs",
   documents: [
     { path: "contract.pdf", filename: "contract.pdf", contentType: "application/pdf" },
     { path: "policy.pdf", filename: "policy.pdf", contentType: "application/pdf" },
@@ -308,10 +315,11 @@ result = client.context.ingest(
     collection="user_alex",
     memories=json.dumps([
         {
+            "id": "alex_preferences",
             "text": "User prefers detailed technical explanations and dark mode",
             "infer": True,
             "user_name": "Alex",
-            "metadata": {"team": "engineering"},
+            "metadata": {"department": "engineering"},
             "additional_metadata": {"source": "onboarding"},
         }
     ]),
@@ -324,10 +332,11 @@ const result = await client.context.ingest({
   collection: "user_alex",
   memories: JSON.stringify([
     {
+      id: "alex_preferences",
       text: "User prefers detailed technical explanations and dark mode",
       infer: true,
       user_name: "Alex",
-      metadata: { team: "engineering" },
+      metadata: { department: "engineering" },
       additional_metadata: { source: "onboarding" },
     },
   ]),
@@ -337,26 +346,50 @@ const result = await client.context.ingest({
 
 **`infer` defaults to `false`.** Set `infer: true` for conversational content where you want HydraDB to extract implicit preferences. Use `infer: false` for content that should be stored verbatim.
 
-### Verify processing
+<a id="verify-processing"></a>
 
-Poll `context.status` with the IDs from the ingest response:
+### Wait for indexing
+
+Wait until the documents and memories are indexed before querying them. Check each collection separately, using the IDs supplied at ingestion or returned in `data.results`.
 
 <CodeGroup>
 ```python Python SDK
-status = client.context.status(
-    database="my_first_database",
-    ids=["contract_q4", "policy_2025"],
-)
+import time
+
+def wait_for_indexing(collection, ids):
+    while True:
+        result = client.context.status(
+            database="my_first_database", collection=collection, ids=ids,
+        )
+        statuses = [item.indexing_status for item in result.data.statuses]
+        if any(status == "errored" for status in statuses):
+            raise RuntimeError("Indexing failed; check the status response for details.")
+        if len(statuses) == len(ids) and all(status == "completed" for status in statuses):
+            return
+        time.sleep(2)
+
+wait_for_indexing("company_docs", ["contract_q4", "policy_2025"])
+wait_for_indexing("user_alex", ["alex_preferences"])
 ```
 ```typescript TypeScript SDK
-const status = await client.context.status({
-  database: "my_first_database",
-  ids: ["contract_q4", "policy_2025"],
-});
+async function waitForIndexing(collection: string, ids: string[]) {
+  while (true) {
+    const result = await client.context.status({
+      database: "my_first_database", collection, ids,
+    });
+    const statuses = result.data?.statuses?.map((item) => item.indexingStatus) ?? [];
+    if (statuses.some((status) => status === "errored")) {
+      throw new Error("Indexing failed; check the status response for details.");
+    }
+    if (statuses.length === ids.length && statuses.every((status) => status === "completed")) return;
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+  }
+}
+
+await waitForIndexing("company_docs", ["contract_q4", "policy_2025"]);
+await waitForIndexing("user_alex", ["alex_preferences"]);
 ```
 </CodeGroup>
-
-Wait until each `indexing_status` is `completed` (or `graph_creation` if you don't need full graph traversal). See [Context Overview](/api-reference/v2/endpoint/sources-overview) for the full status pipeline.
 
 ### Query
 
@@ -367,18 +400,19 @@ A single method covers every retrieval pattern: switch `type` and `query_by` to 
 # Knowledge over documents
 knowledge = client.query(
     database="my_first_database",
-    query="What are the pricing tiers?",
+    collection="company_docs",
+    query="What is our refund policy?",
     type="knowledge",
     query_by="hybrid",
     mode="thinking",
     graph_context=True,
 )
 
-# Personalized: knowledge and this user's memories, from the same collection
+# Shared knowledge and this user's memories
 personalized = client.query(
     database="my_first_database",
-    collection="user_alex",
-    query="What are the pricing tiers, and how should I explain them to this user?",
+    collections=["company_docs", "user_alex"],
+    query="What is our refund policy, and how should I explain it to this user?",
     type="all",
     query_by="hybrid",
     mode="thinking",
@@ -387,6 +421,7 @@ personalized = client.query(
 # Exact-phrase BM25 search
 exact = client.query(
     database="my_first_database",
+    collection="company_docs",
     query="ERROR_429 rate limit",
     type="knowledge",
     query_by="text",
@@ -397,18 +432,19 @@ exact = client.query(
 // Knowledge over documents
 const knowledge = await client.query({
   database: "my_first_database",
-  query: "What are the pricing tiers?",
+  collection: "company_docs",
+  query: "What is our refund policy?",
   type: "knowledge",
   queryBy: "hybrid",
   mode: "thinking",
   graphContext: true,
 });
 
-// Personalized: knowledge and this user's memories, from the same collection
+// Shared knowledge and this user's memories
 const personalized = await client.query({
   database: "my_first_database",
-  collection: "user_alex",
-  query: "What are the pricing tiers, and how should I explain them to this user?",
+  collections: ["company_docs", "user_alex"],
+  query: "What is our refund policy, and how should I explain it to this user?",
   type: "all",
   queryBy: "hybrid",
   mode: "thinking",
@@ -417,6 +453,7 @@ const personalized = await client.query({
 // Exact-phrase BM25 search
 const exact = await client.query({
   database: "my_first_database",
+  collection: "company_docs",
   query: "ERROR_429 rate limit",
   type: "knowledge",
   queryBy: "text",
@@ -425,7 +462,7 @@ const exact = await client.query({
 ```
 </CodeGroup>
 
-For the full parameter reference, see [Query: Overview](/api-reference/v2/endpoint/query-overview).
+For the full parameter reference, see [Query](/api-reference/v2/endpoint/query).
 
 ### Browse, fetch, and inspect
 
@@ -434,6 +471,7 @@ For the full parameter reference, see [Query: Overview](/api-reference/v2/endpoi
 # List knowledge sources with pagination
 sources = client.context.list(
     database="my_first_database",
+    collection="company_docs",
     type="knowledge",
     page=1,
     page_size=50,
@@ -442,13 +480,15 @@ sources = client.context.list(
 # Inspect graph relationships for a specific source
 relations = client.context.relations(
     database="my_first_database",
-    id="doc_12345",
+    collection="company_docs",
+    id="contract_q4",
 )
 
 # Inspect original source content or get a presigned URL
 file = client.context.inspect(
     database="my_first_database",
-    id="doc_12345",
+    collection="company_docs",
+    id="contract_q4",
     mode="url",
 )
 
@@ -456,13 +496,15 @@ file = client.context.inspect(
 client.context.delete(
     type="knowledge",
     database="my_first_database",
-    ids=["doc_12345"],
+    collection="company_docs",
+    ids=["contract_q4"],
 )
 ```
 ```typescript TypeScript SDK
 // List knowledge sources with pagination
 const sources = await client.context.list({
   database: "my_first_database",
+  collection: "company_docs",
   type: "knowledge",
   page: 1,
   pageSize: 50,
@@ -471,13 +513,15 @@ const sources = await client.context.list({
 // Inspect graph relationships for a specific source
 const relations = await client.context.relations({
   database: "my_first_database",
-  id: "doc_12345",
+  collection: "company_docs",
+  id: "contract_q4",
 });
 
 // Inspect original source content or get a presigned URL
 const file = await client.context.inspect({
   database: "my_first_database",
-  id: "doc_12345",
+  collection: "company_docs",
+  id: "contract_q4",
   mode: "url",
 });
 
@@ -485,7 +529,8 @@ const file = await client.context.inspect({
 await client.context.delete({
   type: "knowledge",
   database: "my_first_database",
-  ids: ["doc_12345"],
+  collection: "company_docs",
+  ids: ["contract_q4"],
 });
 ```
 </CodeGroup>

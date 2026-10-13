@@ -6,13 +6,13 @@ openapi: "api-reference/v2/openapi.json POST /query"
 
 import { Field } from "/snippets/field.jsx";
 
-The single retrieval endpoint for everything. Use it any time you need to feed an LLM with grounded context, surface user preferences, or fetch chunks ranked by relevance.
+Query is how agents read from HydraDB. It searches knowledge, memories, or both and returns ranked passages with their source details.
 
-Three independent dimensions control behavior:
+Choose what to search, how to match it, and how much retrieval work to do:
 
 - **`type`** picks **what** to query: `"knowledge"`, `"memory"`, or `"all"` (both, merged and re-ranked together).
-- **`query_by`** picks **how** to match: `"hybrid"` (semantic + BM25, the default) or `"text"` (BM25 only; pair with `operator`).
-- **`mode`** picks **how** to rank results: `"fast"` (single-pass, low-latency), `"thinking"` (expands query, reranks, and can include forceful-relation context), or `"auto"` (scores the query and routes to `"fast"` or `"thinking"` automatically, defaulting to `"thinking"` when the signal is inconclusive; **the default if `mode` is omitted**).
+- **`query_by`** picks **how** to match: `"hybrid"` (semantic similarity and keyword matching, the default) or `"text"` (keyword matching with BM25; pair with `operator`).
+- **`mode`** controls retrieval: `"fast"` for a single pass, `"thinking"` for query expansion, reranking, and explicitly linked sources, or `"auto"` to let HydraDB choose. The default is `"auto"`, which falls back to `"thinking"` when it cannot decide.
 
 [Recommended configurations](/api-reference/v2/endpoint/query-overview#recommended-configurations) maps common use cases to these three settings.
 
@@ -22,103 +22,34 @@ Three independent dimensions control behavior:
 ```python Python SDK
 result = client.query(
     database="acme_corp",
-    collection="user_alex",
-    query="What is our refund policy, and how should I explain it to this user?",
-
-    # What to query: "knowledge", "memory", or "all".
-    type="all",
-
-    # How to match: "hybrid" (default) or "text" (BM25).
-    query_by="hybrid",
-
-    # "thinking" improves quality; use "fast" for lowest latency.
-    mode="thinking",
-
-    # Ranking and response controls.
-    max_results=10,
-    alpha="auto",
-    recency_bias=0.2,
-    graph_context=True,
-
-    # Pull author-declared related sources into additional_context.
-    # Only applies when mode="thinking".
-    query_forceful_relations=True,
-
-    # Top-level keys match metadata; additional_metadata is per-source.
-    metadata_filters={
-        "department": "support",
-        "additional_metadata": {
-            "source": "policy",
-        },
-    },
-
-    # Short factual hint; not a hard filter.
-    additional_context="User is asking from the billing help center.",
+    collection="company_docs",
+    query="What is our refund policy?",
+    type="knowledge",
+    max_results=5,
 )
 ```
 
 ```typescript TypeScript SDK
 const result = await client.query({
   database: "acme_corp",
-  collection: "user_alex",
-  query: "What is our refund policy, and how should I explain it to this user?",
-
-  // What to query: "knowledge", "memory", or "all".
-  type: "all",
-
-  // How to match: "hybrid" (default) or "text" (BM25).
-  queryBy: "hybrid",
-
-  // "thinking" improves quality; use "fast" for lowest latency.
-  mode: "thinking",
-
-  // Ranking and response controls.
-  maxResults: 10,
-  alpha: "auto",
-  recencyBias: 0.2,
-  graphContext: true,
-
-  // Pull author-declared related sources into additional_context.
-  // Only applies when mode: "thinking".
-  queryForcefulRelations: true,
-
-  // Top-level keys match metadata; additional_metadata is per-source.
-  metadataFilters: {
-    department: "support",
-    additional_metadata: {
-      source: "policy",
-    },
-  },
-
-  // Short factual hint; not a hard filter.
-  additionalContext: "User is asking from the billing help center.",
+  collection: "company_docs",
+  query: "What is our refund policy?",
+  type: "knowledge",
+  maxResults: 5,
 });
 ```
 
 ```bash cURL
 curl -X POST 'https://api.hydradb.com/query' \
-  -H "Authorization: Bearer <your_api_key>" \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
   -H "API-Version: 2" \
   -H "Content-Type: application/json" \
   -d '{
     "database": "acme_corp",
-    "collection": "user_alex",
-    "query": "What is our refund policy, and how should I explain it to this user?",
-    "type": "all",
-    "query_by": "hybrid",
-    "mode": "thinking",
-    "max_results": 10,
-    "alpha": "auto",
-    "recency_bias": 0.2,
-    "graph_context": true,
-    "query_forceful_relations": true,
-    "metadata_filters": {
-      "department": "support",
-      "additional_metadata": {
-        "source": "policy"
-      }
-    },
-    "additional_context": "User is asking from the billing help center."
+    "collection": "company_docs",
+    "query": "What is our refund policy?",
+    "type": "knowledge",
+    "max_results": 5
   }'
 ```
 
@@ -126,7 +57,7 @@ curl -X POST 'https://api.hydradb.com/query' \
 
 ### Querying multiple collections
 
-Use `collections` when one query should fan out across multiple user, workspace, or team scopes. The field accepts either a list or a weighted object:
+Use `collections` to search several collections in one request. The field accepts either a list or a weighted object:
 
 ```json Equal weighting
 {
@@ -155,7 +86,7 @@ A list gives every collection equal normalized weight. An object treats values a
 
 ### Transforming the response into LLM context
 
-Use `build_string` / `buildString` from the SDK. It takes any `POST /query` result and returns a formatted plain string.
+Use the SDK’s `build_string` / `buildString` helper to format a query result as context for your model.
 
 <CodeGroup>
 ```python Python SDK
@@ -708,8 +639,8 @@ A zero-result query returns empty arrays/maps rather than an error, as shown in 
 ## Common mistakes
 
 - **`query_forceful_relations` requires `mode` to resolve to `"thinking"`:** In `fast` mode the flag is silently skipped. The server does not error or warn; your `additional_context` will simply be empty. Under `mode: "auto"` this depends on that request's routing decision, not on what you asked for.
-- **Relation `timestamp` is a Unix epoch float here:** In the `graph_context` slice returned by `/query` (and in the passthrough relations returned by [List Documents](/api-reference/v2/endpoint/list-documents) with `include_fields: ["relations"]`), each relation's `timestamp` is a Unix epoch value in seconds (a float, e.g. `1778573640.0`). The dedicated [Context Relations](/api-reference/v2/endpoint/source-relations) endpoint returns the same field as an ISO-8601 string instead. Normalize before comparing relation timestamps across endpoints.
-- **Use the right metadata namespace:** Top-level `metadata_filters` keys match `metadata`; free-form per-document fields must be nested under `additional_metadata` (`document_metadata` is only a legacy alias). Declare hot top-level filter fields in `database_metadata_schema`.
+- **Relation `timestamp` is a Unix epoch float here:** In the `graph_context` slice returned by `/query` (and in the passthrough relations returned by [List Context](/api-reference/v2/endpoint/list-documents) with `include_fields: ["relations"]`), each relation's `timestamp` is a Unix epoch value in seconds (a float, e.g. `1778573640.0`). The dedicated [Context Relations](/api-reference/v2/endpoint/source-relations) endpoint returns the same field as an ISO-8601 string instead. Normalize before comparing relation timestamps across endpoints.
+- **Use the right metadata namespace:** Top-level `metadata_filters` keys match `metadata`; free-form per-document fields must be nested under `additional_metadata` (`document_metadata` is only a legacy alias). Declare frequently filtered fields in `database_metadata_schema`.
 - **Check indexing first:** New documents are not searchable until [Ingestion Status](/api-reference/v2/endpoint/source-status) reports them indexed.
 - **Collection scope:** If you omit `collection`, HydraDB queries the default collection, and a query that names a collection does not read the default one. Use [List Collections](/api-reference/v2/endpoint/list-sub-tenants) to discover available IDs.
 
@@ -721,8 +652,7 @@ Common codes: `400 INVALID_INPUT` (empty `query`, `operator: "and"` or `"phrase"
 
 <div className="api-before-related-resources" />
 
-<Tip>
-**Related Resources**
+## Related resources
 
 - **Setup first:** [Ingest Context](/api-reference/v2/endpoint/ingest-context): content must be indexed
 - **Confirm indexing:** [Ingestion Status](/api-reference/v2/endpoint/source-status): wait for `completed` (or `graph_creation`)
@@ -732,4 +662,3 @@ Common codes: `400 INVALID_INPUT` (empty `query`, `operator: "and"` or `"phrase"
 - **Concepts:** [Concepts: Context Graphs](/essentials/v2/context-graphs)
 - **Response handling:** [Usage: How to Use API Results](/essentials/v2/api-results)
 - **Read more:** [Query: Overview](/api-reference/v2/endpoint/query-overview)
-</Tip>
