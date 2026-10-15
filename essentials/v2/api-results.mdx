@@ -3,17 +3,19 @@ title: "How to Use API Results"
 description: "Turn a query response into an LLM prompt."
 ---
 
-`POST /query` returns structured JSON. Before you can pass it to an LLM, you need to convert the retrieval payload into a plain string. This page shows how.
-
-The same pattern works regardless of whether you set `type: "knowledge"`, `type: "memory"`, or `type: "all"` - the response shape is identical.
+`POST /query` returns matching passages (**chunks**) and source details, not a generated answer. Format these results as **context** (information supplied alongside the question), then pass it to your language model. The SDK helper below handles the formatting; you do not need to interpret the graph fields to get started.
 
 ---
 
-## 1. What the response looks like
+<a id="1-what-the-response-looks-like"></a>
+
+## 1. Read the response
 
 The SDKs return the full response envelope from `POST /query`; the retrieval payload is on its `data` field (e.g. `result.data`). Raw HTTP responses use the same envelope, with the payload under `data`. The `build_string` / `buildString` helper accepts either the full envelope or just the `data` payload, so you can pass the SDK return value to it directly.
 
-The retrieval payload has the same core shape regardless of `type` or `query_by`:
+A standard query returns the fields below under `data`. Use [Format the context](#2-format-the-context) to turn the result into a prompt string.
+
+<Accordion title="Response fields and graph data">
 
 ```json
 {
@@ -75,25 +77,30 @@ The retrieval payload has the same core shape regardless of `type` or `query_by`
 
 Four things matter for prompt construction:
 
-- **`chunks`** - the primary retrieval output. Ranked by relevance; preserve the order HydraDB returns.
-- **`graph_context.query_paths`** - entity traversal paths derived from your query. Useful for relational reasoning. See [Context Graphs](/essentials/v2/context-graphs).
-- **`graph_context.chunk_relations`** + **`chunk_id_to_group_ids`** - per-chunk graph relations grouped by `group_id`, so you can attach the right triplets to each chunk.
-- **`additional_context`** - a map keyed by `chunk_uuid`. When a chunk includes `extra_context_ids`, use those IDs to look up related chunks here.
+- **`chunks`**: passages from matching documents or memories. Ranked by relevance; preserve the order HydraDB returns.
+- **`graph_context.query_paths`**: chains of relationships connecting named people, services, or topics relevant to the query. See [Context Graphs](/essentials/v2/context-graphs).
+- **`graph_context.chunk_relations`** + **`chunk_id_to_group_ids`**: per-chunk graph relations grouped by `group_id`, so you can attach the right triplets to each chunk.
+- **`additional_context`**: a map keyed by `chunk_uuid`. When a chunk includes `extra_context_ids`, use those IDs to look up related chunks here.
 
-The raw object has too much noise for an LLM - IDs, timestamps, metadata. Section 2 shows how to convert it into a clean string.
+The helper in Section 2 formats passages, source details, and any relationships together.
+
+</Accordion>
 
 ---
 
-## 2. Transforming the response into LLM context
+<a id="2-transforming-the-response-into-llm-context"></a>
+
+## 2. Format the context
 
 Use `build_string` / `buildString` from the SDK. It takes any `POST /query` result and returns a formatted plain string.
 
 <CodeGroup>
 ```python Python SDK
+import os
 from hydra_db import HydraDB
 from hydra_db.helpers import build_string
 
-client = HydraDB(token="YOUR_API_KEY")
+client = HydraDB(token=os.environ["HYDRA_DB_API_KEY"])
 
 result = client.query(
     database="your-database",
@@ -129,11 +136,12 @@ const context = buildString(result);
 ```
 ```python Python SDK (Async)
 import asyncio
+import os
 
 from hydra_db import AsyncHydraDB
 from hydra_db.helpers import build_string
 
-client = AsyncHydraDB(token="YOUR_API_KEY")
+client = AsyncHydraDB(token=os.environ["HYDRA_DB_API_KEY"])
 
 
 async def main():
@@ -158,16 +166,19 @@ asyncio.run(main())
 
 ---
 
-## 3. Feeding the context into your LLM
+<a id="3-feeding-the-context-into-your-llm"></a>
+
+## 3. Pass the context to your model
 
 <CodeGroup>
 ```python Python SDK
+import os
 from hydra_db import HydraDB
 from hydra_db.helpers import build_string
 from openai import OpenAI
 
-hydra = HydraDB(token="YOUR_HYDRA_DB_API_KEY")
-openai_client = OpenAI(api_key="YOUR_OPENAI_API_KEY")
+hydra = HydraDB(token=os.environ["HYDRA_DB_API_KEY"])
+openai_client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
 question = "How does authentication work?"
 
@@ -237,13 +248,14 @@ console.log(completion.choices[0].message.content);
 ```
 ```python Python SDK (Async)
 import asyncio
+import os
 
 from hydra_db import AsyncHydraDB
 from hydra_db.helpers import build_string
 from openai import AsyncOpenAI
 
-hydra = AsyncHydraDB(token="YOUR_HYDRA_DB_API_KEY")
-openai_client = AsyncOpenAI(api_key="YOUR_OPENAI_API_KEY")
+hydra = AsyncHydraDB(token=os.environ["HYDRA_DB_API_KEY"])
+openai_client = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
 question = "How does authentication work?"
 
@@ -285,22 +297,25 @@ asyncio.run(main())
 
 ## 4. Combining Knowledge and Memories
 
-The simplest path is one `POST /query` with `type: "all"` - HydraDB queries both stores in parallel and returns one merged, ranked result set.
+The simplest path is one `POST /query` with `type: "all"`. HydraDB queries both stores in parallel and returns one merged, ranked result set.
+
+This example searches shared documents in `company_docs` and the user’s memories in `user_123`. Use the collections you ingested into; both must exist. For restricted documents, also send the caller’s identity as `acl`.
 
 <CodeGroup>
 ```python Python SDK
+import os
 from hydra_db import HydraDB
 from hydra_db.helpers import build_string
 from openai import OpenAI
 
-hydra = HydraDB(token="YOUR_HYDRA_DB_API_KEY")
-openai_client = OpenAI(api_key="YOUR_OPENAI_API_KEY")
+hydra = HydraDB(token=os.environ["HYDRA_DB_API_KEY"])
+openai_client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
 question = "What is our refund policy?"
 
 result = hydra.query(
     database="acme_corp",
-    collection="user_123",
+    collections=["company_docs", "user_123"],
     query=question,
     type="all",
     query_by="hybrid",
@@ -331,7 +346,7 @@ const question = "What is our refund policy?";
 
 const result = await hydra.query({
   database: "acme_corp",
-  collection: "user_123",
+  collections: ["company_docs", "user_123"],
   query: question,
   type: "all",
   queryBy: "hybrid",
@@ -352,13 +367,14 @@ console.log(completion.choices[0].message.content);
 ```
 ```python Python SDK (Async)
 import asyncio
+import os
 
 from hydra_db import AsyncHydraDB
 from hydra_db.helpers import build_string
 from openai import AsyncOpenAI
 
-hydra = AsyncHydraDB(token="YOUR_HYDRA_DB_API_KEY")
-openai_client = AsyncOpenAI(api_key="YOUR_OPENAI_API_KEY")
+hydra = AsyncHydraDB(token=os.environ["HYDRA_DB_API_KEY"])
+openai_client = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
 question = "What is our refund policy?"
 
@@ -366,7 +382,7 @@ question = "What is our refund policy?"
 async def main():
     result = await hydra.query(
         database="acme_corp",
-        collection="user_123",
+        collections=["company_docs", "user_123"],
         query=question,
         type="all",
         query_by="hybrid",
@@ -395,16 +411,19 @@ If you need to format knowledge and memories in separate labeled sections, call 
 <CodeGroup>
 ```python Python SDK
 import asyncio
+import os
 from hydra_db import AsyncHydraDB
 from hydra_db.helpers import build_string
 
-hydra = AsyncHydraDB(token="YOUR_HYDRA_DB_API_KEY")
+hydra = AsyncHydraDB(token=os.environ["HYDRA_DB_API_KEY"])
+question = "What is our refund policy?"
 
 async def main():
     knowledge_result, memory_result = await asyncio.gather(
         hydra.query(
             database="acme_corp",
-            query="refund policy",
+            collection="company_docs",
+            query=question,
             type="knowledge",
             query_by="hybrid",
             mode="thinking",
@@ -433,11 +452,13 @@ import { HydraDBClient } from "@hydradb/sdk";
 import { buildString } from "@hydradb/sdk/helpers";
 
 const hydra = new HydraDBClient({ token: process.env.HYDRA_DB_API_KEY });
+const question = "What is our refund policy?";
 
 const [knowledgeResult, memoryResult] = await Promise.all([
   hydra.query({
     database: "acme_corp",
-    query: "refund policy",
+    collection: "company_docs",
+    query: question,
     type: "knowledge",
     queryBy: "hybrid",
     mode: "thinking",
@@ -458,18 +479,17 @@ const prompt =
 ```
 </CodeGroup>
 
-If memory query fails or times out, fall back to the knowledge-only prompt.
+If the memory query fails or times out, fall back to the knowledge-only prompt.
 
 ---
 
 ## 5. Practical guidance
 
-- **Preserve server order.** Don't re-sort chunks client-side.
-- **Start small on chunks.** `max_results: 10` is a reasonable default. Drop to 5 if you hit token limits, raise to 20 if you rerank downstream.
-- **Use graph context selectively.** It improves relational queries and bloats simple lookups. See [Context Graphs](/essentials/v2/context-graphs).
-- **Always give the model a grounding instruction.** A system prompt like "answer only from the provided context" prevents the model from inventing answers when retrieval is thin.
-- **Format consistently.** Whatever section delimiters you choose (`=== CONTEXT ===`, `Chunk N`, `Source:`), keep them stable across calls so the model learns the structure.
-- **`type: "all"` is the simplest path when you need both knowledge and memories.** One call, one result set, one `build_string` call.
+- **Preserve server order:** Don't re-sort chunks client-side.
+- **Start small on chunks:** `max_results: 10` is a reasonable default. Drop to 5 if you hit token limits, raise to 20 if you rerank downstream.
+- **Use graph context selectively:** It helps with questions about relationships; for simple lookups, use `mode: "fast"` and `graph_context: false` to reduce prompt size. See [Context Graphs](/essentials/v2/context-graphs).
+- **Give the model a grounding instruction:** Use a system prompt like "answer only from the provided context" to reduce unsupported answers when retrieval is thin.
+- **Format consistently:** Whatever section delimiters you choose (`=== CONTEXT ===`, `Chunk N`, `Source:`), keep them stable across calls so the model can read the structure consistently.
 
 ---
 
@@ -482,18 +502,18 @@ If memory query fails or times out, fall back to the knowledge-only prompt.
 | Including too many chunks | Token overflow or answer quality drops | Start at `max_results: 10`; reduce if needed. |
 | Re-sorting chunks client-side | Overrides HydraDB's ranking | Preserve the server-returned order. |
 | Missing a grounding instruction | The model invents answers when retrieval is thin | System prompt: answer only from the provided context. |
-| Setting `graph_context: false` and expecting graph fields | Graph context will be omitted | `graph_context` is on by default; only set it to `false` when you explicitly don't want graph data. |
-| Using `query_forceful_relations` with `mode: "fast"` | Flag is silently ignored | `query_forceful_relations` only takes effect when `mode: "thinking"`. |
+| Setting `graph_context: false` and expecting graph fields | Graph context will be omitted (in fast mode; thinking always returns it) | `graph_context` is on by default; only set it to `false` when you explicitly don't want graph data. |
+| Using `query_forceful_relations` with `mode: "fast"` | Flag is ignored | `query_forceful_relations` only takes effect when `mode: "thinking"` (or `"auto"` routed to thinking). |
 | Looking up `chunk_relations` without `chunk_id_to_group_ids` | The right relations don't attach to the right chunk | Use `chunk_id_to_group_ids[chunk_uuid]` to find the `group_id`s, then filter `chunk_relations` by them. |
 
 ---
 
 ## Related
 
-- [Query](/essentials/v2/query) - request parameters and response shape
-- [Memories](/essentials/v2/memories) - what `POST /query` with `type: "memory"` queries
-- [Knowledge](/essentials/v2/knowledge) - what `POST /query` with `type: "knowledge"` queries
-- [Context Graphs](/essentials/v2/context-graphs) - what `graph_context` fields contain
+- [Query](/essentials/v2/query): request parameters and response shape
+- [Memories](/essentials/v2/memories): what `POST /query` with `type: "memory"` queries
+- [Knowledge](/essentials/v2/knowledge): what `POST /query` with `type: "knowledge"` queries
+- [Context Graphs](/essentials/v2/context-graphs): what `graph_context` fields contain
 
 ---
 
