@@ -4,13 +4,17 @@ Sync the website FAQ knowledge base in HydraDB.
 
 Builds one `knowledge_base` app source per page from three sources:
 
-  1. Docs    -- the v2 "Guides" tab pages listed in docs.json
-                (url = https://docs.hydradb.com/<page path>)
+  1. Docs    -- the v2 "Guides" tab pages listed in docs.json. The body is
+                read from the repo's MDX files (not the deployed site, which
+                has not redeployed yet when a push to main triggers the sync).
+                url = https://docs.hydradb.com/<page path>
   2. Website -- hydradb.com/, /ai, /contact, /alternatives, every
                 /alternatives/* page, and /privacy-policy. HTML is fetched and
                 the readable text is extracted. /blog/* and /terms-of-service
                 are never ingested.
   3. faq/qa.yaml -- a hand-written Q&A list (question, answer, optional url).
+                Item ids are derived from the question text (slug + hash),
+                not the entry position.
 
 Each item is ingested with `POST /context/ingest` (multipart, type=knowledge,
 upsert=true) so it is a `knowledge_base` app source carrying its own `url`.
@@ -21,10 +25,14 @@ After ingest, any source already in the database that is no longer in the set
 is deleted (`POST /context/list` then `DELETE /context`) so removed pages stop
 being answered.
 
+If any page or the sitemap fails to fetch, or any body extracts to empty,
+the run exits non-zero without ingesting or deleting anything. A failed page
+is never upserted with an empty body and never treated as removed.
+
 Config (env):
   HYDRADB_FAQ_API_KEY   secret, required to actually ingest. When missing the
                         run exits 0 with a notice (see --skip-if-no-key).
-  HYDRADB_FAQ_DATABASE  repo variable, defaults to `website-faq`.
+  HYDRADB_FAQ_DATABASE  repo variable, defaults to `website-faqs`.
   HYDRADB_API_BASE      defaults to https://api.hydradb.com
   DOCS_BASE             defaults to https://docs.hydradb.com
   SITE_BASE             defaults to https://hydradb.com
@@ -37,6 +45,7 @@ calling the API. Useful for local validation and CI without a key.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import io
 import json
 import os
@@ -59,7 +68,7 @@ except ImportError:  # pragma: no cover - pyyaml is installed in the workflow
 API_BASE_DEFAULT = "https://api.hydradb.com"
 DOCS_BASE_DEFAULT = "https://docs.hydradb.com"
 SITE_BASE_DEFAULT = "https://hydradb.com"
-DATABASE_DEFAULT = "website-faq"
+DATABASE_DEFAULT = "website-faqs"
 COLLECTION_DEFAULT = "default"
 HTTP_TIMEOUT = 30
 MAX_FETCH_RETRIES = 2
@@ -283,27 +292,56 @@ def mdx_frontmatter_title(mdx_path: Path) -> str | None:
     return tm.group(1).strip() if tm else None
 
 
+def mdx_to_text(text: str) -> str:
+    """Extract readable text from an MDX file's body.
+
+    Reads the repo's MDX source (not the deployed site) so a push to main
+    triggers the sync against the content that was just committed, not the
+    previously-deployed pages.
+    """
+    # Strip frontmatter.
+    text = re.sub(r"^---\s*\n.*?\n---\s*\n", "", text, count=1, flags=re.DOTALL)
+    # Strip import lines.
+    text = re.sub(r"^import\s+.*$\n?", "", text, flags=re.MULTILINE)
+    # Strip HTML comments.
+    text = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
+    # Strip code-fence markers but keep the code inside.
+    text = re.sub(r"```[^\n]*\n?", "", text)
+    # Strip markdown heading markers (keep the heading text).
+    text = re.sub(r"^\s{0,3}#{1,6}\s+", "", text, flags=re.MULTILINE)
+    # Strip JSX/HTML tags (opening, closing, self-closing) but keep text.
+    text = re.sub(r"</?[A-Za-z][A-Za-z0-9]*\b[^>]*?/?>", "", text)
+    # Collapse excessive blank lines.
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
 # ---------------------------------------------------------------------------
 # Website sitemap -> /alternatives/* discovery
 # ---------------------------------------------------------------------------
 
 def sitemap_urls(site_base: str) -> list[str]:
-    """Return all URLs from sitemap.xml at site_base/sitemap.xml, or []."""
+    """Return all URLs from sitemap.xml at site_base/sitemap.xml.
+
+    Raises on fetch/parse failure so a missing or unreadable sitemap aborts
+    the run before any ingest or delete.
+    """
     candidates = [
         f"{site_base.rstrip('/')}/sitemap.xml",
         f"{site_base.rstrip('/')}/sitemap-index.xml",
     ]
+    last_err: Exception | None = None
     for url in candidates:
         try:
             xml = http_get(url)
-        except Exception:
+        except Exception as exc:
+            last_err = exc
             continue
-        urls: list[str] = []
         try:
             root = ET.fromstring(xml)
-        except ET.ParseError:
-            return []
-        # Sitemaps use XML namespaces; match <loc> ignoring the prefix.
+        except ET.ParseError as exc:
+            raise RuntimeError(f"sitemap {url}: parse failed: {exc}") from exc
+        urls: list[str] = []
         for el in root.iter():
             tag = el.tag.split("}")[-1]
             if tag == "loc" and el.text:
@@ -312,17 +350,16 @@ def sitemap_urls(site_base: str) -> list[str]:
         if urls and all(u.endswith(".xml") for u in urls):
             nested: list[str] = []
             for u in urls:
-                try:
-                    sub = http_get(u)
-                    sroot = ET.fromstring(sub)
-                    for el in sroot.iter():
-                        if el.tag.split("}")[-1] == "loc" and el.text:
-                            nested.append(el.text.strip())
-                except Exception:
-                    continue
+                sub = http_get(u)  # raises -> abort
+                sroot = ET.fromstring(sub)
+                for el in sroot.iter():
+                    if el.tag.split("}")[-1] == "loc" and el.text:
+                        nested.append(el.text.strip())
             return nested
         return urls
-    return []
+    raise RuntimeError(
+        f"sitemap: could not fetch any candidate ({last_err})"
+    )
 
 
 def discover_alternative_pages(site_base: str) -> list[str]:
@@ -390,7 +427,10 @@ def make_item(item_id: str, title: str, provider: str, external_id: str,
               url: str, body: str, database: str) -> dict:
     body = (body or "").strip()
     if not body:
-        body = title
+        raise RuntimeError(
+            f"refusing to build item {item_id} with empty body "
+            f"(would upsert empty content)"
+        )
     return {
         "id": item_id,
         "database": database,
@@ -414,27 +454,23 @@ def build_docs_items(docs_pages: list[str], repo_root: Path, docs_base: str,
     items: list[dict] = []
     for page in docs_pages:
         url = f"{docs_base.rstrip('/')}/{page.lstrip('/')}"
-        # Prefer the local frontmatter title (stable, no network).
         mdx_candidates = [
             repo_root / f"{page}.mdx",
             repo_root / f"{page}.md",
             repo_root / page / "index.mdx",
         ]
-        title = None
-        for cand in mdx_candidates:
-            title = mdx_frontmatter_title(cand)
-            if title:
-                break
-        body = ""
-        try:
-            html = http_get(url)
-            body = html_to_text(html)
-            if not title:
-                title = html_title(html)
-        except Exception as exc:
-            warn(f"docs page {page}: fetch failed ({exc}); ingesting title only")
-        if not title:
-            title = page
+        mdx_path = next((c for c in mdx_candidates if c.exists()), None)
+        if mdx_path is None:
+            raise RuntimeError(
+                f"docs page {page}: no MDX/MD file found under {repo_root}"
+            )
+        raw = mdx_path.read_text(encoding="utf-8", errors="replace")
+        title = mdx_frontmatter_title(mdx_path) or page
+        body = mdx_to_text(raw)
+        if not body:
+            raise RuntimeError(
+                f"docs page {page}: extracted empty body from {mdx_path}"
+            )
         item_id = "docs-" + page.replace("/", "-")
         items.append(make_item(item_id, title, "docs", page, url, body, database))
         info(f"docs  {page}  ({len(body)} chars)")
@@ -449,22 +485,27 @@ def build_site_items(site_base: str, database: str) -> list[dict]:
         if path.startswith("/blog/"):
             continue
         url = f"{site_base.rstrip('/')}{path}"
-        title = site_slug(path)
-        body = ""
-        try:
-            html = http_get(url)
-            body = html_to_text(html)
-            t = html_title(html)
-            if t:
-                title = t
-        except Exception as exc:
-            warn(f"site {path}: fetch failed ({exc}); ingesting title only")
+        html = http_get(url)  # raises on failure -> abort before ingest/delete
+        body = html_to_text(html)
+        if not body:
+            raise RuntimeError(f"site {path}: extracted empty body from {url}")
+        title = html_title(html) or site_slug(path)
         item_id = "site-" + site_slug(path)
         items.append(
             make_item(item_id, title, "website", path, url, body, database)
         )
         info(f"site  {path}  ({len(body)} chars)")
     return items
+
+
+def qa_id(question: str) -> str:
+    """Derive a stable item id from the question text (slug + short hash)."""
+    slug = re.sub(r"[^a-z0-9]+", "-", question.lower()).strip("-")
+    slug = slug[:60]
+    h = hashlib.sha1(question.encode("utf-8")).hexdigest()[:8]
+    if not slug:
+        return f"qa-{h}"
+    return f"qa-{slug}-{h}"
 
 
 def build_faq_items(qa_path: Path, database: str) -> list[dict]:
@@ -477,6 +518,7 @@ def build_faq_items(qa_path: Path, database: str) -> list[dict]:
     data = yaml.safe_load(qa_path.read_text(encoding="utf-8")) or {}
     entries = data.get("items") or []
     items: list[dict] = []
+    seen_ids: set[str] = set()
     for i, entry in enumerate(entries, start=1):
         question = (entry.get("question") or "").strip()
         answer = (entry.get("answer") or "").strip()
@@ -485,7 +527,11 @@ def build_faq_items(qa_path: Path, database: str) -> list[dict]:
             continue
         url = (entry.get("url") or "").strip()
         body = f"Q: {question}\n\nA: {answer}"
-        item_id = f"qa-{i}"
+        item_id = qa_id(question)
+        if item_id in seen_ids:
+            warn(f"qa.yaml entry {i}: id collision on {item_id}; skipping")
+            continue
+        seen_ids.add(item_id)
         items.append(
             make_item(item_id, question, "faq", item_id, url, body, database)
         )
@@ -675,4 +721,8 @@ if __name__ == "__main__":
     except ApiError as exc:
         print(f"\n== API ERROR ==\n{exc}", file=sys.stderr)
         print(f"::error title=FAQ sync API error::{exc}", file=sys.stderr)
+        raise SystemExit(1)
+    except RuntimeError as exc:
+        print(f"\n== SYNC ABORTED ==\n{exc}", file=sys.stderr)
+        print(f"::error title=FAQ sync aborted::{exc}", file=sys.stderr)
         raise SystemExit(1)
