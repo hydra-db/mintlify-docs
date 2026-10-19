@@ -21,18 +21,23 @@ upsert=true) so it is a `knowledge_base` app source carrying its own `url`.
 The `url` must be present on the item itself: without it HydraDB replaces the
 url with the internal s3 pointer and the FAQ box shows no source links.
 
-After ingest, any source already in the database that is no longer in the set
-is deleted (`POST /context/list` then `DELETE /context`) so removed pages stop
-being answered.
+Items go to the database's default collection, the one the FAQ endpoint
+(POST /faq/ask) searches. The run then waits until every item is indexed
+(GET /context/status) and fails if any errors. Only then is any source this
+sync owns (docs-, site-, qa- ids) that is no longer in the set deleted
+(`POST /context/list` then `DELETE /context`), so removed pages stop being
+answered.
 
-If any page or the sitemap fails to fetch, or any body extracts to empty,
-the run exits non-zero without ingesting or deleting anything. A failed page
-is never upserted with an empty body and never treated as removed.
+If any input cannot be read (a page, the sitemap, docs.json, faq/qa.yaml) or
+any body extracts to empty, the run exits non-zero without ingesting or
+deleting anything. A failed read is never upserted and never treated as
+removed.
 
 Config (env):
   HYDRADB_FAQ_API_KEY   secret, required to actually ingest. When missing the
-                        run exits 0 with a notice (see --skip-if-no-key).
-  HYDRADB_FAQ_DATABASE  repo variable, defaults to `website-faqs`.
+                        run exits 0 with a notice.
+  HYDRADB_FAQ_DATABASE  repo variable, required: the database POST /faq/ask
+                        reads (FAQ_DATABASE in hydradb-application).
   HYDRADB_API_BASE      defaults to https://api.hydradb.com
   DOCS_BASE             defaults to https://docs.hydradb.com
   SITE_BASE             defaults to https://hydradb.com
@@ -59,20 +64,25 @@ import xml.etree.ElementTree as ET
 from html.parser import HTMLParser
 from pathlib import Path
 
-try:
-    import yaml  # type: ignore
-except ImportError:  # pragma: no cover - pyyaml is installed in the workflow
-    yaml = None
-
 
 API_BASE_DEFAULT = "https://api.hydradb.com"
 DOCS_BASE_DEFAULT = "https://docs.hydradb.com"
 SITE_BASE_DEFAULT = "https://hydradb.com"
-DATABASE_DEFAULT = "website-faqs"
-COLLECTION_DEFAULT = "default"
 HTTP_TIMEOUT = 30
 MAX_FETCH_RETRIES = 2
 USER_AGENT = "hydradb-faq-sync/1.0 (+https://github.com/hydra-db/mintlify-docs)"
+
+# Ids this sync creates. Cleanup deletes only these, never other content.
+OWNED_ID_PREFIXES = ("docs-", "site-", "qa-")
+
+# Indexing wait: GET /context/status until every item is terminal.
+STATUS_POLL_SECONDS = 15
+STATUS_TIMEOUT_SECONDS = 20 * 60
+STATUS_BATCH = 50
+
+# Component attributes that hold visible text in the Guides MDX
+# (Field name/type, Tab/Step/Accordion/Card title).
+MDX_DISPLAY_ATTRS = ("title", "name", "type")
 
 # Pages on hydradb.com to always ingest, independent of sitemap discovery.
 SITE_BASE_PATHS = ["/", "/ai", "/contact", "/alternatives", "/privacy-policy"]
@@ -81,11 +91,13 @@ SITE_BASE_PATHS = ["/", "/ai", "/contact", "/alternatives", "/privacy-policy"]
 SITE_EXCLUDE_PATHS = {"/terms-of-service"}
 
 # Tags whose contents are not readable text and should be dropped wholesale.
+# Only tags with a closing tag belong here: a void element (input, source)
+# never closes, so counting it would drop everything after it.
 SKIP_TAGS = {
     "script", "style", "noscript", "svg", "math", "template",
     "nav", "header", "footer", "aside",
-    "button", "form", "input", "select", "textarea", "label",
-    "iframe", "canvas", "video", "audio", "picture", "source",
+    "button", "form", "select", "textarea", "label",
+    "iframe", "canvas", "video", "audio", "picture",
 }
 
 
@@ -173,48 +185,51 @@ def encode_multipart(fields: dict[str, str]) -> tuple[bytes, str]:
 # ---------------------------------------------------------------------------
 
 class _TextExtractor(HTMLParser):
+    """Collects readable text for the whole page and inside <main>/<article>.
+
+    The parser tracks nesting depth, so a nested wrapper never cuts the
+    content short the way a regex slice to the first closing tag does.
+    """
+
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self._skip_depth = 0
-        self._parts: list[str] = []
+        self._depth = {"main": 0, "article": 0}
+        self._parts: dict[str, list[str]] = {"main": [], "article": [], "page": []}
 
     def handle_starttag(self, tag, attrs):
         if tag in SKIP_TAGS:
             self._skip_depth += 1
+        elif tag in self._depth:
+            self._depth[tag] += 1
 
     def handle_startendtag(self, tag, attrs):
         # self-closing tags contribute no text; nothing to do.
         pass
 
     def handle_endtag(self, tag):
-        if tag in SKIP_TAGS and self._skip_depth > 0:
-            self._skip_depth -= 1
+        if tag in SKIP_TAGS:
+            if self._skip_depth > 0:
+                self._skip_depth -= 1
+        elif tag in self._depth and self._depth[tag] > 0:
+            self._depth[tag] -= 1
 
     def handle_data(self, data):
-        if self._skip_depth == 0:
-            text = data.strip()
-            if text:
-                self._parts.append(text)
+        text = data.strip()
+        if not text or self._skip_depth:
+            return
+        self._parts["page"].append(text)
+        for wrapper, depth in self._depth.items():
+            if depth:
+                self._parts[wrapper].append(text)
 
     def text(self) -> str:
-        return re.sub(r"\s+\n", "\n", "\n".join(self._parts)).strip()
-
-
-def _slice_main(html: str) -> str:
-    """Prefer <main> or <article> content so nav/footer noise is dropped."""
-    for pattern in (
-        r"<main\b[^>]*>(.*?)</main>",
-        r"<article\b[^>]*>(.*?)</article>",
-        r"<div[^>]*id=[\"']?content[\"']?[^>]*>(.*?)</div>",
-    ):
-        m = re.search(pattern, html, re.IGNORECASE | re.DOTALL)
-        if m:
-            return m.group(1)
-    return html
+        # Prefer <main>, then <article>, so nav and footer noise is dropped.
+        parts = self._parts["main"] or self._parts["article"] or self._parts["page"]
+        return "\n".join(parts).strip()
 
 
 def html_to_text(html: str) -> str:
-    html = _slice_main(html)
     parser = _TextExtractor()
     try:
         parser.feed(html)
@@ -297,23 +312,43 @@ def mdx_to_text(text: str) -> str:
 
     Reads the repo's MDX source (not the deployed site) so a push to main
     triggers the sync against the content that was just committed, not the
-    previously-deployed pages.
+    previously-deployed pages. Fenced code is kept verbatim; MDX syntax is
+    stripped only outside it, so code examples keep their imports.
     """
-    # Strip frontmatter.
     text = re.sub(r"^---\s*\n.*?\n---\s*\n", "", text, count=1, flags=re.DOTALL)
-    # Strip import lines.
-    text = re.sub(r"^import\s+.*$\n?", "", text, flags=re.MULTILINE)
-    # Strip HTML comments.
+    out: list[str] = []
+    prose: list[str] = []
+    in_code = False
+    for line in text.splitlines():
+        if line.lstrip().startswith(("```", "~~~")):
+            if not in_code:
+                out.append(_mdx_prose_to_text("\n".join(prose)))
+                prose = []
+            in_code = not in_code
+            continue
+        (out if in_code else prose).append(line)
+    out.append(_mdx_prose_to_text("\n".join(prose)))
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip()
+
+
+def _mdx_prose_to_text(text: str) -> str:
+    text = re.sub(r"^(?:import|export)\s.*$\n?", "", text, flags=re.MULTILINE)
     text = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
-    # Strip code-fence markers but keep the code inside.
-    text = re.sub(r"```[^\n]*\n?", "", text)
-    # Strip markdown heading markers (keep the heading text).
     text = re.sub(r"^\s{0,3}#{1,6}\s+", "", text, flags=re.MULTILINE)
-    # Strip JSX/HTML tags (opening, closing, self-closing) but keep text.
-    text = re.sub(r"</?[A-Za-z][A-Za-z0-9]*\b[^>]*?/?>", "", text)
-    # Collapse excessive blank lines.
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
+    return re.sub(r"</?[A-Za-z][A-Za-z0-9]*\b[^>]*?/?>",
+                  lambda m: _mdx_tag_text(m.group(0)), text)
+
+
+def _mdx_tag_text(tag: str) -> str:
+    """The text a component shows from its attributes, or "" for none:
+    <Field name="ids" type="string[]" required /> -> "ids (string[], required)"."""
+    attrs = dict(re.findall(r"(\w+)=[\"']([^\"']*)[\"']", tag))
+    shown = [attrs[a] for a in MDX_DISPLAY_ATTRS if attrs.get(a)]
+    if re.search(r"\srequired\b(?!\s*=)", tag):
+        shown.append("required")
+    if not shown:
+        return ""
+    return shown[0] + (f" ({', '.join(shown[1:])})" if shown[1:] else "")
 
 
 # ---------------------------------------------------------------------------
@@ -380,18 +415,16 @@ def discover_alternative_pages(site_base: str) -> list[str]:
                 seen.add(normalized)
                 paths.append(normalized)
     # Fall back to scraping links from /alternatives if the sitemap had none.
+    # A failed fetch raises: an unread list must never look like removed pages.
     if not paths:
-        try:
-            html = http_get(f"{site_base.rstrip('/')}/alternatives")
-            for m in re.finditer(r'href=["\']([^"\']+)["\']', html):
-                href = m.group(1)
-                if href.startswith("/alternatives/") and href != "/alternatives/":
-                    p = href.split("#", 1)[0].split("?", 1)[0].rstrip("/")
-                    if p and p not in seen:
-                        seen.add(p)
-                        paths.append(p)
-        except Exception:
-            pass
+        html = http_get(f"{site_base.rstrip('/')}/alternatives")
+        for m in re.finditer(r'href=["\']([^"\']+)["\']', html):
+            href = m.group(1)
+            if href.startswith("/alternatives/") and href != "/alternatives/":
+                p = href.split("#", 1)[0].split("?", 1)[0].rstrip("/")
+                if p and p not in seen:
+                    seen.add(p)
+                    paths.append(p)
     return sorted(paths)
 
 
@@ -434,7 +467,6 @@ def make_item(item_id: str, title: str, provider: str, external_id: str,
     return {
         "id": item_id,
         "database": database,
-        "collection": COLLECTION_DEFAULT,
         "title": title,
         "kind": "knowledge_base",
         "provider": provider,
@@ -509,12 +541,14 @@ def qa_id(question: str) -> str:
 
 
 def build_faq_items(qa_path: Path, database: str) -> list[dict]:
+    # Every failure raises: skipping the file or an entry would make its saved
+    # Q&A sources look removed, and cleanup would delete them.
+    try:
+        import yaml
+    except ImportError as exc:
+        raise RuntimeError("PyYAML is required to read faq/qa.yaml (pip install pyyaml)") from exc
     if not qa_path.exists():
-        warn(f"{qa_path} not found; no Q&A items ingested")
-        return []
-    if yaml is None:
-        warn("PyYAML not installed; skipping faq/qa.yaml")
-        return []
+        raise RuntimeError(f"{qa_path} not found")
     data = yaml.safe_load(qa_path.read_text(encoding="utf-8")) or {}
     entries = data.get("items") or []
     items: list[dict] = []
@@ -523,14 +557,12 @@ def build_faq_items(qa_path: Path, database: str) -> list[dict]:
         question = (entry.get("question") or "").strip()
         answer = (entry.get("answer") or "").strip()
         if not question or not answer:
-            warn(f"qa.yaml entry {i}: missing question or answer; skipping")
-            continue
+            raise RuntimeError(f"qa.yaml entry {i}: missing question or answer")
         url = (entry.get("url") or "").strip()
         body = f"Q: {question}\n\nA: {answer}"
         item_id = qa_id(question)
         if item_id in seen_ids:
-            warn(f"qa.yaml entry {i}: id collision on {item_id}; skipping")
-            continue
+            raise RuntimeError(f"qa.yaml entry {i}: duplicate question ({item_id})")
         seen_ids.add(item_id)
         items.append(
             make_item(item_id, question, "faq", item_id, url, body, database)
@@ -544,13 +576,9 @@ def build_faq_items(qa_path: Path, database: str) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def ingest(items: list[dict], api_key: str, api_base: str, database: str) -> None:
-    if not items:
-        info("no items to ingest")
-        return
     app_knowledge = json.dumps(items, separators=(",", ":"))
     fields = {
         "database": database,
-        "collection": COLLECTION_DEFAULT,
         "type": "knowledge",
         "upsert": "true",
         "app_knowledge": app_knowledge,
@@ -563,15 +591,46 @@ def ingest(items: list[dict], api_key: str, api_base: str, database: str) -> Non
     if status not in (200, 202):
         raise ApiError(status, text)
     try:
-        envelope = json.loads(text)
-    except json.JSONDecodeError:
-        envelope = {}
-    results = (envelope.get("data") or {}).get("results") or []
-    info(f"ingested {len(items)} items (api accepted {len(results)} ids)")
-    # Surface per-item accept errors if any.
-    for r in results:
-        if r.get("error"):
-            warn(f"  item {r.get('id')}: {r.get('error')}")
+        results = (json.loads(text).get("data") or {}).get("results") or []
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"ingest: unreadable response: {text[:200]}") from exc
+    rejected = [f"{r.get('id')}: {r.get('error')}" for r in results if r.get("error")]
+    if rejected:
+        raise RuntimeError(f"ingest rejected {len(rejected)} items: {rejected}")
+    info(f"queued {len(items)} items")
+
+
+def wait_indexed(ids: list[str], api_key: str, api_base: str, database: str) -> None:
+    """Wait until every item is indexed; raise if any errors or the wait times
+    out. A 202 from ingest only means queued."""
+    pending = list(ids)
+    deadline = time.monotonic() + STATUS_TIMEOUT_SECONDS
+    while pending:
+        still: list[str] = []
+        errored: list[str] = []
+        for i in range(0, len(pending), STATUS_BATCH):
+            batch = pending[i:i + STATUS_BATCH]
+            query = urllib.parse.urlencode({"database": database, "ids": ",".join(batch)})
+            status, text = api_request("GET", f"/context/status?{query}", api_key, api_base)
+            if status != 200:
+                raise ApiError(status, text)
+            statuses = {s.get("id"): s for s in (json.loads(text).get("data") or {}).get("statuses") or []}
+            for sid in batch:
+                s = statuses.get(sid) or {}
+                if s.get("indexing_status") == "errored":
+                    errored.append(f"{sid}: {s.get('error_code') or s.get('error_message')}")
+                elif s.get("indexing_status") != "completed":
+                    still.append(sid)
+        if errored:
+            raise RuntimeError(f"{len(errored)} items failed to index: {errored}")
+        pending = still
+        if pending:
+            if time.monotonic() > deadline:
+                raise RuntimeError(f"{len(pending)} items not indexed after "
+                                   f"{STATUS_TIMEOUT_SECONDS // 60} min: {pending}")
+            info(f"{len(pending)} items still indexing")
+            time.sleep(STATUS_POLL_SECONDS)
+    info(f"all {len(ids)} items indexed")
 
 
 def list_existing_ids(api_key: str, api_base: str, database: str) -> set[str]:
@@ -580,7 +639,6 @@ def list_existing_ids(api_key: str, api_base: str, database: str) -> set[str]:
     while True:
         payload = json.dumps({
             "database": database,
-            "collection": COLLECTION_DEFAULT,
             "type": "knowledge",
             "page": page,
             "page_size": 100,
@@ -615,7 +673,6 @@ def delete_ids(ids: list[str], api_key: str, api_base: str, database: str) -> No
         return
     payload = json.dumps({
         "database": database,
-        "collection": COLLECTION_DEFAULT,
         "type": "knowledge",
         "ids": ids,
     })
@@ -652,17 +709,13 @@ def main() -> int:
 
     repo_root = Path(args.repo_root).resolve()
     api_key = os.environ.get("HYDRADB_FAQ_API_KEY", "").strip()
-    database = os.environ.get("HYDRADB_FAQ_DATABASE", "").strip() or DATABASE_DEFAULT
+    database = os.environ.get("HYDRADB_FAQ_DATABASE", "").strip()
     api_base = os.environ.get("HYDRADB_API_BASE", "").strip() or API_BASE_DEFAULT
     docs_base = os.environ.get("DOCS_BASE", "").strip() or DOCS_BASE_DEFAULT
     site_base = os.environ.get("SITE_BASE", "").strip() or SITE_BASE_DEFAULT
     qa_path = Path(os.environ.get("FAQ_QA_PATH", "faq/qa.yaml"))
     if not qa_path.is_absolute():
         qa_path = repo_root / qa_path
-
-    print(f"HydraDB FAQ sync\n  database: {database}\n  api base: {api_base}\n"
-          f"  docs base: {docs_base}\n  site base: {site_base}\n"
-          f"  qa file:   {qa_path}")
 
     if args.dry_run:
         info("DRY RUN: no API calls will be made")
@@ -675,6 +728,14 @@ def main() -> int:
         # Print a GitHub Actions notice so it shows up in the run summary.
         print(f"::notice title=FAQ sync skipped::{notice}")
         return 0
+    # No default: a guessed name would write to a database the FAQ never reads.
+    if not database:
+        raise RuntimeError("HYDRADB_FAQ_DATABASE is not set; set it to the database "
+                           "POST /faq/ask reads (FAQ_DATABASE in hydradb-application)")
+
+    print(f"HydraDB FAQ sync\n  database: {database}\n  api base: {api_base}\n"
+          f"  docs base: {docs_base}\n  site base: {site_base}\n"
+          f"  qa file:   {qa_path}")
 
     # 1. Build the item set.
     step("Building item set")
@@ -696,15 +757,16 @@ def main() -> int:
               f"database '{database}'.")
         return 0
 
-    # 2. Ingest (upsert) the full set.
+    # 2. Ingest (upsert) the full set, and wait until all of it is indexed.
     step(f"Ingesting {len(items)} items into '{database}'")
     ingest(items, api_key, api_base, database)
+    wait_indexed(sorted(new_ids), api_key, api_base, database)
 
-    # 3. Delete sources no longer in the set.
+    # 3. Delete sources this sync owns that are no longer in the set.
     step("Reconciling stale sources")
     existing = list_existing_ids(api_key, api_base, database)
     info(f"database currently has {len(existing)} knowledge sources")
-    stale = sorted(existing - new_ids)
+    stale = sorted(i for i in existing - new_ids if i.startswith(OWNED_ID_PREFIXES))
     if stale:
         info(f"{len(stale)} stale sources to delete: {stale}")
     delete_ids(stale, api_key, api_base, database)
