@@ -100,7 +100,7 @@ require("prefix.secret" not in security.get("description", ""), "Bearer auth mus
 providers = SPEC["paths"]["/connectors/providers"]["get"]
 require(any("BearerAuth" in rule for rule in providers.get("security", [])), "Provider catalog requires Bearer authentication")
 for name in ("list.V2ListContentRequest", "sources.V2SourceDeleteRequest"):
-    require(SCHEMAS[name]["properties"]["type"].get("enum") == ["knowledge", "memory"], f"{name}: publish knowledge and memory selectors")
+    require(SCHEMAS[name]["properties"]["type"].get("enum") == ["knowledge", "memory", "all"], f"{name}: preserve combined knowledge and memory requests")
 for path in ("/context/relations", "/context/{id}/subgraph", "/context/subgraph"):
     for parameter in SPEC["paths"][path]["get"].get("parameters", []):
         if parameter.get("name") == "type":
