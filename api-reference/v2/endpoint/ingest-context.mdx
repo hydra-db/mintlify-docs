@@ -122,8 +122,8 @@ curl -X POST 'https://api.hydradb.com/context/ingest' \
 | Name | Description |
 | --- | --- |
 | <Field name="type" type="&#x22;knowledge&#x22; or &#x22;memory&#x22;" /> | Use singular `"memory"` when writing memories. (default=`"knowledge"`) |
-| <Field name="database" type="string" required /> | Target database. Formerly `tenant_id`; the `tenant_id` alias is still accepted (deprecated). |
-| <Field name="collection" type="string" /> | Logical partition inside the database. Formerly `sub_tenant_id`; the `sub_tenant_id` alias is still accepted (deprecated). (default=`""`, the default collection) |
+| <Field name="database" type="string" required /> | Target database. |
+| <Field name="collection" type="string" /> | Collection to write to. A new name creates the collection automatically. Omit it to use the default collection. |
 | <Field name="upsert" type="boolean" /> | Replace existing sources with the same ID. Set to `false` to error on conflict: a document or app source whose ID exists comes back `failed` with `error_code: "E9003"`. (default=`true`) |
 | <Field name="documents" type="file[]" /> | Binary uploads, **knowledge only**. Required when `type=knowledge` and you want HydraDB to parse documents. Omit when ingesting memories. See [Supported file formats](#supported-file-formats). (default=`[]`) |
 | <Field name="document_metadata" type="string (JSON array)" /> | One entry per file in `documents`, in the same order. The counts must match, or the request returns `400`. If omitted, documents index with inferred defaults such as filename/title. See the item shape below. |
@@ -163,11 +163,11 @@ What HydraDB extracts differs by type:
 | Images and scans | Text read out of the picture with OCR. A photo of a page and a scan of a page both work. |
 | Plain text | The file as-is. |
 
-A scanned page with nothing readable on it, or a photo that happens to contain no text, has nothing to index. Its status ends as `errored` with [`error_code` `E2002`](/api-reference/v2/error-responses#ingestion-error-codes) ("No text content could be extracted from your file"). This is final, so re-uploading the same file returns the same result. A scan with readable text on even one page indexes normally.
+Files with no readable text fail with [`E2002`](/api-reference/v2/error-responses#ingestion-error-codes). Upload a version containing text.
 
 ### Formats we cannot read
 
-These are rejected the moment you upload them, before anything is queued. You get the answer in the upload response rather than minutes later.
+Unsupported files are rejected in the upload response.
 
 | Format | Upload this instead |
 | --- | --- |
@@ -178,19 +178,11 @@ These are rejected the moment you upload them, before anything is queued. You ge
 | `.epub` `.wpd` | Convert to PDF or DOCX |
 | `.zip` | Upload the files individually |
 
-`.heic` is the format iPhones use for photos by default, so it is the one people hit most often without realizing. On iOS you can change this under **Settings > Camera > Formats > Most Compatible**, which makes the camera save JPEGs instead. Or export the photo as JPEG or PDF before uploading.
-
-### How we decide the format
-
-The file extension is what counts. `report.pdf` is treated as a PDF because of the `.pdf`, not because of what is inside it.
-
-If the filename has no extension at all, the `Content-Type` you send with that part is used instead, so a file with no extension in its name, sent as `application/pdf`, is accepted.
-
-Renaming a file does not convert it. A `.heic` photo renamed to `photo.pdf` passes this check, because the check reads the name, then fails later during parsing and comes back as `errored` on [`GET /context/status`](/api-reference/v2/endpoint/source-status). Upload files under their real extension.
+Use the file's real extension. When the filename has no extension, HydraDB uses the part's `Content-Type`. Renaming an unsupported file does not convert it. A renamed file may fail during processing. Check [Ingestion Status](/api-reference/v2/endpoint/source-status) for that failure.
 
 ### When a file is not supported
 
-A rejected file does not stop the rest of your upload. Each file is checked on its own, so a batch of ten with one bad file still indexes the other nine.
+Unsupported files do not block other files in the upload.
 
 The request returns `202` as usual. The rejected file comes back with `status: "failed"` and `error_code: "E1002"`, and every other file is queued normally:
 
@@ -213,9 +205,9 @@ The request returns `202` as usual. The rejected file comes back with `status: "
 }
 ```
 
-`results`, `success_count` and `failed_count` sit inside `data`, not at the top level, like every other v2 response. The outer `success: true` means the request was accepted; `data.success` is what tells you whether every file in it was queued.
+`data.success` is `true` only when every file was queued. Check `data.results` for individual failures.
 
-**Do not poll [`GET /context/status`](/api-reference/v2/endpoint/source-status) for a file rejected with `E1002`.** The file never entered the pipeline, so it has no status record, and looking it up returns `FILE_NOT_FOUND` rather than the format error you were given. The upload response is the only place `E1002` appears. Read `error_code` on each item in `data.results` and act on it there.
+Files rejected with `E1002` have no ingestion status record. Handle the format error from the upload response.
 
 </Accordion>
 
@@ -365,8 +357,8 @@ Per-document metadata (`id`, `metadata`, `additional_metadata`, `relations`, `in
   | Field | Description |
   | --- | --- |
   | <Field name="id" type="string" required /> | Context ID. Treated as the upsert key. Send an empty string to have one generated upstream. Must not contain a comma (`,`). It is reserved as the id separator on `/context/status?ids=`. |
-  | <Field name="database" type="string" /> | Optional. If sent, must match the form-level `database`. Formerly `tenant_id` (deprecated alias). |
-  | <Field name="collection" type="string" /> | Optional. If sent, must match the form-level `collection`. Formerly `sub_tenant_id` (deprecated alias). |
+  | <Field name="database" type="string" /> | Optional. If sent, must match the form-level `database`. |
+  | <Field name="collection" type="string" /> | Optional. If sent, must match the form-level `collection`. |
   | <Field name="title" type="string" /> | Short title or subject shown in search results. |
   | <Field name="description" type="string" /> | Optional long-form description. |
   | <Field name="url" type="string" /> | Canonical URL or reference link. |
@@ -439,7 +431,7 @@ Per-document metadata (`id`, `metadata`, `additional_metadata`, `relations`, `in
   | Field | Description |
   | --- | --- |
   | <Field name="id" type="string" /> | Optional unique ID. Acts as the upsert key. Must not contain a comma (`,`). It is reserved as the id separator on `/context/status?ids=`. (default=auto-generated) |
-  | <Field name="title" type="string" /> | Short label for display in `/context/list` and search hits as `source.title`. (default=the memory's `id`) |
+  | <Field name="title" type="string" /> | Label returned as `title` by List Context and `source_title` by Query. (default=the memory's `id`) |
   | <Field name="text" type="string" recommended /> | Raw text or markdown content. Required unless `user_assistant_pairs` is provided. |
   | <Field name="user_assistant_pairs" type="array" recommended /> | Conversation pairs `{ user, assistant }`. Required unless `text` is provided. |
   | <Field name="is_markdown" type="boolean" /> | Treat `text` as markdown for chunking. (default=`false`) |
@@ -607,7 +599,7 @@ Per-document metadata (`id`, `metadata`, `additional_metadata`, `relations`, `in
 
 - **Multipart, not JSON:** This endpoint uses `multipart/form-data`. Stringify all JSON arrays (`document_metadata`, `app_knowledge`, `memories`) before placing them in the form field. A body that is neither a form nor JSON returns `415`.
 - **Memory vs knowledge:** Use `type: "memory"` for memory ingestion, listing, and deletion. Use `type: "all"` on `POST /query` when results should combine both. The multipart field name for memories is always `memories`.
-- **Collection defaulting:** Omitting `collection` writes to the default collection, created on first write. List available collections with [List Collections](/api-reference/v2/endpoint/list-sub-tenants).
+- **Collections:** A new `collection` name creates the collection on ingestion. Omitting it writes to the default collection. List available collections with [List Collections](/api-reference/v2/endpoint/list-sub-tenants).
 
 <div className="api-before-related-resources" />
 
