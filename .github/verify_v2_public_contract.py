@@ -105,6 +105,7 @@ for path in ("/context/relations", "/context/{id}/subgraph", "/context/subgraph"
     for parameter in SPEC["paths"][path]["get"].get("parameters", []):
         if parameter.get("name") == "type":
             require(parameter["schema"].get("enum") == ["knowledge", "memory"], f"{path}: publish knowledge and memory selectors")
+            require("`all`" not in parameter.get("description", ""), f"{path}: description must match the published selectors")
 require("all" in SCHEMAS["search.SourceType"].get("enum", []), "Query must retain combined knowledge and memory retrieval")
 filter_text = query["metadata_filters"].get("description", "")
 require("500" in filter_text and "64 KiB" in filter_text, "Query filters must document enforced list and byte limits")
