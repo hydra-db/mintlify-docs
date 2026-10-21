@@ -97,6 +97,22 @@ for schema_name, schema in SCHEMAS.items():
                     f"{schema_name}.{field} must preserve arbitrary customer keys")
 security = SPEC["components"]["securitySchemes"]["BearerAuth"]
 require("prefix.secret" not in security.get("description", ""), "Bearer auth must describe the user's API key")
+providers = SPEC["paths"]["/connectors/providers"]["get"]
+require(any("BearerAuth" in rule for rule in providers.get("security", [])), "Provider catalog requires Bearer authentication")
+for name in ("list.V2ListContentRequest", "sources.V2SourceDeleteRequest"):
+    require(SCHEMAS[name]["properties"]["type"].get("enum") == ["knowledge", "memory"], f"{name}: publish knowledge and memory selectors")
+for path in ("/context/relations", "/context/{id}/subgraph", "/context/subgraph"):
+    for parameter in SPEC["paths"][path]["get"].get("parameters", []):
+        if parameter.get("name") == "type":
+            require(parameter["schema"].get("enum") == ["knowledge", "memory"], f"{path}: publish knowledge and memory selectors")
+require("all" in SCHEMAS["search.SourceType"].get("enum", []), "Query must retain combined knowledge and memory retrieval")
+filter_text = query["metadata_filters"].get("description", "")
+require("500" in filter_text and "64 KiB" in filter_text, "Query filters must document enforced list and byte limits")
+graph_source = triplet["source"].get("example", {})
+graph_target = triplet["target"].get("example", {})
+graph_relation = triplet["relation"].get("example", {})
+require(graph_source.get("name") and graph_target.get("name") and graph_source.get("entity_id") != graph_target.get("entity_id"), "Graph examples need distinct named entities")
+require(graph_source.get("entity_id") == graph_relation.get("source_entity_id") and graph_target.get("entity_id") == graph_relation.get("target_entity_id"), "Graph example relation must reference its source and target")
 
 internal_fields = {"attributes", "graph_vector_prune", "graph_vector_prune_spacy_entities", "temporal_intent", "temporal_now"}
 legacy_fields = {"tenant_id", "sub_tenant_id", "sub_tenant_ids", "tenant_metadata_keys", "milvus_sync_required", "milvus_synced", "milvus_rows_synced"}
