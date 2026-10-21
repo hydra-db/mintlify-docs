@@ -1,27 +1,268 @@
 ---
 title: "How to Use API Results"
-description: "Turn a query response into an LLM prompt."
+description: "Pass retrieved context to a model or work with individual results."
 ---
 
-`POST /query` returns matching passages and `data.llm_prompt`, the results formatted as Markdown for your model. Pass that string alongside the user's question. It contains retrieved context, not a generated answer.
-
----
+Use the context returned by `POST /query` as a model prompt, or read individual passages and source details. HydraDB retrieves the context. Your model writes the answer.
 
 <a id="1-what-the-response-looks-like"></a>
+<a id="1-read-the-response"></a>
 
-## 1. Read the response
+## Choose a response format
 
-The SDKs and REST API return a response envelope with the result under `data`. By default, `data` contains structured fields and `llm_prompt`. The SDK's `build_string` / `buildString` helper accepts the whole response and returns the prompt string.
+Set `response_format` on the query request. The result is under `data` in the response envelope.
 
-Use `response_format: "markdown"` to return the prompt string directly as `data`, or `"structured"` to omit the string. The default response includes both. Expand the field reference below when you need individual passages or graph data.
+| `response_format` | Returned `data` |
+|---|---|
+| Omitted, the default | Result object with `llm_prompt`. |
+| `"markdown"` | The prompt string. |
+| `"structured"` | Result object without `llm_prompt`. |
 
-<Accordion title="Response fields and graph data">
+<a id="2-transforming-the-response-into-llm-context"></a>
+<a id="2-format-the-context"></a>
+<a id="3-feeding-the-context-into-your-llm"></a>
+<a id="3-pass-the-context-to-your-model"></a>
 
-The prompt string in this example is abbreviated.
+## Send context to your model
+
+With the default format, `data.llm_prompt` is ready to pass to your model alongside the question. You do not need to format the results yourself.
+
+In SDK 2.1.7 or later, `build_string` / `buildString` returns that string unchanged. It also reads Markdown-only responses and can format responses from older servers.
+
+<CodeGroup>
+```python Python SDK
+import os
+from hydra_db import HydraDB
+from hydra_db.helpers import build_string
+from openai import OpenAI
+
+hydra = HydraDB(token=os.environ["HYDRA_DB_API_KEY"])
+openai_client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+
+question = "How does authentication work?"
+
+result = hydra.query(
+    database="your-database",
+    collection="your-collection",
+    query=question,
+    type="knowledge",
+    query_by="hybrid",
+    mode="fast",
+    graph_context=True,
+)
+
+context = build_string(result)
+
+completion = openai_client.chat.completions.create(
+    model="gpt-4o",
+    messages=[
+        {
+            "role": "system",
+            "content": "You are a helpful assistant. Answer the user's question using only the context provided. If the answer is not in the context, say you don't know.",
+        },
+        {
+            "role": "user",
+            "content": f"Context:\n{context}\n\nQuestion: {question}",
+        },
+    ],
+)
+
+print(completion.choices[0].message.content)
+```
+```typescript TypeScript SDK
+import { HydraDBClient } from "@hydradb/sdk";
+import { buildString } from "@hydradb/sdk/helpers";
+import OpenAI from "openai";
+
+const hydra = new HydraDBClient({ token: process.env.HYDRA_DB_API_KEY });
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+const question = "How does authentication work?";
+
+const result = await hydra.query({
+  database: "your-database",
+  collection: "your-collection",
+  query: question,
+  type: "knowledge",
+  queryBy: "hybrid",
+  mode: "fast",
+  graphContext: true,
+});
+
+const context = buildString(result);
+
+const completion = await openai.chat.completions.create({
+  model: "gpt-4o",
+  messages: [
+    {
+      role: "system",
+      content: "You are a helpful assistant. Answer the user's question using only the context provided. If the answer is not in the context, say you don't know.",
+    },
+    {
+      role: "user",
+      content: `Context:\n${context}\n\nQuestion: ${question}`,
+    },
+  ],
+});
+
+console.log(completion.choices[0].message.content);
+```
+```python Python SDK (Async)
+import asyncio
+import os
+
+from hydra_db import AsyncHydraDB
+from hydra_db.helpers import build_string
+from openai import AsyncOpenAI
+
+hydra = AsyncHydraDB(token=os.environ["HYDRA_DB_API_KEY"])
+openai_client = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
+
+question = "How does authentication work?"
+
+async def main():
+    result = await hydra.query(
+        database="your-database",
+        collection="your-collection",
+        query=question,
+        type="knowledge",
+        query_by="hybrid",
+        mode="fast",
+        graph_context=True,
+    )
+
+    context = build_string(result)
+
+    completion = await openai_client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {
+                "role": "system",
+                "content": "You are a helpful assistant. Answer the user's question using only the context provided. If the answer is not in the context, say you don't know.",
+            },
+            {
+                "role": "user",
+                "content": f"Context:\n{context}\n\nQuestion: {question}",
+            },
+        ],
+    )
+
+    print(completion.choices[0].message.content)
+
+asyncio.run(main())
+```
+</CodeGroup>
+
+<Accordion title="Use HTTP without the SDK">
+
+Read `data.llm_prompt` from the JSON response and pass it to your model.
+
+<CodeGroup>
+```python Python
+import os
+import httpx
+
+response = httpx.post(
+    "https://api.hydradb.com/query",
+    headers={"Authorization": f"Bearer {os.environ['HYDRA_DB_API_KEY']}", "API-Version": "2"},
+    json={"database": "acme_corp", "query": "What is our refund policy?"},
+    timeout=60,
+)
+response.raise_for_status()
+context = response.json()["data"]["llm_prompt"]
+```
+```typescript TypeScript
+const response = await fetch("https://api.hydradb.com/query", {
+  method: "POST",
+  headers: {
+    Authorization: `Bearer ${process.env.HYDRA_DB_API_KEY}`,
+    "API-Version": "2",
+    "Content-Type": "application/json",
+  },
+  body: JSON.stringify({ database: "acme_corp", query: "What is our refund policy?" }),
+});
+if (!response.ok) throw new Error(`Query failed with HTTP ${response.status}`);
+const result = await response.json();
+const context = result.data.llm_prompt;
+```
+```bash cURL
+curl --fail-with-body 'https://api.hydradb.com/query' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -H "Content-Type: application/json" \
+  -d '{"database":"acme_corp","query":"What is our refund policy?"}'
+```
+</CodeGroup>
+
+</Accordion>
+
+### Request Markdown only
+
+Add `response_format: "markdown"` to return the prompt as `data` directly. There is no `data.llm_prompt` field in this format. The SDK helper above handles either format.
 
 ```json
 {
-  "llm_prompt": "# Instructions\n\nThis is the response markdown for the query: ...\n\n...\n\n## Results\n\n...\n\n### 1. my_document.pdf\nText content of the retrieved chunk...",
+  "database": "acme_corp",
+  "query": "What is our refund policy?",
+  "response_format": "markdown"
+}
+```
+
+### Read citations and content labels
+
+The prompt numbers ranked results as `[1]`, `[2]`, and so on. Explicitly linked results use `[R1]`, `[R2]`, and so on. Ask your model to keep these labels when citing the context.
+
+Each result separates **Original content**, the source text, from **Enriched content**, context HydraDB added. Sections for related facts, dated facts, and sources appear when relevant. A query with no matches returns a no-results message rather than an empty prompt, including any filters that constrained the search.
+
+## Work with structured results
+
+Set `response_format: "structured"` when you need individual passages, scores, or source details. The examples below print the matching passages. They do not call a model.
+
+<CodeGroup>
+```python Python SDK
+result = hydra.query(
+    database="your-database",
+    collection="your-collection",
+    query="How does authentication work?",
+    response_format="structured",
+)
+
+for chunk in result.data.chunks:
+    print(chunk.source_title, chunk.chunk_content)
+```
+```typescript TypeScript SDK
+const result = await hydra.query({
+  database: "your-database",
+  collection: "your-collection",
+  query: "How does authentication work?",
+  responseFormat: "structured",
+});
+
+if (!result.data || typeof result.data === "string") {
+  throw new Error("Expected structured query results.");
+}
+for (const chunk of result.data.chunks ?? []) {
+  console.log(chunk.sourceTitle, chunk.chunkContent);
+}
+```
+```bash cURL
+curl --fail-with-body 'https://api.hydradb.com/query' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "database": "your-database",
+    "collection": "your-collection",
+    "query": "How does authentication work?",
+    "response_format": "structured"
+  }'
+```
+</CodeGroup>
+
+<Accordion title="Response fields and graph data">
+
+```json
+{
   "chunks": [
     {
       "chunk_uuid": "doc-001_chunk_0",
@@ -81,224 +322,22 @@ The prompt string in this example is abbreviated.
 The structured fields are available when you need to inspect or format individual results:
 
 - **`chunks`**: passages from matching documents or memories. Ranked by relevance; preserve the order HydraDB returns.
+- **`sources`**: source IDs, titles, and URLs. Use them to display links when a source has a URL.
 - **`graph_context.query_paths`**: chains of relationships connecting named people, services, or topics relevant to the query. See [Context Graphs](/essentials/v2/context-graphs).
 - **`graph_context.chunk_relations`** + **`chunk_id_to_group_ids`**: per-chunk graph relations grouped by `group_id`, so you can attach the right triplets to each chunk.
 - **`additional_context`** (legacy): a map keyed by `chunk_uuid`. When a chunk includes `extra_context_ids`, use those IDs to look up related chunks here.
 
-The `llm_prompt` string already includes the retrieved context and source references. You do not need to join these fields to use it.
+
 
 </Accordion>
 
----
+<a id="4-combining-knowledge-and-memories"></a>
 
-<a id="2-transforming-the-response-into-llm-context"></a>
+## Combine knowledge and memories
 
-## 2. Format the context
+Use one `POST /query` with `type: "all"`. HydraDB queries both stores in parallel and returns one merged, ranked result set.
 
-Use `build_string` / `buildString` from SDK 2.1.7 or later. It returns the server's `llm_prompt` unchanged and can also format older responses that do not include it.
-
-<CodeGroup>
-```python Python SDK
-import os
-from hydra_db import HydraDB
-from hydra_db.helpers import build_string
-
-client = HydraDB(token=os.environ["HYDRA_DB_API_KEY"])
-
-result = client.query(
-    database="your-database",
-    collection="your-collection",
-    query="How does authentication work?",
-    type="knowledge",
-    query_by="hybrid",
-    max_results=5,
-    mode="fast",
-    graph_context=True,
-)
-
-context = build_string(result)
-```
-```typescript TypeScript SDK
-import { HydraDBClient } from "@hydradb/sdk";
-import { buildString } from "@hydradb/sdk/helpers";
-
-const client = new HydraDBClient({ token: process.env.HYDRA_DB_API_KEY });
-
-const result = await client.query({
-  database: "your-database",
-  collection: "your-collection",
-  query: "How does authentication work?",
-  type: "knowledge",
-  queryBy: "hybrid",
-  maxResults: 5,
-  mode: "fast",
-  graphContext: true,
-});
-
-const context = buildString(result);
-```
-```python Python SDK (Async)
-import asyncio
-import os
-
-from hydra_db import AsyncHydraDB
-from hydra_db.helpers import build_string
-
-client = AsyncHydraDB(token=os.environ["HYDRA_DB_API_KEY"])
-
-async def main():
-    result = await client.query(
-        database="your-database",
-        collection="your-collection",
-        query="How does authentication work?",
-        type="knowledge",
-        query_by="hybrid",
-        max_results=5,
-        mode="fast",
-        graph_context=True,
-    )
-
-    context = build_string(result)
-    return context
-
-asyncio.run(main())
-```
-</CodeGroup>
-
----
-
-<a id="3-feeding-the-context-into-your-llm"></a>
-
-## 3. Pass the context to your model
-
-<CodeGroup>
-```python Python SDK
-import os
-from hydra_db import HydraDB
-from hydra_db.helpers import build_string
-from openai import OpenAI
-
-hydra = HydraDB(token=os.environ["HYDRA_DB_API_KEY"])
-openai_client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-
-question = "How does authentication work?"
-
-result = hydra.query(
-    database="your-database",
-    query=question,
-    type="knowledge",
-    query_by="hybrid",
-    mode="fast",
-    graph_context=True,
-)
-
-context = build_string(result)
-
-completion = openai_client.chat.completions.create(
-    model="gpt-4o",
-    messages=[
-        {
-            "role": "system",
-            "content": "You are a helpful assistant. Answer the user's question using only the context provided. If the answer is not in the context, say you don't know.",
-        },
-        {
-            "role": "user",
-            "content": f"Context:\n{context}\n\nQuestion: {question}",
-        },
-    ],
-)
-
-print(completion.choices[0].message.content)
-```
-```typescript TypeScript SDK
-import { HydraDBClient } from "@hydradb/sdk";
-import { buildString } from "@hydradb/sdk/helpers";
-import OpenAI from "openai";
-
-const hydra = new HydraDBClient({ token: process.env.HYDRA_DB_API_KEY });
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
-const question = "How does authentication work?";
-
-const result = await hydra.query({
-  database: "your-database",
-  query: question,
-  type: "knowledge",
-  queryBy: "hybrid",
-  mode: "fast",
-  graphContext: true,
-});
-
-const context = buildString(result);
-
-const completion = await openai.chat.completions.create({
-  model: "gpt-4o",
-  messages: [
-    {
-      role: "system",
-      content: "You are a helpful assistant. Answer the user's question using only the context provided. If the answer is not in the context, say you don't know.",
-    },
-    {
-      role: "user",
-      content: `Context:\n${context}\n\nQuestion: ${question}`,
-    },
-  ],
-});
-
-console.log(completion.choices[0].message.content);
-```
-```python Python SDK (Async)
-import asyncio
-import os
-
-from hydra_db import AsyncHydraDB
-from hydra_db.helpers import build_string
-from openai import AsyncOpenAI
-
-hydra = AsyncHydraDB(token=os.environ["HYDRA_DB_API_KEY"])
-openai_client = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
-
-question = "How does authentication work?"
-
-async def main():
-    result = await hydra.query(
-        database="your-database",
-        query=question,
-        type="knowledge",
-        query_by="hybrid",
-        mode="fast",
-        graph_context=True,
-    )
-
-    context = build_string(result)
-
-    completion = await openai_client.chat.completions.create(
-        model="gpt-4o",
-        messages=[
-            {
-                "role": "system",
-                "content": "You are a helpful assistant. Answer the user's question using only the context provided. If the answer is not in the context, say you don't know.",
-            },
-            {
-                "role": "user",
-                "content": f"Context:\n{context}\n\nQuestion: {question}",
-            },
-        ],
-    )
-
-    print(completion.choices[0].message.content)
-
-asyncio.run(main())
-```
-</CodeGroup>
-
----
-
-## 4. Combining Knowledge and Memories
-
-The simplest path is one `POST /query` with `type: "all"`. HydraDB queries both stores in parallel and returns one merged, ranked result set.
-
-This example searches shared documents in `company_docs` and the user’s memories in `user_123`. Use the collections you ingested into; both must exist. For restricted documents, also send the caller’s identity as `acl`.
+This example searches shared documents in `company_docs` and the user's memories in `user_123`. Use the collections you ingested into; both must exist. For restricted documents, also send the caller's identity as `acl`.
 
 <CodeGroup>
 ```python Python SDK
@@ -403,6 +442,8 @@ asyncio.run(main())
 ```
 </CodeGroup>
 
+<Accordion title="Run separate searches for knowledge and memories">
+
 If you need different searches for knowledge and memories, call `POST /query` twice in parallel. Each response includes its own formatted context and instructions:
 
 <CodeGroup>
@@ -477,9 +518,13 @@ const prompt =
 
 If the memory query fails or times out, fall back to the knowledge-only prompt.
 
+</Accordion>
+
 ---
 
-## 5. Practical guidance
+<a id="5-practical-guidance"></a>
+
+## Practical guidance
 
 - **Preserve server order:** Don't re-sort chunks client-side.
 - **Start small on chunks:** `max_results: 10` is a reasonable default. Drop to 5 if you hit token limits, raise to 20 if you rerank downstream.
@@ -488,10 +533,13 @@ If the memory query fails or times out, fall back to the knowledge-only prompt.
 
 ---
 
-## 6. Common mistakes
+<a id="6-common-mistakes"></a>
+
+## Common mistakes
 
 | Mistake | What goes wrong | Fix |
 |---|---|---|
+| Reading `data.llm_prompt` with `response_format: "structured"` | The prompt field is omitted | Read the structured fields, or omit `response_format` to get both. |
 | Passing the raw result object to the LLM | Wastes tokens on IDs and metadata | Use `build_string` / `buildString`. |
 | Not including `collection` (formerly `sub_tenant_id`) when querying memories | Queries the default collection instead of the user's | Always pass the same `collection` used at ingestion. |
 | Including too many chunks | Token overflow or answer quality drops | Start at `max_results: 10`; reduce if needed. |
@@ -509,48 +557,3 @@ If the memory query fails or times out, fall back to the knowledge-only prompt.
 - [Memories](/essentials/v2/memories): what `POST /query` with `type: "memory"` queries
 - [Knowledge](/essentials/v2/knowledge): what `POST /query` with `type: "knowledge"` queries
 - [Context Graphs](/essentials/v2/context-graphs): what `graph_context` fields contain
-
----
-
-<Accordion title="Full flow without SDK">
-
-Read `data.llm_prompt` from the JSON response and pass it to your model.
-
-<CodeGroup>
-```python Python
-import os
-import httpx
-
-response = httpx.post(
-    "https://api.hydradb.com/query",
-    headers={"Authorization": f"Bearer {os.environ['HYDRA_DB_API_KEY']}", "API-Version": "2"},
-    json={"database": "acme_corp", "query": "What is our refund policy?"},
-    timeout=60,
-)
-response.raise_for_status()
-context = response.json()["data"]["llm_prompt"]
-```
-```typescript TypeScript
-const response = await fetch("https://api.hydradb.com/query", {
-  method: "POST",
-  headers: {
-    Authorization: `Bearer ${process.env.HYDRA_DB_API_KEY}`,
-    "API-Version": "2",
-    "Content-Type": "application/json",
-  },
-  body: JSON.stringify({ database: "acme_corp", query: "What is our refund policy?" }),
-});
-if (!response.ok) throw new Error(`Query failed with HTTP ${response.status}`);
-const result = await response.json();
-const context = result.data.llm_prompt;
-```
-```bash cURL
-curl --fail-with-body 'https://api.hydradb.com/query' \
-  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
-  -H "API-Version: 2" \
-  -H "Content-Type: application/json" \
-  -d '{"database":"acme_corp","query":"What is our refund policy?"}'
-```
-</CodeGroup>
-
-</Accordion>
