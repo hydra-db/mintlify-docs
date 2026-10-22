@@ -85,6 +85,10 @@ for field in ("source_facts", "source_filter", "sources", "app_search_fusion", "
     require(field not in result, f"Query result exposes internal field {field}")
 for field in ("chunks", "graph_context", "additional_context", "llm_prompt"):
     require(field in result, f"Query result is missing released field {field}")
+chunk = resolve(result["chunks"]["items"])
+require(chunk.get("title") == "Chunk", "Query chunks must display the named Chunk type")
+require({"chunk_content", "id", "relevancy_score"} <= chunk.get("properties", {}).keys(),
+        "Named Chunk must retain its expandable fields")
 triplet = SCHEMAS["search.PathTriplet"]["properties"]
 for field in ("source", "target", "relation"):
     child = resolve(triplet[field])
