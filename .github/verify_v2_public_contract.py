@@ -105,6 +105,11 @@ def check_schema_types(schema, path):
 walk(SPEC)
 for schema_name, schema in SCHEMAS.items():
     check_schema_types(schema, schema_name)
+    if schema.get("type") == "object":
+        title = schema.get("title", "")
+        require(bool(re.fullmatch(r"[A-Z][A-Za-z0-9]*", title))
+                and title.lower() == re.sub(r"[^a-z0-9]", "", schema_name.lower()),
+                f"{schema_name}: display the SDK model name, not an invented or missing title")
 for path, methods in SPEC["paths"].items():
     for method, operation in methods.items():
         if method not in {"get", "post", "put", "patch", "delete"}:
