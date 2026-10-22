@@ -71,6 +71,9 @@ def object_shape(schema):
 def check_schema_types(schema, path):
     if not isinstance(schema, dict):
         return
+    title = schema.get("title", "")
+    require(not re.search(r"(^|[ ._-])object(\[\])?($|[ ._-])", title, re.I),
+            f"{path}: use the native object label or an SDK model name, not {title!r}")
     shape_keys = {"type", "$ref", "properties", "additionalProperties", "allOf", "oneOf", "anyOf", "enum", "const", "not"}
     passthrough = {
         f"{name}.{field}"
