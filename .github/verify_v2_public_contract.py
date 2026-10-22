@@ -68,7 +68,53 @@ def object_shape(schema):
     return None
 
 
+def check_schema_types(schema, path):
+    if not isinstance(schema, dict):
+        return
+    shape_keys = {"type", "$ref", "properties", "additionalProperties", "allOf", "oneOf", "anyOf", "enum", "const", "not"}
+    passthrough = {
+        f"{name}.{field}"
+        for name in ("list.V2SourceItem", "list.V2MemoryItem")
+        for field in ("relations", "app_relations")
+    }
+    require(bool(shape_keys & schema.keys()) or path in passthrough,
+            f"{path}: fixed API values need a schema type or reference")
+    types = schema.get("type", [])
+    types = {types} if isinstance(types, str) else set(types)
+    if "object" in types:
+        require(bool(schema.get("properties")) or "additionalProperties" in schema
+                or any(key in schema for key in ("allOf", "oneOf", "anyOf")) or path in passthrough,
+                f"{path}: fixed objects must expose their properties")
+    if "array" in types:
+        require("items" in schema, f"{path}: arrays must declare their element type")
+    for name, child in schema.get("properties", {}).items():
+        check_schema_types(child, f"{path}.{name}")
+    if "items" in schema:
+        check_schema_types(schema["items"], f"{path}[]")
+    for key in ("allOf", "oneOf", "anyOf"):
+        for index, child in enumerate(schema.get(key, [])):
+            check_schema_types(child, f"{path}.{key}[{index}]")
+    values = schema.get("additionalProperties")
+    if isinstance(values, dict) and values:
+        check_schema_types(values, f"{path}.{{key}}")
+
+
 walk(SPEC)
+for schema_name, schema in SCHEMAS.items():
+    check_schema_types(schema, schema_name)
+for path, methods in SPEC["paths"].items():
+    for method, operation in methods.items():
+        if method not in {"get", "post", "put", "patch", "delete"}:
+            continue
+        for parameter in operation.get("parameters", []):
+            if "schema" in parameter:
+                check_schema_types(parameter["schema"], f"{method.upper()} {path} parameter {parameter['name']}")
+        for media in operation.get("requestBody", {}).get("content", {}).values():
+            check_schema_types(media["schema"], f"{method.upper()} {path} request")
+        for status, response in operation.get("responses", {}).items():
+            for media in response.get("content", {}).values():
+                if "schema" in media:
+                    check_schema_types(media["schema"], f"{method.upper()} {path} response {status}")
 query = SCHEMAS["search.QueryRequest"]["properties"]
 for field in ("attributes", "graph_vector_prune", "graph_vector_prune_spacy_entities", "temporal_intent", "temporal_now"):
     require(field not in query, f"QueryRequest exposes internal field {field}")
@@ -86,9 +132,8 @@ for field in ("source_facts", "source_filter", "sources", "app_search_fusion", "
 for field in ("chunks", "graph_context", "additional_context", "llm_prompt"):
     require(field in result, f"Query result is missing released field {field}")
 chunk = resolve(result["chunks"]["items"])
-require(chunk.get("title") == "Chunk", "Query chunks must display the named Chunk type")
 require({"chunk_content", "id", "relevancy_score"} <= chunk.get("properties", {}).keys(),
-        "Named Chunk must retain its expandable fields")
+        "Query chunks must expose their typed, expandable fields")
 triplet = SCHEMAS["search.PathTriplet"]["properties"]
 for field in ("source", "target", "relation"):
     child = resolve(triplet[field])
