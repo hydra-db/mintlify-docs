@@ -155,8 +155,30 @@ def render_operation(spec: dict, method: str, api_path: str) -> str:
     if responses:
         lines.append("\nResponses:")
         for code, resp in responses.items():
-            lines.append(f"- {code}: {(deref(spec, resp).get('description') or '').strip()}")
+            response = deref(spec, resp)
+            lines.append(f"- {code}: {(response.get('description') or '').strip()}")
+            for media, body in response.get("content", {}).items():
+                lines.append(f"  {media}:")
+                lines.extend(render_schema(spec, body.get("schema", {})))
     return "\n".join(lines)
+
+
+def render_schema(spec: dict, schema: dict, prefix: str = "", depth: int = 0) -> list[str]:
+    if depth >= 5:
+        return []
+    schema = deref(spec, schema)
+    lines = []
+    for name, prop in schema.get("properties", {}).items():
+        field = f"{prefix}.{name}" if prefix else name
+        resolved = deref(spec, prop)
+        lines.append(f"- {field} ({schema_type(spec, prop)}): {resolved.get('description', '')}")
+        lines.extend(render_schema(spec, prop, field, depth + 1))
+    if "items" in schema:
+        lines.extend(render_schema(spec, schema["items"], prefix + "[]", depth + 1))
+    for key in ("allOf", "oneOf", "anyOf"):
+        for branch in schema.get(key, []):
+            lines.extend(render_schema(spec, branch, prefix, depth + 1))
+    return lines
 
 
 def first_match(rules: list, key: str) -> list[str] | None:
@@ -170,8 +192,8 @@ def git(repo_root: Path, *args: str) -> str:
     try:
         return subprocess.run(["git", *args], cwd=repo_root, capture_output=True,
                               text=True, check=True).stdout
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return ""
+    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+        raise RuntimeError(f"git {args[0]} failed") from exc
 
 
 def page_tickets(repo_root: Path, rel_path: str) -> str:
@@ -357,9 +379,19 @@ class Api:
                 "collection": self.collection,
                 "type": "knowledge",
                 "ids": ids[i:i + 50],
-            }).encode())
+            }).encode(), extra_headers={"X-HydraDB-Delete-Status": "strict"})
             if status not in (200, 404):
                 raise ApiError(status, text)
+            if status == 404:
+                continue
+            envelope = json.loads(text)
+            data = envelope.get("data") or {}
+            results = {r["id"]: r for r in data.get("results", [])}
+            failed = [sid for sid in ids[i:i + 50]
+                      if results.get(sid, {}).get("deleted") is not True
+                      or results.get(sid, {}).get("error")]
+            if envelope.get("success") is False or failed:
+                raise RuntimeError(f"delete did not confirm removal: {failed}")
 
 
 def main() -> int:
