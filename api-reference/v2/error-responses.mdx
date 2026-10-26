@@ -29,7 +29,9 @@ HydraDB core endpoints (`/databases`, `/context/*`, `/query`, `/feedback`, and `
 | `error.code` | Machine-readable code for programmatic handling. |
 | `error.message` | Human-readable explanation of what failed. |
 | `meta.request_id` | Request identifier. Include it when contacting support. |
+| `meta.api_version` | The API version that answered, for example `2.0.1`. |
 | `meta.latency_ms` | Server-side processing time in milliseconds. |
+| `detail` | Legacy copy of the message and code, plus endpoint-specific fields where the status has one: a `402` carries `detail.upgrade_url`, and a monthly allowance also carries `detail.resets_at`. |
 
 Use `error.code` for branching and log `meta.request_id` for every failed request. The HTTP status tells you the class of failure; the error code tells you what to do.
 
@@ -39,35 +41,39 @@ Use `error.code` for branching and log `meta.request_id` for every failed reques
 |---|---|---|
 | `400` | Invalid parameters or malformed request | No |
 | `401` | Missing, expired, or invalid API key | No |
-| `402` | Your plan does not allow the request, for example one connector too many | No. Upgrade |
-| `403` | Authenticated, but not permitted for the resource, or the plan's database limit is reached | No |
-| `404` | Database, source, memory, or related resource was not found | No |
+| `402` | A plan allowance is used up: the monthly enrichment tokens or storage of the Free plan (`PLAN_LIMIT_REACHED`), the plan's connector count (`PAYMENT_REQUIRED`), or the workspace is on the retired Free plan (`FREE_PLAN_DEPRECATED`) | No. The message says when the allowance resets or what clears it; `detail.upgrade_url` is the upgrade page |
+| `403` | Authenticated, but not permitted for the resource, the plan's database limit is reached, or the key's workspace has no plan on record yet (`PLAN_UNRESOLVED`) | No. `PLAN_UNRESOLVED` clears once workspace setup is finished |
+| `404` | Database, source, memory, or related resource was not found, or the path is not an endpoint (`NOT_FOUND`, answered before authentication) | No |
 | `409` | Conflict: the database already exists, a source is still indexing when you delete it, or a schema field conflicts | Only `SOURCE_PROCESSING`, after `Retry-After` |
-| `413` | Request body or upload too large | No |
+| `410` | A retired v1 endpoint (`ENDPOINT_RETIRED`). The message names the v2 route that replaces it | No. Call the replacement |
+| `413` | One item, or the request as a whole, is over your plan's per-request allowance. The message names the item, the plan's allowance and the [limits table](#limits-per-plan); the transport caps (50 MiB multipart, 16 MiB JSON) answer here too | No. Send smaller items or split the request |
 | `415` | Unsupported `Content-Type`, such as a `POST /context/ingest` body that is neither a multipart form nor JSON | No |
 | `422` | Well-formed request that failed validation, or a query sent before the database finished provisioning | Only `TENANT_INFRA_NOT_READY`, once the database is ready |
-| `429` | Rate limit exceeded | Yes, with backoff |
-| `500` | Internal server error | Yes, with backoff |
+| `429` | A per-second or per-minute allowance is spent for the moment (`RATE_LIMITED`). `Retry-After` is always set | Yes, after `Retry-After` |
+| `500` | Internal server error | Yes, with backoff; honour `Retry-After` when it is set |
 | `503` | Temporary service unavailability | Yes, with backoff |
 
 ## Common error codes
 
 | Code | Typical status | Meaning |
 |---|---|---|
-| `INVALID_INPUT` | `400` | The default for a bad request: a required parameter is missing, malformed, or mutually incompatible with another parameter. Also used for `413` and `415`. |
+| `INVALID_INPUT` | `400` | The default for a bad request: a required parameter is missing, malformed, or mutually incompatible with another parameter. Also the code of every `413` (the message names the plan's per-request allowance) and `415`. |
 | `UNAUTHORIZED` | `401` | The `Authorization: Bearer <your_api_key>` header is missing or invalid. |
+| `PLAN_LIMIT_REACHED` | `402` | A plan allowance is used up: the Free plan's monthly enrichment tokens (the message names the usage and the reset date, `detail.resets_at` and `Retry-After` carry it) or storage (delete data or upgrade). `detail.upgrade_url` is the upgrade page. Never retried by the SDKs. |
 | `PAYMENT_REQUIRED` | `402` | A plan limit refused the write, for example the connector count. |
 | `FREE_PLAN_DEPRECATED` | `402` | The organization is on the deprecated Free plan. The message and `detail.upgrade_url` carry the upgrade link. |
 | `FORBIDDEN` | `403` | The API key is valid but does not have access to the requested route or resource, or the plan's database limit prevents the operation. |
+| `PLAN_UNRESOLVED` | `403` | The key's workspace has no plan on record yet, so the request is refused the same way every time until one is set. Finish workspace setup in the dashboard, or contact support with `meta.request_id`. |
 | `DATABASE_ALREADY_EXISTS` | `409` | `POST /databases` received a `database` (formerly `tenant_id`) that is already in use. |
 | `DATABASE_NOT_FOUND` | `404` | The requested database does not exist or is not visible to the current API key. |
-| `NOT_FOUND` | `404` | The requested resource does not exist, for example a source ID in `DELETE /context`. |
+| `NOT_FOUND` | `404` | The requested resource does not exist, for example a source ID in `DELETE /context`; or the path is not an endpoint at all, in which case the message names the request and links the endpoint list. |
+| `ENDPOINT_RETIRED` | `410` | A v1 route that no longer exists. The message names the v2 route that does the same job, and `Link` carries its documentation. |
 | `SOURCE_PROCESSING` | `409` | `DELETE /context` hit a source that is still indexing. Retry after `Retry-After`. |
 | `VALIDATION_ERROR` | `400` or `422` | A field has an invalid value. Query filter errors return `400`. Invalid connector credentials return `422`. |
 | `TENANT_INFRA_NOT_READY` | `422` | `POST /query` reached a database that is still provisioning. Poll [Database Status](/api-reference/v2/endpoint/tenant-status) until `ready_for_ingestion` is `true`, then retry. |
 | `CORPUS_TYPE_UNSUPPORTED` | `400` | The `type` value does not fit this endpoint or database, for example `type: "all"` on ingest. |
-| `RATE_LIMITED` | `429` | The API key exceeded its current rate limit. |
-| `INTERNAL_ERROR` | `500` | HydraDB hit an unexpected server-side error. A rare auth-layer failure reports `INTERNAL_SERVER_ERROR` instead. |
+| `RATE_LIMITED` | `429` | A per-second or per-minute allowance is spent for the moment. The message names the allowance and the wait; `Retry-After` carries the wait in seconds. A monthly allowance is `402 PLAN_LIMIT_REACHED`, never this code. |
+| `INTERNAL_ERROR` | `500` | HydraDB hit an unexpected server-side error. A store failure while validating the API key reports `INTERNAL_SERVER_ERROR` with `Retry-After` instead. |
 | `SERVICE_UNAVAILABLE` | `503` | A dependency is temporarily unavailable or the service is under load. |
 
 Endpoint pages list the most common codes for that operation. New codes may be added over time, so clients should handle unknown `error.code` values gracefully.
@@ -75,6 +81,35 @@ Endpoint pages list the most common codes for that operation. New codes may be a
 `PATCH /databases/{database}/metadata-schema` currently returns `INTERNAL_ERROR` for its `400` and `409` errors too, so branch on the HTTP status there.
 
 For legacy route and field behavior, see [Migrating from tenant fields](/essentials/v2/multi-tenant#7-migrating-from-the-legacy-tenant-and-sub-tenant-fields).
+
+## Limits per plan
+
+Every limit is enforced per workspace, so all the API keys of one workspace draw on the same allowance. The response says which allowance you reached and what to do; this table says what the numbers are.
+
+| Limit | Free | Ship | Scale | Enterprise and BYOC |
+|---|---|---|---|---|
+| `POST /query` requests (shared with `/byog*`, `/context/{id}/subgraph` and `/context/profile`) | 600 per minute | 1,200 per minute | 3,000 per minute | no platform ceiling; capacity is sized in your agreement |
+| `POST /context/ingest` requests | 5 per second, 120 per minute | 25 per second, 600 per minute | 100 per second, 3,000 per minute | no platform ceiling |
+| Items per ingest request (documents plus `app_knowledge` entries) | 1,000 per request, 60 per minute | 1,000 per request, 300 per minute | no item limit | no item limit |
+| Document upload volume | 10 MiB per file and per request, 20 MiB per minute | 50 MiB per file and per request, 250 MiB per minute | 100 MiB per file and per request, 1 GiB per minute | no platform ceiling |
+| Context volume (`memories`, counted in words) | 5,000 words per item and per request, 25,000 per minute | 20,000 words per item and per request, 100,000 per minute | 40,000 words per item and per request, 400,000 per minute | no platform ceiling |
+| Enrichment tokens | 5,000,000 per calendar month (UTC) | metered | metered | metered |
+| Storage | 1,000 MB | metered | metered | metered |
+| Connectors | 3 | no limit | no limit | no limit |
+| Databases | per plan; the `403` names the allowance | | | |
+| `POST /feedback` | 100 per minute on every plan | | | |
+
+Two transport caps apply to every plan: a multipart body of 50 MiB and a JSON body of 16 MiB. Larger uploads go in several requests.
+
+What each refusal looks like:
+
+| You reached | Status and code | The response carries | What to do |
+|---|---|---|---|
+| A per-second or per-minute allowance | `429 RATE_LIMITED` | `Retry-After` in seconds; the message names the allowance | Wait `Retry-After`, then retry. The SDKs do this for you |
+| A per-item or per-request size allowance | `413 INVALID_INPUT` | The item's size, the plan's allowance and a link to this table | Send smaller items or split the request; a plan with a higher allowance also clears it |
+| The monthly enrichment tokens or the storage allowance | `402 PLAN_LIMIT_REACHED` | `detail.upgrade_url`; for the monthly meter also `detail.resets_at` and `Retry-After` to the reset | Wait for the reset, delete data (storage), or upgrade |
+| The connector count | `402 PAYMENT_REQUIRED` | The allowance in the message | Remove a connector or upgrade |
+| The database count | `403 FORBIDDEN` | The allowance in the message | Delete a database or upgrade |
 
 ## Ingestion error codes
 
@@ -92,7 +127,9 @@ Files rejected with `E1002` have no ingestion status record. Handle this code fr
 
 ## Retry pattern
 
-Retry only transient failures: `429`, `500`, and `503`. Use exponential backoff with jitter and keep retries bounded. Two other codes clear on their own, so wait instead of backing off blindly: `409 SOURCE_PROCESSING` (wait for `Retry-After`) and `422 TENANT_INFRA_NOT_READY` (wait until the database is ready).
+Retry only transient failures: `429`, `500`, and `503`. Use exponential backoff with jitter and keep retries bounded, and honour `Retry-After` when it is set (every `429` sets it). Two other codes clear on their own, so wait instead of backing off blindly: `409 SOURCE_PROCESSING` (wait for `Retry-After`) and `422 TENANT_INFRA_NOT_READY` (wait until the database is ready).
+
+Retrying does not clear a `402`, `403`, `410` or `413`: each message says what does, whether that is a smaller request, the replacement route, finishing workspace setup, or a plan with a higher allowance.
 
 **The SDKs already retry:** both retry `408`, `429`, and `5xx` responses twice with exponential backoff before raising, and the Python SDK also retries `409`. Raise the count with `request_options={"max_retries": 5}` on a Python call, or `maxRetries` on the TypeScript client or call. The SDK examples below increase that limit. The raw HTTP example implements retries directly. Retry writes only when repeating the operation is safe.
 
