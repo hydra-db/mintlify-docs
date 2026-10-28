@@ -1,6 +1,8 @@
 """Regression tests for canonical names and copy used across the live docs."""
 
 from pathlib import Path
+import re
+from types import SimpleNamespace
 import unittest
 
 
@@ -52,15 +54,38 @@ class DocsConsistencyTest(unittest.TestCase):
             matches,
         )
 
-    def test_cookbook_context_block_uses_source_loop_variable(self):
+    def test_cookbook_context_block_uses_each_source(self):
         cookbook = (
             ROOT / "cookbooks/v2/cookbook-01-build-cursor-for-docs.mdx"
         ).read_text(encoding="utf-8")
-        expected = """    for source in sources:
-        title     = source.title or \"Untitled\"
-        source_id = source.id or \"\"
-        source_lines.append(f\"- {title} ({source_id})\")"""
-        self.assertIn(expected, cookbook)
+        match = re.search(
+            r"```python\n(?:from backend\.hydra_client import search_docs\n\n)?"
+            r".*?(def build_context_block\(recall_payload\) -> str:\n.*?)\n```",
+            cookbook,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(match)
+
+        namespace = {}
+        exec(match.group(1), namespace)
+        payload = SimpleNamespace(
+            data=SimpleNamespace(
+                chunks=[
+                    SimpleNamespace(chunk_content=" First chunk "),
+                    SimpleNamespace(chunk_content="Second chunk"),
+                ],
+                sources=[
+                    SimpleNamespace(title="Guide", id="source-1"),
+                    SimpleNamespace(title=None, id=None),
+                ],
+            )
+        )
+
+        self.assertEqual(
+            "Context:\nFirst chunk\n\nSecond chunk\n\n"
+            "Sources:\n- Guide (source-1)\n- Untitled ()",
+            namespace["build_context_block"](payload),
+        )
 
     def test_cookbook_04_uses_notion_workspace_title(self):
         expected_title = "Build Notion AI for Your Workspace"
