@@ -23,6 +23,10 @@ def live_files(pattern: str):
 
 
 class DocsConsistencyTest(unittest.TestCase):
+    def test_ci_runs_docs_consistency_suite(self):
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        self.assertIn("python scripts/test_docs_consistency.py", workflow)
+
     def test_live_docs_use_canonical_api_key_name(self):
         stale_files = [
             str(path.relative_to(ROOT))
