@@ -436,7 +436,8 @@ See the [Glossary](/essentials/v2/glossary) for database and collection terminol
 | Tool | What it does |
 | ---- | ------------ |
 | `hydradb_query` | Search memories and knowledge; returns matching chunks plus graph-enriched context: entity paths, chunk relations, extra context |
-| `hydradb_ingest` | Store a note (`text`) or a conversation (`turns`); HydraDB extracts insights and builds the knowledge graph |
+| `hydradb_ingest` | Store one note, document, conversation, batch, or structured app-record batch; HydraDB extracts insights and builds the knowledge graph |
+| `hydradb_update` | Merge metadata or replace the complete access list of one existing item |
 | `hydradb_list` | Browse stored memories or ingested knowledge sources |
 | `hydradb_inspect` | Retrieve the original content of a source by ID |
 | `hydradb_delete` | Remove a memory or knowledge source by ID |
@@ -448,6 +449,9 @@ See the [Glossary](/essentials/v2/glossary) for database and collection terminol
 | `hydradb_databases` | List the databases this connection can use, with the default marked. Available on OAuth connections |
 
 ### hydradb_query
+
+Every response includes a `request_id`, including a query with no matches. Pass
+that ID to `hydradb_feedback` when the result was wrong or incomplete.
 
 | Parameter | Type | Required | Description |
 | --------- | ---- | -------- | ----------- |
@@ -487,12 +491,16 @@ Because matching ignores case, two documents whose names differ only by case
 
 ### hydradb_ingest
 
-Provide exactly one of `text` or `turns`. Passing both is rejected.
+Provide exactly one of `text`, `turns`, `items`, or `app_knowledge`. Combining
+input modes is rejected. A batch contains 1 to 100 same-kind items and sends one
+API request. Batch text has an 8 MiB total UTF-8 limit.
 
 | Parameter | Type | Required | Description |
 | --------- | ---- | -------- | ----------- |
 | `text` | string | No* | The information to store |
 | `turns` | array | No* | Conversation turns to ingest instead of `text`, each with a `user` and an `assistant` field |
+| `items` | array | No* | Batch of 1 to 100 items; each item has exactly one of `text` or `turns` |
+| `app_knowledge` | array | No* | Batch of 1 to 100 structured app records with `kind`, `fields`, and optional ACL data; split databases only |
 | `kind` | string | No | What to write: `memory` (default) or `knowledge` |
 | `title` | string | No | Title for the entry |
 | `source_id` | string | No | Optional identifier for this entry. Reusing one replaces what is stored under it |
@@ -500,10 +508,101 @@ Provide exactly one of `text` or `turns`. Passing both is rejected.
 | `infer` | boolean | No | Let HydraDB extract insights and build the knowledge graph (default: `true`) |
 | `is_markdown` | boolean | No | Treat `text` as markdown (default: `false`) |
 | `metadata` | object | No | Key/value metadata stored with memory, matchable later via `metadata_filters` |
+| `additional_metadata` | object | No | Free-form document metadata stored with memory or knowledge |
+| `relations` | object | No | Explicit related source IDs and optional relationship properties for a knowledge document |
+| `evidence_kind` | string | No | Knowledge provenance: `assertion`, `record`, `said`, `done`, `third_party`, or `inferred` |
+| `evidence_subject` | string | No | Stable handle for the entity a knowledge document describes |
+| `custom_instructions` | string | No | Memory extraction guidance, up to 4,000 characters; replaces the MCP default and requires inference |
+| `graph` | object | No | Caller-supplied `entities` and `relations`; MCP keys the graph by the item ID |
 | `observation_date` | string | No | Calendar date YYYY-MM-DD when the fact was true |
 | `user_name` | string | No | Name of the user, used with `turns` for personalisation (default: `User`) |
 | `database` | string | No | Database (tenant) scope override for this request |
 | `collection` | string | No | Collection (sub-tenant) scope override for this request |
+
+Each `items` entry accepts the same item fields. Memory items can supply
+`custom_instructions`; memory and knowledge items can supply `additional_metadata`
+and `graph`.
+
+```json Batch memory ingest
+{
+  "kind": "memory",
+  "items": [
+    {
+      "text": "Deploy on Friday",
+      "title": "Deployment date",
+      "additional_metadata": {"team": "platform"},
+      "custom_instructions": "Extract the date and responsible team."
+    },
+    {
+      "text": "Infra owns production deploys",
+      "title": "Deployment owner"
+    }
+  ]
+}
+```
+
+Use plain `text` with `kind: "knowledge"` for an unstructured document. Use
+`app_knowledge` for structured `email`, `message`, `ticket`, `knowledge_base`,
+`comment`, `meeting`, or `custom` records. Each app record supports `id`, `title`,
+`description`, `url`, `timestamp`, `provider`, `external_id`, `fields`, `metadata`,
+`additional_metadata`, `attachments`, `relations`, and `acl`.
+
+```json Structured app knowledge with access
+{
+  "app_knowledge": [
+    {
+      "id": "ticket-4821",
+      "kind": "ticket",
+      "title": "Retry queue saturation",
+      "provider": "linear",
+      "external_id": "ENG-4821",
+      "fields": {"body": "The retry queue reached capacity.", "status": "open"},
+      "additional_metadata": {"team": "platform"},
+      "acl": ["user_email:alice@example.com"]
+    }
+  ]
+}
+```
+
+An omitted app-record `acl` makes the item unrestricted. Send `["__private__"]`
+for private ingest or `["__public__"]` for public ingest. An empty list is
+refused. Re-ingesting an existing `id` without `acl` removes its previous access
+list. If `__public__` appears with other principals, the item is public and
+HydraDB drops the other principals.
+
+Ingestion is asynchronous. Use `hydradb_status` before you query or update newly
+ingested knowledge.
+
+### hydradb_update
+
+Edits one existing item without re-ingesting it. Copy `id` from `hydradb_query`,
+`hydradb_list`, or `hydradb_inspect`; never guess an ID.
+
+| Parameter | Type | Required | Description |
+| --------- | ---- | -------- | ----------- |
+| `id` | string | Yes | Existing context ID to edit |
+| `database_metadata` | object | No* | Keys to merge into schema-controlled database metadata |
+| `additional_metadata` | object | No* | Free-form keys to merge into additional metadata |
+| `acl` | array or null | No* | Complete replacement ACL. `[]` or `null` makes the item private; `["__public__"]` makes it public to identified callers; omission leaves access unchanged |
+| `database` | string | No | Database (tenant) scope override for this request |
+| `collection` | string | No | Collection (sub-tenant) scope override for this request |
+
+\* Provide at least one of `database_metadata`, `additional_metadata`, or `acl`.
+Metadata maps merge only the supplied keys. ACL updates replace the complete
+list, so include every principal that must retain access.
+
+```json Merge metadata and replace access
+{
+  "id": "ticket-4821",
+  "database_metadata": {"priority": "urgent"},
+  "additional_metadata": {"reviewed": true},
+  "acl": ["user_email:alice@example.com", "group:platform"]
+}
+```
+
+The write is idempotent. Retry the identical request if HydraDB reports a partial
+commit or an unconfirmed vector or ACL synchronization. The tool returns an MCP
+error until the edit is fully converged.
 
 ### hydradb_list
 
@@ -515,6 +614,9 @@ Provide exactly one of `text` or `turns`. Passing both is rejected.
 | `page_size` | number | No | Items per page, 1 to 100 |
 | `database` | string | No | Database (tenant) scope override for this request |
 | `collection` | string | No | Collection (sub-tenant) scope override for this request |
+
+HydraDB failures stay failures: degraded stores, malformed success responses,
+and proxy login pages return an MCP error instead of an empty list.
 
 ### hydradb_inspect
 
