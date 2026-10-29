@@ -1,0 +1,1458 @@
+---
+title: "Incident Response Agent"
+description: " Build an AI incident response assistant that answers 'what happened, why did it happen, and how do we fix it?' in four phases. Start with a single incident report and a real search query. End with a FastAPI backend that ingests incidents, runbooks, logs, alerts, postmortems, and on-call documentation, then generates GPT-4o-powered incident investigations grounded in your operational knowledge."
+---
+
+Go from zero to a production AI incident response assistant that answers **"what happened, why did it happen, and how do we fix it?"** in four phases. Start with a single incident report and a real search query. End with a FastAPI backend that ingests incidents, runbooks, logs, alerts, dashboards, and postmortems, then generates GPT-4o-powered investigations grounded in your organization's operational knowledge.
+
+> **How this guide is structured.** Each phase ends with something that works. Phase 0 is a complete minimal system in under 10 minutes. Phases 1–3 progressively add richer operational context, automated investigation, and production-ready workflows. You never need to redo what came before.
+
+> **All code in this cookbook is real.** Base URL is `https://api.hydradb.com`. Get your API key at [app.hydradb.com](https://app.hydradb.com).
+
+---
+
+## Prerequisites
+
+**Required knowledge:** Python basics, REST APIs, environment variables, basic incident response concepts
+
+**Required tools:**
+- HydraDB API key
+- Python 3.11 or 3.12 (`python --version`)
+- OpenAI API key (for investigation summaries in Phase 3)
+- `pip install hydradb-sdk openai`
+
+---
+
+## What You'll Build
+
+By the end of this cookbook, you'll be able to:
+
+- Upload incident reports, runbooks, and operational documentation into HydraDB to answer questions like **"Why did this incident occur?"** and **"How was it resolved previously?"**
+- Progressively ingest incident timelines, service documentation, alerts, logs, monitoring dashboards, postmortems, Slack discussions, and on-call notes across four phases.
+- Build a FastAPI backend that investigates incidents using `search_docs` + GPT-4o to generate evidence-backed root cause analyses.
+- Build an AI assistant capable of:
+  - Explaining why an alert fired.
+  - Correlating related incidents and recurring failures.
+  - Recommending relevant runbooks and remediation steps.
+  - Summarizing incident timelines and key decisions.
+  - Assisting engineers during active incident response with grounded operational knowledge.
+- Integrate the assistant into Slack, Microsoft Teams, or an internal incident management dashboard for real-time investigations.
+## Phase 0 - Minimal Working System · 5–10 minutes
+
+The only goal is to see a real investigation response from a real incident document you uploaded. No multi-source ingestion, no backend server, no automated triage, and no chat interface—just the four API calls that prove the incident investigation pipeline works end-to-end.
+
+**Goal:** Upload a single incident document, run one investigation query, and retrieve grounded results.
+
+> ⚠️ **Complete Phase 0 first, even if you plan to skip ahead.** Every later phase assumes your incident knowledge database exists and indexing is working correctly. Running Phase 0 takes less than 10 minutes and eliminates the most common setup issues before moving to automated incident analysis.
+
+### Prerequisites
+
+Before writing any code, you'll need three things:
+
+1. **A HydraDB API key.** Email [founders@hydradb.com](mailto:founders@hydradb.com) or book a demo at [hydradb.com](https://hydradb.com). You'll receive an API key beginning with `hdb_`.
+
+2. **Python 3.10 or later.** Verify your installation:
+
+```bash
+python3 --version
+```
+
+3. **The HydraDB SDK.** Install the required dependencies:
+
+```bash
+pip install hydradb-sdk python-dotenv
+```
+
+Create a new project directory:
+
+```bash
+mkdir incident-response-agent
+cd incident-response-agent
+
+echo "HYDRA_DB_API_KEY=hdb_your_key_here" > .env
+```
+
+Create a `config.py` file in the project root. This configuration will be reused throughout every phase of this cookbook.
+
+```python
+import os
+from dotenv import load_dotenv
+from hydra_db import HydraDB
+
+load_dotenv()
+
+# HydraDB
+HYDRA_DB_API_KEY = os.environ["HYDRA_DB_API_KEY"]
+DATABASE_ID = os.environ.get("HYDRADB_TENANT_ID", "incident-response")
+
+client = HydraDB(token=HYDRA_DB_API_KEY)
+
+# OpenAI
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+OPENAI_MODEL = "gpt-4o"
+
+# Search defaults
+RECALL_MAX_RESULTS = 15
+RECALL_MIN_SCORE = 0.5
+RECALL_ALPHA = 0.75
+```
+
+> ❌ **The Authorization header must be exact.**
+>
+> ```
+> Authorization: Bearer hdb_abc123
+> ```
+>
+> Use a capital **B** in **Bearer**, a single space after it, and no quotation marks. Any other format will result in a **401 Unauthorized** response.
+
+---
+
+### What You'll Have After Phase 0
+
+By the end of this phase, you'll have:
+
+- A working HydraDB database for incident response knowledge.
+- Your first incident document indexed successfully.
+- The ability to search operational knowledge using natural language.
+- Confidence that your ingestion and retrieval pipeline is working correctly before building more advanced capabilities.
+
+In later phases, you'll expand this foundation by ingesting:
+
+- Incident reports
+- Runbooks
+- Service documentation
+- Alert definitions
+- Monitoring dashboards
+- Postmortems
+- Slack incident channels
+- On-call handoff notes
+- Operational RFCs
+
+Eventually, your assistant will be able to answer questions such as:
+
+- **Why did this incident happen?**
+- **Has this failure occurred before?**
+- **Which services are likely affected?**
+- **What runbook should I follow?**
+- **Who resolved a similar incident previously?**
+- **What changed before the outage began?**
+- **What is the most likely root cause based on historical incidents?**
+
+For now, the goal is much simpler: upload one incident document, search it successfully, and verify that the end-to-end retrieval pipeline is functioning.
+
+## Phase 1 - Batch Incident Ingestion with Structured Metadata · 20–30 minutes
+
+Phase 0 proved that HydraDB can index and retrieve one incident document. Phase 1 turns that minimal setup into a reusable incident knowledge base.
+
+You will:
+
+- Store multiple incident reports in a consistent folder structure.
+- Add stable document IDs and incident metadata.
+- Upload every incident report in one batch.
+- Verify that each file was indexed.
+- Run searches across historical incidents.
+
+**Goal:** Build a searchable incident repository containing multiple incidents with service, severity, date, and source metadata.
+
+> Phase 1 still focuses only on ingestion and retrieval. Do not add an LLM, FastAPI server, Slack bot, or automated root-cause generation yet.
+
+---
+
+### Project Structure
+
+Update the project created in Phase 0 to use the following structure:
+
+```text
+incident-response-agent/
+├── .env
+├── config.py
+├── data/
+│   └── incidents/
+│       ├── INC-1001.md
+│       ├── INC-1002.md
+│       └── INC-1003.md
+└── phase1/
+    ├── __init__.py
+    ├── ingest_incidents.py
+    ├── search_incidents.py
+    └── verify.py
+```
+
+Create the directories:
+
+```bash
+mkdir -p data/incidents phase1
+touch phase1/__init__.py
+```
+
+---
+
+## Step 1 - Create Sample Incident Reports
+
+Create `data/incidents/INC-1001.md`:
+
+```md
+# Incident INC-1001
+
+Service: Checkout API  
+Severity: SEV-2  
+Date: 2026-06-12  
+Status: Resolved
+
+## Summary
+
+Customers experienced slow checkout requests and intermittent HTTP 500 errors.
+
+## Symptoms
+
+- Database connection usage reached 100%.
+- Checkout API latency increased from 180 ms to 4.8 seconds.
+- Error rate reached 17%.
+- Some customers could not complete purchases.
+
+## Root Cause
+
+A newly deployed request handler opened a database connection but did not
+release it when a downstream payment request timed out.
+
+Over time, abandoned connections exhausted the PostgreSQL connection pool.
+
+## Resolution
+
+The deployment was rolled back and the connection cleanup logic was corrected.
+
+The team also reduced the database connection timeout and added alerts for
+connection pool saturation.
+
+## Prevention
+
+- Add integration tests for downstream timeout scenarios.
+- Alert when database connection usage exceeds 80%.
+- Review connection lifecycle management during code review.
+```
+
+Create `data/incidents/INC-1002.md`:
+
+```md
+# Incident INC-1002
+
+Service: Authentication Service  
+Severity: SEV-1  
+Date: 2026-06-20  
+Status: Resolved
+
+## Summary
+
+Users were unable to sign in for approximately 24 minutes.
+
+## Symptoms
+
+- Login requests returned HTTP 503.
+- Token validation latency exceeded 10 seconds.
+- Authentication pods repeatedly restarted.
+- CPU usage remained below 40%.
+
+## Root Cause
+
+A malformed configuration value caused every authentication pod to fail while
+loading its signing-key configuration.
+
+The deployment passed the existing health check because the health endpoint did
+not validate whether signing keys were loaded successfully.
+
+## Resolution
+
+The team restored the previous configuration and restarted the deployment.
+
+## Prevention
+
+- Validate signing-key configuration during application startup.
+- Fail readiness checks when signing keys are unavailable.
+- Add automated configuration validation to the deployment pipeline.
+```
+
+Create `data/incidents/INC-1003.md`:
+
+```md
+# Incident INC-1003
+
+Service: Notification Worker  
+Severity: SEV-3  
+Date: 2026-07-02  
+Status: Resolved
+
+## Summary
+
+Email notifications were delayed by up to 47 minutes.
+
+## Symptoms
+
+- Queue depth increased from 2,000 to 145,000 messages.
+- Worker memory usage increased continuously.
+- No messages were lost.
+- API traffic was unaffected.
+
+## Root Cause
+
+A retry loop immediately retried failed email deliveries without exponential
+backoff.
+
+A temporary third-party email provider outage caused workers to repeatedly
+process the same failed messages, reducing overall queue throughput.
+
+## Resolution
+
+The retry policy was updated to use exponential backoff with jitter.
+
+Additional worker replicas were temporarily deployed to drain the queue.
+
+## Prevention
+
+- Enforce retry limits.
+- Add exponential backoff and jitter.
+- Alert on queue age as well as queue depth.
+- Add a circuit breaker for third-party provider failures.
+```
+
+---
+
+## Step 2 - Add Incident Metadata Parsing
+
+Each incident file contains structured fields near the top:
+
+```text
+Service: Checkout API
+Severity: SEV-2
+Date: 2026-06-12
+Status: Resolved
+```
+
+Create `phase1/ingest_incidents.py`:
+
+```python
+from __future__ import annotations
+
+import re
+from pathlib import Path
+from typing import Any
+
+from config import DATABASE_ID, client
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+INCIDENTS_DIR = PROJECT_ROOT / "data" / "incidents"
+
+INCIDENT_ID_PATTERN = re.compile(r"^# Incident\s+([A-Za-z0-9_-]+)", re.MULTILINE)
+
+
+def extract_field(content: str, field_name: str) -> str:
+    """
+    Extract a metadata field from an incident Markdown document.
+
+    Example:
+        Service: Checkout API
+    """
+    pattern = re.compile(
+        rf"^{re.escape(field_name)}:\s*(.+)$",
+        flags=re.MULTILINE | re.IGNORECASE,
+    )
+
+    match = pattern.search(content)
+    return match.group(1).strip() if match else "unknown"
+
+
+def parse_incident(path: Path) -> dict[str, Any]:
+    """
+    Read one incident report and convert it into a HydraDB ingestion item.
+    """
+    content = path.read_text(encoding="utf-8")
+
+    incident_match = INCIDENT_ID_PATTERN.search(content)
+    incident_id = incident_match.group(1) if incident_match else path.stem
+
+    service = extract_field(content, "Service")
+    severity = extract_field(content, "Severity")
+    incident_date = extract_field(content, "Date")
+    status = extract_field(content, "Status")
+
+    return {
+        # Stable IDs prevent the same file from creating uncontrolled duplicates.
+        "id": f"incident/{incident_id}",
+        "type": "incident_report",
+        "content": {
+            "text": content,
+        },
+        "metadata": {
+            "incident_id": incident_id,
+            "service": service,
+            "severity": severity,
+            "incident_date": incident_date,
+            "status": status,
+            "source_path": str(path.relative_to(PROJECT_ROOT)),
+        },
+    }
+
+
+def load_incidents() -> list[dict[str, Any]]:
+    """
+    Load every Markdown incident report from data/incidents.
+    """
+    paths = sorted(INCIDENTS_DIR.glob("*.md"))
+
+    if not paths:
+        raise FileNotFoundError(
+            f"No incident reports were found in {INCIDENTS_DIR}"
+        )
+
+    return [parse_incident(path) for path in paths]
+
+
+def ingest_incidents() -> None:
+    incidents = load_incidents()
+
+    print(f"Found {len(incidents)} incident reports.")
+
+    payload = {
+        "app_knowledge": incidents,
+    }
+
+    response = client.context.ingest(
+        database_id=DATABASE_ID,
+        request=payload,
+    )
+
+    print("Ingestion submitted successfully.")
+    print(response)
+
+
+if __name__ == "__main__":
+    ingest_incidents()
+```
+
+> The exact request parameter name can vary between HydraDB SDK versions. If your installed SDK expects `body=payload` instead of `request=payload`, change only the `client.context.ingest(...)` call. Keep the document structure unchanged.
+
+Run the ingestion script:
+
+```bash
+python3 -m phase1.ingest_incidents
+```
+
+Expected result:
+
+```text
+Found 3 incident reports.
+Ingestion submitted successfully.
+...
+```
+
+---
+
+## Step 3 - Verify That Each Incident Was Indexed
+
+Create `phase1/verify.py`:
+
+```python
+from __future__ import annotations
+
+import time
+from pathlib import Path
+
+from config import DATABASE_ID, client
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+INCIDENTS_DIR = PROJECT_ROOT / "data" / "incidents"
+
+
+def search_for_incident(incident_id: str):
+    """
+    Search HydraDB for a specific incident identifier.
+    """
+    return client.search(
+        database_id=DATABASE_ID,
+        query=incident_id,
+        max_results=5,
+    )
+
+
+def verify_incident(incident_id: str, attempts: int = 10) -> bool:
+    """
+    Poll search until the incident becomes available or the retry limit is hit.
+    """
+    for attempt in range(1, attempts + 1):
+        results = search_for_incident(incident_id)
+
+        if results:
+            print(f"✓ {incident_id} is searchable")
+            return True
+
+        print(
+            f"Waiting for {incident_id} to be indexed "
+            f"({attempt}/{attempts})..."
+        )
+        time.sleep(3)
+
+    print(f"✗ {incident_id} was not found")
+    return False
+
+
+def main() -> None:
+    incident_ids = [path.stem for path in sorted(INCIDENTS_DIR.glob("*.md"))]
+
+    if not incident_ids:
+        raise FileNotFoundError("No incident files were found.")
+
+    verified = [
+        verify_incident(incident_id)
+        for incident_id in incident_ids
+    ]
+
+    if all(verified):
+        print("\nAll incident reports were indexed successfully.")
+    else:
+        raise RuntimeError(
+            "One or more incident reports could not be verified."
+        )
+
+
+if __name__ == "__main__":
+    main()
+```
+
+Run it:
+
+```bash
+python3 -m phase1.verify
+```
+
+Indexing may take a few seconds. The script retries automatically.
+
+Expected output:
+
+```text
+✓ INC-1001 is searchable
+✓ INC-1002 is searchable
+✓ INC-1003 is searchable
+
+All incident reports were indexed successfully.
+```
+
+---
+
+## Step 4 - Search Historical Incidents
+
+Create `phase1/search_incidents.py`:
+
+```python
+from __future__ import annotations
+
+from typing import Any
+
+from config import (
+    DATABASE_ID,
+    RECALL_ALPHA,
+    RECALL_MAX_RESULTS,
+    RECALL_MIN_SCORE,
+    client,
+)
+
+
+def get_value(item: Any, field_name: str, default=None):
+    """
+    Read a value from either an SDK object or a dictionary response.
+    """
+    if isinstance(item, dict):
+        return item.get(field_name, default)
+
+    return getattr(item, field_name, default)
+
+
+def search_incidents(query: str):
+    """
+    Search the incident knowledge base using a natural-language question.
+    """
+    return client.search(
+        database_id=DATABASE_ID,
+        query=query,
+        max_results=RECALL_MAX_RESULTS,
+        min_score=RECALL_MIN_SCORE,
+        alpha=RECALL_ALPHA,
+    )
+
+
+def print_results(results) -> None:
+    if not results:
+        print("No relevant incident evidence was found.")
+        return
+
+    for index, result in enumerate(results, start=1):
+        content = get_value(result, "chunk_content", "")
+        score = get_value(result, "relevancy_score", 0.0)
+        metadata = get_value(result, "additional_metadata", {}) or {}
+        source_title = get_value(result, "source_title", "unknown")
+
+        if not isinstance(metadata, dict):
+            metadata = {}
+
+        incident_id = metadata.get("incident_id", source_title)
+        service = metadata.get("service", "unknown")
+        severity = metadata.get("severity", "unknown")
+        source_path = metadata.get("source_path", "unknown")
+
+        print("=" * 80)
+        print(f"Result: {index}")
+        print(f"Incident: {incident_id}")
+        print(f"Service: {service}")
+        print(f"Severity: {severity}")
+        print(f"Score: {score:.4f}")
+        print(f"Source: {source_path}")
+        print("-" * 80)
+        print(content.strip())
+        print()
+
+
+def main() -> None:
+    query = input("Ask an incident-response question: ").strip()
+
+    if not query:
+        raise ValueError("The search query cannot be empty.")
+
+    results = search_incidents(query)
+    print_results(results)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+Run the search:
+
+```bash
+python3 -m phase1.search_incidents
+```
+
+Try this query:
+
+```text
+Which incident was caused by exhausted database connections?
+```
+
+A relevant result should include evidence from `INC-1001.md`.
+
+Try additional searches:
+
+```text
+Why were users unable to sign in?
+```
+
+```text
+Which incident involved a third-party provider outage?
+```
+
+```text
+What previous incident required exponential backoff?
+```
+
+```text
+Which failures were caused by unsafe deployment configuration?
+```
+
+---
+
+## Step 5 - Optional Metadata Filtering
+
+Natural-language retrieval finds semantically relevant evidence. Metadata filtering narrows the search to a particular service, severity, date, or incident status.
+
+Add the following function to `phase1/search_incidents.py` if your HydraDB SDK version supports search filters:
+
+```python
+def search_high_severity_incidents(query: str):
+    return client.search(
+        database_id=DATABASE_ID,
+        query=query,
+        max_results=RECALL_MAX_RESULTS,
+        min_score=RECALL_MIN_SCORE,
+        alpha=RECALL_ALPHA,
+        filters={
+            "severity": {
+                "$in": ["SEV-1", "SEV-2"],
+            }
+        },
+    )
+```
+
+Example:
+
+```python
+results = search_high_severity_incidents(
+    "incidents caused by invalid configuration"
+)
+print_results(results)
+```
+
+> Filter syntax may differ between SDK releases. Keep metadata fields simple and consistent so they can be mapped easily to the filter syntax supported by your installed version.
+
+---
+
+## Step 6 - Prevent Duplicate Incident Documents
+
+Stable IDs are important because incident reports may be updated after the initial investigation.
+
+This phase uses IDs such as:
+
+```text
+incident/INC-1001
+incident/INC-1002
+incident/INC-1003
+```
+
+When an incident report changes, ingest the document again using the same ID. Depending on your HydraDB database configuration, the existing document can be updated or replaced rather than creating an unrelated duplicate.
+
+Do not generate random IDs for operational documents that have permanent identifiers.
+
+Recommended ID conventions:
+
+```text
+incident/{incident_id}
+runbook/{service}/{runbook_name}
+postmortem/{incident_id}
+alert/{monitoring_system}/{alert_name}
+service/{service_name}
+deployment/{repository}/{commit_sha}
+```
+
+These IDs will become important in later phases when the agent connects incidents to runbooks, alerts, deployments, and postmortems.
+
+---
+
+## Step 7 - Add Your Own Incident Reports
+
+Replace or extend the sample files with real or synthetic incident documents.
+
+Each report should contain at least:
+
+```md
+# Incident INC-XXXX
+
+Service: service-name
+Severity: SEV-1
+Date: YYYY-MM-DD
+Status: Resolved
+
+## Summary
+
+A short description of the incident.
+
+## Symptoms
+
+Observable failures, alerts, errors, or customer impact.
+
+## Root Cause
+
+The confirmed technical or operational cause.
+
+## Resolution
+
+The actions used to restore service.
+
+## Prevention
+
+Follow-up actions that reduce the chance of recurrence.
+```
+
+Avoid including secrets such as:
+
+- API keys
+- Authentication tokens
+- Database passwords
+- Private customer information
+- Personally identifiable information
+- Internal credentials
+- Unredacted production logs containing sensitive data
+
+Use sanitized or synthetic incident data while developing the cookbook.
+
+---
+
+## Phase 1 Checkpoint
+
+Phase 1 is complete when all of the following are true:
+
+- [ ] At least three incident reports exist in `data/incidents`.
+- [ ] Every incident has a stable document ID.
+- [ ] Service, severity, date, status, and source path are stored as metadata.
+- [ ] The batch ingestion script completes successfully.
+- [ ] The verification script confirms that each incident is searchable.
+- [ ] Natural-language searches return evidence from the correct incidents.
+- [ ] Re-running ingestion does not create uncontrolled duplicate documents.
+
+At this point, you have a reusable historical incident knowledge base.
+
+You do **not** yet have an incident-response agent. The system currently retrieves evidence but does not reason over it or produce a final investigation.
+
+---
+
+## What Phase 1 Adds
+
+Phase 0:
+
+```text
+One file
+    ↓
+One upload
+    ↓
+One search
+```
+
+Phase 1:
+
+```text
+Multiple incident reports
+          ↓
+Metadata extraction
+          ↓
+Batch ingestion
+          ↓
+Index verification
+          ↓
+Cross-incident search
+```
+
+---
+
+## Next: Phase 2
+
+In Phase 2, you will ingest multiple operational source types:
+
+- Incident reports
+- Runbooks
+- Postmortems
+- Alert definitions
+- Deployment records
+- Slack incident discussions
+
+You will normalize them into one searchable operational knowledge model and connect related documents using stable IDs and metadata.
+
+The output of Phase 2 will be a retrieval pipeline capable of answering questions such as:
+
+```text
+What runbook applies to this alert?
+```
+
+```text
+Which deployment happened before the incident?
+```
+
+```text
+Has this root cause appeared in a previous postmortem?
+```
+
+```text
+What remediation steps worked during similar incidents?
+```
+
+# Phase 2 - Multi-Source Operational Knowledge · 30–45 minutes
+
+Phase 1 built a searchable repository of incident reports.
+
+In Phase 2, you'll transform that repository into an operational knowledge base by ingesting multiple document types instead of only incidents.
+
+**Goal:** Build a unified operational knowledge graph that connects incidents, runbooks, deployments, alerts, postmortems, and service documentation.
+
+> By the end of this phase you'll be able to ask questions that require evidence from multiple operational sources.
+
+---
+
+## Architecture
+
+```text
+Incident Reports
+Runbooks
+Postmortems
+Deployments
+Alerts
+Service Docs
+Slack Discussions
+        │
+        ▼
+HydraDB
+        │
+        ▼
+Unified Search
+```
+
+---
+
+# Project Structure
+
+```text
+incident-response-agent/
+
+data/
+    incidents/
+    runbooks/
+    deployments/
+    alerts/
+    postmortems/
+    services/
+
+phase2/
+    ingest.py
+    search.py
+    relations.py
+```
+
+Create directories:
+
+```bash
+mkdir -p \
+data/runbooks \
+data/deployments \
+data/postmortems \
+data/alerts \
+data/services \
+phase2
+```
+
+---
+
+# Step 1 — Add Operational Documents
+
+Example runbook:
+
+```md
+# Checkout API Runbook
+
+Service: Checkout API
+Type: Runbook
+
+## Symptoms
+
+- HTTP 500 errors
+- Database saturation
+
+## Resolution
+
+1. Verify PostgreSQL connection count
+2. Roll back latest deployment
+3. Restart checkout pods
+4. Verify latency
+```
+
+Example deployment:
+
+```md
+# Deployment deploy-2026-06-12
+
+Service: Checkout API
+
+Version: v3.8.1
+
+Commit:
+6ad312f
+
+Time:
+2026-06-12T17:30:00Z
+```
+
+Example postmortem:
+
+```md
+# Postmortem INC-1001
+
+Incident:
+INC-1001
+
+Root Cause
+
+Database connections leaked.
+
+Lessons Learned
+
+Improve connection lifecycle testing.
+```
+
+---
+
+# Phase 2 - Multi-Source Knowledge · 15–20 minutes
+
+In Phase 1, you built a searchable incident repository.
+
+In this phase, you'll ingest multiple operational document types to give the assistant richer context.
+
+**Goal:** Build a unified operational knowledge base.
+
+---
+
+## Project Structure
+
+```text
+data/
+├── incidents/
+├── runbooks/
+├── deployments/
+├── postmortems/
+├── alerts/
+└── services/
+```
+
+---
+
+## Step 1 - Add Operational Documents
+
+Add a few sample documents to each folder.
+
+Example:
+
+```md
+# Checkout API Runbook
+
+Service: Checkout API
+
+## Resolution
+
+1. Roll back deployment
+2. Verify database connections
+3. Restart checkout service
+```
+
+---
+
+## Step 2 - Batch Ingest Documents
+
+Create `phase2/ingest.py`.
+
+```python
+from pathlib import Path
+from config import DATABASE_ID, client
+
+ROOT = Path("data")
+
+documents = []
+
+for folder in ROOT.iterdir():
+    if not folder.is_dir():
+        continue
+
+    for file in folder.glob("*.md"):
+        documents.append({
+            "id": f"{folder.name}/{file.stem}",
+            "type": folder.name,
+            "content": {
+                "text": file.read_text()
+            },
+            "metadata": {
+                "source": folder.name
+            }
+        })
+
+client.context.ingest(
+    database_id=DATABASE_ID,
+    request={
+        "app_knowledge": documents
+    },
+)
+
+print("Documents indexed.")
+```
+
+Run:
+
+```bash
+python3 phase2/ingest.py
+```
+
+---
+
+## Step 3 - Search
+
+```python
+results = client.search(
+    database_id=DATABASE_ID,
+    query="checkout database connection issue",
+    max_results=5,
+)
+
+for result in results:
+    print(result.chunk_content)
+```
+
+Example queries:
+
+```
+Which deployment caused the outage?
+
+Which runbook should I follow?
+
+Has this happened before?
+```
+
+---
+
+## Checkpoint
+
+- [ ] Incidents indexed
+- [ ] Runbooks indexed
+- [ ] Deployments indexed
+- [ ] Search returns results from multiple sources
+
+---
+
+## Next Phase
+
+Next, you'll build an AI investigation engine using GPT-4o. Instead of returning search results, the assistant will generate grounded incident investigations with summaries, root causes, and recommended actions.
+
+# Phase 3 - AI Investigation Engine · 20–25 minutes
+
+In Phase 2, you built a searchable operational knowledge base.
+
+In this phase, you'll combine HydraDB with GPT-4o to generate grounded incident investigations.
+
+**Goal:** Build an API that answers incident questions using retrieved operational context.
+
+---
+
+## Architecture
+
+```text
+Question
+    │
+HydraDB Search
+    │
+Relevant Documents
+    │
+GPT-4o
+    │
+Investigation Report
+```
+
+---
+
+## Step 1 - Install OpenAI
+
+```bash
+pip install openai fastapi uvicorn
+```
+
+Add to `.env`:
+
+```text
+OPENAI_API_KEY=your_key_here
+```
+
+---
+
+## Step 2 - Build Investigation API
+
+Create `phase3/app.py`
+
+```python
+from fastapi import FastAPI
+from openai import OpenAI
+
+from config import (
+    DATABASE_ID,
+    OPENAI_API_KEY,
+    client,
+)
+
+llm = OpenAI(api_key=OPENAI_API_KEY)
+
+app = FastAPI()
+
+
+@app.post("/investigate")
+def investigate(question: str):
+
+    results = client.search(
+        database_id=DATABASE_ID,
+        query=question,
+        max_results=10,
+    )
+
+    context = "\n\n".join(
+        r.chunk_content for r in results
+    )
+
+    prompt = f"""
+Use only the evidence below.
+
+Evidence:
+
+{context}
+
+Question:
+
+{question}
+"""
+
+    response = llm.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {
+                "role": "user",
+                "content": prompt,
+            }
+        ],
+    )
+
+    return {
+        "answer": response.choices[0].message.content
+    }
+```
+
+---
+
+## Step 3 - Run the API
+
+```bash
+uvicorn phase3.app:app --reload
+```
+
+Open:
+
+```
+http://127.0.0.1:8000/docs
+```
+
+---
+
+## Step 4 - Test
+
+Example questions:
+
+```
+Why did Checkout API fail?
+```
+
+```
+What runbook should I follow?
+```
+
+```
+Has this happened before?
+```
+
+```
+What deployment likely caused the outage?
+```
+
+---
+
+## Example Response
+
+```text
+Summary
+
+Checkout API experienced database connection exhaustion
+after deployment v3.8.1.
+
+Evidence
+
+• Incident INC-1001
+• Checkout Runbook
+• Deployment v3.8.1
+
+Root Cause
+
+Connections were not released after downstream timeouts.
+
+Resolution
+
+Rollback deployment and restart checkout service.
+```
+
+---
+
+## Checkpoint
+
+- [ ] FastAPI running
+- [ ] HydraDB search working
+- [ ] GPT generates grounded answers
+- [ ] API returns investigation summaries
+
+---
+
+## Next Phase
+
+Next, you'll turn the investigation API into a production incident response assistant by adding Slack integration, similar incident search, timeline generation, and automated runbook recommendations.
+
+# Phase 4 - Production Incident Response Assistant · 20–30 minutes
+
+In Phase 3, you built an AI investigation API.
+
+In this final phase, you'll turn it into a production-ready incident response assistant.
+
+**Goal:** Build an end-to-end incident copilot that helps engineers investigate, understand, and respond to incidents.
+
+---
+
+## Architecture
+
+```text
+Alerts / User Question
+        │
+FastAPI
+        │
+HydraDB Search
+        │
+GPT-4o
+        │
+Investigation Report
+```
+
+---
+
+## Step 1 - Add Investigation Endpoints
+
+Extend your FastAPI application.
+
+```text
+POST /investigate
+
+POST /similar-incidents
+
+POST /timeline
+
+POST /runbook
+```
+
+Each endpoint retrieves relevant documents from HydraDB before generating a response.
+
+---
+
+## Step 2 - Generate Similar Incidents
+
+```python
+results = client.search(
+    database_id=DATABASE_ID,
+    query="database connection exhaustion",
+    max_results=5,
+)
+
+for incident in results:
+    print(incident.source_title)
+```
+
+This helps engineers quickly identify recurring failures.
+
+---
+
+## Step 3 - Build an Incident Timeline
+
+Retrieve evidence from:
+
+- Incident reports
+- Deployments
+- Alerts
+- Slack discussions
+
+Then generate a chronological timeline.
+
+Example:
+
+```text
+17:28 Deployment Started
+
+17:31 Error Rate Increased
+
+17:34 Database Connections Saturated
+
+17:36 Alert Triggered
+
+17:40 Rollback Completed
+
+17:43 Service Recovered
+```
+
+---
+
+## Step 4 - Recommend Runbooks
+
+Retrieve the most relevant runbook.
+
+Example:
+
+```
+Question
+
+Checkout API is returning HTTP 500.
+
+↓
+
+Suggested Runbook
+
+checkout-api.md
+```
+
+---
+
+## Step 5 - Final Investigation
+
+Example response:
+
+```text
+Summary
+
+Checkout API experienced database connection exhaustion.
+
+Root Cause
+
+Database connections were not released after downstream timeouts.
+
+Related Incident
+
+INC-1001
+
+Recommended Runbook
+
+checkout-api.md
+
+Confidence
+
+0.94
+```
+
+---
+
+## Checkpoint
+
+- [ ] Investigation API completed
+- [ ] Similar incident search working
+- [ ] Timeline generation working
+- [ ] Runbook recommendations working
+- [ ] End-to-end incident assistant operational
+
+---
+
+# Congratulations 🎉
+
+You have built a production-ready AI Incident Response Assistant capable of:
+
+- Ingesting operational knowledge into HydraDB
+- Searching across multiple operational sources
+- Generating grounded AI investigations
+- Finding similar incidents
+- Recommending runbooks
+- Producing incident timelines
+- Serving responses through a FastAPI backend
+
+---
+
+## Future Improvements
+
+This project can be extended with features such as:
+
+- Slack or Microsoft Teams integration
+- PagerDuty incident automation
+- Jira or ServiceNow ticket creation
+- Live log ingestion from Elasticsearch or Loki
+- Grafana and Prometheus integration
+- Kubernetes event analysis
+- Deployment and CI/CD correlation
+- Root cause hypothesis ranking
+- Automatic postmortem generation
+- Multi-agent incident investigation workflows
+- Real-time streaming investigations
+- Human-in-the-loop approval before executing remediation
+- Fine-tuned models for organization-specific incident analysis
