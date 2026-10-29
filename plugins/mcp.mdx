@@ -462,6 +462,7 @@ that ID to `hydradb_feedback` when the result was wrong or incomplete.
 | `graph_context` | boolean | No | Include knowledge graph relations in the results (default: `true`) |
 | `titles` | string[] | No | Restrict the search to documents whose **complete** title exactly matches any value, ignoring case |
 | `metadata_filters` | object | No | Exact-match metadata filters as `{key: value}` |
+| `acl` | string[] | No | End-user principals to answer as. Results include unrestricted documents and documents that admit at least one principal |
 | `database` | string | No | Database (tenant) scope override for this request |
 | `collection` | string | No | Collection (sub-tenant) scope override for this request |
 
@@ -491,9 +492,10 @@ Because matching ignores case, two documents whose names differ only by case
 
 ### hydradb_ingest
 
-Provide exactly one of `text`, `turns`, `items`, or `app_knowledge`. Combining
-input modes is rejected. A batch contains 1 to 100 same-kind items and sends one
-API request. Batch text has an 8 MiB total UTF-8 limit.
+Provide exactly one of `text`, `turns`, `items`, or `app_knowledge`. Batches
+contain 1 to 100 items and send one API request. All entries in an `items` batch
+share the request's `kind` (`memory` or `knowledge`). The complete serialized
+ingest arguments have an 8 MiB UTF-8 limit.
 
 | Parameter | Type | Required | Description |
 | --------- | ---- | -------- | ----------- |
@@ -507,21 +509,27 @@ API request. Batch text has an 8 MiB total UTF-8 limit.
 | `overwrite` | boolean | No | Replace an existing entry with the same `source_id` (default: `true`) |
 | `infer` | boolean | No | Let HydraDB extract insights and build the knowledge graph (default: `true`) |
 | `is_markdown` | boolean | No | Treat `text` as markdown (default: `false`) |
-| `metadata` | object | No | Key/value metadata stored with memory, matchable later via `metadata_filters` |
-| `additional_metadata` | object | No | Free-form document metadata stored with memory or knowledge |
-| `relations` | object | No | Explicit related source IDs and optional relationship properties for a knowledge document |
+| `metadata` | object | No | Key/value metadata stored with memory or knowledge, matchable later via `metadata_filters`; 16 KiB compact-JSON limit |
+| `additional_metadata` | object | No | Free-form document metadata stored with memory or knowledge; 1 KiB compact-JSON limit |
+| `relations` | object | No | Knowledge relations with an `ids` array and optional `properties` map |
 | `evidence_kind` | string | No | Knowledge provenance: `assertion`, `record`, `said`, `done`, `third_party`, or `inferred` |
 | `evidence_subject` | string | No | Stable handle for the entity a knowledge document describes |
 | `custom_instructions` | string | No | Memory extraction guidance, up to 4,000 characters; replaces the MCP default and requires inference |
-| `graph` | object | No | Caller-supplied `entities` and `relations`; MCP keys the graph by the item ID |
+| `graph` | object | No | Caller graph with a nonempty `entities` map (`name`, `type`, optional `namespace` and `identifier`) and a `relations` array (`source`, `target`, `predicate`, optional `context` and `temporal_details`) |
 | `observation_date` | string | No | Calendar date YYYY-MM-DD when the fact was true |
 | `user_name` | string | No | Name of the user, used with `turns` for personalisation (default: `User`) |
 | `database` | string | No | Database (tenant) scope override for this request |
 | `collection` | string | No | Collection (sub-tenant) scope override for this request |
 
-Each `items` entry accepts the same item fields. Memory items can supply
-`custom_instructions`; memory and knowledge items can supply `additional_metadata`
-and `graph`.
+Set content and item-specific options on each `items` entry. Set `kind`,
+`overwrite`, `database`, and `collection` on the request. Request-level
+`custom_instructions` applies unless an entry overrides it. Knowledge entries
+require `text` and reject `turns`, `is_markdown`, `user_name`, `observation_date`,
+and `custom_instructions`.
+
+[Metadata size rules](/essentials/v2/metadata#4-size-limits) count UTF-8 bytes
+for the whole compact JSON map, including keys and punctuation. An oversized map
+rejects the complete ingest request before HydraDB stores any item.
 
 ```json Batch memory ingest
 {
@@ -570,8 +578,22 @@ refused. Re-ingesting an existing `id` without `acl` removes its previous access
 list. If `__public__` appears with other principals, the item is public and
 HydraDB drops the other principals.
 
-Ingestion is asynchronous. Use `hydradb_status` before you query or update newly
-ingested knowledge.
+<Warning>
+  An access list scopes permission-aware reads; it does not authenticate the
+  caller. A normal API-key read that omits `acl` can still see the item. An empty
+  read-side `acl` is also unrestricted. Pass the authenticated end user's real
+  principals to each read tool.
+</Warning>
+
+Check the ingest response before polling. It reports accepted and rejected
+counts, `accepted_ids`, `rejected_items`, `indexing_pending`, each item's ID and
+acceptance state, and the server's `stored_title` where applicable. MCP generates
+missing batch IDs. An all-failed ingest is an MCP error. A partial success keeps
+its accepted items and reports the rejected items. Acceptance means queued for
+asynchronous indexing, not yet searchable; use `hydradb_status` only for accepted
+IDs before you query or update newly ingested knowledge. A knowledge title that
+already ends in `.md` keeps one suffix; queries remain compatible with older
+doubled-title forms.
 
 ### hydradb_update
 
@@ -581,19 +603,28 @@ Edits one existing item without re-ingesting it. Copy `id` from `hydradb_query`,
 | Parameter | Type | Required | Description |
 | --------- | ---- | -------- | ----------- |
 | `id` | string | Yes | Existing context ID to edit |
-| `database_metadata` | object | No* | Keys to merge into schema-controlled database metadata |
-| `additional_metadata` | object | No* | Free-form keys to merge into additional metadata |
+| `database_metadata` | object | No* | Keys to merge into schema-controlled database metadata; 16 KiB compact-JSON limit |
+| `additional_metadata` | object | No* | Free-form keys to merge into additional metadata; 1 KiB compact-JSON limit |
 | `acl` | array or null | No* | Complete replacement ACL. `[]` or `null` makes the item private; `["__public__"]` makes it public to identified callers; omission leaves access unchanged |
 | `database` | string | No | Database (tenant) scope override for this request |
-| `collection` | string | No | Collection (sub-tenant) scope override for this request |
+| `collection` | string | Conditional | Collection (sub-tenant) scope for this request |
 
 \* Provide at least one of `database_metadata`, `additional_metadata`, or `acl`.
 Metadata maps merge only the supplied keys. ACL updates replace the complete
 list, so include every principal that must retain access.
 
+The [metadata size rules](/essentials/v2/metadata#4-size-limits) count UTF-8
+bytes for the complete compact JSON map, including keys and punctuation. An
+oversized map rejects the complete edit.
+
+A collection must resolve from the request or MCP connection configuration.
+Copy the collection attached to the source returned by `hydradb_query` or
+`hydradb_list`.
+
 ```json Merge metadata and replace access
 {
   "id": "ticket-4821",
+  "collection": "support-tickets",
   "database_metadata": {"priority": "urgent"},
   "additional_metadata": {"reviewed": true},
   "acl": ["user_email:alice@example.com", "group:platform"]
@@ -608,10 +639,11 @@ error until the edit is fully converged.
 
 | Parameter | Type | Required | Description |
 | --------- | ---- | -------- | ----------- |
-| `kind` | string | Yes | Which family to list: `memory` or `knowledge` |
+| `kind` | string | Yes | Which family to list: `memory`, `knowledge`, or `all` |
 | `ids` | array | No | Specific IDs to filter by |
 | `page` | number | No | Page number, 1-indexed (default: `1`) |
 | `page_size` | number | No | Items per page, 1 to 100 |
+| `acl` | string[] | No | End-user principals to answer as. Results include unrestricted documents and documents that admit at least one principal |
 | `database` | string | No | Database (tenant) scope override for this request |
 | `collection` | string | No | Collection (sub-tenant) scope override for this request |
 
@@ -626,6 +658,7 @@ and proxy login pages return an MCP error instead of an empty list.
 | `mode` | string | No | `content` for text, `url` for a presigned URL, `both` for both (default: `content`) |
 | `offset` | number | No | Character offset to start reading from |
 | `limit` | number | No | Maximum characters to return (max `20000`) |
+| `acl` | string[] | No | End-user principals to answer as. The source must be unrestricted or admit at least one principal |
 | `database` | string | No | Database (tenant) scope override for this request |
 | `collection` | string | No | Collection (sub-tenant) scope override for this request |
 
