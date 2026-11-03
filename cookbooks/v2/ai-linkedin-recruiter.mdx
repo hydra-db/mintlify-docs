@@ -3,13 +3,14 @@ title: "AI LinkedIn: People search in Natural Language"
 description: "Learn how to build an intelligent recruiting platform that understands natural language queries like 'find me someone who has 5+ years of experience in machine learning and has worked at Apple before' using HydraDB's AI search capabilities."
 ---
 
-This guide demonstrates how to build a revolutionary AI-powered hiring platform that transforms how recruiters and hiring managers discover candidates. Instead of traditional keyword searches, your platform will understand natural language queries and provide intelligent candidate matching using HydraDB's advanced AI capabilities.
+This guide shows how to build an AI hiring platform where recruiters and hiring managers find candidates by describing them. Instead of keyword searches, your platform takes natural language queries and matches candidates with HydraDB search.
 
-> **Note**: All code in this guide uses the official HydraDB TypeScript SDK (`@hydradb/sdk`). Base URL: `https://api.hydradb.com`. Get your API key at [app.hydradb.com](https://app.hydradb.com).
+> **Note:** All code in this guide uses the official HydraDB TypeScript SDK (`@hydradb/sdk`). Base URL: `https://api.hydradb.com`. Get your API key at [app.hydradb.com](https://app.hydradb.com).
+
 ## Prerequisites
 
-**Required knowledge**: TypeScript/JavaScript basics, REST APIs, environment variables  
-**Required tools**:
+**Required knowledge:** TypeScript/JavaScript basics, REST APIs, environment variables  
+**Required tools:**
 - HydraDB API key
 - Node.js 18+ (`node --version`)
 - `npm install @hydradb/sdk`
@@ -20,16 +21,16 @@ By the end of this cookbook, you'll be able to:
 - Upload structured candidate profiles into HydraDB with rich metadata (experience, skills, company history, education)
 - Search candidates using natural language queries like "Find me someone who has 5+ years of ML experience and worked at Apple"
 - Rank candidates by fit score and generate personalized interview questions per candidate
-- Store recruiter memory so HydraDB personalizes future candidate suggestions based on past successful hires
+- Personalize candidate suggestions with each recruiter's preferences and past successful hires
 
 ## The Problem with Traditional Hiring Platforms
 
 Traditional hiring platforms force recruiters to think like databases:
 
-- **Keyword matching**: “Machine Learning OR Apple OR 5 years”
-- **Boolean operators**: Complex database-style search syntax
-- **Manual screening**: Hours spent reviewing irrelevant profiles
-- **Missed candidates**: Great candidates who don't match exact keywords
+- **Keyword matching:** “Machine Learning OR Apple OR 5 years”
+- **Boolean operators:** Complex database-style search syntax
+- **Manual screening:** Hours spent reviewing irrelevant profiles
+- **Missed candidates:** Great candidates who don't match exact keywords
 
 ## The AI-Powered Solution
 
@@ -64,7 +65,7 @@ graph TD
 
 ### Understanding Candidate Data Structure
 
-The key to powerful AI search is structuring candidate data correctly. Here's how to organize candidate information for optimal search results:
+Good search starts with well-structured candidate data. Here's how to organize a profile:
 
 #### Core Candidate Profile Structure
 
@@ -118,39 +119,16 @@ const candidateProfile = {
 
   // Document-specific metadata
   additional_metadata: {
-    // Company history
-    companies: [
-      {
-        name: 'Apple Inc.',
-        role: 'Senior ML Engineer',
-        team: 'Siri',
-        duration_years: 3,
-        company_size: 'large_tech',
-        company_type: 'public'
-      },
-      {
-        name: 'StartupXYZ',
-        role: 'ML Engineer',
-        team: 'Recommendations',
-        duration_years: 2,
-        company_size: 'startup',
-        company_type: 'private'
-      }
-    ],
+    // Company history (roles, teams and tenure live in content.text)
+    companies: ['Apple Inc.', 'StartupXYZ'],
+    company_sizes: ['large_tech', 'startup'],
 
     // Skills and technologies
     technologies: ['python', 'tensorflow', 'pytorch', 'kubernetes'],
     programming_languages: ['python', 'java', 'scala'],
 
     // Education
-    education: [
-      {
-        degree: 'Master of Science',
-        field: 'Computer Science',
-        institution: 'Stanford University',
-        graduation_year: 2018
-      }
-    ],
+    education: ['MS Computer Science, Stanford University', 'BS Mathematics, UC Berkeley'],
 
     // Location and preferences
     location: {
@@ -174,6 +152,23 @@ const candidateProfile = {
   url: 'https://linkedin.com/in/johnsmith-ml',
   description: 'Senior ML Engineer with Apple experience, specializing in NLP and speech recognition'
 };
+```
+
+Per item, `metadata` is capped at 16 KiB and `additional_metadata` at 1 KiB. A metadata value can nest one level (a list of strings, or a flat object), so a list of company objects is rejected. Put long history in `content.text`.
+
+Upload the profile as an app source. Ingestion is asynchronous: poll [`GET /context/status`](/api-reference/v2/endpoint/source-status) until its `indexing_status` is `completed` (or `errored`) before you rely on search results.
+
+```javascript
+import { HydraDBClient } from "@hydradb/sdk";
+
+const client = new HydraDBClient({ token: process.env.HYDRA_DB_API_KEY });
+
+await client.context.ingest({
+  type: "knowledge",
+  database: "recruiting_database",
+  collection: "ml_engineering",
+  appKnowledge: JSON.stringify([candidateProfile]),
+});
 ```
 
 
@@ -335,6 +330,7 @@ const queryPatterns = {
 
 ### Implementing HydraDB Search for Hiring
 
+Send the same `collection` you ingested the profiles into; a query without `collection` reads only the database's default collection.
 
 ```javascript
 import { HydraDBClient } from "@hydradb/sdk";
@@ -342,70 +338,81 @@ import { HydraDBClient } from "@hydradb/sdk";
 class AIRecruitingSearch {
   constructor() {
     this.client = new HydraDBClient({ token: process.env.HYDRA_DB_API_KEY });
-    this.database = 'linkedin-recruiter';
+    this.database = 'recruiting_database';
+    this.collection = 'ml_engineering';
   }
 
   async findCandidates(query, recruiterContext = {}) {
-    const hiringContext = this.buildHiringInstructions(recruiterContext);
-    const enrichedQuery = hiringContext ? `${hiringContext}\n\n${query}` : query;
+    const { metadataFilters, additionalContext, ...roleContext } = recruiterContext;
+    const hiringContext = [this.buildHiringContext(roleContext), additionalContext]
+      .filter(Boolean)
+      .join('\n');
 
     const results = await this.client.query({
       database: this.database,
-      query: enrichedQuery,
+      collection: this.collection,
+      query,
+
+      // Short factual hint about the role; guides retrieval without changing the query
+      additionalContext: hiringContext || undefined,
+      metadataFilters,
 
       // Hiring-specific configurations
       maxResults: 20, // More candidates for review
       mode: 'thinking', // Multi-query with reranking for better results
 
       // Search tuning for candidate discovery
-      alpha: 0.6, // Favor semantic understanding
+      alpha: 0.6, // Below the 0.8 default: company names and skills are literal tokens
       recencyBias: 0.2 // Don't heavily favor recent profiles
     });
 
     return this.enhanceCandidateResults(results, query);
   }
 
-  buildHiringInstructions(recruiterContext) {
-    let instructions = `You are helping a recruiter find the best candidates. `;
-    
+  buildHiringContext(recruiterContext) {
+    const parts = [];
+
     if (recruiterContext.role) {
-      instructions += `They are looking to fill a ${recruiterContext.role} position. `;
+      parts.push(`Hiring for a ${recruiterContext.role} position.`);
     }
-    
+
     if (recruiterContext.company) {
-      instructions += `The role is at ${recruiterContext.company}. `;
+      parts.push(`The role is at ${recruiterContext.company}.`);
     }
-    
+
     if (recruiterContext.teamSize) {
-      instructions += `The team size is ${recruiterContext.teamSize}. `;
+      parts.push(`The team size is ${recruiterContext.teamSize}.`);
     }
-    
-    instructions += `Focus on candidate fit, experience relevance, and potential for success. 
-                    Highlight why each candidate would be a good match. 
-                    Consider both hard skills and soft skills. 
-                    Rank candidates by overall fit for the role.`;
-    
-    return instructions;
+
+    return parts.join(' ');
   }
 
   enhanceCandidateResults(results, originalQuery) {
     if (!results.data?.chunks) return results;
 
     // Add hiring-specific analysis to each candidate
-    const enhancedSources = results.data.chunks.map(candidate => ({
-      ...candidate,
-      fit_score: this.calculateFitScore(candidate, originalQuery),
-      strengths: this.extractStrengths(candidate),
-      potential_concerns: this.extractConcerns(candidate),
-      interview_questions: this.suggestInterviewQuestions(candidate, originalQuery)
-    }));
+    const enhancedSources = results.data.chunks.map(chunk => {
+      // Merge both metadata layers so the helpers below read one object
+      const candidate = {
+        ...chunk,
+        title: chunk.sourceTitle,
+        metadata: { ...chunk.metadata, ...chunk.additionalMetadata }
+      };
+      return {
+        ...candidate,
+        fit_score: this.calculateFitScore(candidate, originalQuery),
+        strengths: this.extractStrengths(candidate),
+        potential_concerns: this.extractConcerns(candidate),
+        interview_questions: this.suggestInterviewQuestions(candidate, originalQuery)
+      };
+    });
 
     // Sort by fit score
     enhancedSources.sort((a, b) => b.fit_score - a.fit_score);
 
     return {
       ...results,
-      chunks: enhancedSources,
+      data: { ...results.data, chunks: enhancedSources },
       search_insights: this.generateSearchInsights(enhancedSources, originalQuery)
     };
   }
@@ -416,7 +423,7 @@ class AIRecruitingSearch {
     if (meta.total_years_experience >= 5) strengths.push("Extensive experience");
     if (meta.publications_count > 0) strengths.push("Published researcher");
     if (meta.career_level === "senior" || meta.career_level === "staff") strengths.push("Senior-level contributor");
-    if ((meta.companies || []).some(c => c.company_size === "large_tech")) strengths.push("Big-tech background");
+    if ((meta.company_sizes || []).includes("large_tech")) strengths.push("Big-tech background");
     if (meta.has_management_experience) strengths.push("Proven leadership");
     return strengths;
   }
@@ -424,11 +431,11 @@ class AIRecruitingSearch {
   extractConcerns(candidate) {
     const concerns = [];
     const meta = candidate.metadata || {};
-    if (meta.total_years_experience < 3) concerns.push("Limited experience — verify depth of role");
-    if ((meta.companies || []).every(c => c.company_size === "large_tech")) {
-      concerns.push("No startup experience — assess adaptability");
+    if (meta.total_years_experience < 3) concerns.push("Limited experience: verify depth of role");
+    if ((meta.company_sizes || []).every(size => size === "large_tech")) {
+      concerns.push("No startup experience: assess adaptability");
     }
-    if (meta.job_search_status === "passively_looking") concerns.push("Not actively searching — expect longer close cycle");
+    if (meta.job_search_status === "passively_looking") concerns.push("Not actively searching: expect longer close cycle");
     return concerns;
   }
 
@@ -436,10 +443,10 @@ class AIRecruitingSearch {
     const questions = [];
     const meta = candidate.metadata || {};
     if ((meta.companies || []).length > 0) {
-      questions.push(`Walk me through your most impactful project at ${meta.companies[0].name}.`);
+      questions.push(`Walk me through your most impactful project at ${meta.companies[0]}.`);
     }
     if (query.toLowerCase().includes("machine learning") || (meta.primary_skills || []).includes("machine_learning")) {
-      questions.push("Describe a model you shipped end-to-end — from data to production monitoring.");
+      questions.push("Describe a model you shipped end-to-end, from data to production monitoring.");
     }
     if (meta.has_management_experience) {
       questions.push("Tell me about a time you had to let someone go. How did you handle it?");
@@ -451,7 +458,7 @@ class AIRecruitingSearch {
   generateSearchInsights(candidates, query) {
     const avgYears = candidates.reduce((sum, c) => sum + (c.metadata?.total_years_experience || 0), 0) / (candidates.length || 1);
     const topCompanies = [...new Set(
-      candidates.flatMap(c => (c.metadata?.companies || []).map(co => co.name))
+      candidates.flatMap(c => c.metadata?.companies || [])
     )].slice(0, 5);
     return {
       total_candidates: candidates.length,
@@ -477,7 +484,7 @@ class AIRecruitingSearch {
     const queryLower = query.toLowerCase();
     if (candidate.metadata?.companies) {
       candidate.metadata.companies.forEach(company => {
-        if (queryLower.includes(company.name.toLowerCase())) {
+        if (queryLower.includes(company.toLowerCase())) {
           score += 25;
         }
       });
@@ -501,7 +508,7 @@ class AIRecruitingSearch {
 
 ### Understanding Recruiter Patterns
 
-AI memories transform recruiting by learning each recruiter's preferences and patterns:
+A recruiter profile captures each recruiter's preferences and hiring patterns:
 
 #### What AI Memories Capture
 
@@ -550,34 +557,31 @@ const recruiterMemoryProfile = {
 
 ### Implementing Personalized Search
 
+Pass your profile lookup function to `new PersonalizedRecruitingSearch(getRecruiterProfile)`. To keep the profile in HydraDB, store it as [memories](/essentials/v2/memories) per recruiter and read it back with a `type: "memory"` query.
 
 ```javascript
 class PersonalizedRecruitingSearch extends AIRecruitingSearch {
-  async searchWithPersonalization(query, recruiterId, jobContext = {}) {
-    // AI memories are automatically managed by HydraDB when we provide user_name
-    const personalizedContext = {
-      sessionId: await this.getRecruiterSessionId(recruiterId),
-      recruiterId: recruiterId, // Enables automatic AI memory management
-      ...jobContext
-    };
+  constructor(getRecruiterProfile) {
+    super();
+    this.getRecruiterProfile = getRecruiterProfile;
+  }
 
-    const results = await this.findCandidates(query, personalizedContext);
+  async searchWithPersonalization(query, recruiterId, jobContext = {}) {
+    const results = await this.findCandidates(query, jobContext);
     
     // Add personalized insights based on recruiter's history
     return this.addPersonalizedInsights(results, recruiterId);
   }
 
   async addPersonalizedInsights(results, recruiterId) {
-    // Get recruiter's AI memory context (managed automatically by HydraDB)
+    // Load the recruiter profile from your own store (see the note above)
     const recruiterProfile = await this.getRecruiterProfile(recruiterId);
     
     const personalizedResults = {
       ...results,
       personalized_insights: {
-        recommended_candidates: this.getRecommendedCandidates(results.data?.chunks, recruiterProfile),
-        similar_to_past_hires: this.findSimilarToPastHires(results.data?.chunks, recruiterProfile),
-        interview_suggestions: this.generatePersonalizedInterviewQuestions(results.data?.chunks, recruiterProfile),
-        salary_insights: this.generateSalaryInsights(results.data?.chunks, recruiterProfile)
+        recommended_candidates: this.getRecommendedCandidates(results.data?.chunks || [], recruiterProfile),
+        interview_suggestions: this.generatePersonalizedInterviewQuestions(results.data?.chunks || [], recruiterProfile)
       }
     };
 
@@ -588,7 +592,7 @@ class PersonalizedRecruitingSearch extends AIRecruitingSearch {
     return candidates
       .filter(candidate => {
         // Check if candidate matches recruiter's successful hire patterns
-        const companies = candidate.metadata?.companies?.map(c => c.name.toLowerCase()) || [];
+        const companies = candidate.metadata?.companies?.map(c => c.toLowerCase()) || [];
         const skills = candidate.metadata?.primary_skills || [];
         
         // Match against successful hire patterns
@@ -615,7 +619,7 @@ class PersonalizedRecruitingSearch extends AIRecruitingSearch {
       if (candidate.metadata?.companies) {
         candidate.metadata.companies.forEach(company => {
           candidateQuestions.push(
-            `Tell me about your experience at ${company.name} and how it relates to our ${recruiterProfile.hiring_context?.team_type} team.`
+            `Tell me about your experience at ${company} and how it relates to our ${recruiterProfile.hiring_context?.team_type} team.`
           );
         });
       }
@@ -642,9 +646,9 @@ class PersonalizedRecruitingSearch extends AIRecruitingSearch {
 
 ### Example: AI Memory in Action
 
-Here's how AI memories make recruiting more effective:
+Here's what a recruiter profile changes for the same query:
 
-#### Initial Search (No Memory)
+#### Without a Recruiter Profile
 
 ```
 
@@ -657,7 +661,7 @@ Basic Results:
 ```
 
 
-#### After 10 Searches (AI Memory Active)
+#### With a Recruiter Profile
 
 ```
 
@@ -670,7 +674,7 @@ AI-Enhanced Results:
 - Includes salary expectations matching recruiter's budget
 - Recommends candidates with remote experience (company is remote-first)
 
-AI Memory Insights:
+Personalized Insights:
 "Based on your previous successful hires, I'm highlighting candidates who:
 - Have experience at high-growth startups like your previous hires from Stripe and Airbnb
 - Combine React with Node.js and TypeScript (your most successful tech stack combination)
@@ -682,7 +686,7 @@ AI Memory Insights:
 
 ### Complex Query Understanding
 
-HydraDB excels at understanding complex, multi-faceted queries:
+Real recruiter queries mix several requirements at once. Here is how they break down:
 
 #### Multi-Criteria Searches
 
@@ -695,7 +699,7 @@ const complexQueries = [
       experience_requirement: "5+ years",
       domain_requirement: "machine learning", 
       company_requirement: "Apple",
-      additionalContext: "Looking for proven ML expertise with big tech experience"
+      intent: "Looking for proven ML expertise with big tech experience"
     }
   },
   
@@ -713,7 +717,7 @@ const complexQueries = [
   {
     query: "Show me candidates who transitioned from consulting to product management at a tech company and have an MBA",
     breakdown: {
-      career_transition: "consulting → product management",
+      career_transition: "consulting to product management",
       industry_context: "tech company",
       education_requirement: "MBA",
       career_narrative: "Career switcher with business education"
@@ -725,28 +729,25 @@ const complexQueries = [
 
 ### Metadata-assisted filtering
 
-Use HydraDB metadata filters for exact hard requirements (for example `job_search_status: "open"`). Keep range requirements such as years of experience or salary in the natural-language query and in your own ranking step; `metadata_filters` are exact-match constraints, not range operators.
+Use HydraDB metadata filters for exact hard requirements (for example `job_search_status: "actively_looking"`) on fields declared in the database metadata schema. Keep range requirements such as years of experience or salary in the natural-language query and in your own ranking step; `metadata_filters` support `equals`, `contains`, and `contains_any`, not range operators.
 
+
+Pass an `acceptsCandidate(candidate, criteria)` function that checks salary, experience, and deal-breakers against your profile fields. Return `false` when a required value is missing. The method requires this function and returns only candidates it accepts.
 
 ```javascript
 class AdvancedCandidateSearch extends PersonalizedRecruitingSearch {
-  async searchWithComplexCriteria(query, criteria = {}) {
-    const {
-      experienceRange,
-      requiredSkills,
-      preferredCompanies,
-      salaryRange,
-      locationRequirements,
-      educationLevel,
-      availabilityStatus
-    } = criteria;
+  async searchWithComplexCriteria(query, criteria, acceptsCandidate) {
+    if (typeof acceptsCandidate !== "function") {
+      throw new TypeError("Pass your application criteria-checking function");
+    }
+    const { availabilityStatus } = criteria;
 
     // Build exact metadata filters for hard equality requirements.
-    // Do not use metadata_filters for ranges; rank those client-side below.
+    // Check ranges and exclusions with acceptsCandidate below.
     const metadataFilters = {};
     
     if (availabilityStatus) {
-      metadataFilters.job_search_status = availabilityStatus;
+      metadataFilters.job_search_status = { equals: availabilityStatus };
     }
 
     // Use natural language query for soft requirements and range context.
@@ -757,7 +758,15 @@ class AdvancedCandidateSearch extends PersonalizedRecruitingSearch {
       additionalContext: this.buildAdvancedInstructions(criteria)
     });
 
-    return this.rankByComplexCriteria(results, criteria);
+    const candidates = (results.data?.chunks || []).filter(candidate =>
+      acceptsCandidate(candidate, criteria)
+    );
+
+    return {
+      ...results,
+      data: { ...results.data, chunks: candidates },
+      search_insights: this.generateSearchInsights(candidates, enhancedQuery)
+    };
   }
 
   enhanceQueryWithContext(originalQuery, criteria) {
@@ -779,7 +788,7 @@ class AdvancedCandidateSearch extends PersonalizedRecruitingSearch {
   }
 
   buildAdvancedInstructions(criteria) {
-    let instructions = "Find candidates who best match these requirements:\n";
+    let instructions = "";
     
     if (criteria.mustHave) {
       instructions += `Must have: ${criteria.mustHave.join(', ')}\n`;
@@ -789,13 +798,10 @@ class AdvancedCandidateSearch extends PersonalizedRecruitingSearch {
       instructions += `Nice to have: ${criteria.niceToHave.join(', ')}\n`;
     }
     
-    if (criteria.dealBreakers) {
-      instructions += `Avoid candidates with: ${criteria.dealBreakers.join(', ')}\n`;
-    }
+    // Leave criteria.dealBreakers out: retrieval would match those terms, not avoid them.
+    // acceptsCandidate rejects them after retrieval.
     
-    instructions += "Rank candidates by overall fit, considering both technical skills and cultural alignment.";
-    
-    return instructions;
+    return instructions.trim();
   }
 }
 ```
@@ -821,7 +827,7 @@ Missed:
 ```
 
 
-#### AI Semantic Search Power
+#### Semantic Search
 
 ```
 
@@ -829,34 +835,29 @@ Search: "Find me someone who has 5+ years of experience in machine learning and 
 AI Understanding:
 - "machine learning" includes: ML, AI, neural networks, deep learning, data science
 - "worked at Apple" includes: current and former employees, contractors, interns
-- "5+ years" considers: total experience, relevant experience, progressive experience
+- "5+ years" is matched loosely as text: enforce it in your own ranking step
 - Context understanding: Looking for proven ML expertise with big tech credibility
 
 Enhanced Results:
-✓ "Senior AI Engineer at Apple, 6 years in deep learning"
-✓ "Data Scientist, former Apple ML intern, 5 years total ML experience"  
-✓ "ML Engineer who worked on Siri team for 2 years, 6 years total ML"
-✓ "Research Scientist at Apple AI/ML, PhD + 4 years industry experience"
+- "Senior AI Engineer at Apple, 6 years in deep learning"
+- "Data Scientist, former Apple ML intern, 5 years total ML experience"  
+- "ML Engineer who worked on Siri team for 2 years, 6 years total ML"
+- "Research Scientist at Apple AI/ML, PhD + 4 years industry experience"
 ```
 
 
 ### Smart Ranking and Scoring
 
+This example scores experience against `searchContext.experience_requirements`. Add your own checks for skills, availability, and other job requirements. These scores are application rules, not HydraDB relevance scores.
 
 ```javascript
 class IntelligentCandidateRanking {
   rankCandidates(candidates, searchContext) {
     return candidates.map(candidate => {
       const scores = {
-        experience_fit: this.scoreExperienceFit(candidate, searchContext),
-        skill_relevance: this.scoreSkillRelevance(candidate, searchContext),
-        company_prestige: this.scoreCompanyBackground(candidate, searchContext),
-        career_trajectory: this.scoreCareerTrajectory(candidate, searchContext),
-        cultural_fit: this.scoreCulturalFit(candidate, searchContext),
-        availability: this.scoreAvailability(candidate, searchContext)
+        experience_fit: this.scoreExperienceFit(candidate, searchContext)
       };
-      
-      const overallScore = this.calculateWeightedScore(scores, searchContext.weights);
+      const overallScore = scores.experience_fit;
       
       return {
         ...candidate,
@@ -892,18 +893,6 @@ class IntelligentCandidateRanking {
       explanations.push("Strong experience match for the role requirements");
     }
     
-    if (scores.company_prestige > 80) {
-      explanations.push("Impressive company background that adds credibility");
-    }
-    
-    if (scores.skill_relevance > 90) {
-      explanations.push("Excellent technical skill alignment");
-    }
-    
-    if (scores.career_trajectory > 85) {
-      explanations.push("Demonstrated career growth and progression");
-    }
-    
     return explanations.join("; ");
   }
 }
@@ -911,6 +900,8 @@ class IntelligentCandidateRanking {
 
 
 ## Step 6: Real-World Search Examples
+
+The examples below are illustrative output of the full pipeline: HydraDB retrieval plus the ranking and scoring code above.
 
 ### Example 1: Technical Role Search
 
@@ -924,12 +915,6 @@ AI Understanding:
 - Company context: Growth-stage startup
 - Implied skills: Frontend, backend, scaling challenges
 - Implied experience: 5+ years, startup environment
-
-Metadata Filtering:
-- career_level: 'senior'
-- company_types: ['startup', 'scale_up']
-- technical_domains: ['web_development', 'full_stack']
-- scaling_experience: true
 
 Top Results:
 1. Sarah Chen - Senior Full-Stack Engineer at Stripe (Series C)
@@ -954,7 +939,7 @@ Recruiter Query: "I need an engineering manager who transitioned from individual
 
 AI Understanding:
 - Role: Engineering manager
-- Career path: IC → Manager transition
+- Career path: IC to manager transition
 - Skill: Team building and growth
 - Industry: Tech company
 - Leadership style: Grown with teams
@@ -968,13 +953,13 @@ The AI identifies candidates who:
 
 Top Results:
 1. David Park - Engineering Manager at Airbnb
-   - IC for 4 years → Manager for 3 years
+   - IC for 4 years, then manager for 3 years
    - Grew team from 3 to 15 engineers
    - Still codes 20% of time, maintains technical credibility
    - Fit Score: 94% - "Classic IC-to-manager transition with proven team growth"
 
 2. Jessica Liu - Senior Engineering Manager at Slack
-   - Frontend engineer for 5 years → Manager for 2 years
+   - Frontend engineer for 5 years, then manager for 2 years
    - Built hiring process that scaled team 300%
    - Known for developing junior engineers into senior roles
    - Fit Score: 89% - "Strong developer background with team development focus"
@@ -1021,23 +1006,15 @@ Top Results:
 
 ### Intelligent Interview Question Generation
 
-AI search doesn't just find candidates - it helps prepare for better interviews:
+Use the retrieved profile to draft interview questions. This example takes a `role` with `title` and `min_experience`:
 
 
 ```javascript
 class AIInterviewPrep {
-  generatePersonalizedQuestions(candidate, role, recruiterHistory) {
-    const questions = {
-      technical_questions: this.generateTechnicalQuestions(candidate, role),
-      behavioral_questions: this.generateBehavioralQuestions(candidate, role),
-      company_specific: this.generateCompanyQuestions(candidate, recruiterHistory),
-      red_flag_exploration: this.generateRedFlagQuestions(candidate)
-    };
-
+  generatePersonalizedQuestions(candidate, role) {
     return {
-      ...questions,
-      interview_strategy: this.generateInterviewStrategy(candidate, role),
-      key_areas_to_explore: this.identifyKeyAreas(candidate, role)
+      technical_questions: this.generateTechnicalQuestions(candidate, role),
+      interview_strategy: this.generateInterviewStrategy(candidate, role)
     };
   }
 
@@ -1047,7 +1024,7 @@ class AIInterviewPrep {
     // Questions based on candidate's specific experience
     if (candidate.metadata?.companies) {
       candidate.metadata.companies.forEach(company => {
-        if (company.name === 'Apple' && role.includes('ML')) {
+        if (company.startsWith('Apple') && role.title.includes('ML')) {
           questions.push(
             "At Apple, you worked on the Siri team. Can you walk me through how you approached the challenge of improving speech recognition accuracy while maintaining low latency?"
           );
@@ -1079,7 +1056,7 @@ class AIInterviewPrep {
       strategy.focus_areas.push("Deep dive into specific projects and impact");
     }
 
-    if (candidate.metadata?.companies?.some(c => c.company_size === 'large_tech')) {
+    if (candidate.metadata?.company_sizes?.includes('large_tech')) {
       strategy.selling_points.push("Highlight startup agility and impact potential");
       strategy.follow_up_areas.push("Understand motivation for startup environment");
     }
@@ -1099,7 +1076,7 @@ class AIInterviewPrep {
 
 ```javascript
 const recommendedCandidateFields = {
-  // Core identification (Required by HydraDB)
+  // Core identification (only id is required; the rest helps search and display)
   id: "unique_candidate_identifier",
   database: "recruiting_database",
   collection: "ml_engineering",
@@ -1137,17 +1114,9 @@ const recommendedCandidateFields = {
 
   // Document-specific metadata
   additional_metadata: {
-    // Company history with context
-    companies: [
-      {
-        name: "Apple Inc.",
-        role: "Senior ML Engineer",
-        team: "Siri",
-        duration_years: 3,
-        company_stage: "public",
-        company_size: "large_tech"
-      }
-    ],
+    // Company history (flat lists; role details go in content.text)
+    companies: ["Apple Inc."],
+    company_sizes: ["large_tech"],
 
     // Performance indicators
     impact_metrics: {
@@ -1187,11 +1156,11 @@ const searchStrategy = {
 
 #### Query Optimization Tips
 
-1. **Use Natural Language**: Write queries as you would speak to a human recruiter
-2. **Include Context**: Add company stage, team size, and cultural requirements
-3. **Specify Experience**: Use ranges (3-5 years, 5+ years) rather than exact numbers
-4. **Combine Hard and Soft Skills**: Technical requirements + leadership/communication needs
-5. **Add Industry Context**: Startup vs. enterprise, B2B vs. consumer, etc.
+1. **Use Natural Language:** Write queries as you would speak to a human recruiter
+2. **Include Context:** Add company stage, team size, and cultural requirements
+3. **Specify Experience:** Use ranges (3-5 years, 5+ years) rather than exact numbers
+4. **Combine Hard and Soft Skills:** Technical requirements + leadership/communication needs
+5. **Add Industry Context:** Startup vs. enterprise, B2B vs. consumer, etc.
 
 ### Performance Optimization
 
@@ -1202,8 +1171,8 @@ const searchStrategy = {
 const optimizationTips = {
   // Batch candidate uploads for efficiency
   upload_strategy: {
-    batch_size: 20, // Max 20 candidates per batch
-    interval_between_batches: 1000, // 1 second between batches
+    batch_size: 20, // No fixed cap, but a batch over your plan limit returns 413 (split it)
+    interval_between_batches: 1000, // Back off further on 429 (honor Retry-After)
     // verify: always call GET /context/status after upload
   },
   
@@ -1231,23 +1200,25 @@ const optimizationTips = {
 
 ```javascript
 const hiringMetrics = {
+  // Example values: measure your own baseline before and after launch
+
   // Search quality metrics
   search_effectiveness: {
     relevant_results_percentage: 85, // % of results marked as relevant
-    average_time_to_find_candidate: "15 minutes", // vs. 2+ hours traditional
-    queries_per_successful_hire: 3.2 // vs. 15+ traditional
+    average_time_to_find_candidate: "15 minutes",
+    queries_per_successful_hire: 3.2
   },
   
   // Recruiter productivity
   recruiter_efficiency: {
-    candidates_reviewed_per_hour: 12, // vs. 4 traditional
-    interviews_scheduled_per_week: 8, // vs. 3 traditional
+    candidates_reviewed_per_hour: 12,
+    interviews_scheduled_per_week: 8,
     time_saved_per_search: "45 minutes"
   },
   
   // Hiring quality
   hire_quality: {
-    offer_acceptance_rate: 78, // Higher due to better matching
+    offer_acceptance_rate: 78, // %
     new_hire_performance_rating: 4.2, // /5 scale
     hiring_manager_satisfaction: 92 // % satisfied with candidates
   },
@@ -1262,37 +1233,21 @@ const hiringMetrics = {
 ```
 
 
-### Success Stories and ROI
-
-#### Before AI Search (Traditional Platform)
-
-- **Time per hire**: 6-8 weeks
-- **Recruiter efficiency**: 3 relevant candidates per day
-- **Search accuracy**: 35% of results relevant
-- **Offer acceptance**: 45%
-
-#### After AI Search (HydraDB-Powered)
-
-- **Time per hire**: 3-4 weeks (-50%)
-- **Recruiter efficiency**: 12 relevant candidates per day (+300%)
-- **Search accuracy**: 85% of results relevant (+140%)
-- **Offer acceptance**: 78% (+73%)
-
 ## Conclusion
 
-Building an AI-powered hiring platform with HydraDB transforms recruiting from a manual, keyword-based process into an intelligent, conversational experience. By leveraging natural language search, rich metadata, and AI memories, recruiters can:
+HydraDB moves recruiting from a manual, keyword-based process to a conversational one. With natural language search, rich metadata, and recruiter memory, recruiters can:
 
-- **Find better candidates faster**: AI understands intent beyond keywords
-- **Improve matching accuracy**: Semantic search finds relevant candidates traditional systems miss
-- **Personalize the experience**: AI memories learn each recruiter's preferences and successful patterns
-- **Scale efficiently**: Handle complex queries that would require multiple traditional searches
-- **Make data-driven decisions**: Rich insights and scoring help prioritize candidates
+- **Find better candidates faster:** AI understands intent beyond keywords
+- **Improve matching accuracy:** Semantic search finds relevant candidates traditional systems miss
+- **Personalize the experience:** Recruiter profiles capture each recruiter's preferences and successful patterns
+- **Scale efficiently:** Handle complex queries that would require multiple traditional searches
+- **Make data-driven decisions:** Rich insights and scoring help prioritize candidates
 
 The key to success lies in:
 
-1. **Rich data ingestion**: Comprehensive candidate profiles with structured metadata
-2. **Natural language interface**: Let recruiters search as they think and speak
-3. **AI memory utilization**: Continuous learning from recruiter behavior and preferences
-4. **Iterative refinement**: Improving search quality based on hiring outcomes
+1. **Rich data ingestion:** Comprehensive candidate profiles with structured metadata
+2. **Natural language interface:** Let recruiters search as they think and speak
+3. **Recruiter memory:** Keep each recruiter's preferences and past hires, and feed them into ranking
+4. **Iterative refinement:** Improving search quality based on hiring outcomes
 
-Start with core search functionality, gradually add AI memories and personalization, and continuously optimize based on recruiter feedback and hiring success metrics. The result will be a hiring platform that doesn't just find candidates - it understands what makes great hires.
+Start with core search functionality, gradually add AI memories and personalization, and continuously optimize based on recruiter feedback and hiring success metrics. The result will be a hiring platform that doesn't just find candidates; it understands what makes great hires.

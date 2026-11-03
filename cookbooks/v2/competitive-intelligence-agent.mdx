@@ -1,13 +1,13 @@
 ---
 title: "AI Competitive Intelligence Agent"
-description: "Continuously ingest competitor press releases, job postings, customer reviews, and earnings transcripts into HydraDB. Answer 'What is Competitor X doing right now?' and 'How has their messaging shifted over the last 6 months?' with full temporal context. Every API call in this guide is real and verified."
+description: "Continuously ingest competitor press releases, job postings, customer reviews, and earnings transcripts into HydraDB. Answer 'What is Competitor X doing right now?' and 'How has their messaging shifted over the last 6 months?' with full temporal context."
 ---
 
-This guide walks you through building a **competitive intelligence agent with persistent temporal memory** powered by HydraDB. Unlike a static market research doc or a naive RAG pipeline, this agent continuously ingests competitor signals and answers both point-in-time questions ("What has Acme Corp announced about enterprise?") and trend questions ("How has their pricing messaging shifted since Q1?") - with full context across press releases, job postings, customer reviews, and earnings calls unified in one retrieval layer.
+This guide walks you through building a **competitive intelligence agent with persistent temporal memory** powered by HydraDB. Unlike a static market research doc or a naive RAG pipeline, this agent continuously ingests competitor signals and answers both point-in-time questions ("What has Acme Corp announced about enterprise?") and trend questions ("How has their pricing messaging shifted since Q1?"), with full context across press releases, job postings, customer reviews, and earnings calls unified in one retrieval layer.
 
-> **Note**: All code in this guide is production-ready and uses real HydraDB endpoints. Base URL: `https://api.hydradb.com`. Get your API key at [app.hydradb.com](https://app.hydradb.com).
+> **API setup:** Base URL: `https://api.hydradb.com`. Get your API key at [app.hydradb.com](https://app.hydradb.com).
 
-> **Goal**: Build an agent that ingests four signal types from competitor sources, verifies indexing, and answers competitive queries using `POST /query` with `recency_bias` tuned per query type - point-in-time or trend. Full round-trip under 200ms.
+> **Goal**: Build an agent that ingests four signal types from competitor sources, verifies indexing, and answers competitive queries using `POST /query` with `recency_bias` tuned per query type: point-in-time or trend.
 
 ---
 
@@ -32,15 +32,15 @@ By the end of this cookbook, you'll be able to:
 
 ## The Problem with Manual Competitive Research
 
-Most competitive intelligence today is a manual process - a researcher Googles, copies links into a Notion page, and writes a monthly summary. Ask "What did Competitor X say about enterprise last quarter?" and there's no system to answer it.
+Most competitive intelligence today is a manual process: a researcher Googles, copies links into a Notion page, and writes a monthly summary. Ask "What did Competitor X say about enterprise last quarter?" and there's no system to answer it.
 
-Standard RAG pipelines don't solve this either. A vector store treats a press release from 18 months ago identically to one from last week - they produce similar embeddings. Ask "how has their messaging shifted?" and you get a random mix of old and new signals with no temporal ranking. Ask "what are they announcing right now?" and stale results pollute the top of the list.
+Standard RAG pipelines don't solve this either. A vector store treats a press release from 18 months ago identically to one from last week; they produce similar embeddings. Ask "how has their messaging shifted?" and you get a random mix of old and new signals with no temporal ranking. Ask "what are they announcing right now?" and stale results pollute the top of the list.
 
 HydraDB fixes this with three capabilities that standard vector search can't replicate:
 
-1. **Timestamp-aware ranking** - every uploaded source is ranked by recency at query time. Set `recency_bias: 0.8` to surface the latest signals first. Set `recency_bias: 0.3` to pull historical signals for trend comparison.
-2. **Context graph** - HydraDB automatically extracts entities and links them across sources. A job posting mentioning "enterprise security", a press release announcing an enterprise tier, and a G2 review complaining about enterprise onboarding are automatically connected - so a query about enterprise strategy surfaces all three.
-3. **Collection isolation** - each competitor gets their own `collection` within a shared `competitive-intel` database. Query one competitor in isolation or compare across all of them in a single call.
+1. **Timestamp-aware ranking:** every source you upload with an event time (`event_time` in `additional_metadata`) is ranked by recency at query time. Set `recency_bias: 0.8` to surface the latest signals first. Set `recency_bias: 0.3` to pull historical signals for trend comparison.
+2. **Context graph:** HydraDB automatically extracts entities and links them across sources. A job posting mentioning "enterprise security", a press release announcing an enterprise tier, and a G2 review complaining about enterprise onboarding are automatically connected, so a query about enterprise strategy surfaces all three.
+3. **Collection isolation:** each competitor gets their own `collection` within a shared `competitive-intel` database. Query one competitor in isolation or compare across all of them in a single call.
 
 ---
 
@@ -62,9 +62,9 @@ graph LR
 
 ---
 
-## Step 1 - Create Database
+## Step 1: Create Database
 
-One database for all competitive intelligence. Collections isolate by competitor and are created automatically on the first upload - no setup required.
+One database for all competitive intelligence. Collections isolate by competitor and are created automatically on the first upload; no setup required.
 
 ```bash
 curl -X POST 'https://api.hydradb.com/databases' \
@@ -75,20 +75,24 @@ curl -X POST 'https://api.hydradb.com/databases' \
 
 ```python
 # setup.py
-import os
+import os, time
 from hydra_db import HydraDB
 
 client = HydraDB(token=os.environ["HYDRA_DB_API_KEY"])
 DATABASE_ID = "competitive-intel"
 
 client.databases.create(database=DATABASE_ID)
+
+# Creation is asynchronous. Wait until the database can take writes.
+while not client.databases.status(database=DATABASE_ID).data.infra.ready_for_ingestion:
+    time.sleep(2)
 print(f"✓ Database '{DATABASE_ID}' ready.")
 
 def collection_for(competitor: str) -> str:
     """Normalise competitor name to a valid collection."""
     return competitor.lower().replace(" ", "-")
 
-# e.g. collection_for("Acme Corp") → "acme-corp"
+# e.g. collection_for("Acme Corp") returns "acme-corp"
 ```
 
 Output:
@@ -96,19 +100,21 @@ Output:
 ✓ Database 'competitive-intel' ready.
 ```
 
-> **Collection pattern**: Use `collection: "acme-corp"`, `collection: "betacorp"` on every upload. This lets you query a single competitor (`collection: "acme-corp"`) or all competitors at once (omit `collection`). Collections are created automatically on first write.
+> **Collection pattern**: Use `collection: "acme-corp"`, `collection: "betacorp"` on every upload. This lets you query a single competitor (`collection: "acme-corp"`) or several competitors at once (list them in `collections`; every listed collection must exist). Collections are created automatically on first write.
 
 ---
 
-## Step 2 - Ingest Competitor Signals
+## Step 2: Ingest Competitor Signals
 
 All four signal types use `POST /context/ingest`. This endpoint uses **multipart form-data**, not JSON. `database` and `collection` are form fields, not body keys.
 
-> **Important**: Do not set `Content-Type: application/json` on ingestion requests. The endpoint expects `multipart/form-data`. Let your HTTP client set the boundary automatically - only pass `Authorization` in headers.
+> **Important**: Do not set `Content-Type: application/json` on ingestion requests. The endpoint expects `multipart/form-data`. Let your HTTP client set the boundary automatically; only pass `Authorization` in headers.
 
-> **Batch limit**: Max 20 sources per request. Wait 1 second between batches. Always call `GET /context/status` before running search - queries against unindexed sources return empty results.
+> **Indexing first**: Always call `GET /context/status` before running search: queries against unindexed sources return empty results.
 
-The upload response looks like this for all signal types:
+> **Event time drives recency**: `recency_bias` ranks by the event time in each source's `additional_metadata` (`event_time`, `timestamp`, or `date`), not by upload time. A source without one is ranked by relevance only. Each connector below sends `event_time` in `document_metadata`: pass the publish date when you have it, or it falls back to the time of upload.
+
+The upload response looks like this for all signal types (this is the envelope's `data` field, `result.data` in the SDK):
 
 ```json
 {
@@ -127,7 +133,7 @@ The upload response looks like this for all signal types:
 }
 ```
 
-Save the `id` from `results[0].id` - you need it to verify indexing.
+Save the `id` from `results[0].id`; you need it to verify indexing.
 
 ### 2.1 Press Releases & Blog Posts
 
@@ -135,55 +141,66 @@ Press releases are the most explicit signal. Prepend signal metadata to the cont
 
 ```python
 # connectors/press.py
-import os, time
+import os, time, json
+from datetime import datetime, timezone
 from hydra_db import HydraDB
 
 client = HydraDB(token=os.environ["HYDRA_DB_API_KEY"])
 DATABASE_ID = "competitive-intel"
 
 
-def ingest_press_release(competitor: str, title: str, text: str) -> str:
+def ingest_press_release(competitor: str, title: str, text: str, published_at: str = None) -> str:
     """
     Upload a press release or blog post to HydraDB.
-    competitor: normalised name, e.g. "acme-corp"
-    title:      article headline
-    text:       full article body
-    Returns:    id for verification
+    competitor:   normalised name, e.g. "acme-corp"
+    title:        article headline
+    text:         full article body
+    published_at: ISO 8601 publish date; defaults to now
+    Returns:      id for verification
     """
     content  = f"Signal type: press_release\nCompetitor: {competitor}\nTitle: {title}\n\n{text}"
     filename = f"press-{competitor}-{int(time.time())}.txt"
+    # One item per file in `documents`. event_time drives recency ranking.
+    document_metadata = json.dumps([{"additional_metadata": {
+        "signal_type": "press_release",
+        "event_time":  published_at or datetime.now(timezone.utc).isoformat(),
+    }}])
 
     result = client.context.ingest(
         database=DATABASE_ID,
         collection=competitor,
         documents=[(filename, content.encode("utf-8"), "text/plain")],
+        document_metadata=document_metadata,
     )
     id = result.data.results[0].id
-    print(f"[press] Uploaded {filename} → id: {id}")
+    print(f"[press] Uploaded {filename} id: {id}")
     return id
 ```
 
 ### 2.2 Job Postings
 
-Job postings are one of the strongest competitive signals - they reveal exactly what a company is building before any press release. A spike in "enterprise security engineer" roles signals an enterprise push. "ML platform engineer" roles signal AI product investment. Include the job title and department in the content so HydraDB's graph links related roles across uploads.
+Job postings are one of the strongest competitive signals: they reveal exactly what a company is building before any press release. A spike in "enterprise security engineer" roles signals an enterprise push. "ML platform engineer" roles signal AI product investment. Include the job title and department in the content so HydraDB's graph links related roles across uploads.
 
 ```python
 # connectors/jobs.py
-import os, time
+import os, time, json
+from datetime import datetime, timezone
 from hydra_db import HydraDB
 
 client = HydraDB(token=os.environ["HYDRA_DB_API_KEY"])
 DATABASE_ID = "competitive-intel"
 
 
-def ingest_job_posting(competitor: str, title: str, department: str, description: str) -> str:
+def ingest_job_posting(competitor: str, title: str, department: str, description: str,
+                       published_at: str = None) -> str:
     """
     Upload a job posting from LinkedIn, Greenhouse, Lever, etc.
-    competitor:  e.g. "acme-corp"
-    title:       job title - included in content for graph linking
-    department:  e.g. "Engineering", "Product", "Sales"
-    description: full job description text
-    Returns:     id for verification
+    competitor:   e.g. "acme-corp"
+    title:        job title - included in content for graph linking
+    department:   e.g. "Engineering", "Product", "Sales"
+    description:  full job description text
+    published_at: ISO 8601 posting date; defaults to now
+    Returns:      id for verification
     """
     content = (
         f"Signal type: job_posting\n"
@@ -193,24 +210,30 @@ def ingest_job_posting(competitor: str, title: str, department: str, description
         f"{description}"
     )
     filename = f"job-{competitor}-{int(time.time())}.txt"
+    document_metadata = json.dumps([{"additional_metadata": {
+        "signal_type": "job_posting",
+        "event_time":  published_at or datetime.now(timezone.utc).isoformat(),
+    }}])
 
     result = client.context.ingest(
         database=DATABASE_ID,
         collection=competitor,
         documents=[(filename, content.encode("utf-8"), "text/plain")],
+        document_metadata=document_metadata,
     )
     id = result.data.results[0].id
-    print(f"[jobs] Uploaded {filename} → id: {id}")
+    print(f"[jobs] Uploaded {filename} id: {id}")
     return id
 ```
 
 ### 2.3 Customer Reviews (G2 / Capterra / Trustpilot)
 
-Customer reviews are the most honest signal - they surface real objections, real pain points, and what customers actually value. None of this appears in official press releases. Negative reviews (rating ≤ 2) are especially valuable for building sales battlecards.
+Customer reviews are the most honest signal: they surface real objections, real pain points, and what customers actually value. None of this appears in official press releases. Negative reviews (rated 2 or lower) are especially valuable for building sales battlecards.
 
 ```python
 # connectors/reviews.py
-import os, time
+import os, time, json
+from datetime import datetime, timezone
 from hydra_db import HydraDB
 
 client = HydraDB(token=os.environ["HYDRA_DB_API_KEY"])
@@ -223,14 +246,16 @@ def ingest_review(
     body:          str,
     rating:        int,
     reviewer_role: str = "Unknown",
+    published_at:  str = None,
 ) -> str:
     """
     Upload a customer review from G2, Capterra, Trustpilot, etc.
     competitor:    e.g. "acme-corp"
     title:         review headline
     body:          full review text
-    rating:        1–5 stars
+    rating:        1 to 5 stars
     reviewer_role: e.g. "IT Director", "VP Engineering"
+    published_at:  ISO 8601 review date; defaults to now
     Returns:       id for verification
     """
     sentiment = "positive" if rating >= 4 else "negative" if rating <= 2 else "neutral"
@@ -243,36 +268,44 @@ def ingest_review(
         f"{body}"
     )
     filename = f"review-{competitor}-{int(time.time())}.txt"
+    document_metadata = json.dumps([{"additional_metadata": {
+        "signal_type": "customer_review",
+        "event_time":  published_at or datetime.now(timezone.utc).isoformat(),
+    }}])
 
     result = client.context.ingest(
         database=DATABASE_ID,
         collection=competitor,
         documents=[(filename, content.encode("utf-8"), "text/plain")],
+        document_metadata=document_metadata,
     )
     id = result.data.results[0].id
-    print(f"[reviews] Uploaded {filename} ({sentiment}) → id: {id}")
+    print(f"[reviews] Uploaded {filename} ({sentiment}) id: {id}")
     return id
 ```
 
 ### 2.4 Earnings Call Transcripts
 
-For public competitors, earnings calls contain the most explicit strategic signals - pricing changes, market focus, competitive responses, and financial trajectory. Upload as plain text. HydraDB handles chunking and indexing automatically.
+For public competitors, earnings calls contain the most explicit strategic signals: pricing changes, market focus, competitive responses, and financial trajectory. Upload as plain text. HydraDB handles chunking and indexing automatically.
 
 ```python
 # connectors/earnings.py
-import os, time
+import os, time, json
+from datetime import datetime, timezone
 from hydra_db import HydraDB
 
 client = HydraDB(token=os.environ["HYDRA_DB_API_KEY"])
 DATABASE_ID = "competitive-intel"
 
 
-def ingest_earnings_transcript(competitor: str, quarter: str, transcript: str) -> str:
+def ingest_earnings_transcript(competitor: str, quarter: str, transcript: str,
+                               call_date: str = None) -> str:
     """
     Upload an earnings call transcript.
     competitor:  e.g. "acme-corp"
     quarter:     e.g. "2024-Q3"
     transcript:  full text of the earnings call
+    call_date:   ISO 8601 date of the call; defaults to now
     Returns:     id for verification
     """
     content = (
@@ -282,34 +315,40 @@ def ingest_earnings_transcript(competitor: str, quarter: str, transcript: str) -
         f"{transcript}"
     )
     filename = f"earnings-{competitor}-{quarter}-{int(time.time())}.txt"
+    document_metadata = json.dumps([{"additional_metadata": {
+        "signal_type": "earnings_call",
+        "event_time":  call_date or datetime.now(timezone.utc).isoformat(),
+    }}])
 
     result = client.context.ingest(
         database=DATABASE_ID,
         collection=competitor,
         documents=[(filename, content.encode("utf-8"), "text/plain")],
+        document_metadata=document_metadata,
     )
     id = result.data.results[0].id
-    print(f"[earnings] Uploaded {filename} → id: {id}")
+    print(f"[earnings] Uploaded {filename} id: {id}")
     return id
 ```
 
 ---
 
-## Step 3 - Verify Indexing
+## Step 3: Verify Indexing
 
-After uploading, poll `GET /context/status` until `indexing_status` is `completed`. HydraDB indexes asynchronously - typically 10–30 seconds per file. Do not query until indexing is complete; unindexed sources return empty results.
+After uploading, poll `GET /context/status` until `indexing_status` is `completed`. HydraDB indexes asynchronously, typically 10 to 30 seconds per file. Do not query until indexing is complete; unindexed sources return empty results. A source becomes searchable at `graph_creation` (while the graph is still being built), is done at `completed`, and failed at `errored`.
 
-> **Note**: [`GET /context/status`](/api-reference/v2/endpoint/source-status) takes `ids` and `database` as **query parameters**. Pass multiple `ids` to check a batch in one call.
+> **Note**: [`GET /context/status`](/api-reference/v2/endpoint/source-status) takes `ids`, `database`, and `collection` as **query parameters**. Status is scoped to the collection, so pass the competitor's collection or the lookup returns `errored` with `error_code: "FILE_NOT_FOUND"`. Pass multiple `ids` to check a batch in one call.
 
 ```bash
 curl -G \
   'https://api.hydradb.com/context/status' \
   -H "Authorization: Bearer YOUR_API_KEY" \
   --data-urlencode "database=competitive-intel" \
+  --data-urlencode "collection=acme-corp" \
   --data-urlencode "ids=YOUR_ID"
 ```
 
-**Response when indexed**:
+**Response when indexed** (the envelope's `data` field):
 ```json
 {
   "statuses": [
@@ -334,7 +373,7 @@ client = HydraDB(token=os.environ["HYDRA_DB_API_KEY"])
 DATABASE_ID = "competitive-intel"
 
 
-def wait_until_indexed(id: str, max_tries: int = 20, interval: int = 3) -> None:
+def wait_until_indexed(id: str, collection: str, max_tries: int = 20, interval: int = 3) -> None:
     """
     Poll /context/status until the item is indexed or times out.
     Raises RuntimeError if indexing errors. Warns on timeout (may still complete).
@@ -343,6 +382,7 @@ def wait_until_indexed(id: str, max_tries: int = 20, interval: int = 3) -> None:
         time.sleep(interval)
         status_result = client.context.status(
             database=DATABASE_ID,
+            collection=collection,   # the competitor collection the source went into
             ids=[id],
         )
         items  = status_result.data.statuses or []
@@ -352,7 +392,7 @@ def wait_until_indexed(id: str, max_tries: int = 20, interval: int = 3) -> None:
             print(f"Indexed ✓ ({id})")
             return
         if status == "errored":
-            raise RuntimeError(f"Indexing failed for id: {id}")
+            raise RuntimeError(f"Indexing failed for id: {id} ({items[0].error_code})")
 
         print(f"Indexing... {status or 'queued'} (attempt {i+1}/{max_tries})")
 
@@ -369,7 +409,7 @@ Indexed ✓ (d25fb5a6-0378-4bcb-8cbc-2012c3d12ca2)
 
 ---
 
-## Step 4 - Query: Point-in-Time Questions
+## Step 4: Query Point-in-Time Questions
 
 Use `POST /query` to answer "What is Competitor X doing right now?". Set `recency_bias: 0.8` so HydraDB strongly weights the most recent signals. Set `mode: "thinking"` to enable multi-query reranking.
 
@@ -427,7 +467,7 @@ def print_results(result) -> None:
     chunks = result.data.chunks or []
     print(f"\n{len(chunks)} chunks retrieved:\n")
     for chunk in chunks:
-        fname = (chunk.additional_metadata or {}).get("filename", "unknown")
+        fname = chunk.source_title or "unknown"   # defaults to the uploaded filename
         score = chunk.relevancy_score or 0
         print(f"  [{fname} - {score:.2f}]")
         print(f"  {(chunk.chunk_content or '')[:200]}...")
@@ -444,17 +484,18 @@ print_results(result)
 ```
 
 **Response structure**:
-```json
+```text
 {
   "chunks": [
     {
       "chunk_uuid": "d25fb5a6-..._chunk_0",
       "id":  "d25fb5a6-...",
       "chunk_content": "Signal type: press_release\nCompetitor: acme-corp\n\nAcme Corp today announced AcmeShield...",
+      "source_title": "press-acme-corp-1234567890.txt",
       "relevancy_score": 0.818,
       "additional_metadata": {
-        "filename":      "press-acme-corp-1234567890.txt",
-        "collection": "acme-corp"
+        "signal_type": "press_release",
+        "event_time":  "2024-09-12T14:00:00+00:00"
       }
     }
   ],
@@ -481,13 +522,13 @@ print_results(result)
 }
 ```
 
-> **Reading graph_context**: The `chunk_relations` array shows entities HydraDB automatically extracted and linked across all your uploaded sources. A press release mentioning "AcmeShield" is connected to a job posting mentioning "SAML/SSO" and a G2 review mentioning "enterprise onboarding" - no manual tagging required. This is what surfaces all three when you ask about "enterprise strategy".
+> **Reading graph_context**: The `chunk_relations` array shows entities HydraDB automatically extracted and linked across all your uploaded sources. A press release mentioning "AcmeShield" is connected to a job posting mentioning "SAML/SSO" and a G2 review mentioning "enterprise onboarding", with no manual tagging required. This is what surfaces all three when you ask about "enterprise strategy".
 
 ---
 
-## Step 5 - Query: Trend & Temporal Questions
+## Step 5: Query Trend & Temporal Questions
 
-For trend and comparison questions, reduce `recency_bias` to `0.3` so HydraDB surfaces both old and new signals. This gives it the historical range it needs to answer "how has X changed?" - a question that naive RAG cannot reliably answer at all.
+For trend and comparison questions, reduce `recency_bias` to `0.3` so HydraDB surfaces both old and new signals. This gives it the historical range it needs to answer "how has X changed?", a question that naive RAG cannot reliably answer at all.
 
 ```python
 # query/trends.py
@@ -523,15 +564,15 @@ print_results(result2)
 ```
 
 > **recency_bias guide**:
-> - `0.8–1.0` - Point-in-time: "What is X doing now?" Strongly weights the latest signals.
-> - `0.3–0.5` - Trend: "How has X changed?" Surfaces old and new for comparison.
-> - `0.0` - No bias: equal weight across all time periods.
+> - `0.8` to `1.0`: Point-in-time: "What is X doing now?" Strongly weights the latest signals.
+> - `0.3` to `0.5`: Trend: "How has X changed?" Surfaces old and new for comparison.
+> - `0.0`: No bias, equal weight across all time periods. Send it explicitly; omitting `recency_bias` applies a mild `0.4` tilt.
 
-> **Multi-competitor comparison**: To compare two competitors in one query, omit `collection` entirely and ask "How does acme-corp's enterprise positioning compare to betacorp's?" HydraDB searches across all collections within the database and surfaces signals from both.
+> **Multi-competitor comparison**: To compare two competitors in one query, pass both in `collections` (for example `["acme-corp", "betacorp"]`) and ask "How does acme-corp's enterprise positioning compare to betacorp's?" HydraDB runs the query against each listed collection and surfaces signals from both. Every listed collection must already exist. Without `collection` or `collections`, the query only searches the database's default collection.
 
 ---
 
-## Step 6 - Weekly Briefing Agent
+## Step 6: Weekly Briefing Agent
 
 Push a proactive Monday-morning briefing to each analyst's Slack channel. Each analyst profile runs a set of questions through [`/query`](/api-reference/v2/endpoint/query) with `recency_bias: 0.85` to surface the freshest signals.
 
@@ -640,7 +681,7 @@ All endpoints used in this cookbook. Base URL: `https://api.hydradb.com` · Head
 |--------|----------|---------|
 | `POST` | `/databases` | Create the competitive-intel database |
 | `POST` | `/context/ingest` | Upload a signal file (multipart form-data) |
-| `GET` | `/context/status?database=...&ids=...` | Check indexing status |
+| `GET` | `/context/status?database=...&collection=...&ids=...` | Check indexing status |
 | `POST` | `/query` | Query indexed signals |
 
 ### Create Database
@@ -657,13 +698,14 @@ All endpoints used in this cookbook. Base URL: `https://api.hydradb.com` · Head
 | `database` | Text | `competitive-intel` |
 | `collection` | Text | `acme-corp` |
 | `documents` | File | your `.txt` or `.pdf` file |
+| `document_metadata` | Text | JSON array, one item per file: `[{"additional_metadata": {"signal_type": "press_release", "event_time": "2024-09-12T14:00:00Z"}}]` |
 
 ### Verify Processing (query params)
 ```
-GET /context/status?database=competitive-intel&ids=YOUR_ID
+GET /context/status?database=competitive-intel&collection=acme-corp&ids=YOUR_ID
 ```
 
-### Full Search - Point-in-Time
+### Full Search: Point-in-Time
 ```json
 {
   "database":     "competitive-intel",
@@ -677,7 +719,7 @@ GET /context/status?database=competitive-intel&ids=YOUR_ID
 }
 ```
 
-### Full Search - Trend
+### Full Search: Trend
 ```json
 {
   "database":     "competitive-intel",
@@ -699,13 +741,13 @@ Tested across 3 competitor corpora (150+ sources each: press releases, job posti
 
 | Metric | Manual / Naive RAG | HydraDB CI Agent | Delta |
 |--------|-------------------|------------------|-------|
-| Time to answer "what is X doing now?" | 30–60 min (manual) | under 10 seconds | **200x faster** |
+| Time to answer "what is X doing now?" | 30 to 60 min (manual) | under 10 seconds | **200x faster** |
 | Search accuracy on temporal questions | 28% | 81% | **+189%** |
 | Stale signals surfaced in top results | 39% | 6% | **−85%** |
 | Signal sources covered | Press only (typically) | All 4 unified | **4x coverage** |
 | P95 query latency | N/A (manual) | under 200 ms | **Sub-second** |
 
-> The 28% accuracy for temporal questions in naive RAG is a structural limitation - embedding a Q2 press release and a Q4 press release produces similar vectors. They look alike semantically. HydraDB's `recency_bias` parameter and timestamp-aware ranking distinguish them at query time.
+> The 28% accuracy for temporal questions in naive RAG is a structural limitation: embedding a Q2 press release and a Q4 press release produces similar vectors. They look alike semantically. HydraDB's `recency_bias` parameter and timestamp-aware ranking distinguish them at query time.
 
 > **Benchmark methodology**: Figures are based on internal HydraDB testing. See [research.hydradb.com/hydradb.pdf](https://research.hydradb.com/hydradb.pdf) for the full methodology. Results will vary by corpus size, content quality, and query distribution.
 
@@ -735,9 +777,9 @@ competitive_intel_agent/
 ## Requirements
 
 ```
-requests
+hydradb-sdk
+requests           # Slack briefings post with requests
 python-dotenv
-slack-sdk          # only if using Slack briefings
 ```
 
 ---
@@ -745,9 +787,9 @@ slack-sdk          # only if using Slack briefings
 ## Next Steps
 
 1. Run `setup.py` to create your database and verify the connection.
-2. Run each connector script with real competitor data - start with one competitor and two signal types.
+2. Run each connector script with real competitor data; start with one competitor and two signal types.
 3. Verify all uploads are indexed before querying.
 4. Run `python query/search.py` to confirm results look correct.
 5. Schedule `briefing/weekly.py` via cron (`0 8 * * 1`) or a workflow tool like n8n.
 
-The agent improves as you add more signals - each new press release, job posting, or review adds to the context graph that HydraDB builds automatically. There is no retraining step. Run the connector scripts on a schedule and the intelligence layer stays current without any manual curation.
+The agent improves as you add more signals: each new press release, job posting, or review adds to the context graph that HydraDB builds automatically. There is no retraining step. Run the connector scripts on a schedule and the intelligence layer stays current without any manual curation.
