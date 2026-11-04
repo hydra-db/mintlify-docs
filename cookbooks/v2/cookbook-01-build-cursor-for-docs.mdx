@@ -48,7 +48,7 @@ You need three things before writing any code:
 
 ```bash
 mkdir cursor-for-docs && cd cursor-for-docs
-echo "HYDRA_DB_API_KEY=hdb_your_key_here" > .env
+echo "HYDRADB_API_KEY=hdb_your_key_here" > .env
 ```
 
 Create `config.py` in the project root. This is the canonical configuration used by every script in this guide:
@@ -61,10 +61,10 @@ from hydra_db import HydraDB
 load_dotenv()
 
 # HydraDB
-HYDRA_DB_API_KEY = os.environ["HYDRA_DB_API_KEY"]
+HYDRADB_API_KEY = os.environ["HYDRADB_API_KEY"]
 DATABASE_ID     = os.environ.get("HYDRADB_TENANT_ID", "engineering-docs")
 
-client = HydraDB(token=HYDRA_DB_API_KEY)
+client = HydraDB(token=HYDRADB_API_KEY)
 
 # OpenAI
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
@@ -104,7 +104,6 @@ def _poll_until_ready(timeout=180, interval=4):
         infra = status.infra
         if infra.scheduler_status and infra.graph_status and infra.vectorstore_status.knowledge and infra.vectorstore_status.memories:
             print("✓ Database ready."); return
-        print(f"  scheduler={infra.scheduler_status} graph={infra.graph_status} vectorstore={infra.vectorstore_status} - retrying in {interval}s")
         time.sleep(interval)
     raise TimeoutError("Database not ready within 180s")
 
@@ -118,13 +117,12 @@ python3 phase0/create_tenant.py
 **Expected output:**
 
 ```
-Accepted: {'database': 'engineering-docs', 'status': 'accepted', 'message': 'Database accepted. Poll /databases/status for readiness.'}
+Accepted
 Polling for readiness...
-  scheduler=False graph=False vectorstore=[False, False] - retrying in 4s
 ✓ Database ready.
 ```
 
-**If it fails:** `401` - API key wrong or missing `Bearer ` prefix. Confirm `.env` has `HYDRA_DB_API_KEY=hdb_abc123` with no surrounding quotes.
+**If it fails:** `401` - API key wrong or missing `Bearer ` prefix. Confirm `.env` has `HYDRADB_API_KEY=hdb_abc123` with no surrounding quotes.
 
 ---
 
@@ -169,22 +167,21 @@ def upload_file(filepath: str):
             documents=[(filename, f, "text/markdown")],
         )
 
-    print("RESULT:", result)
+    item = result.data.results[0]
+    print("RESULT:", item.id, item.status)
     return result
 
 if __name__ == "__main__":
     result = upload_file("phase0/sample_docs/auth_middleware.md")
     # Note the id from the response - you need it for Step 3
-    print("\nCopy your id for use in verify.py:", result)
+    print("Copy your id for use in verify.py:", result.data.results[0].id)
 ```
 
 **Expected output:**
 
 ```
-STATUS CODE: 200
-RESPONSE: {"results": [{"id": "YOUR_ID_HERE", "filename": "auth_middleware.md", "status": "accepted", "error": null}]}
-
-Copy your id for use in verify.py: {'results': [{'id': 'YOUR_ID_HERE', 'filename': 'auth_middleware.md', 'status': 'accepted', 'error': None}]}
+RESULT: YOUR_ID_HERE queued
+Copy your id for use in verify.py: YOUR_ID_HERE
 ```
 
 The exact value of `id` depends on HydraDB's internal file registration. Copy the value returned and use it in Step 3.
@@ -201,6 +198,8 @@ The exact value of `id` depends on HydraDB's internal file registration. Copy th
 
 Replace `YOUR_ID_HERE` with the `id` from Step 2:
 
+Save this as `phase0/verify.py`.
+
 ```python
 import sys, os, time
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
@@ -214,20 +213,24 @@ def verify_item(id: str, timeout: int = 120, interval: int = 3):
     Polls /context/status until indexing_status is "completed" or "errored".
     """
     print(f"Verifying '{id}'...")
+    last_status = None
     deadline = time.time() + timeout
     while time.time() < deadline:
         status = client.context.status(
             database=DATABASE_ID,
             ids=[id],
         )
-        print("STATUS:", status)
-
         items = status.data.statuses or []
         if items:
             s = items[0].indexing_status
-            if   s == "completed": print(f"✓ '{id}' ready."); return
-            elif s == "errored":   print("Indexing errored."); return
-            print(f"  indexing_status: {s} - waiting...")
+            if s != last_status:
+                print("STATUS:", s)
+                last_status = s
+            if s == "completed":
+                print(f"✓ '{id}' ready.")
+                return
+            if s == "errored":
+                raise RuntimeError(f"Indexing errored for '{id}'")
 
         time.sleep(interval)
     raise TimeoutError("Indexing timed out")
@@ -236,15 +239,12 @@ if __name__ == "__main__":
     verify_item(ITEM_ID)
 ```
 
-**Expected output:**
+**Example output when indexing completes (SDK 2.1.7 shape):** Read `status.data.statuses[0].indexing_status`. A run can also report `processing`.
 
 ```
 Verifying 'YOUR_ID_HERE'...
-STATUS CODE: 200
-RESPONSE: {"statuses": [{"id": "YOUR_ID_HERE", "indexing_status": "processing"}]}
-  indexing_status: processing - waiting...
-STATUS CODE: 200
-RESPONSE: {"statuses": [{"id": "YOUR_ID_HERE", "indexing_status": "completed"}]}
+STATUS: queued
+STATUS: completed
 ✓ 'YOUR_ID_HERE' ready.
 ```
 
@@ -292,32 +292,18 @@ if __name__ == "__main__":
     chunks  = data.data.chunks or []     # iterate the "chunks" array
     sources = data.data.sources or []    # sources list for citations
 
-    print(f"\nChunks returned: {len(chunks)}")
-    for i, chunk in enumerate(chunks, 1):
-        chunk_content = chunk.chunk_content or ""  # always use chunk_content
-        score         = chunk.relevancy_score if chunk.relevancy_score is not None else "?"
-        print(f"\n[{i}] relevancy_score={score}")
-        print(f"     {chunk_content[:300]}")
-
-    print(f"\nSources: {[s.title for s in sources]}")
+    print("Chunks found:", bool(chunks))
+    if chunks:
+        print("First chunk:", (chunks[0].chunk_content or "")[:300])
+    print("Sources:", sorted({s.title for s in sources if s.title}))
 ```
 
-**Expected output:**
+**Example output after indexing (SDK 2.1.7 shape):** Read `data.data.chunks[].chunk_content` and `data.data.sources[].title`. Chunk text can vary.
 
 ```
-STATUS CODE: 200
-
-Chunks returned: 2
-
-[1] relevancy_score=0.94
-     Token validation is skipped for requests from internal IP ranges
-     (10.0.0.0/8 and 172.16.0.0/12). Service-to-service calls within
-     the VPC caused circular dependency issues during startup...
-
-[2] relevancy_score=0.87
-     The security team approved this exception in RFC-007, on the condition
-     that internal network access is controlled at the VPC level.
-
+Chunks found: True
+First chunk: Token validation is skipped for requests from internal IP ranges
+...
 Sources: ['auth_middleware.md']
 ```
 
@@ -386,7 +372,7 @@ The response also includes a `sources` array - a deduplicated list of the origin
 import sys, os, json, time, subprocess, pathlib
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from config import client, DATABASE_ID
-from phase0.verify import verify_file
+from phase0.verify import verify_item
 
 TEXT_EXTS = {".py",".ts",".js",".go",".rs",".java",".md",".yaml",".toml",".txt"}
 SKIP_DIRS = {".git","node_modules","dist","build","__pycache__",".venv"}
@@ -409,7 +395,7 @@ def upload_batch(batch: list) -> list:
     return ids
 
 def verify_batch(ids: list):
-    for fid in ids: verify_file(fid)
+    for fid in ids: verify_item(fid)
 
 def ingest_directory(repo_path: str, repo_name: str) -> list:
     batch, all_ids = [], []
@@ -829,7 +815,7 @@ The flow through the backend is:
 ```
 backend/
 ├── __init__.py       - makes backend a package so imports work
-├── config.py         - env vars, HYDRA_DB_API_KEY, HydraDB client, OpenAI keys, search defaults
+├── config.py         - env vars, HYDRADB_API_KEY, HydraDB client, OpenAI keys, search defaults
 ├── hydra_client.py   - search_docs() wrapper for HydraDB retrieval
 ├── search.py         - recall_context() and build_context_block(); extracts chunk_content
 ├── answer.py         - prompt formatter, GPT-4o streaming call, anti-hallucination rules
@@ -838,7 +824,7 @@ backend/
 
 **Architecture summary:**
 
-- **`config.py`** - Loads `.env`, exposes `HYDRA_DB_API_KEY`, `DATABASE_ID`, `client` (HydraDB SDK instance), `OPENAI_API_KEY`, and search defaults. Every other file imports from here only.
+- **`config.py`** - Loads `.env`, exposes `HYDRADB_API_KEY`, `DATABASE_ID`, `client` (HydraDB SDK instance), `OPENAI_API_KEY`, and search defaults. Every other file imports from here only.
 - **`hydra_client.py`** - `search_docs()` is the HydraDB retrieval path. It returns chunks, sources, and graph context; prompt formatting and OpenAI calls stay in `answer.py`. Imported by → `search.py`, `app.py`.
 - **`search.py`** - `recall_context()` calls `search_docs()` and returns the raw payload. `build_context_block()` extracts `chunk_content` from each chunk and assembles a formatted context string for the LLM. Imported by → `app.py`.
 - **`answer.py`** - Takes the context block from `search.py`, formats the system + user prompt, and calls the OpenAI streaming API. Contains all anti-hallucination rules. Never calls HydraDB. Imported by → `app.py`.
@@ -866,7 +852,7 @@ mkdir -p backend && touch backend/__init__.py
 
 ### backend/config.py
 
-Centralises all credentials. Use `HYDRA_DB_API_KEY` as the variable name for your HydraDB key. All other backend files import from here.
+Centralises all credentials. Use `HYDRADB_API_KEY` as the variable name for your HydraDB key. All other backend files import from here.
 
 ```python
 import os
@@ -876,10 +862,10 @@ from hydra_db import HydraDB
 load_dotenv()
 
 # HydraDB
-HYDRA_DB_API_KEY = os.environ["HYDRA_DB_API_KEY"]
+HYDRADB_API_KEY = os.environ["HYDRADB_API_KEY"]
 DATABASE_ID     = os.environ.get("HYDRADB_TENANT_ID", "engineering-docs")
 
-client = HydraDB(token=HYDRA_DB_API_KEY)
+client = HydraDB(token=HYDRADB_API_KEY)
 
 # OpenAI
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
@@ -979,9 +965,9 @@ def build_context_block(recall_payload) -> str:
 
     source_lines = []
     for source in sources:
-        title     = context.title or "Untitled"
-        id = context.id or ""
-        source_lines.append(f"- {title} ({id})")
+        title     = source.title or "Untitled"
+        source_id = source.id or ""
+        source_lines.append(f"- {title} ({source_id})")
 
     sources_text = "\n".join(source_lines)
 
@@ -1271,7 +1257,7 @@ A good progression: Phase 0 search in the terminal → FastAPI `/ask` in Postman
 
 **Cause:** The Authorization header is missing or malformed. Most common: the `Bearer ` prefix is absent, quotes surround the key in `.env`, or there is a leading/trailing space in the key value.
 
-**Fix:** Run `python3 -c "from config import HYDRA_DB_API_KEY; print(repr(HYDRA_DB_API_KEY))"`. The output should be `'hdb_abc123'` - no surrounding spaces. Your header must be exactly `Authorization: Bearer hdb_abc123`.
+**Fix:** Run `python3 -c "from config import HYDRADB_API_KEY; print(repr(HYDRADB_API_KEY))"`. The output should be `'hdb_abc123'` - no surrounding spaces. Your header must be exactly `Authorization: Bearer hdb_abc123`.
 
 ### 404 - Database Does Not Exist
 
@@ -1289,13 +1275,13 @@ A good progression: Phase 0 search in the terminal → FastAPI `/ask` in Postman
 
 **Cause:** For file upload: the field name is wrong (`file` instead of `documents`), or `Content-Type: application/json` was manually set (which breaks multipart). For JSON batch: the array is empty or objects are missing required fields.
 
-**Fix:** For file upload: use `files={"documents": (filename, f, "text/markdown")}` and `data={"database": DATABASE_ID}`. Do NOT set `Content-Type` manually. For JSON batch: confirm each item has `id`, `type`, and `content.text`.
+**Fix:** For file upload, call `client.context.ingest(database=DATABASE_ID, documents=[(filename, f, "text/markdown")])` with an open binary file. Let the SDK set `Content-Type`. For JSON batch, pass a non-empty JSON string as `app_knowledge`; confirm each item has `id`, `type`, and `content.text`. Catch `hydra_db.core.api_error.ApiError` to inspect the status code and response body, as shown below.
 
 ### Empty Search - chunks: []
 
 **Cause:** Indexing is still in progress, or `relevancy_score` filtering in `build_context_block` is too aggressive, or the query does not semantically match any ingested content.
 
-**Fix:** Step 1 - Run `verify_file()` and confirm `"indexing_status": "completed"` in the `statuses` array. Step 2 - Run `phase0/search.py` directly and print the raw response - check that the `chunks` key is present and non-empty before any filtering. Step 3 - Check the `relevancy_score` values on returned chunks.
+**Fix:** Step 1 - Run `verify_item(id)` and wait for `STATUS: completed`. Step 2 - Run `phase0/search.py` and check `data.data.chunks` before any filtering. Step 3 - Check the `relevancy_score` values on returned chunks. SDK request failures raise `ApiError`; empty results alone do not.
 
 ### 429 - OpenAI insufficient_quota
 
@@ -1312,7 +1298,19 @@ def stream_answer(question: str, context: str):
     yield f"Context:\n{context[:1000]}"
 ```
 
-> 💡 **General debugging pattern.** Add `print("STATUS CODE:", resp.status_code)` and `print("RESPONSE:", resp.text[:500])` immediately after every `requests.post()` call. See the full error body before doing anything else.
+Catch SDK errors around the call that fails. Print the status code and body, but never print your API key:
+
+```python
+from hydra_db.core.api_error import ApiError
+from config import client, DATABASE_ID
+
+try:
+    response = client.query(database=DATABASE_ID, query="internal IP auth skip logic", max_results=10)
+except ApiError as e:
+    print("STATUS:", e.status_code)
+    print("BODY:", e.body)
+    raise
+```
 
 ---
 
@@ -1353,26 +1351,17 @@ GET /databases/status?database=engineering-docs
 
 ### Upload File - Beginner Path
 
-**POST** `/context/ingest` - Multipart form-data · field name `"files"` · database as form field
+**POST** `/context/ingest` - Multipart form-data · field name `"documents"` · database as form field. The SDK returns IDs in `response.data.results[].id` and raises `ApiError` on request failure.
 
 ```python
 # Correct multipart file upload
-client.context.ingest(
+response = client.context.ingest(
     database=DATABASE_ID,
     documents=[(filename, f, "text/markdown")],
 )
 
-# Response:
-{
-  "results": [
-    {
-      "id": "<id>",
-      "filename":  "auth_middleware.md",
-      "status":    "accepted",
-      "error":     null
-    }
-  ]
-}
+item = response.data.results[0]
+print(item.id, item.status)
 ```
 
 ### Upload Sources - JSON Body (Advanced)
@@ -1396,7 +1385,7 @@ client.context.ingest(
     }]),
 )
 
-# Response: { "ids": ["myrepo/auth/middleware.py"] }
+# SDK response: response.data.results[0].id == "myrepo/auth/middleware.py"
 ```
 
 ### Verify Indexing
