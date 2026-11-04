@@ -445,8 +445,15 @@ See the [Glossary](/essentials/v2/glossary) for database and collection terminol
 | `hydradb_delete_collection` | Permanently delete a collection and all of its data |
 | `hydradb_status` | Check indexing status for source IDs |
 | `hydradb_subgraph` | Everything connected to one item you have an ID for: the rest of its thread, its replies, its parents and children, and the items it links to |
+| `hydradb_relations` | Read extracted knowledge-graph relations for one item or a collection, page by page |
 | `hydradb_feedback` | Report that a query's results were wrong or incomplete, using that query's `request_id` |
 | `hydradb_databases` | List the databases this connection can use, with the default marked. Available on OAuth connections |
+| `hydradb_database_create` | Create a database with an optional metadata schema and embedding dimension |
+| `hydradb_database_delete` | Permanently delete a database other than the connection default |
+| `hydradb_database_readiness` | Check whether database provisioning finished |
+| `hydradb_database_stats` | Read database-wide knowledge and memory row counts |
+| `hydradb_database_schema_inspect` | Read the metadata fields declared for a database |
+| `hydradb_database_schema_update` | Add fields to a database metadata schema |
 
 ### hydradb_query
 
@@ -492,10 +499,10 @@ Because matching ignores case, two documents whose names differ only by case
 
 ### hydradb_ingest
 
-Provide exactly one of `text`, `turns`, `items`, or `app_knowledge`. Batches
+Provide exactly one of `text`, `turns`, `items`, `app_knowledge`, or `file`. Batches
 contain 1 to 100 items and send one API request. All entries in an `items` batch
 share the request's `kind` (`memory` or `knowledge`). The complete serialized
-ingest arguments have an 8 MiB UTF-8 limit.
+non-file ingest arguments have an 8 MiB UTF-8 limit.
 
 | Parameter | Type | Required | Description |
 | --------- | ---- | -------- | ----------- |
@@ -503,6 +510,7 @@ ingest arguments have an 8 MiB UTF-8 limit.
 | `turns` | array | No* | Conversation turns to ingest instead of `text`, each with a `user` and an `assistant` field |
 | `items` | array | No* | Batch of 1 to 100 items; each item has exactly one of `text` or `turns` |
 | `app_knowledge` | array | No* | Batch of 1 to 100 structured app records with `kind`, `fields`, and optional ACL data; split databases only |
+| `file` | object | No* | File to ingest as knowledge. Set `filename` and exactly one of `content_base64` or `path` |
 | `kind` | string | No | What to write: `memory` (default) or `knowledge` |
 | `title` | string | No | Title for the entry |
 | `source_id` | string | No | Optional identifier for this entry. Reusing one replaces what is stored under it |
@@ -591,6 +599,31 @@ HydraDB drops the other principals.
   read-side `acl` is also unrestricted. Pass the authenticated end user's real
   principals to each read tool.
 </Warning>
+
+#### File ingest
+
+Set `file.filename` to the real filename, including its extension. Then provide
+exactly one file source:
+
+- `content_base64`: base64-encoded bytes with an 8 MB decoded-size limit. This
+  works on local and hosted servers.
+- `path`: an absolute local path with a 50 MB file-size limit. This works only
+  with the local stdio server; the hosted server cannot read your disk.
+
+Files are always ingested as knowledge. The document title uses `title` when
+provided and otherwise uses `filename`. `source_id` sets the document ID, and
+`overwrite` controls replacement. Other text, conversation, inference, graph,
+and metadata fields cannot be combined with `file`.
+
+```json Upload a file
+{
+  "file": {
+    "filename": "q3-plan.pdf",
+    "content_base64": "JVBERi0xLjQK..."
+  },
+  "title": "Q3 plan"
+}
+```
 
 Check the ingest response before polling. It reports accepted and rejected
 counts, `accepted_ids`, `rejected_items`, `indexing_pending`, each item's ID and
@@ -723,6 +756,25 @@ Permanently removes one collection and every memory, knowledge source, and graph
 | `database` | string | No | Database (tenant) scope override for this request |
 | `collection` | string | No | Collection (sub-tenant) scope override for this request |
 
+### hydradb_relations
+
+Returns the knowledge-graph relation triplets HydraDB extracted from stored
+content. Each relation includes its source entity, predicate, target entity, and
+supporting passage.
+
+| Parameter | Type | Required | Description |
+| --------- | ---- | -------- | ----------- |
+| `id` | string | No | Item ID from `hydradb_query` or `hydradb_list`. Omit it to read the complete collection |
+| `kind` | string | No | `knowledge` (default) or `memory` |
+| `limit` | number | No | Relations per call, from 1 to 200 (default: `50`) |
+| `cursor` | number | No | `next_cursor` from the previous page |
+| `acl` | string[] | No | End-user principals to answer as |
+| `database` | string | No | Database scope override |
+| `collection` | string | No | Collection scope override |
+
+The structured result includes `has_more`, `next_cursor`, and `next_args` for
+the next page.
+
 ### hydradb_databases
 
 Available on connections made with **Sign in with HydraDB**. Takes no parameters.
@@ -731,6 +783,78 @@ Lists the databases this connection can address and marks the one it uses by
 default, so an agent working across several databases can find their names
 without asking you. If you approved the app with **other databases not allowed**,
 the list has one entry and any other name is refused.
+
+### Database management tools
+
+The database management tools are available by default. Set
+`HYDRADB_MCP_DATABASE_TOOLS=0` on the server to withhold the six tools below.
+Read-only credentials can inspect database state but cannot create, delete, or
+change a metadata schema.
+
+| Tool | Parameters | Behavior |
+| ---- | ---------- | -------- |
+| `hydradb_database_create` | `database` (required), `embeddings_dimension`, `database_metadata_schema` | Starts asynchronous database creation. Poll `hydradb_database_readiness` before ingesting |
+| `hydradb_database_delete` | `database` (required) | Permanently deletes the database and all data. The connection's default database is refused |
+| `hydradb_database_readiness` | `database` | Reports `ready_for_ingestion` and provisioning component status |
+| `hydradb_database_stats` | `database` | Reports database-wide knowledge and memory row counts |
+| `hydradb_database_schema_inspect` | `database` | Lists the declared metadata field names and types |
+| `hydradb_database_schema_update` | `database`, `add_fields` (required) | Adds metadata fields. It cannot remove, rename, or retype existing fields |
+
+When `database` is optional, omission uses the connection's configured database.
+Metadata fields use `name` and `data_type`. Supported types are `BOOL`, `INT8`,
+`INT16`, `INT32`, `INT64`, `FLOAT`, `DOUBLE`, `VARCHAR`, and `JSON`. Optional
+field settings are `max_length`, `enable_match`, `enable_dense_embedding`, and
+`enable_sparse_embedding`.
+
+```json Create a database with searchable metadata
+{
+  "database": "support",
+  "database_metadata_schema": [
+    {
+      "name": "priority",
+      "data_type": "VARCHAR",
+      "max_length": 32,
+      "enable_match": true
+    }
+  ]
+}
+```
+
+### Connector tools
+
+Connector tools are available by default. Set `HYDRADB_MCP_CONNECTOR_TOOLS=0`
+to withhold the complete family.
+
+| Tool | What it does |
+| ---- | ------------ |
+| `hydradb_connector_provider_list` | List supported connector providers |
+| `hydradb_connector_provider_inspect` | Read one provider's setup guide and credential-field schema |
+| `hydradb_connector_list` | List connected sources, optionally with health |
+| `hydradb_connector_inspect` | Read one connector's configuration and lifecycle |
+| `hydradb_connector_health` | Explain connector and resource sync health |
+| `hydradb_connector_connect` | Return a secure dashboard link for connecting a provider |
+| `hydradb_connector_reconnect` | Return a secure dashboard link for replacing credentials |
+| `hydradb_connector_update` | Update noncredential connector settings |
+| `hydradb_connector_delete` | Permanently delete a connector |
+| `hydradb_connector_sync` | Start a connector sync |
+| `hydradb_connector_pause` | Pause connector syncing |
+| `hydradb_connector_resume` | Resume connector syncing |
+| `hydradb_connector_discover` | Discover resources available in the connected provider account |
+| `hydradb_connector_resource_list` | List resources already added to a connector |
+| `hydradb_connector_resource_add` | Add discovered resources and start syncing them |
+| `hydradb_connector_resource_update` | Replace one resource's ACL or instructions |
+| `hydradb_connector_resource_delete` | Permanently remove one resource from a connector |
+
+A confined OAuth connection sees only connectors assigned to an allowed database
+and collection. Connector mutations fail closed on database- or
+collection-confined OAuth connections because connector endpoints cannot enforce
+those grants atomically. Use an organization-wide connection for connector
+mutations.
+
+Provider inspection returns credential schema metadata, never credential values.
+Do not paste credentials into a chat or MCP argument. The connect and reconnect
+tools return HydraDB dashboard links; the dashboard performs the
+credential-bearing request.
 
 ### Graph tools (BYOG openCypher)
 
