@@ -25,6 +25,18 @@ def live_files(pattern: str):
 
 
 class DocsConsistencyTest(unittest.TestCase):
+    def test_cookbook_verification_imports_have_definitions(self):
+        cookbook = (
+            ROOT / "cookbooks/v2/cookbook-01-build-cursor-for-docs.mdx"
+        ).read_text(encoding="utf-8")
+        imports = re.findall(r"^from phase0\.verify import (.+)$", cookbook, re.MULTILINE)
+        self.assertTrue(imports)
+        for imported in imports:
+            for name in imported.split(","):
+                name = name.strip()
+                with self.subTest(name=name):
+                    self.assertRegex(cookbook, rf"(?m)^def {re.escape(name)}\(")
+
     def test_ci_runs_docs_consistency_suite(self):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         self.assertIn("python scripts/test_docs_consistency.py", workflow)
