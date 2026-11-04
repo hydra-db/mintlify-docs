@@ -39,7 +39,7 @@ What this script checks:
 No SDKs are used. HTTP requests are raw requests that mirror the cURL surface.
 
 Security note: do not commit real API keys. Paste a short-lived key below only
-for local ad-hoc runs, or prefer HYDRA_DB_API_KEY in your shell.
+for local ad-hoc runs, or prefer HYDRADB_API_KEY in your shell.
 """
 
 from __future__ import annotations
@@ -1400,7 +1400,7 @@ def main() -> int:
     if not API_KEY:
         recorder.fail(
             "runtime configuration API key",
-            "API_KEY is empty. Set HYDRA_DB_API_KEY or paste a short-lived key into API_KEY at the top of this script.",
+            "API_KEY is empty. Set HYDRADB_API_KEY or paste a short-lived key into API_KEY at the top of this script.",
         )
         recorder.summary()
         return 1
