@@ -10,9 +10,6 @@ tags:
   - cookbook
 ---
 
-# Build an AI Chief of Staff
-
-
 An AI that doesn't just answer questions - it *takes action*. Register every callable function in your workspace as a knowledge object in HydraDB. Any agent or user can say "prepare for tomorrow's board meeting" and receive a structured, personalized execution plan: which functions to call, in which order, with which parameters. Every API call is real and copy-paste ready.
 
 
@@ -229,7 +226,8 @@ Here is a more complex schema - a finance function with approval constraints and
   "meta": {
     "department":         "finance",
     "permission_level":   "manager",
-    "cost_threshold":     5000,         // escalate to CFO above this
+    "cost_threshold":     5000,
+    "requires_approval":  true,
     "business_hours_only": true,
     "collections":        ["finance", "approvals"],
     "side_effects":       "Triggers payment processing. Irreversible without finance team intervention.",
@@ -237,6 +235,8 @@ Here is a more complex schema - a finance function with approval constraints and
   }
 }
 ```
+
+The finance action always requires approval. `cost_threshold` can also require approval for functions that don't set `requires_approval`; the amount must come from your trusted finance system, not a model's estimate.
 
 
 ### Upload to HydraDB
@@ -309,7 +309,7 @@ def upload_functions(schema_paths: list, collection: str = "functions") -> list:
     if batch:
         all_ids += _upload_batch(batch, collection)
 
-    print(f"Functions: {len(all_ids)} schemas indexed.")
+    print(f"Functions: {len(all_ids)} schemas accepted for indexing.")
     return all_ids
 
 
@@ -319,7 +319,13 @@ def _upload_batch(batch: list, collection: str) -> list:
         collection=collection,
         app_knowledge=json.dumps(batch),
     )
-    return [item.id for item in (data.results or []) if item.id]
+    results = data.data.results if data.data else []
+    accepted = [item.id for item in (results or []) if item.id and item.status in {"queued", "processing", "completed"}]
+    if len(accepted) != len(batch):
+        print(f"Accepted {len(accepted)} functions; inspect per-item errors: {results}")
+    if not accepted:
+        raise RuntimeError("No function schemas were accepted")
+    return accepted
 
 
 # Upload all functions (all teams, scoped to "functions" collection)
@@ -330,7 +336,7 @@ if __name__ == "__main__":
 
 Output:
 ```
-Functions: 10 schemas indexed.
+Functions: 10 schemas accepted for indexing.
 ```
 
 
@@ -414,16 +420,20 @@ class ChiefOfStaffOrchestrator:
     It does: authorize, inject tokens, execute, log outcomes.
     """
 
-    def __init__(self, registry: dict, policy_engine, auth_vault):
+    def __init__(self, registry: dict, policy_engine, auth_vault, schemas=None, approvals=None):
         """
         registry:     Map of function_id → callable that executes the real API call.
-        policy_engine: Object with .check(user, function_id, params) → bool
+        policy_engine: Object with .check(user, function_id, schema) → bool
         auth_vault:   Object with .get_token(user_id, oauth_provider) → str
+        schemas:      Reviewed local schemas keyed by function_id.
+        approvals:    Trusted ApprovalStore; missing means approval-required calls wait.
         """
         self.registry      = registry
         self.policy        = policy_engine
         self.vault         = auth_vault
         self.llm           = OpenAI()
+        self.schemas       = schemas or {}
+        self.approvals     = approvals
 
     def handle_task(
         self,
@@ -436,9 +446,9 @@ class ChiefOfStaffOrchestrator:
         Single-function task handling.
         1. Ask HydraDB which function to call.
         2. Authorize against policy engine.
-        3. Inject OAuth token from vault.
-        4. Execute via registry callable.
-        5. Log result back to HydraDB as memory.
+        3. Extract parameters and request approval when required.
+        4. After approval, inject a token and execute through the shared gate.
+        5. Log the result back to HydraDB as memory.
         """
         session_id = session_id or str(uuid.uuid4())
 
@@ -456,35 +466,48 @@ class ChiefOfStaffOrchestrator:
         if not chunks:
             return {"status": "no_match", "message": "No function found for this task."}
 
-        # Top chunk is the best-matching function schema
         top_chunk   = chunks[0]
-        schema      = json.loads(top_chunk.chunk_content)
-        function_id = schema["id"]
-
-        # Step 2 - Authorize: check user permissions against policy engine
-        if not self.policy.check(user_id, function_id, schema):
+        function_id = json.loads(top_chunk.chunk_content)["id"]
+        schema = self.schemas.get(function_id)
+        if schema is None or not self.policy.check(user_id, function_id, schema):
             self._log_blocked(user_id, task, function_id)
-            return {"status": "blocked", "reason": "Policy engine denied this function for your role."}
-
-        # Step 3 - Resolve parameters: use LLM to extract params from task + schema
+            return {"status": "blocked", "reason": "Policy denied this function or its schema is missing."}
         params = self._extract_params(task, schema, user_id, session_id)
+        return self.execute_function(function_id, user_id, params, task=task)
 
-        # Step 4 - Inject OAuth token for the function's provider
-        oauth_provider = schema.get("auth", {}).get("oauth_provider")
-        if oauth_provider:
-            params["_token"] = self.vault.get_token(user_id, oauth_provider)
+    def execute_function(self, function_id, user_id, params, task="", approval_id=None):
+        schema = self.schemas.get(function_id)
+        if schema is None or not self.policy.check(user_id, function_id, schema):
+            self._log_blocked(user_id, task, function_id)
+            return {"status": "blocked", "reason": "Policy denied this function or its schema is missing."}
 
-        # Step 5 - Execute via registry
+        params = {key: value for key, value in params.items() if not key.startswith("_")}
         exec_fn = self.registry.get(function_id)
         if not exec_fn:
             return {"status": "error", "message": f"No executor registered for {function_id}."}
 
+        if approval_id is not None or self.policy.requires_approval(user_id, schema, params):
+            if self.approvals is None:
+                return {"status": "pending", "reason": "Approval service is not configured; nothing executed."}
+            if approval_id is None:
+                approval_id = self.approvals.request_approval(user_id, function_id, params, task)
+                return {"status": "pending", "approval_id": approval_id}
+            decision = self.approvals.consume(approval_id, user_id, function_id, params)
+            if decision != "approved":
+                return {"status": "pending" if decision == "pending" else "blocked", "approval_id": approval_id, "reason": decision}
+
+        oauth_provider = schema.get("auth", {}).get("oauth_provider")
+        if oauth_provider:
+            params["_token"] = self.vault.get_token(user_id, oauth_provider)
         result = exec_fn(params)
-
-        # Step 6 - Log outcome to HydraDB memory for self-improvement
         self._log_execution(user_id, task, function_id, params, result)
-
         return {"status": "done", "function_id": function_id, "result": result}
+
+    def resume_approval(self, approval_id, user_id):
+        record = self.approvals.get(approval_id) if self.approvals else None
+        if not record or record["user_id"] != user_id:
+            return {"status": "blocked", "reason": "Unknown approval or wrong requesting user."}
+        return self.execute_function(record["function_id"], user_id, record["params"], task=record["task"], approval_id=approval_id)
 
 
     def _extract_params(self, task: str, schema: dict, user_id: str, session_id: str) -> dict:
@@ -547,6 +570,8 @@ class ChiefOfStaffOrchestrator:
 ```
 
 > **Note**: Use `metadata_filters` for hard, exact routing constraints. Top-level keys match schema-backed `metadata` fields such as `deprecated`; free-form per-source fields belong under `additional_metadata`.
+
+All execution paths below use `execute_function()`: direct tasks, plans, event triggers, and compensation. Supply trusted local `schemas` loaded from your reviewed JSON files and the approval store from [Approval workflow](#approval-workflow). Retrieved content and LLM output select a function; they cannot replace its authorization metadata. The registry is private to the execution boundary, not exposed as an alternate dispatch API.
 
 
 ### Function registry
@@ -970,6 +995,8 @@ def execute_plan(
     plan:        list,    # [{step, function_id, params, depends_on, reason}]
     user_id:     str,
     orchestrator,
+    results=None,
+    approval_ids=None,
 ) -> dict:
     """
     Execute a plan in dependency order.
@@ -977,15 +1004,19 @@ def execute_plan(
     via the results dict keyed by step number.
     Stops on first failure unless the step is marked optional.
     """
-    results    = {}   # step_number → execution result
-    completed  = set()
-    failed     = set()
+    results = {} if results is None else {int(number): entry for number, entry in results.items()}
+    approval_ids = approval_ids or {}
+    completed = {number for number, entry in results.items() if entry.get("status") == "done" and entry["result"].get("success", False)}
+    failed = {number for number, entry in results.items() if entry.get("status") == "done" and not entry["result"].get("success", False)}
+    for step in plan:
+        if step["step"] in failed and not step.get("optional", False):
+            return {"status": "failed", "failed_step": step["step"], "results": results}
 
     def _ready(step: dict) -> bool:
         """A step is ready when all its dependencies have completed successfully."""
         return all(d in completed for d in step.get("depends_on", []))
 
-    remaining = list(plan)
+    remaining = [step for step in plan if step["step"] not in completed | failed]
     max_iterations = len(plan) * 2   # guard against circular deps
     iterations = 0
 
@@ -1010,8 +1041,11 @@ def execute_plan(
 
             print(f"  Step {step_num}: {function_id} - {step.get('reason','')[:60]}")
 
-            result = orchestrator.registry.get(function_id, lambda p: {"success": False, "error": "not registered"})(params)
-            results[step_num] = {"function_id": function_id, "result": result}
+            outcome = orchestrator.execute_function(function_id, user_id, params, task=step.get("reason", ""), approval_id=approval_ids.get(step_num))
+            results[step_num] = outcome
+            if outcome["status"] != "done":
+                return {"status": outcome["status"], "pending_step": step_num, "approval_id": outcome.get("approval_id"), "results": results}
+            result = outcome["result"]
 
             if result.get("success", False):
                 completed.add(step_num)
@@ -1027,8 +1061,10 @@ def execute_plan(
         if not progress:
             break   # circular dependency or all remaining steps blocked
 
-    return {"status": "complete", "completed": list(completed), "failed": list(failed), "results": results}
+    return {"status": "blocked" if remaining else "complete", "completed": list(completed), "failed": list(failed), "results": results}
 ```
+
+When a plan returns `pending`, persist its plan and `results` server-side. After an authenticated approver records a decision, call `execute_plan(plan, user_id, orchestrator, results=saved_results, approval_ids={pending_step: approval_id})`. Completed steps aren't executed again. Never accept completion records or approver identities from an unverified request body.
 
 
 ### Rollback & compensation
@@ -1038,47 +1074,42 @@ For destructive or irreversible actions, register a compensation function alongs
 
 
 ```python title="planning/rollback.py"
-# Compensation registry: maps function_id → compensation callable
-# Compensation functions undo the side effects of their paired function.
-# Not every function has a compensation - mark those as non-compensatable.
 COMPENSATION_REGISTRY = {
-    "create_gsuite_account":   lambda r: delete_gsuite_account(r.get("account_id")),
-    "create_jira_account":    lambda r: delete_jira_account(r.get("jira_id")),
-    "create_github_access":   lambda r: revoke_github_access(r.get("username")),
-    "create_calendar_event":  lambda r: delete_calendar_event(r.get("event_id")),
-    # "send_slack_message":    None,  - cannot be meaningfully rolled back
-    # "send_email":            None,  - cannot be searched programmatically
+    "create_gsuite_account": "delete_gsuite_account",
+    "create_jira_account": "delete_jira_account",
+    "create_github_access": "revoke_github_access",
+    "create_calendar_event": "delete_calendar_event",
 }
 
-def rollback_plan(results: dict, failed_step: int):
+def rollback_plan(results: dict, failed_step: int, user_id: str, orchestrator, approval_ids=None, compensated=None):
     """
     Compensate for completed steps in reverse order after a failure.
     Skips steps without a compensation function.
     Logs each compensation attempt to HydraDB's execution-log collection.
     """
-    completed_steps = sorted(
-        [s for s in results if s < failed_step], reverse=True
-    )
+    approval_ids = approval_ids or {}
+    compensated = set(compensated or [])
+    completed_steps = sorted([s for s, entry in results.items() if s < failed_step and entry.get("status") == "done" and entry["result"].get("success", False)], reverse=True)
     for step_num in completed_steps:
+        if step_num in compensated:
+            continue
         entry       = results[step_num]
         function_id = entry["function_id"]
         result      = entry["result"]
         compensate  = COMPENSATION_REGISTRY.get(function_id)
 
         if compensate:
-            try:
-                compensate(result)
-                print(f"  Rolled back step {step_num}: {function_id}")
-                log_execution_outcome(
-                    user_id="system", task=f"rollback {function_id}",
-                    function_id=f"rollback_{function_id}",
-                    outcome="success", latency_ms=0,
-                )
-            except Exception as e:
-                print(f"  Rollback FAILED for step {step_num}: {e}")
+            outcome = orchestrator.execute_function(compensate, user_id, result, task=f"rollback {function_id}", approval_id=approval_ids.get(step_num))
+            if outcome["status"] != "done" or not outcome["result"].get("success", False):
+                return {"status": outcome["status"] if outcome["status"] != "done" else "failed", "pending_step": step_num, "approval_id": outcome.get("approval_id"), "compensated": sorted(compensated)}
+            compensated.add(step_num)
+            print(f"  Rolled back step {step_num}: {function_id}")
         else:
             print(f"  Step {step_num} ({function_id}): no compensation registered. Manual review needed.")
+    return {"status": "complete", "compensated": sorted(compensated)}
 ```
+
+Register each compensation ID with its own trusted schema and executor, just like a forward action. Missing schemas, denied policies, and pending approvals stop compensation without side effects. Persist `compensated` server-side and pass it back with `approval_ids` when resuming so earlier compensations aren't repeated.
 
 
  STEP 6 
@@ -1109,6 +1140,8 @@ orchestrator = ChiefOfStaffOrchestrator(
     registry=FUNCTION_REGISTRY,
     policy_engine=PolicyEngine(),
     auth_vault=AuthVault(),
+    schemas={schema["id"]: schema for schema in map(load_schema, FUNCTION_SCHEMAS)},
+    approvals=ApprovalStore(approver_id=os.environ["APPROVER_SLACK_USER_ID"]),
 )
 
 # Maps Slack user IDs to internal user IDs (use CRM or HRIS lookup in production)
@@ -1308,7 +1341,8 @@ class PolicyEngine:
     def check(self, user_id: str, function_id: str, schema: dict) -> bool:
         """
         Return True if the user is authorized to call this function.
-        Checks: permission_level, department, business_hours, cost_threshold.
+        Checks permission_level, department, and business_hours.
+        Approval is checked separately against the resolved parameters.
         """
         user_role = USER_ROLES.get(user_id, {"level": "viewer", "departments": []})
         meta      = schema.get("meta", {})
@@ -1340,13 +1374,12 @@ class PolicyEngine:
     def requires_approval(self, user_id: str, schema: dict, params: dict) -> bool:
         """
         Return True if this call needs human approval before execution.
-        Triggered when: cost exceeds threshold, function has 'requires_approval: true',
-        or user is requesting an action outside their normal patterns.
+        Triggered when cost exceeds threshold or requires_approval is true.
         """
         meta      = schema.get("meta", {})
         threshold = meta.get("cost_threshold", None)
         amount    = params.get("amount", 0)
-        if threshold and amount > threshold:
+        if threshold is not None and amount > threshold:
             return True
         return meta.get("requires_approval", False)
 ```
@@ -1355,64 +1388,61 @@ class PolicyEngine:
 ### Approval workflow
 
 
-When `policy.requires_approval()` returns `True`, route the action through a Slack approval message before executing. Store the pending action in HydraDB so the Orchestrator can resume it after approval without losing context.
+When `policy.requires_approval()` returns `True`, execution stops with `pending`. The approval must come from an authenticated approver before a registry function receives parameters or an OAuth token. An approval is bound to the requesting user, function, and exact parameters, and can be consumed only once. Denial, a missing approval service, or an unknown approval ID never authorizes execution.
+
+This single-process example keeps authorization state in a locked application store, **not** in semantically retrieved HydraDB memory. For production, replace it with durable, transactional storage, expiry, and authenticated approval callbacks. A Slack message can notify the approver, but a message or model-generated `approved` field is not an authorization decision.
 
 
 ```python title="security/approval.py"
-import json, os
-from hydra_db import HydraDB
+import copy
+import json
+import threading
+import uuid
 
-client = HydraDB(token=os.environ["HYDRADB_API_KEY"])
-TENANT_ID = "chief-of-staff"
 
+class ApprovalStore:
+    def __init__(self, approver_id):
+        if not approver_id:
+            raise ValueError("Configure an authorized approver")
+        self.approver_id = approver_id
+        self._requests = {}
+        self._lock = threading.Lock()
 
-def request_approval(
-    user_id:     str,
-    function_id: str,
-    params:      dict,
-    task:        str,
-    approver_id: str,   # Slack user ID of the approver (their manager, finance, etc.)
-) -> str:
-    """
-    Send an approval request via Slack and store the pending action in HydraDB.
-    Returns an approval_id that the approver sends back to resume execution.
-    """
-    approval_id = str(uuid.uuid4())[:8]
+    def request_approval(self, user_id, function_id, params, task):
+        approval_id = str(uuid.uuid4())
+        with self._lock:
+            self._requests[approval_id] = {"user_id": user_id, "function_id": function_id, "params": copy.deepcopy(params), "task": task, "status": "pending"}
+        return approval_id
 
-    # Store the pending action in HydraDB so it can be resumed after approval
-    client.context.ingest(
-        type='memory',
-        database=TENANT_ID,
-        collection="approvals",
-        upsert=True,
-        memories=json.dumps([{
-            "text": json.dumps({
-                "approval_id": approval_id,
-                "user_id":     user_id,
-                "function_id": function_id,
-                "params":      params,
-                "task":        task,
-                "status":      "pending",
-            }),
-            "user_name": "approval-system",
-            "infer":     False,
-        }]),
-    )
+    def get(self, approval_id):
+        with self._lock:
+            return copy.deepcopy(self._requests.get(approval_id))
 
-    # Send the Slack approval request to the approver
-    slack_bot.chat_postMessage(
-        channel=approver_id,
-        text=(
-            f"*Approval required* [ID: `{approval_id}`]\n"
-            f"*Requested by:* {user_id}\n"
-            f"*Action:* `{function_id}`\n"
-            f"*Task:* {task}\n"
-            f"*Params:* ```{json.dumps(params, indent=2)}```\n\n"
-            f"Reply `/approve {approval_id}` or `/reject {approval_id} [reason]`"
-        ),
-    )
-    return approval_id
+    def decide(self, approval_id, authenticated_approver_id, approved):
+        if authenticated_approver_id != self.approver_id:
+            raise PermissionError("Only the configured authenticated approver can decide")
+        if type(approved) is not bool:
+            raise ValueError("Approval decisions must be booleans")
+        with self._lock:
+            record = self._requests[approval_id]
+            if record["status"] != "pending":
+                raise ValueError("This request already has a decision")
+            record["status"] = "approved" if approved else "denied"
+
+    def consume(self, approval_id, user_id, function_id, params):
+        with self._lock:
+            record = self._requests.get(approval_id)
+            if not record or record["user_id"] != user_id or record["function_id"] != function_id or json.dumps(record["params"], sort_keys=True) != json.dumps(params, sort_keys=True):
+                return "invalid"
+            decision = record["status"]
+            if decision == "approved":
+                record["status"] = "consumed"
+            return decision
 ```
+
+Configure `APPROVER_SLACK_USER_ID` before constructing the orchestrator. To notify the approver, your application can use `slack_bot.chat_postMessage(channel=orchestrator.approvals.approver_id, text=f"Approval required: {approval_id}")` after receiving `pending`. Keep tokens out of notification payloads.
+
+In your verified Slack interaction handler, obtain the approver's identity from the authenticated interaction, not from LLM output or a caller-supplied field. Call `orchestrator.approvals.decide(approval_id, authenticated_approver_id, approved)` and then `orchestrator.resume_approval(approval_id, requesting_user_id)`. Pending and denied requests still don't execute; approved requests recheck current policy and run once. For plans, resume through `execute_plan()` with its saved server-side state instead of separately executing the pending step.
 
 
 ⚠️
