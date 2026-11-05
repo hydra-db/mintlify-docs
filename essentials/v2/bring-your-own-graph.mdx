@@ -252,6 +252,10 @@ Rules for these shapes:
   exists with a different label, the node gets both labels.
 - **A write `UNWIND` reads from a parameter** (`UNWIND $rows AS row`), not
   from a literal list.
+- **Every row in a batch has the same fields, and no value is `null`.** A
+  property value can be a boolean, an integer, a float or a string. To leave
+  a property unset, leave it out of the row and the `SET`. Split rows that
+  have different fields into separate batches.
 - **Single `CREATE` adds a new edge each time it runs.** `MERGE` and the two
   batch shapes do not duplicate edges, so they are safe to retry.
 - **A write that starts with `MATCH` needs a label, an `id` or a property**
@@ -363,11 +367,13 @@ SET p.role = "owner"
 Each write returns `data: []`. To create the node when it does not exist,
 use the node batch with one row.
 
-**Connect two existing nodes:** Eve starts working at Acme. `MERGE` does not
-add a second edge if it already exists.
+**Connect two existing nodes:** Eve starts working at Acme. Running this
+again does not add a second edge. Relationship properties are part of what
+`MERGE` matches, so leave them out of a `MERGE` when the edge can already
+exist with other values. After this step Acme has three people.
 
 ```cypher
-MERGE (a:Person {id: 5})-[:WORKS_AT {since: 2024}]->(b:Company {id: 101})
+MERGE (a:Person {id: 5})-[:WORKS_AT]->(b:Company {id: 101})
 ```
 
 **List a node's neighbors:** There is no wildcard relationship, so ask for
@@ -698,55 +704,71 @@ collection, and verify the counts.
 
 This script reads from Neo4j with the official driver and writes to
 HydraDB with the [`HydraGraph` client](#a-minimal-client). Any source you can
-read nodes and relationships from works the same way. It gives each node an
-integer `id`, loads the nodes, and then loads the relationships by `id`.
-Cypher does not allow a label or relationship type as a parameter, so it
-writes one batch per label and per type. It copies `Person` nodes and `KNOWS`
-relationships; repeat both steps for every other label and relationship type
-in your graph, and compare each count:
+read nodes and relationships from works the same way. It gives each source
+node an integer `id`, loads the nodes with all their properties, and then
+loads the relationships by `id`. Cypher does not allow a label or
+relationship type as a parameter, so it writes one batch per label and per
+type. It copies `Person` nodes and `KNOWS` relationships; repeat both steps
+for every other label and relationship type, and compare each count.
+
+Three rules keep the copy correct:
+
+- **Key each node by its source identity.** The script uses Neo4j's
+  `elementId()`, which is unique across labels, so two nodes never share an
+  `id`.
+- **Save the id map and reuse it.** A rerun after a failure then gives each
+  node the same `id`, and edges keep their endpoints.
+- **Group rows by their fields.** A batch needs the same fields in every row
+  and no `null` values, so rows with different properties go in separate
+  batches.
 
 ```python
+import json, os, re
 from neo4j import GraphDatabase
 
 src = GraphDatabase.driver("neo4j://localhost:7687", auth=("neo4j", "<password>"))
 g = HydraGraph("https://api.hydradb.com", "<api key>", "crm", "contacts")
+ID_FILE = "contacts-ids.json"  # keep it: a rerun must reuse it
+
+ids = json.load(open(ID_FILE)) if os.path.exists(ID_FILE) else {}  # elementId -> integer id
+
+def node_id(element_id):
+    if element_id not in ids:
+        ids[element_id] = len(ids) + 1
+    return ids[element_id]
 
 def batches(rows, n=500):
     for i in range(0, len(rows), n):
         yield rows[i:i + n]
 
-ids = {}  # your key -> integer id; one map for all labels in the collection
-
 with src.session() as s:
-    # 1. Nodes: give each one an integer id, keep your key as ext_id.
-    people = s.run("MATCH (p:Person) RETURN p.ext_id AS ext_id, p.name AS name").data()
-    for row in people:
-        row["id"] = ids.setdefault(row["ext_id"], len(ids) + 1)
-    for chunk in batches(people):
-        g.query("""
-            UNWIND $rows AS row
-            MERGE (n {id: row.id})
-            SET n:Person, n.ext_id = row.ext_id, n.name = row.name
-        """, {"rows": chunk})
+    # 1. Nodes: every scalar property, grouped by the set of fields present.
+    groups = {}
+    for rec in s.run("MATCH (p:Person) RETURN elementId(p) AS eid, properties(p) AS props"):
+        props = {k: v for k, v in rec["props"].items()
+                 if k != "id" and v is not None and isinstance(v, (bool, int, float, str))}
+        row = {"id": node_id(rec["eid"]), **props}
+        groups.setdefault(tuple(sorted(props)), []).append(row)
+    json.dump(ids, open(ID_FILE, "w"))
+    for keys, rows in groups.items():
+        assert all(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", k) for k in keys)
+        sets = "".join(f", n.{k} = row.{k}" for k in keys)
+        for chunk in batches(rows):
+            g.query(f"UNWIND $rows AS row MERGE (n {{id: row.id}}) SET n:Person{sets}", {"rows": chunk})
 
     # 2. Relationships, one type at a time, by integer id.
-    knows = s.run("""
-        MATCH (a:Person)-[:KNOWS]->(b:Person)
-        RETURN a.ext_id AS src, b.ext_id AS dst
-    """).data()
+    knows = s.run("MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN elementId(a) AS src, elementId(b) AS dst").data()
     edges = [{"src": ids[r["src"]], "dst": ids[r["dst"]]} for r in knows]
     for chunk in batches(edges):
-        g.query("""
-            UNWIND $rows AS row
-            CREATE (a {id: row.src})-[:KNOWS]->(b {id: row.dst})
-        """, {"rows": chunk})
+        g.query("UNWIND $rows AS row CREATE (a {id: row.src})-[:KNOWS]->(b {id: row.dst})", {"rows": chunk})
 
 # 3. Verify counts match.
 print(g.query("MATCH (p:Person) RETURN count(p) AS people"))
 ```
 
-The edge batch takes no properties. To copy relationship properties, write
-each relationship with
+The script drops list and map property values, because BYOG stores scalar
+values only. The edge batch takes no properties. To copy relationship
+properties, write each relationship with
 `MERGE (a:Person {id: $src})-[:KNOWS {since: $since}]->(b:Person {id: $dst})`.
 
 ---
