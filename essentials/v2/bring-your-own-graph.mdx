@@ -737,21 +737,42 @@ def node_id(element_id):
         ids[element_id] = len(ids) + 1
     return ids[element_id]
 
-def batches(rows, n=500):
-    for i in range(0, len(rows), n):
-        yield rows[i:i + n]
+def save_ids():
+    # Write a new file, then replace the old one, so a crash never leaves a broken map.
+    with open(ID_FILE + ".tmp", "w") as f:
+        json.dump(ids, f)
+    os.replace(ID_FILE + ".tmp", ID_FILE)
+
+def field(name):
+    # A property name in the query text must be an identifier: first-name -> first_name.
+    name = re.sub(r"\W", "_", name)
+    return name if re.match(r"[A-Za-z_]", name) else "_" + name
+
+def batches(rows, max_bytes=200_000):
+    # The request limit is 256 KiB, so batch by size, not by row count.
+    chunk, size = [], 0
+    for row in rows:
+        n = len(json.dumps(row))
+        if chunk and size + n > max_bytes:
+            yield chunk
+            chunk, size = [], 0
+        chunk.append(row)
+        size += n
+    if chunk:
+        yield chunk
 
 with src.session() as s:
     # 1. Nodes: every scalar property, grouped by the set of fields present.
     groups = {}
     for rec in s.run("MATCH (p:Person) RETURN elementId(p) AS eid, properties(p) AS props"):
-        props = {k: v for k, v in rec["props"].items()
-                 if k != "id" and v is not None and isinstance(v, (bool, int, float, str))}
+        props = {}
+        for k, v in rec["props"].items():
+            if v is not None and isinstance(v, (bool, int, float, str)):
+                props["source_id" if k == "id" else field(k)] = v  # keep a source id as source_id
         row = {"id": node_id(rec["eid"]), **props}
         groups.setdefault(tuple(sorted(props)), []).append(row)
-    json.dump(ids, open(ID_FILE, "w"))
+    save_ids()
     for keys, rows in groups.items():
-        assert all(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", k) for k in keys)
         sets = "".join(f", n.{k} = row.{k}" for k in keys)
         for chunk in batches(rows):
             g.query(f"UNWIND $rows AS row MERGE (n {{id: row.id}}) SET n:Person{sets}", {"rows": chunk})
@@ -767,7 +788,10 @@ print(g.query("MATCH (p:Person) RETURN count(p) AS people"))
 ```
 
 The script drops list and map property values, because BYOG stores scalar
-values only. The edge batch takes no properties. To copy relationship
+values only. It renames a property whose name is not an identifier
+(`first-name` becomes `first_name`), and it keeps a source property named `id`
+as `source_id`, because `id` is the BYOG node identity. Two source names that
+rename to the same name collide, so rename one of them first. The edge batch takes no properties. To copy relationship
 properties, write each relationship with
 `MERGE (a:Person {id: $src})-[:KNOWS {since: $since}]->(b:Person {id: $dst})`.
 
