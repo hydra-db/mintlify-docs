@@ -36,7 +36,7 @@ The architectural insight is separation of concerns: your primary LLM handles co
 - HydraDB API key
 - Python 3.11 or 3.12 (`python --version`)
 - OpenAI API key (for parameter extraction and plan sequencing)
-- `pip install hydradb-sdk openai slack-sdk backoff`
+- `pip install hydradb-sdk openai slack-sdk flask backoff`
 
 ## What You'll Build
 
@@ -1089,6 +1089,7 @@ def rollback_plan(results: dict, failed_step: int, user_id: str, orchestrator, a
     """
     approval_ids = approval_ids or {}
     compensated = set(compensated or [])
+    results = {int(number): entry for number, entry in results.items()}
     completed_steps = sorted([s for s, entry in results.items() if s < failed_step and entry.get("status") == "done" and entry["result"].get("success", False)], reverse=True)
     for step_num in completed_steps:
         if step_num in compensated:
@@ -1131,11 +1132,15 @@ Expose a Slack slash-command that forwards the user's natural-language instructi
 
 
 ```python title="triggers/slack_command.py"
+import os
+import threading
 from flask import Flask, request, jsonify
 from slack_sdk import WebClient
+from slack_sdk.signature import SignatureVerifier
 
 flask_app  = Flask(__name__)
 slack_bot  = WebClient(token=os.environ["SLACK_BOT_TOKEN"])
+slack_verifier = SignatureVerifier(os.environ["SLACK_SIGNING_SECRET"])
 orchestrator = ChiefOfStaffOrchestrator(
     registry=FUNCTION_REGISTRY,
     policy_engine=PolicyEngine(),
@@ -1143,6 +1148,35 @@ orchestrator = ChiefOfStaffOrchestrator(
     schemas={schema["id"]: schema for schema in map(load_schema, FUNCTION_SCHEMAS)},
     approvals=ApprovalStore(approver_id=os.environ["APPROVER_SLACK_USER_ID"]),
 )
+PENDING_ACTIONS = {}
+PENDING_LOCK = threading.Lock()
+
+@flask_app.before_request
+def verify_slack_signature():
+    if request.path.startswith("/slack/") and not slack_verifier.is_valid_request(request.get_data(), request.headers):
+        return jsonify({"text": "Invalid Slack signature."}), 401
+
+def report_slack_result(result, context):
+    status = result["status"]
+    if status == "pending":
+        approval_id = result.get("approval_id")
+        if approval_id:
+            with PENDING_LOCK:
+                PENDING_ACTIONS[approval_id] = {**context, "results": result.get("results"), "pending_step": result.get("pending_step")}
+            slack_bot.chat_postMessage(
+                channel=orchestrator.approvals.approver_id,
+                text=f"Approval required for {context['user_id']}: /approve {approval_id} or /reject {approval_id}",
+            )
+            reply = f"Waiting for approval {approval_id}. No further action executed."
+        else:
+            reply = f"Waiting for approval. {result.get('reason', 'Nothing executed.')}"
+    elif status == "complete":
+        reply = f"Plan finished. Completed: {result.get('completed', [])}; failed: {result.get('failed', [])}."
+    elif status == "done" and result["result"].get("success", True):
+        reply = result["result"].get("summary", "Done.")
+    else:
+        reply = f"Action stopped ({status}): {result.get('reason') or result.get('message') or result.get('result', {}).get('error', 'No successful completion.')}"
+    slack_bot.chat_postEphemeral(channel=context["channel"], user=context["slack_uid"], text=reply)
 
 # Maps Slack user IDs to internal user IDs (use CRM or HRIS lookup in production)
 def slack_to_user_id(slack_uid: str) -> str:
@@ -1164,7 +1198,6 @@ def handle_slack_ai_command():
     if not task:
         return jsonify({"text": "Please describe what you'd like me to do."})
 
-    # Ack immediately so Slack doesn't time out the slash-command (3s limit)
     slack_bot.chat_postEphemeral(
         channel=channel, user=slack_uid,
         text=f"_Working on it: “{task[:80]}…”_"
@@ -1174,21 +1207,50 @@ def handle_slack_ai_command():
     MULTI_STEP_SIGNALS = ["prepare", "onboard", "set up", "ship", "launch"]
     is_multi = any(s in task.lower() for s in MULTI_STEP_SIGNALS)
 
+    plan = None
     if is_multi:
         plan   = generate_execution_plan(task, user_id)
         result = execute_plan(plan, user_id, orchestrator)
-        steps  = result.get("completed", [])
-        reply  = f"Done. Completed {len(steps)} step(s): {', '.join(str(s) for s in steps)}."
     else:
         result = orchestrator.handle_task(task, user_id)
-        reply  = result.get("result", {}).get("summary", "Done.")
 
-    slack_bot.chat_postEphemeral(channel=channel, user=slack_uid, text=reply)
-    return jsonify({})   # already replied via ephemeral - return empty 200
+    report_slack_result(result, {"user_id": user_id, "slack_uid": slack_uid, "channel": channel, "plan": plan})
+    return jsonify({})
+
+@flask_app.route("/slack/approval", methods=["POST"])
+def handle_slack_approval():
+    command = request.form.get("command")
+    if command not in {"/approve", "/reject"}:
+        return jsonify({"text": "Use /approve or /reject followed by an approval ID."}), 400
+    approval_id = request.form.get("text", "").strip().split(" ", 1)[0]
+    with PENDING_LOCK:
+        context = PENDING_ACTIONS.get(approval_id)
+    if context is None:
+        return jsonify({"text": "Unknown or already handled approval."}), 404
+    try:
+        orchestrator.approvals.decide(approval_id, request.form["user_id"], command == "/approve")
+    except PermissionError:
+        return jsonify({"text": "Only the configured approver can decide."}), 403
+    except ValueError:
+        return jsonify({"text": "This approval already has a decision."}), 409
+    with PENDING_LOCK:
+        PENDING_ACTIONS.pop(approval_id)
+    if command == "/reject":
+        result = {"status": "blocked", "reason": "The approver denied this action."}
+    elif context["plan"] is not None:
+        result = execute_plan(context["plan"], context["user_id"], orchestrator, results=context["results"], approval_ids={context["pending_step"]: approval_id})
+    else:
+        result = orchestrator.resume_approval(approval_id, context["user_id"])
+    report_slack_result(result, context)
+    return jsonify({"text": f"Decision recorded for {approval_id}; execution status: {result['status']}."})
 
 if __name__ == "__main__":
     flask_app.run(host="0.0.0.0", port=8080)
 ```
+
+Configure `/ai` to POST to `/slack/ai`, and `/approve` and `/reject` to POST to `/slack/approval`. Set `SLACK_SIGNING_SECRET`, `SLACK_BOT_TOKEN`, and `APPROVER_SLACK_USER_ID`. Every Slack request is signature-verified before reading its identity; only the configured approver can authorize a pending action. The requester receives the approval ID and final result, and a pending plan retains its completed-step state instead of restarting. Non-Slack webhooks need their provider's own signature verification.
+
+This synchronous, single-process example demonstrates the state transitions. In production, persist the pending state transactionally and queue long-running work before acknowledging Slack's three-second deadline; posting an ephemeral message is not an HTTP acknowledgment. Authenticated live Slack delivery and timing aren't verified by the local fixtures.
 
 
 ### Scheduled jobs

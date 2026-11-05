@@ -10,14 +10,18 @@ from pathlib import Path
 import re
 import tempfile
 import threading
+import time
 from types import SimpleNamespace
 import unittest
+from urllib.parse import urlencode
 import uuid
 
 import httpx
 from hydra_db import HydraDB
 from notion_client import Client as NotionClient
 from notion_client.helpers import iterate_paginated_api
+from flask import Flask, jsonify, request
+from slack_sdk.signature import SignatureVerifier
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -311,6 +315,96 @@ class ApprovalInvariantTest(unittest.TestCase):
         result = ns["execute_plan"]([{"step": 1, "function_id": "synthetic_action", "params": {"amount": 10000}, "depends_on": []}], "synthetic-user", orchestrator)
         self.assertEqual([], self.executed)
         self.assertEqual("pending", result["status"])
+
+    def slack_fixture(self, orchestrator):
+        app = Flask(__name__)
+        events = []
+        bot = SimpleNamespace(chat_postEphemeral=lambda **kwargs: events.append(("ephemeral", kwargs)), chat_postMessage=lambda **kwargs: events.append(("message", kwargs)))
+        plan = [{"step": 1, "function_id": "first", "params": {}, "depends_on": []}, {"step": 2, "function_id": "synthetic_action", "params": {"amount": 10000}, "depends_on": [1]}]
+        orchestrator.schemas["first"] = {"id": "first", "meta": {}}
+        orchestrator.registry["first"] = lambda _: self.executed.append("first") or {"success": True}
+        ns = definitions(ROUTING, "def handle_slack_ai_command", flask_app=app, request=request, jsonify=jsonify, slack_bot=bot, orchestrator=orchestrator, execute_plan=definitions(ROUTING, "def execute_plan")["execute_plan"], generate_execution_plan=lambda *_: plan, PENDING_ACTIONS={}, PENDING_LOCK=threading.Lock(), slack_verifier=SignatureVerifier("synthetic-signing-secret"))
+        ns["slack_to_user_id"] = lambda _: "synthetic-user"
+        return app.test_client(), ns, events
+
+    def slack_post(self, client, ns, path, **fields):
+        body = urlencode(fields)
+        timestamp = str(int(time.time()))
+        signature = ns["slack_verifier"].generate_signature(timestamp=timestamp, body=body)
+        return client.post(path, data=body, content_type="application/x-www-form-urlencoded", headers={"X-Slack-Request-Timestamp": timestamp, "X-Slack-Signature": signature})
+
+    def test_slack_reports_pending_and_keeps_plan_state(self):
+        for task in ("Synthetic action", "Onboard synthetic user"):
+            with self.subTest(task=task):
+                orchestrator = self.make_orchestrator()
+                self.add_approval_store(orchestrator)
+                client, ns, events = self.slack_fixture(orchestrator)
+                response = self.slack_post(client, ns, "/slack/ai", user_id="synthetic-slack-user", channel_id="synthetic-channel", text=task)
+                self.assertEqual(200, response.status_code)
+                reply = [event[1]["text"] for event in events if event[0] == "ephemeral"][-1]
+                self.assertIn("approval", reply.lower())
+                self.assertNotIn("Done", reply)
+                self.assertEqual(1, len(ns["PENDING_ACTIONS"]))
+                approval_id = next(iter(ns["PENDING_ACTIONS"]))
+                self.assertIn(approval_id, reply)
+                self.assertTrue(any(event[0] == "message" and approval_id in event[1]["text"] for event in events))
+                if task.startswith("Onboard"):
+                    self.assertEqual(["first"], self.executed)
+                    self.assertIn(1, ns["PENDING_ACTIONS"][approval_id]["results"])
+                else:
+                    self.assertEqual([], self.executed)
+
+    def test_rollback_accepts_json_persisted_results(self):
+        orchestrator = self.make_orchestrator(False)
+        self.schema["meta"].pop("cost_threshold")
+        ns = definitions(ROUTING, "def rollback_plan", COMPENSATION_REGISTRY={"forward_action": "synthetic_action"})
+        results = json.loads(json.dumps({1: {"status": "done", "function_id": "forward_action", "result": {"success": True}}}))
+        result = ns["rollback_plan"](results, 2, "synthetic-user", orchestrator)
+        self.assertEqual("complete", result["status"])
+        self.assertEqual([1], result["compensated"])
+        self.assertEqual(1, len(self.executed))
+
+    def test_signed_slack_approval_resumes_or_denies_without_repeating_steps(self):
+        for task in ("Synthetic action", "Onboard synthetic user"):
+            for command in ("/approve", "/reject"):
+                with self.subTest(task=task, command=command):
+                    orchestrator = self.make_orchestrator()
+                    self.add_approval_store(orchestrator)
+                    client, ns, events = self.slack_fixture(orchestrator)
+                    self.slack_post(client, ns, "/slack/ai", user_id="synthetic-slack-user", channel_id="synthetic-channel", text=task)
+                    approval_id = next(iter(ns["PENDING_ACTIONS"]))
+                    before = len(self.executed)
+                    unauthorized = self.slack_post(client, ns, "/slack/approval", command=command, text=approval_id, user_id="untrusted-user")
+                    self.assertEqual(403, unauthorized.status_code)
+                    self.assertEqual(before, len(self.executed))
+                    ns["PENDING_ACTIONS"][approval_id] = json.loads(json.dumps(ns["PENDING_ACTIONS"][approval_id]))
+                    response = self.slack_post(client, ns, "/slack/approval", command=command, text=approval_id, user_id="synthetic-approver")
+                    self.assertEqual(200, response.status_code)
+                    self.assertEqual(before + (command == "/approve"), len(self.executed))
+                    self.assertEqual(1 if task.startswith("Onboard") else 0, self.executed.count("first"))
+                    self.assertNotIn(approval_id, ns["PENDING_ACTIONS"])
+                    reply = [event[1]["text"] for event in events if event[0] == "ephemeral"][-1]
+                    self.assertIn("blocked" if command == "/reject" else "Plan finished" if task.startswith("Onboard") else "Done", reply)
+                    repeated = self.slack_post(client, ns, "/slack/approval", command=command, text=approval_id, user_id="synthetic-approver")
+                    self.assertEqual(404, repeated.status_code)
+                    self.assertEqual(before + (command == "/approve"), len(self.executed))
+
+    def test_unsigned_slack_requests_cannot_trigger_execution_or_decisions(self):
+        orchestrator = self.make_orchestrator()
+        self.add_approval_store(orchestrator)
+        client, ns, events = self.slack_fixture(orchestrator)
+        for path in ("/slack/ai", "/slack/approval"):
+            response = client.post(path, data={"user_id": "synthetic-approver", "text": "Synthetic action", "command": "/approve"})
+            self.assertEqual(401, response.status_code)
+        self.assertEqual([], self.executed)
+        self.assertEqual([], events)
+
+    def test_slack_signature_hook_does_not_intercept_other_webhooks(self):
+        orchestrator = self.make_orchestrator()
+        client, ns, events = self.slack_fixture(orchestrator)
+        client.application.add_url_rule("/webhooks/fixture", "fixture", lambda: jsonify({"status": "fixture"}), methods=["POST"])
+        response = client.post("/webhooks/fixture", json={})
+        self.assertEqual(200, response.status_code)
 
 
 if __name__ == "__main__":
