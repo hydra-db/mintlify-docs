@@ -154,10 +154,13 @@ curl "$BASE/byog/collections?database=crm" \
 Drops the collection and all its data. Deleting a collection that does not
 exist also succeeds.
 
-- The collection leaves the API at once: it no longer appears in
-  `GET /byog/collections`. HydraDB frees its storage later.
-- A very large collection can need more than one call. If the delete fails,
-  call it again. It continues where it stopped.
+- When the delete succeeds, the collection is removed from
+  `GET /byog/collections`.
+- A very large collection can need more than one call. If the call returns
+  an error, call it again. The delete continues where it stopped. Until a
+  call succeeds, the collection stays in the list.
+- HydraDB keeps the storage of a deleted collection. The data is not
+  available through the API after the delete.
 - Do not write to a collection while you delete it. In rare cases, a write
   that runs at the same time as the delete can survive it.
 
@@ -243,16 +246,19 @@ Rules for these shapes:
 - **The edge batch takes no labels and no properties in its pattern.** Load
   nodes with the node batch first, then their edges. Write one batch per
   relationship type.
-- **`UNWIND` reads from a parameter** (`UNWIND $rows AS row`), not from a
-  literal list.
+- **An edge to an `id` that does not exist creates a node.** That node has
+  the `id` and no label or other property. Load the nodes before their edges.
+- **One `id` is one node, whatever the label.** If you write an `id` that
+  exists with a different label, the node gets both labels.
+- **A write `UNWIND` reads from a parameter** (`UNWIND $rows AS row`), not
+  from a literal list.
 - **Single `CREATE` adds a new edge each time it runs.** `MERGE` and the two
   batch shapes do not duplicate edges, so they are safe to retry.
 - **A write that starts with `MATCH` needs a label, an `id` or a property**
   on the node: `MATCH (n:Person) DETACH DELETE n`, not `MATCH (n) DETACH DELETE n`.
 - **A write returns no rows.** `CREATE … RETURN` and `MERGE … RETURN` are
   refused. Run a read after the write.
-- **Indexes are managed for you.** `CREATE INDEX` and other schema commands
-  are refused.
+- **`CREATE INDEX` is refused.**
 
 These write forms are refused:
 
@@ -264,7 +270,7 @@ These write forms are refused:
 | `MATCH (a), (b) CREATE (a)-[:KNOWS]->(b)` | `MERGE (a:Person {id: 1})-[:KNOWS]->(b:Person {id: 2})` |
 | `SET n = $map`, `SET n += row.props` | Name each property: `SET n.name = row.name` |
 | `FOREACH`, `CALL { … }` with a write inside | `UNWIND $rows AS row` with a batch shape |
-| `CREATE INDEX …` | Nothing: indexes are managed for you |
+| `CREATE INDEX …` | Remove the statement |
 
 #### Reads
 
@@ -275,7 +281,12 @@ Supported:
 - Typed traversal over one or more hops:
   `MATCH (a:Person)-[:KNOWS]->(b)-[:WORKS_AT]->(c:Company) RETURN c.name`
 - Bounded variable-length typed paths: `-[:KNOWS*1..3]->`
-- `UNWIND`, `WITH`, `ORDER BY`, `SKIP`, `LIMIT`, `DISTINCT`
+- `WITH`, `ORDER BY`, `SKIP`, `LIMIT`, `DISTINCT`
+- `UNWIND` at the start of a read, in one shape only: one `UNWIND` over a
+  list of plain values (not maps), one `MATCH`, and a final `RETURN`.
+  Example: `UNWIND $ids AS i MATCH (p:Person {id: i}) RETURN p.name AS name`
+  with `{"ids": [1, 2]}`. This shape cannot have `WHERE`, `WITH`,
+  `OPTIONAL MATCH`, `ORDER BY`, `SKIP`, `LIMIT` or `UNION`.
 - Aggregates: `count`, `sum`, `avg`, `min`, `max`, `collect`
 - `CASE`, `EXISTS { … }`, string functions such as `toUpper` and `toLower`
 - Parameters, map and list literals, and `CALL { … }` subqueries that only read
@@ -462,8 +473,10 @@ MATCH (p:Person {id: 5})
 DETACH DELETE p
 ```
 
-To delete many nodes, pass their ids:
-`UNWIND $ids AS id MATCH (n {id: id}) DETACH DELETE n`.
+To delete many nodes, pass their ids as maps:
+`UNWIND $rows AS row MATCH (n {id: row.id}) DETACH DELETE n` with
+`{"rows": [{"id": 4}, {"id": 5}]}`. A list of plain ids
+(`UNWIND $ids AS id`) is refused for a delete.
 
 ### Response format
 
@@ -653,7 +666,7 @@ any write clause: `CREATE`, `MERGE`, `SET`, `DELETE`, `REMOVE`, `FOREACH`.
 - **Chunk bulk imports:** see [Bulk loading](#bulk-loading).
 - **Make a slow read smaller:** start the `MATCH` from a label and an `id` or
   property, lower the upper bound of a variable-length path, and add `LIMIT`.
-  Indexes are managed for you; you cannot create one.
+  `CREATE INDEX` is refused.
 
 </Accordion>
 </AccordionGroup>
@@ -676,8 +689,7 @@ notice:
   `properties()`, `nodes()`, `relationships()`, `startNode()`, `endNode()`,
   `elementId()` and `shortestPath` are not available. Every relationship
   pattern needs a type.
-- **No index commands.** Remove `CREATE INDEX` statements; indexes are
-  managed for you.
+- **No index commands.** Remove `CREATE INDEX` statements.
 - Procedure calls (for example Neo4j's `CALL db.*` / `CALL apoc.*`) and
   `LOAD CSV` are not available; batch data in through `params`.
 
