@@ -1,5 +1,5 @@
 ---
-title: "Internal IT Support Agent"
+title: "Build Notion AI for Your Workspace"
 description: "Ingest your entire workspace - Notion, Confluence, Slack - into HydraDB and build a conversational interface that understands relationships between documents. Answer 'why did we decide X?' using HydraDB's context graph. Every endpoint in this guide is real and copy-paste ready."
 ---
 
@@ -23,7 +23,7 @@ HydraDB is different. It doesn't just store vectors - it builds a **living conte
 
 | Source | Install | Environment |
 | --- | --- | --- |
-| Notion | `pip install notion-client` | `NOTION_TOKEN` |
+| Notion | `pip install notion-client==3.1.0` | `NOTION_TOKEN` |
 | Confluence | `pip install requests` | `CONFLUENCE_URL`, `CONFLUENCE_USER`, `CONFLUENCE_TOKEN` |
 | Slack | `pip install slack_sdk slack_bolt` | `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN` |
 
@@ -82,7 +82,7 @@ curl -X POST 'https://api.hydradb.com/databases' \
 import os, time, uuid
 from hydra_db import HydraDB
 
-API_KEY   = os.environ["HYDRA_DB_API_KEY"]
+API_KEY   = os.environ["HYDRADB_API_KEY"]
 DATABASE_ID = "notion-ai-workspace"
 
 client = HydraDB(token=API_KEY)
@@ -102,19 +102,20 @@ HydraDB automatically parses, chunks, embeds, and connects your content into a c
 
 ### Notion Connector
 
-Fetch pages from Notion, format them into HydraDB's app source structure, and batch upload. HydraDB builds the context graph automatically - no edge creation needed.
+Fetch pages from Notion, format them into HydraDB's app source structure, and batch upload. HydraDB builds the context graph automatically - no edge creation needed. This helper targets `notion-client==3.1.0`: databases contain data sources, and queries use `notion.data_sources.query()`, not the removed `databases.query()`. Share the database and its data sources with your Notion integration. The helper paginates each data source and the page's top-level blocks; recursively expanding nested blocks is outside this example.
 
 > **Batch limit:** Max **20 sources per request**. Wait **1 second between batches** to respect rate limits.
 
 ```python
 import json, time
 from notion_client import Client
+from notion_client.helpers import iterate_paginated_api
 
 notion = Client(auth=os.environ["NOTION_TOKEN"])
 
 def extract_text(page_id: str) -> str:
-    """Extract plain text from all rich_text blocks on a page."""
-    blocks = notion.blocks.children.list(block_id=page_id)["results"]
+    """Extract plain text from the page's top-level rich_text blocks."""
+    blocks = iterate_paginated_api(notion.blocks.children.list, block_id=page_id)
     lines  = []
     for b in blocks:
         rt   = b.get(b["type"], {}).get("rich_text", [])
@@ -133,11 +134,23 @@ def upload_batch(sources: list, collection: str = None) -> list:
         database=DATABASE_ID,
         app_knowledge=json.dumps(sources),
     )
-    return [r.id for r in (result.data.results or []) if r.id]
+    results = result.data.results if result.data else []
+    accepted = [r.id for r in (results or []) if r.id and r.status in {"queued", "processing", "completed"}]
+    for item in (results or []):
+        if not item.id or item.status not in {"queued", "processing", "completed"}:
+            print(f"Rejected {item.id or '<missing id>'}: {item.error or item.status}")
+    if not accepted:
+        raise RuntimeError("No sources were accepted; inspect per-item errors")
+    return accepted
 
 
 def ingest_notion_database(database_id: str, collection: str = None) -> list:
-    pages   = notion.databases.query(database_id=database_id)["results"]
+    database = notion.databases.retrieve(database_id=database_id)
+    pages = (
+        page
+        for source in database["data_sources"]
+        for page in iterate_paginated_api(notion.data_sources.query, data_source_id=source["id"])
+    )
     batch   = []
     all_ids = []
 
@@ -289,11 +302,11 @@ def add_user_memory(
     Uses the SDK-spec body format with the memories[] array wrapper.
     """
     payload = {
-        "memories": [{
+        "memories": json.dumps([{
             "text":      preference,
             "user_name": user_name,
             "infer":     infer,
-        }],
+        }]),
         "database": DATABASE_ID,
         "upsert":    True,
     }
@@ -610,4 +623,4 @@ HydraDB leads LongMemEvals with 90% search accuracy. Compared to a naive RAG pip
 | Stale doc surface rate | 41% of results | 7% of results | −83% |
 | P95 query latency | 220ms | under 200 ms | Sub-second |
 
-> **Benchmark methodology.** Figures are based on internal HydraDB testing. For the formal benchmark paper see [research.hydradb.com/hydradb.pdf](https://research.hydradb.com/hydradb.pdf). Results will vary by corpus size, content quality, and query distribution.
+> **Benchmark methodology.** Figures are based on internal HydraDB testing. For the formal benchmark paper see [benchmarks.hydradb.com/hydradb](https://benchmarks.hydradb.com/hydradb). Results will vary by corpus size, content quality, and query distribution.
