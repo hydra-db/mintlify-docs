@@ -419,6 +419,60 @@ class ApprovalInvariantTest(unittest.TestCase):
         self.assertNotIn("synthetic-private-value", notice)
         self.assertNotIn("_token", notice)
 
+    def test_plan_resume_normalizes_json_approval_map_and_step_identities(self):
+        orchestrator = self.make_orchestrator()
+        self.add_approval_store(orchestrator)
+        orchestrator.schemas["first"] = {"id": "first", "meta": {}}
+        orchestrator.registry["first"] = lambda _: self.executed.append("first") or {"success": True}
+        plan = [{"step": "1", "function_id": "first", "params": {}, "depends_on": []}, {"step": "2", "function_id": "synthetic_action", "params": {"amount": 10000}, "depends_on": ["1"]}]
+        execute = definitions(ROUTING, "def execute_plan")["execute_plan"]
+        pending = execute(plan, "synthetic-user", orchestrator)
+        approval_id = pending["approval_id"]
+        orchestrator.approvals.decide(approval_id, "synthetic-approver", True)
+        results = json.loads(json.dumps(pending["results"]))
+        approval_ids = json.loads(json.dumps({2: approval_id}))
+        resumed = execute(plan, "synthetic-user", orchestrator, results=results, approval_ids=approval_ids)
+        self.assertEqual("complete", resumed["status"])
+        self.assertEqual({1, 2}, set(resumed["results"]))
+        self.assertEqual(1, self.executed.count("first"))
+        self.assertEqual(2, len(self.executed))
+
+    def test_rollback_resume_normalizes_json_approval_and_compensation_state(self):
+        orchestrator = self.make_orchestrator()
+        self.add_approval_store(orchestrator)
+        rollback = definitions(ROUTING, "def rollback_plan", COMPENSATION_REGISTRY={"forward_action": "synthetic_action"})["rollback_plan"]
+        results = json.loads(json.dumps({1: {"status": "done", "function_id": "forward_action", "result": {"success": True, "amount": 10000}}}))
+        pending = rollback(results, 2, "synthetic-user", orchestrator)
+        approval_id = pending["approval_id"]
+        orchestrator.approvals.decide(approval_id, "synthetic-approver", True)
+        approval_ids = json.loads(json.dumps({1: approval_id}))
+        resumed = rollback(results, 2, "synthetic-user", orchestrator, approval_ids=approval_ids, compensated=json.loads(json.dumps(pending["compensated"])))
+        self.assertEqual("complete", resumed["status"])
+        self.assertEqual([1], resumed["compensated"])
+        self.assertEqual(1, len(self.executed))
+        repeated = rollback(results, "2", "synthetic-user", orchestrator, approval_ids=approval_ids, compensated=["1"])
+        self.assertEqual("complete", repeated["status"])
+        self.assertEqual([1], repeated["compensated"])
+        self.assertEqual(1, len(self.executed))
+
+    def test_slack_plan_resume_normalizes_restored_step_identities(self):
+        orchestrator = self.make_orchestrator()
+        self.add_approval_store(orchestrator)
+        client, ns, events = self.slack_fixture(orchestrator)
+        self.slack_post(client, ns, "/slack/ai", user_id="synthetic-slack-user", channel_id="synthetic-channel", text="Onboard synthetic user")
+        approval_id = next(iter(ns["PENDING_ACTIONS"]))
+        context = json.loads(json.dumps(ns["PENDING_ACTIONS"][approval_id]))
+        context["pending_step"] = str(context["pending_step"])
+        for step in context["plan"]:
+            step["step"] = str(step["step"])
+            step["depends_on"] = [str(number) for number in step["depends_on"]]
+        ns["PENDING_ACTIONS"][approval_id] = context
+        response = self.slack_post(client, ns, "/slack/approval", command="/approve", text=approval_id, user_id="synthetic-approver")
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(1, self.executed.count("first"))
+        self.assertEqual(2, len(self.executed))
+        self.assertIn("complete", response.json["text"])
+
 
 if __name__ == "__main__":
     unittest.main()
