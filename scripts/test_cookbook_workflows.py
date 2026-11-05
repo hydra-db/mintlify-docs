@@ -323,7 +323,7 @@ class ApprovalInvariantTest(unittest.TestCase):
         plan = [{"step": 1, "function_id": "first", "params": {}, "depends_on": []}, {"step": 2, "function_id": "synthetic_action", "params": {"amount": 10000}, "depends_on": [1]}]
         orchestrator.schemas["first"] = {"id": "first", "meta": {}}
         orchestrator.registry["first"] = lambda _: self.executed.append("first") or {"success": True}
-        ns = definitions(ROUTING, "def handle_slack_ai_command", flask_app=app, request=request, jsonify=jsonify, slack_bot=bot, orchestrator=orchestrator, execute_plan=definitions(ROUTING, "def execute_plan")["execute_plan"], generate_execution_plan=lambda *_: plan, PENDING_ACTIONS={}, PENDING_LOCK=threading.Lock(), slack_verifier=SignatureVerifier("synthetic-signing-secret"))
+        ns = definitions(ROUTING, "def handle_slack_ai_command", json=json, flask_app=app, request=request, jsonify=jsonify, slack_bot=bot, orchestrator=orchestrator, execute_plan=definitions(ROUTING, "def execute_plan")["execute_plan"], generate_execution_plan=lambda *_: plan, PENDING_ACTIONS={}, PENDING_LOCK=threading.Lock(), slack_verifier=SignatureVerifier("synthetic-signing-secret"))
         ns["slack_to_user_id"] = lambda _: "synthetic-user"
         return app.test_client(), ns, events
 
@@ -405,6 +405,19 @@ class ApprovalInvariantTest(unittest.TestCase):
         client.application.add_url_rule("/webhooks/fixture", "fixture", lambda: jsonify({"status": "fixture"}), methods=["POST"])
         response = client.post("/webhooks/fixture", json={})
         self.assertEqual(200, response.status_code)
+
+    def test_slack_approval_preview_identifies_action_without_disclosing_hidden_fields(self):
+        orchestrator = self.make_orchestrator()
+        self.add_approval_store(orchestrator)
+        self.schema["meta"]["approval_preview_fields"] = ["amount", "nested", "_token"]
+        orchestrator._extract_params = lambda *_: {"amount": 10000, "note": "synthetic-private-value", "nested": {"token": "synthetic-private-value"}, "_token": "synthetic-private-value"}
+        client, ns, events = self.slack_fixture(orchestrator)
+        self.slack_post(client, ns, "/slack/ai", user_id="synthetic-slack-user", channel_id="synthetic-channel", text="Synthetic action")
+        notice = next(event[1]["text"] for event in events if event[0] == "message")
+        self.assertIn("synthetic_action", notice)
+        self.assertIn("10000", notice)
+        self.assertNotIn("synthetic-private-value", notice)
+        self.assertNotIn("_token", notice)
 
 
 if __name__ == "__main__":

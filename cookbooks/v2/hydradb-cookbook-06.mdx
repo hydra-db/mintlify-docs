@@ -228,6 +228,7 @@ Here is a more complex schema - a finance function with approval constraints and
     "permission_level":   "manager",
     "cost_threshold":     5000,
     "requires_approval":  true,
+    "approval_preview_fields": ["expense_id", "approver_id"],
     "business_hours_only": true,
     "collections":        ["finance", "approvals"],
     "side_effects":       "Triggers payment processing. Irreversible without finance team intervention.",
@@ -1132,6 +1133,7 @@ Expose a Slack slash-command that forwards the user's natural-language instructi
 
 
 ```python title="triggers/slack_command.py"
+import json
 import os
 import threading
 from flask import Flask, request, jsonify
@@ -1163,9 +1165,17 @@ def report_slack_result(result, context):
         if approval_id:
             with PENDING_LOCK:
                 PENDING_ACTIONS[approval_id] = {**context, "results": result.get("results"), "pending_step": result.get("pending_step")}
+            record = orchestrator.approvals.get(approval_id)
+            schema = orchestrator.schemas[record["function_id"]]
+            preview = {
+                key: value if isinstance(value, (str, int, float, bool, type(None))) else "<hidden>"
+                for key, value in record["params"].items()
+                if key in schema.get("meta", {}).get("approval_preview_fields", []) and not key.startswith("_")
+            }
             slack_bot.chat_postMessage(
                 channel=orchestrator.approvals.approver_id,
-                text=f"Approval required for {context['user_id']}: /approve {approval_id} or /reject {approval_id}",
+                text=f"Approval required for {context['user_id']}\nFunction: {record['function_id']}\nSafe parameters: {json.dumps(preview, sort_keys=True)}\n/approve {approval_id} or /reject {approval_id}",
+                mrkdwn=False,
             )
             reply = f"Waiting for approval {approval_id}. No further action executed."
         else:
@@ -1249,6 +1259,8 @@ if __name__ == "__main__":
 ```
 
 Configure `/ai` to POST to `/slack/ai`, and `/approve` and `/reject` to POST to `/slack/approval`. Set `SLACK_SIGNING_SECRET`, `SLACK_BOT_TOKEN`, and `APPROVER_SLACK_USER_ID`. Every Slack request is signature-verified before reading its identity; only the configured approver can authorize a pending action. The requester receives the approval ID and final result, and a pending plan retains its completed-step state instead of restarting. Non-Slack webhooks need their provider's own signature verification.
+
+Set each reviewed schema's `meta.approval_preview_fields` to the non-sensitive scalar fields an approver needs to identify the action, as in the finance schema above. Notifications show the stored function ID and only those fields. Credentials, message bodies, and private fields must not be allowlisted; reserved token fields and structured values remain hidden. Provide an authenticated detail view in your production app if a decision needs information that cannot safely appear in Slack.
 
 This synchronous, single-process example demonstrates the state transitions. In production, persist the pending state transactionally and queue long-running work before acknowledging Slack's three-second deadline; posting an ephemeral message is not an HTTP acknowledgment. Authenticated live Slack delivery and timing aren't verified by the local fixtures.
 
@@ -1502,9 +1514,9 @@ class ApprovalStore:
             return decision
 ```
 
-Configure `APPROVER_SLACK_USER_ID` before constructing the orchestrator. To notify the approver, your application can use `slack_bot.chat_postMessage(channel=orchestrator.approvals.approver_id, text=f"Approval required: {approval_id}")` after receiving `pending`. Keep tokens out of notification payloads.
+Configure `APPROVER_SLACK_USER_ID` before constructing the orchestrator. The [Slack handlers](#slack-slash-command-direct-commands) notify the approver through `report_slack_result()`, showing the stored function ID and allowlisted safe parameters. Keep credentials out of notification payloads.
 
-In your verified Slack interaction handler, obtain the approver's identity from the authenticated interaction, not from LLM output or a caller-supplied field. Call `orchestrator.approvals.decide(approval_id, authenticated_approver_id, approved)` and then `orchestrator.resume_approval(approval_id, requesting_user_id)`. Pending and denied requests still don't execute; approved requests recheck current policy and run once. For plans, resume through `execute_plan()` with its saved server-side state instead of separately executing the pending step.
+The supplied Slack approval route records the verified approver's decision and resumes the saved action or plan. For another authenticated application, obtain the approver's identity from its verified session, not from LLM output or a caller-supplied field. Call `orchestrator.approvals.decide(approval_id, authenticated_approver_id, approved)` and then `orchestrator.resume_approval(approval_id, requesting_user_id)`. Pending and denied requests still don't execute; approved requests recheck current policy and run once. For plans, resume through `execute_plan()` with its saved server-side state instead of separately executing the pending step.
 
 
 ⚠️
