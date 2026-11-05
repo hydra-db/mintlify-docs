@@ -7,6 +7,12 @@ Bring Your Own Graph (BYOG) lets you use **Cypher** to read and write data in
 [HydraDB's core graph database](https://github.com/hydra-db/hydradb), which we
 host and scale in our cloud.
 
+<Warning>
+BYOG runs a **subset of Cypher**. Every node needs an integer `id`, and writes
+must use the shapes in [Supported Cypher](#supported-cypher). Read that section
+before you load data.
+</Warning>
+
 Migrating from an existing graph database? Start at
 [Migrating from Neo4j or another Cypher-compatible database](#migrating-from-neo4j-or-another-cypher-compatible-database).
 To bring your own entities and relations without writing Cypher, attach
@@ -26,15 +32,16 @@ curl -X POST "$BASE/byog/databases" \
   -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
   -d '{"database": "crm"}'
 
-# 2. Write data - the collection is created on first write
+# 2. Write data - the collection is created on first write.
+#    Every node has an integer id. The label goes in SET.
 curl -X POST "$BASE/byog/query" \
   -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
   -d '{
     "database": "crm",
     "collection": "contacts",
-    "query": "UNWIND $rows AS row CREATE (p:Person) SET p = row RETURN count(p) AS created",
-    "params": {"rows": [{"name": "Alice", "role": "admin"},
-                        {"name": "Bob",   "role": "analyst"}]}
+    "query": "UNWIND $rows AS row MERGE (p {id: row.id}) SET p:Person, p.name = row.name, p.role = row.role",
+    "params": {"rows": [{"id": 1, "name": "Alice", "role": "admin"},
+                        {"id": 2, "name": "Bob",   "role": "analyst"}]}
   }'
 
 # 3. Read it back
@@ -60,7 +67,7 @@ Authorization: Bearer <api key>
 
 A missing or invalid key returns `403`. Your databases are visible only to
 your organization: another organization's databases look like names that
-don't exist, and `MATCH (n) RETURN n` returns only your own nodes.
+don't exist, and `MATCH (p:Person) RETURN p.name` returns only your own nodes.
 
 ### Endpoints
 
@@ -96,8 +103,8 @@ curl -X POST "$BASE/byog/query" \
   -d '{
     "database": "crm",
     "collection": "contacts",
-    "query": "CREATE (n:Person {name: $name}) RETURN n",
-    "params": {"name": "Alice"}
+    "query": "MATCH (p:Person {id: $id}) RETURN p.name AS name, p.role AS role",
+    "params": {"id": 1}
   }'
 ```
 
@@ -105,10 +112,10 @@ curl -X POST "$BASE/byog/query" \
 {
   "success": true,
   "data": [
-    { "n": { "id": 0, "labels": ["Person"], "name": "Alice" } }
+    { "name": "Alice", "role": "admin" }
   ],
   "error": null,
-  "meta": { "request_id": "0f345406-…", "api_version": "2.0.1", "latency_ms": 142.4 }
+  "meta": { "request_id": "0f345406-…", "api_version": "2.0.1", "latency_ms": 42.4 }
 }
 ```
 </CodeGroup>
@@ -117,6 +124,7 @@ curl -X POST "$BASE/byog/query" \
   and cannot see data in any other.
 - Collections are created automatically on the first write. Reading a
   collection that doesn't exist yet returns zero rows.
+- A write returns no rows (`data: []`). Run a read to see the result.
 - Pass user data through `params` instead of building it into the query string.
 - Collection names can use letters, digits, `_` and `-`, must start with a
   letter or digit, and can be up to 64 characters long.
@@ -146,6 +154,11 @@ curl "$BASE/byog/collections?database=crm" \
 Drops the collection and all its data. Deleting a collection that does not
 exist also succeeds.
 
+- The collection leaves the API at once: it no longer appears in
+  `GET /byog/collections`. HydraDB frees its storage later.
+- Do not write to a collection while you delete it. In rare cases, a write
+  that runs at the same time as the delete can survive it.
+
 <CodeGroup>
 ```bash Request
 curl -X DELETE "$BASE/byog/collections" \
@@ -165,7 +178,7 @@ curl -X DELETE "$BASE/byog/collections" \
 
 #### `DELETE /byog/databases`: drop a database
 
-Drops the graph collections and, if created through `POST /byog/databases`, the database itself. For a database created through the standard database API, the graph collections are dropped, `deleted` is `false`, and the database stays. Use the standard `DELETE /databases` to remove that database.
+Drops the graph collections and, if created through `POST /byog/databases`, the database itself. For a database created through the standard database API, the graph collections are dropped, `deleted` is `false`, and the database stays. Use the standard `DELETE /databases` to remove that database. The rules for deleting a collection apply to each collection.
 
 <CodeGroup>
 ```bash Request
@@ -191,129 +204,180 @@ curl -X DELETE "$BASE/byog/databases" \
 
 ### Supported Cypher
 
-All of openCypher is supported except server-side procedures and file loading.
+BYOG runs a subset of openCypher. Reads are broad. Writes accept only the
+shapes below. A query outside this list fails with `400` before it changes
+any data. Retrying the same query fails the same way.
 
-#### Modeling and CRUD
+#### Node ids
 
-- Create, read, update and delete: `CREATE`, `MATCH`, `MERGE`, `SET`,
-  `REMOVE`, `DELETE` / `DETACH DELETE`
-- Pattern matching, `WHERE` filters, aggregation, `ORDER BY` / `SKIP` / `LIMIT`
-- `UNWIND` and `WITH` pipelines
-- Indexes: `CREATE INDEX FOR (n:Label) ON (n.prop)`
-- `CALL { ... }` subqueries
+- Every node has an **integer** `id` property, which you choose. A string id
+  fails with "node id property must be an integer".
+- The `id` is the node's identity in the collection. Two writes with the same
+  `id` change the same node, whatever label they use. Keep ids unique across
+  all labels in a collection.
+- To keep your own string key (an email, a UUID), store it as a second
+  property, such as `ext_id`, and map it to an integer `id` in your code.
 
-#### Graph traversal and exploration
+#### Writes
 
-- **Multi-hop patterns:** chain relationships in one `MATCH`:
-  `MATCH (a:Person)-[:KNOWS]->(b)-[:WORKS_AT]->(c:Company) RETURN c.name`.
-- **Variable-length traversal:** follow a relationship a bounded or unbounded
-  number of hops with `*`:
-  `MATCH (a:Person {name:$n})-[:KNOWS*1..4]->(reach) RETURN DISTINCT reach.name`.
-- **Neighborhood expansion:** a node's edges and neighbors in any direction:
-  `MATCH (p:Person {name:$n})-[r]-(nbr) RETURN type(r) AS rel, nbr.name AS neighbor`.
-- **Path finding:** `shortestPath` returns the full path (nodes and edges in
-  traversal order), not only the endpoints.
-- **Directed, typed, filtered traversal:** outgoing (`->`), incoming (`<-`)
-  or either (`-`) edges, filtered by relationship type and by node or edge
-  properties anywhere along the walk.
+| To do this | Use this shape |
+|---|---|
+| Create or update nodes in a batch | `UNWIND $rows AS row MERGE (n {id: row.id}) SET n:Person, n.name = row.name` |
+| Create an edge and its two nodes, safe to re-run | `MERGE (a:Person {id: 1, name: "Alice"})-[:KNOWS {since: 2020}]->(b:Person {id: 2, name: "Bob"})` |
+| Create an edge and its two nodes, once | `CREATE (a:Person {id: 1})-[:KNOWS]->(b:Person {id: 2})` |
+| Create edges in a batch | `UNWIND $rows AS row CREATE (a {id: row.src})-[:KNOWS]->(b {id: row.dst})` |
+| Update a node | `MATCH (n:Person {id: 1}) SET n.age = 31` |
+| Delete nodes and their edges | `MATCH (n:Person {id: 1}) DETACH DELETE n` |
+| Delete one edge | `MATCH (a:Person {id: 1})-[r:KNOWS]->(b:Person {id: 2}) DELETE r` |
 
-#### Not supported
+Rules for these shapes:
 
-These are rejected with `400` before the query runs; nothing is executed,
-and retrying the same query fails the same way:
+- **A write is a one-hop edge pattern or a node batch.** You cannot create a
+  lone node with `CREATE` or `MERGE`. Use the node batch: it is the only way
+  to write a node with no edges.
+- **The node batch sets exactly one label, in `SET`** (`SET n:Person, …`),
+  not in the `MERGE` pattern. Name each property you set
+  (`n.name = row.name`).
+- **The edge batch takes no labels and no properties in its pattern.** Load
+  nodes with the node batch first, then their edges. Write one batch per
+  relationship type.
+- **`UNWIND` reads from a parameter** (`UNWIND $rows AS row`), not from a
+  literal list.
+- **Single `CREATE` adds a new edge each time it runs.** `MERGE` and the two
+  batch shapes do not duplicate edges, so they are safe to retry.
+- **A write that starts with `MATCH` needs a label, an `id` or a property**
+  on the node: `MATCH (n:Person) DETACH DELETE n`, not `MATCH (n) DETACH DELETE n`.
+- **A write returns no rows.** `CREATE … RETURN` and `MERGE … RETURN` are
+  refused. Run a read after the write.
+- **Indexes are managed for you.** `CREATE INDEX` and other schema commands
+  are refused.
 
-- **Procedure calls:** `CALL some.procedure(...)`, including `db.*` and
-  `apoc.*`. (`CALL { ... }` *subqueries* are fine.)
-- **`LOAD CSV`:** send data through `params` instead.
+These write forms are refused:
 
-Dialect notes:
+| Refused | Use instead |
+|---|---|
+| `CREATE (:Person {name: "a"})` (a node without an edge) | The node batch |
+| `CREATE (:Person {id: "a"})-[:KNOWS]->(:Person {id: "b"})` (string ids) | Integer ids, with the string in another property |
+| `CREATE … RETURN …`, `MERGE … RETURN …` | Write, then read |
+| `MATCH (a), (b) CREATE (a)-[:KNOWS]->(b)` | `MERGE (a:Person {id: 1})-[:KNOWS]->(b:Person {id: 2})` |
+| `SET n = $map`, `SET n += row.props` | Name each property: `SET n.name = row.name` |
+| `FOREACH`, `CALL { … }` with a write inside | `UNWIND $rows AS row` with a batch shape |
+| `CREATE INDEX …` | Nothing: indexes are managed for you |
 
-- **Existence checks** are bare pattern predicates:
-  `MATCH (p:Person) WHERE (p)-[:KNOWS]->() RETURN p.name AS name`.
-  The `EXISTS { ... }` block form and the `exists()` function are not
-  accepted.
-- **`shortestPath`** goes in a `RETURN` or `WITH` clause (not `MATCH p = …`)
-  and the traversal must be directed.
+#### Reads
+
+Supported:
+
+- `MATCH` with labels and properties, `WHERE` (including `IN`, `AND`/`OR`,
+  `STARTS WITH`, `ENDS WITH`, `CONTAINS`) and `OPTIONAL MATCH`
+- Typed traversal over one or more hops:
+  `MATCH (a:Person)-[:KNOWS]->(b)-[:WORKS_AT]->(c:Company) RETURN c.name`
+- Bounded variable-length typed paths: `-[:KNOWS*1..3]->`
+- `UNWIND`, `WITH`, `ORDER BY`, `SKIP`, `LIMIT`, `DISTINCT`
+- Aggregates: `count`, `sum`, `avg`, `min`, `max`, `collect`
+- `CASE`, `EXISTS { … }`, string functions such as `toUpper` and `toLower`
+- Parameters, map and list literals, and `CALL { … }` subqueries that only read
+
+Refused:
+
+- Functions on graph elements: `type()`, `id()`, `elementId()`, `labels()`,
+  `keys()`, `properties()`, `nodes()`, `relationships()`, `startNode()`,
+  `endNode()`
+- `shortestPath`
+- Relationship patterns without a type: `(a)--(b)`, `(a)-[r]->(b)`,
+  `()-[r]->()`. Name the type: `(a)-[:KNOWS]->(b)`.
+- Procedure calls (`CALL db.*`, `CALL apoc.*`) and `LOAD CSV`
+
+Return properties, not whole nodes. `RETURN n` gives the node's integer `id`,
+not an object with its properties. Write `RETURN n.name AS name` instead.
 
 ### Common Cypher queries
 
-**Load the sample graph:** Five people, two companies, and the `KNOWS` / `WORKS_AT` edges between them.
+**Load the sample graph:** Five people, two companies, and the `KNOWS` /
+`WORKS_AT` edges between them. This is three requests: nodes first, then one
+edge batch per relationship type.
 
 ```cypher
-CREATE (alice:Person {ext_id: "u1", name: "Alice", role: "admin"}),
-       (bob:Person   {ext_id: "u2", name: "Bob",   role: "analyst"}),
-       (carol:Person {ext_id: "u3", name: "Carol", role: "engineer"}),
-       (dan:Person   {ext_id: "u4", name: "Dan",   role: "engineer"}),
-       (eve:Person   {ext_id: "u5", name: "Eve",   role: "designer"}),
-       (acme:Company   {ext_id: "c1", name: "Acme",   sector: "fintech"}),
-       (globex:Company {ext_id: "c2", name: "Globex", sector: "retail"}),
-       (alice)-[:KNOWS {since: 2020}]->(bob),
-       (bob)-[:KNOWS {since: 2021}]->(carol),
-       (carol)-[:KNOWS {since: 2022}]->(dan),
-       (alice)-[:KNOWS {since: 2023}]->(eve),
-       (bob)-[:WORKS_AT]->(acme),
-       (carol)-[:WORKS_AT]->(acme),
-       (dan)-[:WORKS_AT]->(globex)
-RETURN count(*) AS created
+// Request 1: nodes. Run it once per label.
+UNWIND $rows AS row
+MERGE (n {id: row.id})
+SET n:Person, n.ext_id = row.ext_id, n.name = row.name, n.role = row.role
 ```
 
-<Accordion title="Result">
-
-```json
-[{"created": 1}]
+```json params
+{"rows": [
+  {"id": 1, "ext_id": "u1", "name": "Alice", "role": "admin"},
+  {"id": 2, "ext_id": "u2", "name": "Bob",   "role": "analyst"},
+  {"id": 3, "ext_id": "u3", "name": "Carol", "role": "engineer"},
+  {"id": 4, "ext_id": "u4", "name": "Dan",   "role": "engineer"},
+  {"id": 5, "ext_id": "u5", "name": "Eve",   "role": "designer"}
+]}
 ```
 
-</Accordion>
-
-**Upsert a node on your own key:** Updates Alice's role, or creates her if `u1` doesn't exist.
+Run the same query with `SET n:Company, n.ext_id = row.ext_id, n.name = row.name, n.sector = row.sector`
+and `{"rows": [{"id": 101, "ext_id": "c1", "name": "Acme", "sector": "fintech"}, {"id": 102, "ext_id": "c2", "name": "Globex", "sector": "retail"}]}`.
+The company ids do not reuse a person id.
 
 ```cypher
-MERGE (p:Person {ext_id: "u1"})
+// Request 2: KNOWS edges.
+UNWIND $rows AS row
+CREATE (a {id: row.src})-[:KNOWS]->(b {id: row.dst})
+```
+
+```json params
+{"rows": [{"src": 1, "dst": 2}, {"src": 2, "dst": 3}, {"src": 3, "dst": 4}, {"src": 1, "dst": 5}]}
+```
+
+```cypher
+// Request 3: WORKS_AT edges.
+UNWIND $rows AS row
+CREATE (a {id: row.src})-[:WORKS_AT]->(b {id: row.dst})
+```
+
+```json params
+{"rows": [{"src": 2, "dst": 101}, {"src": 3, "dst": 101}, {"src": 4, "dst": 102}]}
+```
+
+Each request returns `data: []`.
+
+**Update a node:** Changes Alice's role.
+
+```cypher
+MATCH (p:Person {id: 1})
 SET p.role = "owner"
-RETURN p.ext_id AS id, p.name AS name, p.role AS role
 ```
 
-<Accordion title="Result">
+Each write returns `data: []`. To create the node when it does not exist,
+use the node batch with one row.
 
-```json
-[{"id": "u1", "name": "Alice", "role": "owner"}]
-```
-
-</Accordion>
-
-**Connect two existing nodes:** Eve starts working at Acme.
+**Connect two existing nodes:** Eve starts working at Acme. `MERGE` does not
+add a second edge if it already exists.
 
 ```cypher
-MATCH (a:Person {ext_id: "u5"}), (b:Company {ext_id: "c1"})
-MERGE (a)-[w:WORKS_AT]->(b)
-SET w.since = 2024
-RETURN a.name AS person, type(w) AS rel, b.name AS company, w.since AS since
+MERGE (a:Person {id: 5})-[:WORKS_AT {since: 2024}]->(b:Company {id: 101})
 ```
 
-<Accordion title="Result">
-
-```json
-[{"company": "Acme", "person": "Eve", "rel": "WORKS_AT", "since": 2024}]
-```
-
-</Accordion>
-
-**Expand a node's neighborhood:** Every relationship on Bob, in any direction, and the node on the other end.
+**List a node's neighbors:** There is no wildcard relationship, so ask for
+each type and direction you need. Who does Bob know, and who knows Bob?
 
 ```cypher
-MATCH (p:Person {name: "Bob"})-[r]-(nbr)
-RETURN type(r) AS rel, labels(nbr) AS kind, nbr.name AS neighbor
-ORDER BY rel, neighbor
+MATCH (p:Person {name: "Bob"})-[:KNOWS]->(friend:Person)
+RETURN friend.name AS friend
 ```
 
-<Accordion title="Result">
+```cypher
+MATCH (fan:Person)-[:KNOWS]->(p:Person {name: "Bob"})
+RETURN fan.name AS fan
+```
+
+<Accordion title="Results">
 
 ```json
-[
-  {"kind": ["Person"], "neighbor": "Alice", "rel": "KNOWS"},
-  {"kind": ["Person"], "neighbor": "Carol", "rel": "KNOWS"},
-  {"kind": ["Company"], "neighbor": "Acme", "rel": "WORKS_AT"}
-]
+[{"friend": "Carol"}]
+```
+
+```json
+[{"fan": "Alice"}]
 ```
 
 </Accordion>
@@ -340,70 +404,8 @@ ORDER BY name
 
 </Accordion>
 
-**Shortest path between two nodes:** Returns the whole path (nodes and edges in order), not only the endpoints.
-
-```cypher
-MATCH (a:Person {name: "Alice"}), (b:Person {name: "Carol"})
-RETURN shortestPath((a)-[:KNOWS*..8]->(b)) AS path
-```
-
-<Accordion title="Result">
-
-```json
-[
-  {
-    "path": {
-      "edges": [
-        {
-          "id": 0,
-          "relation": "KNOWS",
-          "since": 2020,
-          "source_node_id": 0,
-          "target_node_id": 1
-        },
-        {
-          "id": 1,
-          "relation": "KNOWS",
-          "since": 2021,
-          "source_node_id": 1,
-          "target_node_id": 2
-        }
-      ],
-      "nodes": [
-        {
-          "ext_id": "u1",
-          "id": 0,
-          "labels": [
-            "Person"
-          ],
-          "name": "Alice",
-          "role": "owner"
-        },
-        {
-          "ext_id": "u2",
-          "id": 1,
-          "labels": [
-            "Person"
-          ],
-          "name": "Bob",
-          "role": "analyst"
-        },
-        {
-          "ext_id": "u3",
-          "id": 2,
-          "labels": [
-            "Person"
-          ],
-          "name": "Carol",
-          "role": "engineer"
-        }
-      ]
-    }
-  }
-]
-```
-
-</Accordion>
+A variable-length path can visit a node more than once. Use `DISTINCT` when
+you want each node one time.
 
 **Filtered, typed traversal:** Who does Alice know that works at a fintech company?
 
@@ -444,35 +446,22 @@ ORDER BY headcount DESC
 
 </Accordion>
 
-**Index a property you filter on:** Speeds up lookups by `ext_id`.
+**Delete one edge:** Eve leaves Acme.
 
 ```cypher
-CREATE INDEX FOR (n:Person) ON (n.ext_id)
+MATCH (a:Person {id: 5})-[r:WORKS_AT]->(c:Company {id: 101})
+DELETE r
 ```
-
-<Accordion title="Result">
-
-```json
-[]
-```
-
-</Accordion>
 
 **Delete a node and its edges:** Removes Eve and every relationship attached to her.
 
 ```cypher
-MATCH (p:Person {ext_id: "u5"})
+MATCH (p:Person {id: 5})
 DETACH DELETE p
-RETURN count(*) AS deleted
 ```
 
-<Accordion title="Result">
-
-```json
-[{"deleted": 1}]
-```
-
-</Accordion>
+To delete many nodes, pass their ids:
+`UNWIND $ids AS id MATCH (n {id: id}) DETACH DELETE n`.
 
 ### Response format
 
@@ -493,24 +482,17 @@ aliases:
 
 - **Alias every column you read:** `RETURN n.name AS name`. An unaliased
   column is keyed by its expression text (`"n.name"`).
-- A write with no `RETURN` succeeds with `data: []`.
+- A write succeeds with `data: []`.
 
 What each kind of value looks like inside a row:
 
 | You return | Example | Row in `data` |
 |---|---|---|
 | Scalar | `RETURN p.name AS name` | `{"name": "Alice"}` |
-| Node | `RETURN p` | `{"p": {"id": 0, "labels": ["Person"], "name": "Alice"}}` |
-| Relationship | `RETURN k` | `{"k": {"id": 7, "relation": "KNOWS", "source_node_id": 0, "target_node_id": 1, "since": 2020}}` |
-| Path | `RETURN shortestPath(...) AS path` | `{"path": {"nodes": [...], "edges": [...]}}` |
 | List / map | `RETURN collect(p.name) AS names` | `{"names": ["Alice", "Bob"]}` |
+| Node | `RETURN p` | `{"p": 1}`: the node's integer `id`, not its properties |
+| Relationship or path | `RETURN k` | Not available. Return properties: `RETURN k.since AS since` |
 
-- Nodes and relationships are flat objects: their properties plus the keys
-  in the table. A stored property with one of those names (`id`, `labels`,
-  `relation`, `source_node_id`, `target_node_id`) is hidden in the response;
-  alias it (`RETURN n.id AS my_id`).
-- `id` is internal: it can be reused after deletes and does not survive an
-  export/re-import. Key your data on a property you own, such as `ext_id` or `email`.
 - Integers are 64-bit. Values beyond 2⁵³ lose precision in languages that
   parse JSON numbers as doubles; return them as strings.
 
@@ -563,20 +545,14 @@ async function query(cypher: string, params: object = {}): Promise<Record<string
 rows = g.query("MATCH (p:Person) RETURN p.name AS name, p.role AS role ORDER BY name")
 names = [r["name"] for r in rows]                  # ["Alice", "Bob"]
 
-# Nodes - one flat object: properties plus id and labels.
-alice = g.query("MATCH (p:Person {name: $n}) RETURN p", {"n": "Alice"})[0]["p"]
-props = {k: v for k, v in alice.items() if k not in ("id", "labels")}
+# Nodes - return the properties you need, not the node.
+alice = g.query("MATCH (p:Person {name: $n}) RETURN p.id AS id, p.role AS role",
+                {"n": "Alice"})[0]
 
 # Relationships - project both ends in the same query.
-for row in g.query("MATCH (a:Person)-[k:KNOWS]->(b:Person) "
-                   "RETURN a.name AS a, b.name AS b, k.since AS since"):
-    print(f'{row["a"]} knows {row["b"]} since {row["since"]}')
-
-# Paths - nodes and edges in traversal order.
-path = g.query("MATCH (a:Person {name:$x}), (b:Person {name:$y}) "
-               "RETURN shortestPath((a)-[*..6]->(b)) AS path",
-               {"x": "Alice", "y": "Bob"})[0]["path"]
-hops = [n["name"] for n in path["nodes"]]          # ["Alice", ..., "Bob"]
+for row in g.query("MATCH (a:Person)-[:KNOWS]->(b:Person) "
+                   "RETURN a.name AS a, b.name AS b"):
+    print(f'{row["a"]} knows {row["b"]}')
 ```
 
 #### Pagination
@@ -600,27 +576,33 @@ people = list(all_rows("MATCH (p:Person) RETURN p.name AS name ORDER BY name"))
 
 #### Bulk loading
 
-Chunk rows to stay inside the 256 KiB body cap and the 30 s write budget;
-`MERGE` on your own key makes the load re-runnable after a failure:
+Chunk rows to stay inside the 256 KiB body cap and the 30 s write budget.
+Load nodes first, then edges. Both batch shapes are safe to re-run after a
+failure:
 
 ```python
-def load(rows, chunk=500):
-    for i in range(0, len(rows), chunk):
+def load(people, knows, chunk=500):
+    for i in range(0, len(people), chunk):
         g.query("""
             UNWIND $rows AS row
-            MERGE (n:Person {ext_id: row.ext_id})
-            SET n += row
-        """, {"rows": rows[i:i+chunk]})
+            MERGE (n {id: row.id})
+            SET n:Person, n.ext_id = row.ext_id, n.name = row.name
+        """, {"rows": people[i:i+chunk]})
+    for i in range(0, len(knows), chunk):
+        g.query("""
+            UNWIND $rows AS row
+            CREATE (a {id: row.src})-[:KNOWS]->(b {id: row.dst})
+        """, {"rows": knows[i:i+chunk]})
 ```
 
 #### Handling failures
 
-- **`400`:** the message says what to fix, either your Cypher (compiler
-  feedback is passed through) or a query that needs `LIMIT` or an index (budget
-  timeout). Retrying unchanged fails identically.
-- **`429` / `500`:** transient; retry with backoff. Writes built on `MERGE`
-  (as in [Bulk loading](#bulk-loading)) are safe to retry; bare `CREATE` batches are not idempotent, so
-  a retried chunk can duplicate nodes.
+- **`400`:** the message says what to fix: an unsupported Cypher shape (see
+  [Supported Cypher](#supported-cypher)), another Cypher error, or a query
+  that ran past its time budget. Retrying unchanged fails identically.
+- **`429` / `500`:** transient; retry with backoff. `MERGE` and the batch
+  shapes (as in [Bulk loading](#bulk-loading)) are safe to retry. A single
+  `CREATE` of an edge is not: a retry can add a duplicate edge.
 
 ### Errors and limits
 
@@ -641,13 +623,13 @@ mirrored in `detail`):
 
 | Status | Meaning |
 |---|---|
-| `400` | Invalid request (missing fields, bad collection name), unsupported construct, **Cypher errors** (the compiler's message is passed through so you can fix the query), or **query timeout** |
+| `400` | Invalid request (missing fields, bad collection name), a **Cypher shape outside [Supported Cypher](#supported-cypher)**, another **Cypher error** (the message tells you what to fix), or a **query timeout** |
 | `403` | Missing or invalid API key |
 | `404` | Unknown database; create it with `POST /byog/databases` |
 | `409` | `POST /byog/databases` with a name that already exists |
 | `413` | Request body over 256 KiB |
 | `429` | Rate limit exceeded; back off and retry |
-| `500` | Server error. Retry reads with backoff; retry writes only when they are idempotent, such as the `MERGE` batches above |
+| `500` | Server error. Retry reads with backoff; retry writes only when they are safe to repeat, such as `MERGE` and the batch shapes |
 
 </Accordion>
 
@@ -656,7 +638,7 @@ mirrored in `detail`):
 | Limit | Value | On exceeding |
 |---|---|---|
 | Request body | 256 KiB | `413` |
-| Read query execution | 8 s | `400`: "query exceeded the execution time budget; simplify it, add LIMIT, or create an index" |
+| Read query execution | 8 s | `400`: "query exceeded the execution time budget; …" |
 | Write query execution | 30 s | same `400` |
 | Result set size | deployment-configured cap; rows beyond it are **silently dropped** | no error; paginate |
 
@@ -667,8 +649,9 @@ any write clause: `CREATE`, `MERGE`, `SET`, `DELETE`, `REMOVE`, `FOREACH`.
   `ORDER BY … SKIP $offset LIMIT $page`. Without an `ORDER BY`, rows dropped
   at the result-set cap are arbitrary.
 - **Chunk bulk imports:** see [Bulk loading](#bulk-loading).
-- **Create indexes** for properties you filter on:
-  `CREATE INDEX FOR (n:Person) ON (n.name)`. A slow read usually needs one.
+- **Make a slow read smaller:** start the `MATCH` from a label and an `id` or
+  property, lower the upper bound of a variable-length path, and add `LIMIT`.
+  Indexes are managed for you; you cannot create one.
 
 </Accordion>
 </AccordionGroup>
@@ -677,27 +660,36 @@ any write clause: `CREATE`, `MERGE`, `SET`, `DELETE`, `REMOVE`, `FOREACH`.
 
 ## Migrating from Neo4j or another Cypher-compatible database
 
-Most application Cypher from Neo4j, Memgraph, or any other Cypher-compatible database
-ports directly. The differences you are most likely to notice:
+Most read queries port with small changes. Write queries need a rewrite into
+the [supported write shapes](#writes). The differences you are most likely to
+notice:
 
-- Procedure calls (for example Neo4j's `CALL db.*` / `CALL apoc.*`) are not
-  available; the equivalents are either plain Cypher or not part of the
-  supported surface.
-- `LOAD CSV` is not available; batch data in through `params`.
-- Internal node ids are not portable; migrate using your own key properties,
-  for example
-  `UNWIND $rows AS row MERGE (n:Person {ext_id: row.ext_id}) SET n += row`.
+- **Integer ids.** Every node needs an integer `id`, unique in the collection.
+  Keep your old key (for example `ext_id`) as an ordinary property, and map it
+  to an integer in your migration script.
+- **Write shapes.** No lone-node `CREATE` or `MERGE`, no `SET n += row`, no
+  `MATCH … CREATE`, no `RETURN` after a write. Load nodes with the node batch
+  and edges with the edge batch.
+- **Fewer functions.** `type()`, `id()`, `labels()`, `keys()`,
+  `properties()`, `nodes()`, `relationships()`, `startNode()`, `endNode()`,
+  `elementId()` and `shortestPath` are not available. Every relationship
+  pattern needs a type.
+- **No index commands.** Remove `CREATE INDEX` statements; indexes are
+  managed for you.
+- Procedure calls (for example Neo4j's `CALL db.*` / `CALL apoc.*`) and
+  `LOAD CSV` are not available; batch data in through `params`.
 
 Migrate one collection at a time: export a graph, replay it into one
 collection, and verify the counts.
 
 This script reads from Neo4j with the official driver and writes to
 HydraDB with the [`HydraGraph` client](#a-minimal-client). Any source you can
-read nodes and relationships from works the same way. It loads nodes first,
-then relationships matched on your own key. Cypher does not allow a
-relationship type as a parameter, so it writes one batch per type. It copies
-`Person` nodes and `KNOWS` relationships; repeat both steps for every other
-label and relationship type in your graph, and compare each count:
+read nodes and relationships from works the same way. It gives each node an
+integer `id`, loads the nodes, and then loads the relationships by `id`.
+Cypher does not allow a label or relationship type as a parameter, so it
+writes one batch per label and per type. It copies `Person` nodes and `KNOWS`
+relationships; repeat both steps for every other label and relationship type
+in your graph, and compare each count:
 
 ```python
 from neo4j import GraphDatabase
@@ -709,32 +701,39 @@ def batches(rows, n=500):
     for i in range(0, len(rows), n):
         yield rows[i:i + n]
 
-# Index the key first so the relationship MATCH below stays fast.
-g.query("CREATE INDEX FOR (n:Person) ON (n.ext_id)")
+ids = {}  # your key -> integer id; one map for all labels in the collection
 
 with src.session() as s:
-    # 1. Nodes, keyed on a property you own.
-    people = [r["p"] for r in s.run("MATCH (p:Person) RETURN properties(p) AS p")]
+    # 1. Nodes: give each one an integer id, keep your key as ext_id.
+    people = s.run("MATCH (p:Person) RETURN p.ext_id AS ext_id, p.name AS name").data()
+    for row in people:
+        row["id"] = ids.setdefault(row["ext_id"], len(ids) + 1)
     for chunk in batches(people):
-        g.query("UNWIND $rows AS row MERGE (n:Person {ext_id: row.ext_id}) SET n += row",
-                {"rows": chunk})
-
-    # 2. Relationships, one type at a time.
-    knows = s.run("""
-        MATCH (a:Person)-[k:KNOWS]->(b:Person)
-        RETURN a.ext_id AS src, b.ext_id AS dst, properties(k) AS props
-    """).data()
-    for chunk in batches(knows):
         g.query("""
             UNWIND $rows AS row
-            MATCH (a:Person {ext_id: row.src}), (b:Person {ext_id: row.dst})
-            MERGE (a)-[k:KNOWS]->(b)
-            SET k += row.props
+            MERGE (n {id: row.id})
+            SET n:Person, n.ext_id = row.ext_id, n.name = row.name
+        """, {"rows": chunk})
+
+    # 2. Relationships, one type at a time, by integer id.
+    knows = s.run("""
+        MATCH (a:Person)-[:KNOWS]->(b:Person)
+        RETURN a.ext_id AS src, b.ext_id AS dst
+    """).data()
+    edges = [{"src": ids[r["src"]], "dst": ids[r["dst"]]} for r in knows]
+    for chunk in batches(edges):
+        g.query("""
+            UNWIND $rows AS row
+            CREATE (a {id: row.src})-[:KNOWS]->(b {id: row.dst})
         """, {"rows": chunk})
 
 # 3. Verify counts match.
 print(g.query("MATCH (p:Person) RETURN count(p) AS people"))
 ```
+
+The edge batch takes no properties. To copy relationship properties, write
+each relationship with
+`MERGE (a:Person {id: $src})-[:KNOWS {since: $since}]->(b:Person {id: $dst})`.
 
 ---
 
