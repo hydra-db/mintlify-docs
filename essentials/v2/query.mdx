@@ -89,7 +89,8 @@ The response is wrapped in the standard envelope, so read the result from `data`
       "chunk_relations": [],
       "chunk_id_to_group_ids": {}
     },
-    "additional_context": {}
+    "additional_context": {},
+    "tabular_data": null
   },
   "error": null,
   "meta": {
@@ -118,8 +119,65 @@ The full response schema is on the [Query API reference](/api-reference/v2/endpo
 - **`data.chunks`:** the matching passages, ranked by relevance, each with its `chunk_content`, `source_title`, `relevancy_score`, and `metadata`. Keep the order.
 - **`data.sources`:** one entry per source, with its `id`, `title`, and `url` for citations.
 - **`data.graph_context`** and **`data.additional_context`:** relationships and linked passages, covered in [section 5](#5-add-relationships).
+- **`data.tabular_data`:** `null` for a document question like the one above. Present in thinking mode when the collection holds spreadsheets and the question is about them: A computed answer (`status: "ok"`) with `columns`, `records`, `sources` and `citations`, a decline (`status: "not_applicable"`) when the question is not about the tables, or `null`. See [Ask questions over spreadsheets](#ask-questions-over-spreadsheets).
 
 Pass the whole result to `build_string` (Python) or `buildString` (TypeScript) for a prompt-ready string. See [How to Use API Results](/essentials/v2/api-results) for more. New context is searchable once its [indexing status](/api-reference/v2/endpoint/source-status) reaches `graph_creation`.
+
+### Ask questions over spreadsheets
+
+When a collection holds CSV, TSV or Excel files (see [Spreadsheets become queryable tables](/essentials/v2/knowledge#spreadsheets-become-queryable-tables)), a question in `"mode": "thinking"` that needs filtering, grouping or arithmetic over the rows is answered by SQL that HydraDB writes and runs over the complete table. Ask in plain language: "total revenue per region, highest first", "how many units of Gizmo were sold in Mumbai and Pune", "which regions beat their target". Set `include_table_sql: true` to get the statement back.
+
+```bash cURL
+curl -X POST 'https://api.hydradb.com/query' \
+  -H "Authorization: Bearer $HYDRADB_API_KEY" \
+  -H "API-Version: 2" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "database": "your-database",
+    "collection": "sales",
+    "query": "What is the total revenue per region, highest first?",
+    "mode": "thinking",
+    "include_table_sql": true,
+    "response_format": "structured"
+  }'
+```
+
+What comes back in `data.tabular_data`:
+
+```json
+{
+  "status": "ok",
+  "answer_type": "computed",
+  "sql": "SELECT \"region\", SUM(\"revenue\") AS \"total_revenue\" FROM \"table_1fda2c6d06a92aa70abaf1df\" GROUP BY \"region\" ORDER BY \"total_revenue\" DESC",
+  "columns": [
+    { "name": "region", "type": "VARCHAR", "kind": "string" },
+    { "name": "total_revenue", "type": "HUGEINT", "kind": "integer" }
+  ],
+  "records": [
+    { "region": "East", "total_revenue": 97500 },
+    { "region": "West", "total_revenue": 85860 },
+    { "region": "North", "total_revenue": 56470 },
+    { "region": "South", "total_revenue": 37815 }
+  ],
+  "truncated": false,
+  "sources": [
+    { "id": "sales_2026", "title": "sales_2026.csv", "collection": "sales", "version": "9181604be39c" }
+  ],
+  "citations": {
+    "rows": [{ "chunk_id": "sales_2026_chunk_0001", "collection": "sales", "source_id": "sales_2026" }],
+    "constants": []
+  }
+}
+```
+
+- **`status`:** `"ok"` is an answer. `"not_applicable"` with `reason` (`not_tabular`: the question is not about the tables; `needs_context`: it needs a value or definition the context does not state; `listing_pending`: tables are still being catalogued, ask again; `scope_too_large`: the request covers more sources than one table query reads, name source IDs or fewer collections) means no SQL ran and the text passages stand on their own. `"error"` carries a `code` and `message`; the rest of the response is unaffected.
+- **`answer_type`:** `"exact"` when every record is a stored row of a table (the rows are named in `citations.rows`); `"computed"` when the records are aggregated or derived.
+- **`records`** are the result rows keyed by column name, up to 100 per answer (`truncated` says whether more existed). Values follow each column's `kind`: integers and doubles are JSON numbers, booleans are booleans, decimals are strings (to keep precision), dates and timestamps are strings, a SQL NULL is `null`. `columns` lists each column's name, SQL `type` and `kind`.
+- **`sources`** lists every table the SQL read, as you know it: the document `id` and `title`, its `collection`, the `sheet` for a workbook, and the `version` it was ingested as. A re-upload gets a new version.
+- **`citations`** is what to cite. `rows` are the stored rows behind the answer, each as `{chunk_id, collection, source_id, row}`: for an `exact` answer one per record, with its one-based stored `row` and the passage in `data.chunks` that holds it when one does; for a `computed` answer one per passage that holds rows the SQL read. `constants` are literals the SQL took from the question or from a passage, such as a target or a threshold stated in a document, each with the chunk it came from.
+- The text passages in `data.chunks` are returned as usual, so the answer and its evidence travel together; in this response, `data.chunks` carries the passage `sales_2026_chunk_0001` that the citation names. `llm_prompt` and the Markdown rendering include the table under a "Table query" heading.
+
+Table answers run in thinking mode only; `"fast"` returns the ranked passages without `tabular_data`. Questions that are better answered from text keep working as before: the table path engages only when the question calls for it.
 
 ## 2. Pick a recipe
 
@@ -239,6 +297,8 @@ For directly ingested knowledge and content from connectors without ACL enforcem
 | `query_forceful_relations` ignored | Request runs in `mode: "fast"` (or `auto` routed to fast) | Linked sources are fetched only in thinking mode. Set `mode: "thinking"`. |
 | `graph_context: false` ignored | Request runs in thinking mode (`mode: "thinking"`, or `auto` routed to thinking) | Thinking always includes the graph slice; `false` takes effect only in fast mode. Set `mode: "fast"` to drop it. |
 | Expected a deterministic `fast` or `thinking` pipeline, got auto-routed instead | `mode` was omitted | Omitting `mode` means `"auto"`. Set `mode` explicitly to `"fast"` or `"thinking"`. |
+| No `tabular_data` for a question about a spreadsheet | Request ran in `mode: "fast"` (or `auto` routed to fast) | Table answers run in thinking mode only. Set `mode: "thinking"`. |
+| `tabular_data.status` is `not_applicable` with reason `needs_context` | The question relies on a value or definition the context does not state (a target, a threshold, a category) | Add the document that defines it, or state the value in the question. |
 
 ## Related
 
