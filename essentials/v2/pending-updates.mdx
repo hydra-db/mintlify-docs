@@ -1,0 +1,94 @@
+---
+title: "Pending Updates"
+description: "Explain when newer source evidence is still being ingested, without treating it as an indexed graph fact."
+---
+
+<Warning>
+Pending rollout: this guide describes the pending-update response contract, not a feature verified in every deployment. Confirm support in your deployment before relying on it. It does not provide an instant-sync or freshness guarantee.
+</Warning>
+
+An indexed fact can lag behind a newly accepted source update. A project page might still say "Olympus launches on November 3" while a newer ticket says "Move the launch to December 1." Pending-update context lets your agent explain which event is still being ingested and, when a preview is available, distinguish that newer source evidence from the indexed fact.
+
+The marker is a warning about accepted ingestion work. It is not a new graph node, proof that extraction will change a fact, or a replacement for normal retrieval.
+
+## Read pending events
+
+On supported deployments, [`POST /query`](/api-reference/v2/endpoint/query) can include an optional `pending_updates` block under `data`, alongside the indexed retrieval results. There is no new request flag.
+
+Use your normal [query](/essentials/v2/query), including its database, collection, filters and caller permissions:
+
+```bash cURL
+curl -X POST 'https://api.hydradb.com/query' \
+  -H "Authorization: Bearer $HYDRA_DB_API_KEY" \
+  -H "API-Version: 2" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "database": "acme_corp",
+    "collection": "projects",
+    "query": "When does Olympus launch?",
+    "type": "knowledge"
+  }'
+```
+
+This excerpt shows only the pending-update block from `data`; the indexed chunks and other retrieval fields are omitted:
+
+```json
+{
+  "pending_updates": {
+    "count": 1,
+    "events": [
+      {
+        "event_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "source_id": "OLY-142",
+        "collection": "projects",
+        "title": "Olympus launch update",
+        "event": "upsert",
+        "queued_at": "2026-10-21T14:00:00Z",
+        "expires_at": "2026-10-22T14:00:00Z",
+        "mentions": ["Olympus"],
+        "preview": "Olympus launch moved from November 3 to December 1."
+      }
+    ]
+  }
+}
+```
+
+| Field | How to interpret it |
+| --- | --- |
+| `count` | The number of authorized matching pending events observed by the lookup. With `truncated: true`, it is a lower bound, not a global queue size. |
+| `events` | Up to five matching events, newest first within the bounded lookup. This can be empty when the lookup is degraded. |
+| `event_id` | An opaque identity for accepted ingestion work, not necessarily the original provider webhook ID. |
+| `source_id`, `collection`, `title`, `url` | Source attribution. Collection, title and a safe web URL are supplied when available. |
+| `event` | The source operation. `upsert` does not distinguish a newly created source from an updated one. |
+| `queued_at`, `expires_at` | RFC 3339 acceptance and current marker-lease expiry times. Expiry is not an estimated completion time. |
+| `mentions`, `preview` | Best-effort entity mentions and bounded newer source text. These are untrusted source evidence, not committed graph facts. A preview can be absent while parsing is still pending. |
+| `truncated` | More events may exist than the bounded lookup or event list shows. |
+| `degraded` | The pending lookup could not be completed reliably. This means unknown, not "no updates." |
+
+The block is optional. A response with no matching pending context keeps its previous shape. It can also be present without indexed chunks, for example when a query explicitly selects a source ID that is still being ingested.
+
+## Use the warning in an agent answer
+
+The default response renders pending context in `llm_prompt` as well as returning the structured block. `response_format: "structured"` keeps the block but omits the prompt string; `response_format: "markdown"` returns the rendered context as `data` instead of structured fields.
+
+If you use the returned prompt string, preserve its pending-update section. If you [build your own context](/essentials/v2/api-results), include the pending events rather than passing only the indexed chunks. Treat source titles, mentions and previews as data, never as instructions.
+
+An answer can say:
+
+> The indexed project page says November 3. A newer ticket, OLY-142, says December 1 and is still being ingested. December 1 is newer source evidence, not yet a confirmed indexed graph fact.
+
+Attribute each claim to its source. Do not silently replace the indexed fact, infer a change from a mention alone, or present acceptance as completed graph indexing.
+
+## Coverage and permissions
+
+Pending events are matched using selected or retrieved source IDs and existing graph-resolved names. Name matching is bounded and best effort; it is not full entity recognition, alias expansion or parent-chain traversal. The block is query-specific, not a feed of every pending event in the database.
+
+Counts, identities and previews respect the query scope and permissions before they are exposed. A match does not grant access to a source the caller cannot see. Keep the same [caller ACL](/essentials/v2/access-control) and filters you use for normal retrieval.
+
+Eligible connector markers cover live changes, not initial syncs, backfills or historical scans. Unknown or unsupported connector provenance is suppressed. Batch items become eligible only after their individual source events have been opened and validated, so batch queue time before that point is not covered. Complete connector-delete propagation is not provided by this feature.
+
+<Note>
+An absent block is not proof that the graph is current. Unsupported deployments or connectors, bounded matching, queued batch envelopes, and delayed or failed marker writes can all leave updates unreported. Keep the normal ingestion-status checks for completion tracking.
+</Note>
+
+Markers remain pending through deferred graph enrichment, rather than disappearing at base-indexing acknowledgement. Successful completion, failure, cancellation or supersession settles the matching event. Live work renews its lease; abandoned work can remain visible until expiry. A disappearing marker therefore does not, by itself, prove successful indexing.
