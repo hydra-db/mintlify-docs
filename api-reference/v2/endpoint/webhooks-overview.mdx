@@ -38,7 +38,7 @@ Manage signing or delete the webhook:
 1. `POST /webhooks/indexing` with your HTTPS endpoint and `generate_signing_secret: true`. Store the signing secret it returns. Your endpoint must be reachable over public HTTPS; localhost and private network addresses are rejected.
 2. `POST /webhooks/indexing/test` to check your receiver accepts the delivery and verifies the signature.
 3. Ingest content as usual. Each item that finishes indexing produces one delivery.
-4. `GET /webhooks/indexing/deliveries?status=failed` to find deliveries your endpoint rejected, then retry them once the problem is fixed.
+4. `GET /webhooks/indexing/deliveries?status=permanently_failed` to find deliveries that ran out of retries, then retry them once the problem is fixed. A `failed` delivery is still being retried automatically.
 
 ## Delivery and retries
 
@@ -46,6 +46,84 @@ Manage signing or delete the webhook:
 - Failed deliveries retry with exponential backoff. HydraDB Cloud marks a delivery `permanently_failed` after 16 attempts or 48 hours after the first failure, whichever comes first.
 - Automatic and manual retries use your current signing secret.
 - Test deliveries do not appear in the delivery history.
+
+## Read the payload you receive
+
+Each delivery is a `POST` with a JSON body and these headers:
+
+| Header | Description |
+|---|---|
+| `Content-Type` | Always `application/json` |
+| `X-HydraDB-Delivery-ID` | Stable delivery ID for this event |
+| `X-HydraDB-Event` | Event name, such as `indexing.status_changed` |
+| `X-HydraDB-Signature` | `sha256=<hex>`, the HMAC-SHA256 of the raw request body keyed by your signing secret. Present only when signing is configured. See [Verify the signature](#verify-the-signature) |
+
+<Accordion title="Delivery payloads for completed, errored, and test events: JSON">
+
+<CodeGroup>
+```json Completed
+{
+  "event": "indexing.status_changed",
+  "delivery_id": "<delivery_id>",
+  "id": "<id>",
+  "tenant_id": "<database_id>",
+  "database": "<database>",
+  "sub_tenant_id": "<collection>",
+  "collection": "<collection>",
+  "status": "completed",
+  "timestamp": "<ISO-8601 timestamp>"
+}
+```
+```json Errored
+{
+  "event": "indexing.status_changed",
+  "delivery_id": "<delivery_id>",
+  "id": "<id>",
+  "tenant_id": "<database_id>",
+  "database": "<database>",
+  "sub_tenant_id": "<collection>",
+  "collection": "<collection>",
+  "status": "errored",
+  "timestamp": "<ISO-8601 timestamp>",
+  "error_code": "<error_code>",
+  "error_message": "<error_message>"
+}
+```
+```json Test delivery
+{
+  "event": "indexing.status_changed",
+  "delivery_id": "test_<random>",
+  "id": "test_document",
+  "tenant_id": "<org_id>",
+  "database": "<org_id>",
+  "sub_tenant_id": "<org_id>",
+  "collection": "<org_id>",
+  "status": "completed",
+  "timestamp": "<ISO-8601 timestamp>",
+  "test": true
+}
+```
+</CodeGroup>
+
+A test delivery is synthetic: nothing was ingested, so there is no database name to report, and every scope field, including `database`, is set to your organization ID. Match on `test: true` (or the `test_` prefix on `delivery_id`) to tell it apart from a real delivery.
+
+</Accordion>
+
+| Field | Description |
+|---|---|
+| `event` | Event type. Currently `indexing.status_changed`. |
+| `delivery_id` | Stable ID for this event. Store it to deduplicate retries. |
+| `id` | The document, memory, or app source ID you supplied during ingestion. |
+| `database` | The name of the database you ingested into: the value you sent as `database` (or `tenant_id`) on the ingest request. Empty only for sources ingested before this field existed; read `tenant_id` if you need a scope that is always set. |
+| `collection` | Collection scope for the indexed source. |
+| `status` | Terminal indexing status. Usually `completed` or `errored`. |
+| `timestamp` | Time the webhook payload was created. |
+| `error_code` | Present when available for failed indexing. |
+| `error_message` | Present when available for failed indexing. |
+| `tenant_id` | Deprecated. An identifier for the database, not the name you ingested into. Always present. |
+| `sub_tenant_id` | Deprecated alias for `collection`, carrying the same value. |
+
+Route and filter on `database`, not `tenant_id`; `database` is the name you sent. New integrations should read `database` and `collection`.
 
 ## Verify the signature
 
@@ -230,6 +308,50 @@ app.listen(3000);
 </CodeGroup>
 
 </Accordion>
+
+## Manage the signing secret
+
+`POST /webhooks/indexing/signing-secret` enables or rotates signing after registration, and `DELETE` on the same path disables it. Two ways to set a secret:
+
+- **Let HydraDB generate one:** send no body. The secret is returned exactly once, in plain text, and takes effect immediately.
+- **Supply your own:** send `signing_secret`, at least 16 characters. Use this to deploy the secret to your receiver before HydraDB starts signing with it, as in [Rotate without downtime](#rotate-without-downtime).
+
+<Accordion title="Generate, supply, or disable the signing secret: cURL">
+
+<CodeGroup>
+```bash Generate a secret
+curl -X POST 'https://api.hydradb.com/webhooks/indexing/signing-secret' \
+  -H "Authorization: Bearer $HYDRADB_API_KEY" \
+  -H "API-Version: 2"
+```
+```json Generate data
+{
+  "signing_secret": "whsec_Yk8sQ2pWc0xuNGRIeUZ0UmJKZ1B3WHZNaTdaYUUxcW8",
+  "generated": true,
+  "message": "Signing secret generated. Copy it now - it cannot be retrieved later, and it takes effect immediately."
+}
+```
+```bash Supply your own
+curl -X POST 'https://api.hydradb.com/webhooks/indexing/signing-secret' \
+  -H "Authorization: Bearer $HYDRADB_API_KEY" \
+  -H "API-Version: 2" \
+  -H "Content-Type: application/json" \
+  -d '{ "signing_secret": "at-least-16-characters" }'
+```
+```bash Disable signing
+curl -X DELETE 'https://api.hydradb.com/webhooks/indexing/signing-secret' \
+  -H "Authorization: Bearer $HYDRADB_API_KEY" \
+  -H "API-Version: 2"
+```
+</CodeGroup>
+
+Disabling removes the stored secret, and deliveries stop carrying `X-HydraDB-Signature`.
+
+</Accordion>
+
+<Warning>
+  Rotating takes effect immediately, with no overlap period. Deliveries in flight during a rotation are signed with the new secret, so a receiver that only knows the old one will reject them. [Rotate without downtime](#rotate-without-downtime) shows how to avoid the gap.
+</Warning>
 
 ### Rotate without downtime
 
