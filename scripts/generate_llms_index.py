@@ -42,7 +42,7 @@ def generate():
             else:
                 group = "Site information"
             groups[group].append((slug, f"- [{title}](https://docs.hydradb.com/{slug}.md)"))
-    lines = ["# HydraDB Documentation", "", "> Documentation for HydraDB's supported v2 API, SDKs, integrations, and cookbooks. Legacy v1 pages are listed separately and aren't compatible with current SDK installs.", "", "Start with the v2 quickstart. The Agent Integration Guide explains the API contract; this index lists every non-archive documentation page, including linked detail pages outside the navigation."]
+    lines = ["# HydraDB Documentation", "", "> Documentation for HydraDB's supported v2 API, SDKs, and integrations. Legacy v1 pages are listed separately and aren't compatible with current SDK installs.", "", "Start with the v2 quickstart. The Agent Integration Guide explains the API contract; this index lists every non-archive documentation page, including linked detail pages outside the navigation."]
     for heading, pages in groups.items():
         lines.extend(["", f"## {heading}", ""])
         lines.extend(line for _, line in sorted(pages))
