@@ -1,0 +1,141 @@
+---
+title: "Build your own customer support agent"
+sidebarTitle: "Customer support"
+description: "Support agents that answer from one shared help center and remember each customer's history."
+---
+
+import Setup from "/snippets/cookbook-setup.mdx";
+
+A good support answer needs two things at once: what the help center says, and what has already happened with this customer. This cookbook keeps the help center in one shared collection and each customer's history in their own, then queries both together. Triage, billing, and technical agents all read the same context.
+
+| Benchmark | Result | What it shows here |
+| --- | --- | --- |
+| [LongMemEval-S](https://benchmarks.hydradb.com/longmemeval) | 90.79% overall | A customer's facts and preferences kept current across many sessions |
+| [BEAM 1M](https://benchmarks.hydradb.com/beam-1m) | 82% overall | History that stays useful over months |
+| [KyroBench](https://benchmarks.hydradb.com/kyrobench) | 0.776 nDCG | One customer's context kept out of another's results |
+
+<Setup />
+
+## 1. Create a database with a shared collection
+
+```python support.py
+import json
+
+from hydra import answer, client, create_database, wait_indexed
+
+DATABASE = "acme_support"
+HELP_CENTER = "help_center"
+
+create_database(DATABASE)
+
+
+def customer_collection(customer_id):
+    return f"customer_{customer_id}"
+```
+
+## 2. Upload the help center
+
+Upload help articles as files. Give each a stable `id` so that publishing a new version replaces the old one.
+
+```python support.py
+articles = {
+    "refunds.md": "# Refunds\n\nRefunds are available within 30 days of purchase. "
+                  "Annual plans are refunded pro rata.\n",
+    "sso.md": "# Single sign-on\n\nSSO is available on the Business plan. "
+              "Set it up under Settings, then Security.\n",
+}
+for name, body in articles.items():
+    with open(name, "w") as f:
+        f.write(body)
+
+handles = [open(name, "rb") for name in articles]
+result = client.context.ingest(
+    type="knowledge",
+    database=DATABASE,
+    collection=HELP_CENTER,
+    documents=[(name, h, "text/markdown") for name, h in zip(articles, handles)],
+    document_metadata=json.dumps([{"id": name.removesuffix(".md")} for name in articles]),
+)
+for h in handles:
+    h.close()
+wait_indexed(DATABASE, HELP_CENTER, [r.id for r in result.data.results])
+```
+
+## 3. Remember each conversation
+
+When a conversation ends, save it as a [memory](/essentials/v2/memories) in that customer's collection. With `infer: true`, HydraDB extracts what matters: the customer's plan, what they asked for, what they were told.
+
+```python support.py
+def remember(customer_id, turns):
+    """turns is a list of (customer message, agent reply) pairs."""
+    collection = customer_collection(customer_id)
+    result = client.context.ingest(
+        type="memory",
+        database=DATABASE,
+        collection=collection,
+        memories=json.dumps([{
+            "user_assistant_pairs": [{"user": u, "assistant": a} for u, a in turns],
+            "infer": True,
+        }]),
+    )
+    wait_indexed(DATABASE, collection, [r.id for r in result.data.results])
+
+
+remember("4821", [
+    ("We're on the annual Business plan. I asked for a refund on September 30.",
+     "I've logged the request. Finance will confirm once the billing cycle closes."),
+])
+```
+
+## 4. Answer from both collections
+
+Name both collections and set `type: "all"`. The query reads this customer's memories and the shared help center, and nothing else. Take `customer_id` from the authenticated session, never from the message: the collection name is what keeps one customer's history out of another's answers.
+
+```python support.py
+ROLES = {
+    "triage": "Decide whether this is a billing or a technical question, and say why.",
+    "billing": "Answer billing questions. State the policy, then what applies to this customer.",
+    "technical": "Answer setup questions with numbered steps.",
+}
+
+
+def support_agent(role, customer_id, question):
+    result = client.query(
+        database=DATABASE,
+        collections=[HELP_CENTER, customer_collection(customer_id)],
+        query=question,
+        type="all",
+        mode="thinking",
+    )
+    return answer(question, result, ROLES[role])
+
+
+question = "Any update on my refund, and how much will I get back?"
+print(support_agent("triage", "4821", question))
+print(support_agent("billing", "4821", question))
+```
+
+## Run it
+
+```bash
+python support.py
+```
+
+The billing answer should combine both sources: the refund was requested on September 30 and is waiting on the billing cycle, and annual plans are refunded pro rata.
+
+## Use real data
+
+Sync the help center and past tickets with [connectors](/essentials/v2/connectors), such as Zendesk, pointing at the shared collection. Keep step 3 in your application, called when a conversation closes. If each of your customers is a company with its own private knowledge, give each company its own database. See [Databases and Collections](/essentials/v2/databases-and-collections).
+
+## Common mistakes
+
+- **Saving customer memories in the shared collection:** every customer's query then reads every other customer's history.
+- **Using `collection` with one name:** the query then misses either the help center or the customer. Use `collections` with both.
+- **Querying a customer with no history:** every collection named in `collections` must exist, and a collection is created by its first write. For a new customer, query the help center alone.
+- **Building the collection name from user input:** derive it from the session's customer ID on your server.
+
+## Next steps
+
+- [Memories](/essentials/v2/memories): `infer` and conversation input.
+- [Databases and Collections](/essentials/v2/databases-and-collections): scoping patterns for B2C and B2B.
+- [Use Query Results](/essentials/v2/api-results): combining knowledge and memories in a prompt.

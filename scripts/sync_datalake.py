@@ -2,7 +2,7 @@
 """
 Sync the public docs into the team's internal knowledge data lake.
 
-Every page in the v2 navigation of docs.json (Guides, API Reference)
+Every page in the v2 navigation of docs.json (Guides, Cookbooks, API Reference)
 becomes one `knowledge_base` app source in HydraDB, tagged with the shared
 data-lake metadata from scripts/datalake_taxonomy.json so the team's MCP can
 narrow a search to, say, public API reference pages about connectors:

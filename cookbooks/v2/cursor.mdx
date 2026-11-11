@@ -1,0 +1,160 @@
+---
+title: "Build your own Cursor"
+sidebarTitle: "Cursor"
+description: "A coding assistant that indexes a repository and searches it before answering questions about the code."
+---
+
+import Setup from "/snippets/cookbook-setup.mdx";
+
+A coding assistant is only as good as what it can find in the repository. This cookbook ingests a repository into HydraDB, which builds a context graph of its files, types, and functions, then gives a model one tool: search the code.
+
+| Benchmark | Result | What it shows here |
+| --- | --- | --- |
+| [CodeWikiBench](https://benchmarks.hydradb.com/codewiki-bench) | 90.73 / 100 on nlohmann/json, against 66.06 for DeepWiki and 61.28 for CodeWiki | An agent that documents a repository from HydraDB queries alone |
+
+<Setup />
+
+## 1. Create a database with one collection per repository
+
+A collection per repository keeps a query inside one codebase.
+
+```python cursor.py
+import hashlib
+import json
+from pathlib import Path
+
+from hydra import client, create_database, llm, wait_indexed
+
+DATABASE = "code"
+REPO = Path("path/to/your/repo")
+COLLECTION = REPO.name.replace("-", "_")
+EXTENSIONS = {".py", ".ts", ".go", ".rs", ".java", ".c", ".h", ".cpp", ".hpp", ".md"}
+
+create_database(DATABASE)
+```
+
+## 2. Upload the files
+
+Upload source files as documents. Derive each `id` from the file's path, so that uploading a changed file again replaces the old version (`upsert` defaults to `true`). Keep the path in `additional_metadata` to cite it later. HydraDB extracts entities and relations itself; you supply no parsing rules.
+
+```python cursor.py
+def source_id(path):
+    return f"{COLLECTION}_{hashlib.sha1(str(path).encode()).hexdigest()[:16]}"
+
+
+files = [
+    p for p in REPO.rglob("*")
+    if p.is_file() and p.suffix in EXTENSIONS and ".git" not in p.parts
+]
+ids = []
+for start in range(0, len(files), 20):
+    batch = files[start : start + 20]
+    handles = [open(p, "rb") for p in batch]
+    try:
+        result = client.context.ingest(
+            type="knowledge",
+            database=DATABASE,
+            collection=COLLECTION,
+            documents=[(p.name, h, "text/plain") for p, h in zip(batch, handles)],
+            document_metadata=json.dumps([
+                {
+                    "id": source_id(p.relative_to(REPO)),
+                    "additional_metadata": {"path": str(p.relative_to(REPO))},
+                }
+                for p in batch
+            ]),
+        )
+    finally:
+        for h in handles:
+            h.close()
+    ids += [r.id for r in result.data.results]
+
+for start in range(0, len(ids), 50):
+    wait_indexed(DATABASE, COLLECTION, ids[start : start + 50])
+```
+
+## 3. Write the search tool
+
+These are the query settings from the CodeWikiBench run: hybrid matching, `thinking` mode, graph context on, and eight chunks. `thinking` mode is what follows relations between files, so a question about a function also finds its callers.
+
+```python cursor.py
+def search_code(question):
+    result = client.query(
+        database=DATABASE,
+        collection=COLLECTION,
+        query=question,
+        type="knowledge",
+        query_by="hybrid",
+        mode="thinking",
+        graph_context=True,
+        query_forceful_relations=True,
+        max_results=8,
+    )
+    return "\n\n".join(
+        f"[{(chunk.additional_metadata or {}).get('path', chunk.source_title)}]\n{chunk.chunk_content}"
+        for chunk in result.data.chunks
+    )
+```
+
+## 4. Let the model call it
+
+Give the model the tool and loop until it stops calling it. The model decides what to search for and how many times, which is how it follows a question across files.
+
+```python cursor.py
+TOOLS = [{
+    "type": "function",
+    "function": {
+        "name": "search_code",
+        "description": "Search the repository. Ask one natural-language question.",
+        "parameters": {
+            "type": "object",
+            "properties": {"question": {"type": "string"}},
+            "required": ["question"],
+        },
+    },
+}]
+
+
+def ask(question):
+    messages = [
+        {
+            "role": "system",
+            "content": "You answer questions about a codebase. Search before you "
+            "answer, and cite the file path for every claim.",
+        },
+        {"role": "user", "content": question},
+    ]
+    while True:
+        reply = llm.chat.completions.create(
+            model="gpt-4o", messages=messages, tools=TOOLS
+        ).choices[0].message
+        if not reply.tool_calls:
+            return reply.content
+        messages.append(reply)
+        for call in reply.tool_calls:
+            found = search_code(json.loads(call.function.arguments)["question"])
+            messages.append({"role": "tool", "tool_call_id": call.id, "content": found})
+
+
+print(ask("How does request authentication work, and where is it enforced?"))
+```
+
+## Run it
+
+```bash
+python cursor.py
+```
+
+Indexing a few hundred files takes a few minutes. The answer should name specific files and cite a path for each claim.
+
+## Common mistakes
+
+- **Querying before indexing finishes:** files that are still `queued` or `processing` are not searchable. Wait for `graph_creation` or `completed`.
+- **Random source IDs:** without a stable `id`, uploading a changed file adds a second copy instead of replacing the first.
+- **Using `fast` mode for cross-file questions:** `fast` is one retrieval pass. Use `thinking` when the answer spans files.
+
+## Next steps
+
+- [Context Graphs](/essentials/v2/context-graphs): read the relations HydraDB extracted.
+- [App Sources](/essentials/v2/app-sources): add pull requests and Slack threads, so the assistant can answer why code was written the way it was.
+- [Claude Code](/plugins/claude-code) and [Cursor](/plugins/cursor) plugins: give an existing coding agent HydraDB memory without building your own.
