@@ -3,7 +3,8 @@
 No network and no credentials: each SDK method is replaced by a stub that first
 binds the call to the real method's signature (so an unknown or misspelled
 argument fails), checks the JSON payloads against the documented shapes, and
-returns a minimal response.
+returns the SDK's own response model for that method, filled with public fields
+only. A cookbook that reads a field the public API does not return fails here.
 """
 
 import inspect
@@ -17,6 +18,8 @@ import types
 from types import SimpleNamespace as NS
 import unittest
 from unittest import mock
+
+from hydra_db import types as sdk
 
 ROOT = Path(__file__).resolve().parents[1]
 COOKBOOKS = sorted(p for p in (ROOT / "cookbooks/v2").glob("*.mdx") if p.name != "index.mdx")
@@ -34,6 +37,25 @@ MEMORY_KEYS = {
     "custom_instructions", "user_name", "metadata", "additional_metadata",
 }
 OPERATORS = {"equals", "contains", "contains_any"}
+# fields.* per kind, from the field reference in essentials/v2/app-sources.mdx.
+KIND_FIELDS = {
+    "email": {"subject", "body", "from", "to", "cc", "bcc", "thread_id", "reply_to_id",
+              "forwarded_from_id", "created_at", "url"},
+    "message": {"body", "author", "thread_id", "parent_id", "mentions", "created_at",
+                "edited_at", "url"},
+    "ticket": {"title", "description", "status", "priority", "assignee", "reporter",
+               "parent_id", "linked_issue_ids", "created_at", "updated_at", "url"},
+    "knowledge_base": {"title", "body", "parent_id", "created_by", "updated_by",
+                       "created_at", "updated_at", "url"},
+    "comment": {"body", "author", "parent_id", "thread_id", "created_at", "updated_at",
+                "url", "properties"},
+    "meeting": {"title", "body", "host", "host_email", "participants", "started_at",
+                "updated_at", "labels", "url"},
+    "custom": {"body", "parent_id", "thread_id", "data"},
+}
+# Plain-text and document extensions POST /context/ingest accepts
+# (api-reference/v2/endpoint/ingest-context.mdx#supported-file-formats).
+UPLOAD_EXTENSIONS = {".txt", ".md", ".markdown", ".json", ".pdf", ".docx", ".csv"}
 
 
 def python_blocks(path):
@@ -77,9 +99,9 @@ class Stubs:
             (client.context, "ingest", self.ingest),
             (client.context, "status", self.context_status),
             (client, "query", self.query),
-            (client.connectors, "create", lambda **k: NS(connector_id="conn_1")),
-            (client.connectors, "discover", lambda *a, **k: NS(resources=[NS(id="C1", resource_type="channel", name="general")])),
-            (client.connectors, "configure", lambda *a, **k: NS()),
+            (client.connectors, "create", self.connector_create),
+            (client.connectors, "discover", self.connector_discover),
+            (client.connectors, "configure", self.connector_configure),
         ]:
             setattr(owner, name, self.checked(name, getattr(owner, name), handler))
 
@@ -100,10 +122,29 @@ class Stubs:
                 {"name", "data_type", "max_length", "enable_dense_embedding", "enable_sparse_embedding"},
             )
             self.declared.add(field["name"])
-        return NS(data=NS())
+        return sdk.HandlerEnvelopeTenantsTenantCreateAcceptedResponse(success=True)
 
     def database_status(self, database):
-        return NS(data=NS(infra=NS(ready_for_ingestion=True)))
+        return sdk.HandlerEnvelopeTenantsInfraStatusResponseV2(
+            data=sdk.TenantsInfraStatusResponseV2(
+                infra=sdk.TenantsInfraV2(ready_for_ingestion=True)
+            )
+        )
+
+    def connector_create(self, **kwargs):
+        self.test.assertNotIn("enforce_acl", kwargs)  # Needs a dashboard session.
+        return sdk.HandlerConnectorCreateResponse(connector_id="conn_1")
+
+    def connector_discover(self, id):
+        return sdk.HandlerDiscoverResponseBody(resources=[
+            sdk.HandlerDiscoveredResourceDto(id="C1", resource_type="channel", name="general")
+        ])
+
+    def connector_configure(self, id, resources):
+        for resource in resources:
+            sdk.HandlerResourceMapping(**resource)
+            self.test.assertLessEqual(set(resource), {"resource_id", "resource_type", "name"})
+        return sdk.HandlerConfigureResponse()
 
     def ingest(self, type, database, collection, documents=None, document_metadata=None,
                app_knowledge=None, memories=None):
@@ -126,20 +167,34 @@ class Stubs:
                 test.assertEqual(len(documents), len(items))
                 for (filename, handle, content_type), item in zip(documents, items):
                     test.assertLessEqual(set(item), DOCUMENT_METADATA_KEYS)
-                    handle.read()
+                    test.assertIn(Path(filename).suffix, UPLOAD_EXTENSIONS, filename)
+                    test.assertTrue(handle.read(), f"{filename} is empty")
                     ids.append(item["id"])
             for item in json.loads(app_knowledge or "[]"):
                 test.assertLessEqual(set(item), APP_SOURCE_KEYS)
                 test.assertIn(item["kind"], KINDS)
                 test.assertEqual(item["kind"], item["fields"]["kind"])
+                test.assertLessEqual(
+                    set(item["fields"]) - {"kind"}, KIND_FIELDS[item["kind"]], item["id"]
+                )
                 test.assertLessEqual(set(item.get("metadata", {})), self.declared)
                 ids.append(item["id"])
-        return NS(data=NS(results=[NS(id=i) for i in ids]))
+        test.assertTrue(ids)
+        test.assertTrue(all(re.fullmatch(r"[^,\s]+", i) for i in ids), ids)
+        return sdk.HandlerEnvelopeIngestionV2IngestResponse(
+            data=sdk.IngestionV2IngestResponse(
+                results=[sdk.IngestionV2IngestResultItem(id=i, status="queued") for i in ids]
+            )
+        )
 
     def context_status(self, database, collection, ids):
         self.test.assertIn(collection, self.collections)
         self.test.assertTrue(ids)
-        return NS(data=NS(statuses=[NS(indexing_status="completed") for _ in ids]))
+        return sdk.HandlerEnvelopeIngestionV2BatchProcessingStatus(
+            data=sdk.IngestionV2BatchProcessingStatus(statuses=[
+                sdk.IngestionV2ProcessingStatus(id=i, indexing_status="completed") for i in ids
+            ])
+        )
 
     def query(self, **kwargs):
         test = self.test
@@ -154,11 +209,16 @@ class Stubs:
             test.assertIn(key, self.declared)
             test.assertEqual(1, len(value))
             test.assertLessEqual(set(value), OPERATORS)
-        chunk = NS(chunk_content="text", source_title="title", additional_metadata=None)
-        source = NS(id="source_1", title="title", url=None)
-        return NS(
-            data=NS(llm_prompt="context", chunks=[chunk], sources=[source]),
-            meta=NS(request_id="req_1"),
+        if "acl" in kwargs:
+            test.assertTrue(kwargs["acl"] and all(isinstance(p, str) for p in kwargs["acl"]))
+        # Public fields only: `sources` and other internal fields stay unset,
+        # as .github/verify_v2_public_contract.py requires of the public result.
+        chunk = sdk.SearchV2Chunk(
+            id="source_1", chunk_uuid="source_1_chunk_0", chunk_content="text",
+            source_title="title", relevancy_score=0.9,
+        )
+        return sdk.HandlerEnvelopeSearchV2RetrievalResult(
+            data=sdk.SearchV2RetrievalResult(llm_prompt="context", chunks=[chunk]),
         )
 
 
