@@ -41,6 +41,8 @@ ROOT = Path(__file__).resolve().parents[1]
 GUIDE = ROOT / "AGENTS.mdx"
 SPEC = json.loads((ROOT / "api-reference/v2/openapi.json").read_text())
 SCHEMAS = SPEC["components"]["schemas"]
+SPEC_TEXT = json.dumps(SPEC)
+FULL_TEXT = {}
 BASE = "https://api.hydradb.com"
 
 # Fields the spec still lists but .github/verify_v2_public_contract.py keeps out
@@ -114,6 +116,38 @@ def request_schema(op):
     return {"properties": {}}
 
 
+# Two routes for one operation: the SDKs call the first, the page documents the second.
+SAME_ROUTE = {("GET", "/context/{id}/subgraph"): ("GET", "/context/subgraph")}
+
+
+def binding(page):
+    """Return (METHOD, path template) for an endpoint page, or None."""
+    match = re.search(r'^openapi: "api-reference/v2/openapi.json (\w+) ([^"]+)"', page.read_text(), re.M)
+    return match.groups() if match else None
+
+
+def section(page, tag):
+    return "\n".join(re.findall(rf"<{tag}>(.*?)</{tag}>", page.read_text(), re.S))
+
+
+def success_example(page):
+    """The first 2xx JSON body in a page's <ResponseExample>, with its status code."""
+    method, template = binding(page)
+    responses = SPEC["paths"][template][method.lower()]["responses"]
+    declared = next(code for code in responses if code.startswith("2"))
+    for label, body in re.findall(r"```json([^\n]*)\n(.*?)\n\s*```", section(page, "ResponseExample"), re.S):
+        try:
+            sample = json.loads(body)
+        except json.JSONDecodeError:
+            continue
+        failed = isinstance(sample, dict) and sample.get("success") is False
+        if failed or re.match(r"\s*[45]\d\d|\s*Failure", label):
+            continue
+        code = re.match(r"\s*(2\d\d)", label)
+        return int(code.group(1) if code else declared), sample
+    return None
+
+
 def envelope(data):
     return {"success": True, "data": data, "error": None,
             "meta": {"request_id": "req_test", "latency_ms": 1.0}}
@@ -126,10 +160,13 @@ class FakeHydraDB:
         self.test = test
         self.calls = []
         self.failures = []  # Kept here too: an example may swallow the exception.
+        self.examples = {}  # (method, path template) -> (status, body) documented on the page under test.
 
     def respond(self, template, method, query, body):
         ids = query.get("ids") or query.get("id") or ["source_1"]
         key = (method, template)
+        if key in self.examples:
+            return self.examples[key]
         if key == ("POST", "/databases"):
             return 202, envelope({"database": body.get("database"), "status": "accepted"})
         if key == ("GET", "/databases/status"):
@@ -237,7 +274,8 @@ class FakeHydraDB:
         if media:
             test.assertEqual([], unknown_keys(payload, media["schema"]), f"{where}: canned response is off-spec")
         data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
-        test.assertFalse(set(data) & INTERNAL_RESPONSE, f"{where}: internal response field")
+        if template == "/query":
+            test.assertFalse(set(data) & INTERNAL_RESPONSE, f"{where}: internal response field")
         self.calls.append(where)
         return httpx.Response(status, json=payload)
 
@@ -279,11 +317,20 @@ class PythonExamples(unittest.TestCase):
     def run_page(self, page, fake, make_client):
         namespace = {"__name__": "__main__", **self.AMBIENT}
         ran = 0
+        bound = binding(page)
+        request_example = section(page, "RequestExample") if bound else ""
+        documented = success_example(page) if bound else None
         before = fake.calls.count("POST /feedback")
         expected = sum(source.count("feedback.submit(") for _, source in blocks("python", page)
                        if "for " not in source)
         for line, source in blocks("python", page):
             namespace["client"] = namespace["hydra"] = make_client()
+            seen = len(fake.calls)
+            in_request_example = bool(bound) and source.strip() and source.strip() in request_example
+            # The page's request example gets the page's own documented response.
+            fake.examples = {}
+            if in_request_example and documented:
+                fake.examples = {route: documented for route in (bound, SAME_ROUTE.get(bound)) if route}
             with self.subTest(example=f"{page.relative_to(ROOT)}:{line}"):
                 try:
                     exec(compile(textwrap.dedent(source), f"{page.name}:{line}", "exec"), namespace)
@@ -291,6 +338,13 @@ class PythonExamples(unittest.TestCase):
                     self.assertIn(error.name, self.OPTIONAL_MODULES)
                     continue
                 ran += 1
+                if in_request_example:
+                    accepted = {" ".join(route) for route in (bound, SAME_ROUTE.get(bound)) if route}
+                    self.assertTrue(accepted & set(fake.calls[seen:]),
+                                    "the request example does not call the endpoint this page documents")
+                    self.bound_examples += 1
+                    self.served_examples += bool(documented)
+        fake.examples = {}
         # Feedback calls sit inside try/except, so count the ones that arrived.
         with self.subTest(page=str(page.relative_to(ROOT)), check="feedback calls reached the API"):
             self.assertGreaterEqual(fake.calls.count("POST /feedback") - before, expected)
@@ -298,6 +352,7 @@ class PythonExamples(unittest.TestCase):
 
     def test_every_python_block_runs_through_the_sdk(self):
         fake = FakeHydraDB(self)
+        self.bound_examples = self.served_examples = 0
         real_sync, real_async = hydra_db.HydraDB, hydra_db.AsyncHydraDB
         transport = httpx.MockTransport(fake.handle)
 
@@ -342,6 +397,13 @@ class PythonExamples(unittest.TestCase):
                 os.chdir(previous)
         self.assertEqual([], fake.failures)
         self.assertGreaterEqual(ran, 90)
+        # Every endpoint page has a Python request example that calls its endpoint,
+        # and nearly all of them were answered with the page's documented response.
+        endpoints = [page for page in V2_PAGES if binding(page)]
+        self.assertEqual(len(endpoints), self.bound_examples)
+        # Pages with no <ResponseExample> show the response Mintlify renders from the spec.
+        without_example = sum(1 for page in endpoints if "<ResponseExample>" not in page.read_text())
+        self.assertEqual(len(endpoints) - without_example, self.served_examples)
         for expected in ("POST /databases", "GET /databases/status", "POST /context/ingest",
                          "GET /context/status", "POST /query", "POST /feedback",
                          "POST /connectors", "GET /context/inspect"):
@@ -411,49 +473,133 @@ class TypeScriptExamples(unittest.TestCase):
         self.assertGreaterEqual(count, 100)
 
 
+class EndpointPages(unittest.TestCase):
+    """Checks on the pages bound to one operation with `openapi:` front matter."""
+
+    PAGES = [page for page in V2_PAGES if binding(page)]
+
+    def test_every_operation_has_a_page(self):
+        documented = {binding(page) for page in self.PAGES} | set(SAME_ROUTE.values())
+        published = {(method.upper(), path) for path, item in SPEC["paths"].items()
+                     for method in item if method in {"get", "post", "put", "patch", "delete"}}
+        self.assertEqual(published, documented)
+
+    def test_python_and_typescript_call_the_same_method(self):
+        def snake(name):
+            return re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
+
+        for page in self.PAGES:
+            example = section(page, "RequestExample")
+            python = re.search(r"```python[^\n]*\n(.*?)```", example, re.S)
+            typescript = re.search(r"```typescript[^\n]*\n(.*?)```", example, re.S)
+            with self.subTest(page=page.name):
+                self.assertTrue(python and typescript, "request example needs Python and TypeScript")
+                called = re.search(r"\b(?:client|hydra)\.((?:\w+\.)?\w+)\(", python.group(1)).group(1)
+                called_ts = re.search(r"\b(?:client|hydra)\.((?:\w+\.)?\w+)\(", typescript.group(1)).group(1)
+                self.assertEqual(called, ".".join(snake(part) for part in called_ts.split(".")))
+
+    def test_documented_fields_exist_in_the_spec(self):
+        """A `<Field name>` in a request table must be a real request field."""
+        checked = 0
+        for page in self.PAGES:
+            method, template = binding(page)
+            op = SPEC["paths"][template][method.lower()]
+            schema = request_schema(op)
+            known = set(schema.get("properties", {})) | {p["name"] for p in op.get("parameters", [])}
+            text = page.read_text()
+            request_part = text.split("<ResponseExample>")[0] + text.split("</ResponseExample>")[-1]
+            for name in re.findall(r'^\| <Field name="([^"]+)"', request_part, re.M):
+                checked += 1
+                self.assertFalse({name} & INTERNAL_REQUEST, f"{page.name}: internal field {name}")
+                if "." not in name and name in known:
+                    continue
+                # A nested or item-level name: it must at least appear in the spec's text
+                # for this operation's request body.
+                leaf = name.split(".")[-1].split("[")[0]
+                self.assertIn(f'"{leaf}"', FULL_TEXT.get(template, SPEC_TEXT), f"{page.name}: {name}")
+        self.assertGreaterEqual(checked, 60)
+
+
 class JsonAndCurlExamples(unittest.TestCase):
+    REFERENCE = [page for page in V2_PAGES if "plugins" not in page.parts]
+
     def test_json_blocks_parse_and_use_public_fields(self):
-        for line, source in blocks("json"):
-            with self.subTest(line=line):
-                sample = json.loads(source)
-                text = json.dumps(sample)
-                for name in LEGACY | INTERNAL_REQUEST:
-                    self.assertNotIn(f'"{name}"', text)
-                data = sample.get("data", sample) if isinstance(sample, dict) else {}
-                if isinstance(data, dict) and "chunks" in data:
-                    self.assertFalse(set(data) & INTERNAL_RESPONSE)
-                    self.assertEqual([], unknown_keys(data, SCHEMAS["search.V2RetrievalResult"]))
-                if isinstance(sample, dict) and "query" in sample and "database" in sample:
-                    self.assertEqual([], unknown_keys(sample, request_schema(operation("POST", "/query")[1])))
+        count = 0
+        for page in self.REFERENCE:
+            for line, source in blocks("json", page):
+                with self.subTest(example=f"{page.relative_to(ROOT)}:{line}"):
+                    try:
+                        sample = json.loads(source)
+                    except json.JSONDecodeError:
+                        self.assertRegex(source, r"\.\.\.|//", "invalid JSON that is not an elided excerpt")
+                        continue
+                    count += 1
+                    text = json.dumps(sample)
+                    for name in INTERNAL_REQUEST:
+                        self.assertNotIn(f'"{name}"', text)
+                    if page == GUIDE:
+                        for name in LEGACY:
+                            self.assertNotIn(f'"{name}"', text)
+                    data = sample.get("data", sample) if isinstance(sample, dict) else {}
+                    if isinstance(data, dict) and "chunks" in data:
+                        self.assertFalse(set(data) & INTERNAL_RESPONSE)
+                        self.assertEqual([], unknown_keys(data, SCHEMAS["search.V2RetrievalResult"]))
+                    if isinstance(sample, dict) and "query" in sample and "database" in sample \
+                            and "params" not in sample:
+                        self.assertEqual([], unknown_keys(sample, request_schema(operation("POST", "/query")[1])))
+        self.assertGreaterEqual(count, 120)
+
+    @staticmethod
+    def curl_calls(source):
+        """Yield (method, path, command) for each curl call to the API in a bash block."""
+        for command in re.split(r"\n(?=\s*(?:\w+=\$\()?curl\b)", source):
+            url = re.search(r"https://api\.hydradb\.com(/[^\s'\"?]*)", command)
+            if not url:
+                continue
+            explicit = re.search(r"(?:-X ?|--request )(\w+)", command)
+            sends_body = re.search(r"\s(?:-d|--data|--data-raw|-F|--form)\b", command) and " -G" not in command
+            yield (explicit.group(1) if explicit else "POST" if sends_body else "GET"), url.group(1), command
+
+    def check_curl(self, method, path, command):
+        _, op = operation(method, path)
+        if "AUTH[@]" not in command:  # The quickstart keeps both headers in a shell array.
+            self.assertIn("API-Version: 2", command)
+            self.assertIn("Authorization: Bearer", command)
+        schema = request_schema(op)
+        properties = schema.get("properties", {})
+        for field in re.findall(r"(?:-F|--form) ['\"]?(\w+)=", command):
+            self.assertIn(field, properties, "form field is not in the spec")
+        declared = {p["name"] for p in op.get("parameters", [])}
+        inline = re.search(re.escape(path) + r"\?([^\s'\"]+)", command)
+        for field in re.findall(r"--data-urlencode ['\"]?(\w+)=", command) + \
+                (re.findall(r"(\w+)=", inline.group(1)) if inline else []):
+            self.assertIn(field, declared, "query parameter is not in the spec")
+        body = re.search(r"(?:-d|--data|--data-raw) '(\{.*\})'", command, re.S)
+        if body:
+            sent = json.loads(body.group(1))
+            self.assertEqual([], unknown_keys(sent, schema), "JSON body has a field the spec does not declare")
+            self.assertFalse(set(sent) & INTERNAL_REQUEST)
+            for required in schema.get("required", []):
+                self.assertIn(required, sent, "JSON body lacks a required field")
+        form = dict(re.findall(r"-F '(\w+)=(\[.*?\])'", command, re.S))
+        if form:
+            form["type"] = (re.search(r'-F "?type=(\w+)', command) or [None, None])[1]
+            FakeHydraDB(self).check_ingest_items(form, f"{method} {path}")
 
     def test_curl_blocks_match_the_spec(self):
         calls = 0
-        for line, source in blocks("bash"):
-            for command in re.split(r"\n(?=\s*(?:\w+=\$\()?curl\b)", source):
-                url = re.search(r"https://api\.hydradb\.com(/[^\s'\"?]*)", command)
-                if not url:
-                    continue
-                calls += 1
-                method = (re.search(r"-X (\w+)", command) or [None, "GET"])[1]
-                with self.subTest(line=line, call=f"{method} {url.group(1)}"):
-                    _, op = operation(method, url.group(1))
-                    self.assertIn("API-Version: 2", command)
-                    self.assertIn("Authorization: Bearer", command)
-                    properties = request_schema(op).get("properties", {})
-                    for field in re.findall(r"-F ['\"]?(\w+)=", command):
-                        self.assertIn(field, properties)
-                    form = {name: value for name, value in
-                            re.findall(r"-F '(\w+)=(\[.*?\])'", command, re.S)}
-                    if form:
-                        form["type"] = (re.search(r'-F "type=(\w+)"', command) or [None, None])[1]
-                        FakeHydraDB(self).check_ingest_items(form, f"line {line}")
-                    declared = {p["name"] for p in op.get("parameters", [])}
-                    for field in re.findall(r"--data-urlencode ['\"]?(\w+)=", command):
-                        self.assertIn(field, declared)
-                    body = re.search(r"-d '(\{.*?\})'", command, re.S)
-                    if body:
-                        self.assertEqual([], unknown_keys(json.loads(body.group(1)), request_schema(op)))
-        self.assertGreaterEqual(calls, 5)
+        for page in self.REFERENCE:
+            bound = binding(page)
+            request_example = section(page, "RequestExample") if bound else ""
+            for line, source in blocks("bash", page):
+                for method, path, command in self.curl_calls(source):
+                    calls += 1
+                    with self.subTest(example=f"{page.relative_to(ROOT)}:{line}", call=f"{method} {path}"):
+                        self.check_curl(method, path, command)
+                        if bound and source.strip() in request_example:
+                            self.assertEqual(bound, (method, operation(method, path)[0]),
+                                             "the request example does not call the endpoint this page documents")
+        self.assertGreaterEqual(calls, 80)
 
     def test_status_values_are_the_documented_ones(self):
         pages = V2_PAGES + sorted((ROOT / "cookbooks/v2").glob("*.mdx")) + sorted((ROOT / "snippets").glob("*.mdx"))
