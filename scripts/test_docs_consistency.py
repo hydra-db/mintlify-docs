@@ -167,6 +167,37 @@ class SharedFactsTest(unittest.TestCase):
                 )
                 self.assertTrue(exists, f"{path.name}: {url} does not exist")
 
+    def test_anchor_links_point_at_real_headings(self):
+        def prose(text):
+            return re.sub(r"^[ \t]*```.*?^[ \t]*```", "", text, flags=re.M | re.S)
+
+        def slug(heading):
+            heading = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", heading)
+            heading = re.sub(r"<[^>]+>", "", heading).replace("`", "").strip().lower()
+            return re.sub(r"[^\w\- ]", "", heading).replace(" ", "-")
+
+        # A same-page link must match a real heading (the hygiene check's rule).
+        # A link from another page may also use an explicit anchor tag.
+        headings, tagged = {}, {}
+        for path in live_files("*.mdx"):
+            text = prose(path.read_text(encoding="utf-8"))
+            headings[path] = {slug(m.group(1)) for m in re.finditer(r"^#{1,6}\s+(.*)$", text, re.M)}
+            tagged[path] = headings[path] | set(re.findall(r'<(?:a|span) id="([^"]+)"', text))
+        missing = []
+        for path, own in headings.items():
+            relative = str(path.relative_to(ROOT))
+            if "/v2/" not in f"/{relative}" and relative != "AGENTS.mdx":
+                continue
+            text = prose(path.read_text(encoding="utf-8"))
+            for target, anchor in re.findall(r"\]\((/[^)#\s]*)?#([^)\s]+)\)", text):
+                if not target:
+                    known = own
+                else:
+                    known = tagged.get(ROOT / f"{target.strip('/')}.mdx")
+                if known is not None and anchor not in known:
+                    missing.append(f"{relative}: {target}#{anchor}")
+        self.assertEqual([], missing, "\n".join(missing))
+
     def test_guides_do_not_show_internal_query_fields(self):
         for path in live_files("*.mdx"):
             if "/v2/" in str(path) or path.name == "AGENTS.mdx":
