@@ -6,12 +6,13 @@ openapi: "api-reference/v2/openapi.json POST /context/ingest"
 
 import { Field } from "/snippets/field.jsx";
 
-Use `type: "knowledge"` for:
+Ingest context into a database in one multipart request. Ingestion is asynchronous: the response returns an ID for each source, and a source is searchable once indexing completes. Choose the payload by what you are storing:
 
-1. **Documents:** Use the `documents` field for binary uploads that HydraDB should parse: PDFs, Office and iWork files, spreadsheets, images and plain text. See [Supported file formats](#supported-file-formats) for the full list.
-2. **App sources:** Use `app_knowledge` for text and metadata your app has already extracted (Slack threads, Notion pages, emails, tickets). Read more about [ingesting knowledge from your apps](/essentials/v2/app-sources).
-
-Use `type: "memory"` and `memories` for preferences, decisions, inferred behavior traits, and past conversations your agent should remember in future sessions. With `infer: true`, HydraDB uses earlier context to extract preferences and improve accuracy; `infer: false` stores the text verbatim. See [Memories](/essentials/v2/memories).
+| Payload | Send | Use for |
+| --- | --- | --- |
+| Documents | `type: "knowledge"` and `documents` | Binary uploads that HydraDB should parse: PDFs, Office and iWork files, spreadsheets, images, and plain text. See [Supported file formats](#supported-file-formats). |
+| App sources | `type: "knowledge"` and `app_knowledge` | Text and metadata your application has already extracted from an app (Slack threads, Notion pages, emails, tickets). See [App Sources](/essentials/v2/app-sources). |
+| Memories | `type: "memory"` and `memories` | Preferences, decisions, inferred behavior traits, and past conversations your agent should remember in future sessions. See [Memories](/essentials/v2/memories). |
 
 <RequestExample>
 
@@ -51,7 +52,179 @@ curl -X POST 'https://api.hydradb.com/context/ingest' \
 
 </RequestExample>
 
-## Upload in-memory text as a `.txt` file
+## Form fields
+
+| Name | Description |
+| --- | --- |
+| <Field name="type" type="&#x22;knowledge&#x22; or &#x22;memory&#x22;" /> | Use singular `"memory"` when ingesting memories. (default=`"knowledge"`) |
+| <Field name="database" type="string" required /> | Target database. |
+| <Field name="collection" type="string" /> | Collection to write to. A new name creates the collection automatically. Omit it to use the default collection. List existing collections with [List Collections](/api-reference/v2/endpoint/list-sub-tenants). |
+| <Field name="upsert" type="boolean" /> | Replace existing sources with the same ID. Set to `false` to error on conflict: a document or app source whose ID exists comes back `failed` with `error_code: "E9003"`. (default=`true`) |
+| <Field name="documents" type="file[]" /> | Binary uploads, **knowledge only**. Required when `type=knowledge` and you want HydraDB to parse documents. Omit when ingesting memories. See [Supported file formats](#supported-file-formats). (default=`[]`) |
+| <Field name="document_metadata" type="string (JSON array)" /> | One entry per file in `documents`, in the same order. The counts must match, or the request returns `400`. If omitted, documents index with inferred defaults such as filename/title. See [item fields](#examples-and-item-fields). |
+| <Field name="app_knowledge" type="string (JSON object or array)" /> | Pre-extracted source objects (Slack, Notion, web pages, etc.), **knowledge only**. See [item fields](#examples-and-item-fields). |
+| <Field name="graph_payload" type="string (JSON map)" /> | Map of source ID to your own entities and relations. Replaces LLM graph extraction for each keyed source. Works for `type=knowledge` and `type=memory`. See the "Bring your own graph" example in [item fields](#examples-and-item-fields) and the [Bring Your Own Graph](/essentials/v2/bring-your-own-graph#using-byog-without-cypher) guide. |
+| <Field name="memories" type="string (JSON array)" /> | Memory items, **memory only**. Required and non-empty when `type=memory`. The form field is plural `memories`, even though `type` is singular `memory`. See [item fields](#examples-and-item-fields). |
+
+- **Multipart, not JSON:** This endpoint uses `multipart/form-data`. Stringify all JSON arrays (`document_metadata`, `app_knowledge`, `memories`) before placing them in the form field. A body that is neither a form nor JSON returns `415`.
+- **`202 Accepted` means queued, not indexed:** A successful response only confirms your sources were accepted, not that they are ready to query. Before querying, poll [`GET /context/status`](/api-reference/v2/endpoint/source-status) with the returned IDs until each source reaches `graph_creation` (searchable), `completed`, or `errored`. Alternatively, register a webhook for `indexing.status_changed` events (see [Webhooks](/essentials/v2/webhooks)).
+- **Memory and knowledge:** Use `type: "memory"` for memory ingestion, listing, and deletion. Use `type: "all"` on `POST /query` when results should combine both.
+
+## Supported file formats
+
+<span id="size-limit"></span>
+
+Each file in `documents` can be up to **50 MB**. A larger file returns `413` with a message naming the file, and no part of the request is processed. Split larger files before uploading.
+
+<Accordion title="View supported and unsupported file formats">
+
+HydraDB accepts these formats through `documents`:
+
+| Type | Formats |
+| --- | --- |
+| Documents | `.pdf` `.doc` `.docx` `.docm` `.dot` `.dotx` `.odt` `.ott` `.rtf` |
+| Spreadsheets | `.xls` `.xlsx` `.xlsm` `.xlsb` `.ods` `.ots` `.csv` `.tsv` |
+| Presentations | `.ppt` `.pptx` `.pptm` `.odp` `.otp` |
+| Apple iWork | `.pages` `.numbers` `.key` |
+| Images | `.png` `.jpg` `.jpeg` `.tif` `.tiff` `.webp` `.gif` `.bmp` |
+| Plain text | `.txt` `.md` `.markdown` `.json` |
+
+What HydraDB extracts differs by type:
+
+| Type | What gets indexed |
+| --- | --- |
+| Documents and presentations | The text, in reading order. Slide titles and body text both come through. |
+| Spreadsheets | Cell values rendered as a table, one per sheet. Formulas are indexed as their computed result, not the formula itself. |
+| Images and scans | Text read out of the picture with OCR. A photo of a page and a scan of a page both work. |
+| Plain text | The file as-is. |
+
+Files with no readable text fail with [`E2002`](/api-reference/v2/error-responses#ingestion-error-codes). Upload a version containing text.
+
+### Unsupported formats
+
+| Format | Upload this instead |
+| --- | --- |
+| `.heic` `.heif` `.avif` | Export the photo as JPEG or PDF |
+| `.svg` `.ico` | Export as PNG or JPEG |
+| `.html` `.htm` `.xml` | Save the page as PDF |
+| `.eml` `.msg` | Save the message as PDF, or send it as an app source |
+| `.epub` `.wpd` | Convert to PDF or DOCX |
+| `.zip` | Upload the files individually |
+
+Use the file's real extension. When the filename has no extension, HydraDB uses the part's `Content-Type`. Renaming an unsupported file does not convert it: a renamed file may fail during indexing. Check [Ingestion Status](/api-reference/v2/endpoint/source-status) for that failure.
+
+### When a file is not supported
+
+An unsupported file is rejected in the upload response and does not block other files in the upload. The request returns `202` as usual. The rejected file comes back with `status: "failed"` and `error_code: "E1002"`, and every other file is queued normally:
+
+```json
+{
+  "success": true,
+  "data": {
+    "success": false,
+    "message": "Upload completed with some failures.",
+    "results": [
+      { "id": "6cc7bcd185b044cd", "filename": "report.pdf", "status": "queued", "error": null, "error_code": null },
+      { "id": "f47411c736447126", "filename": "photo.heic", "status": "failed", "error": "This file format isn't supported. Please upload a PDF, Office document (Word, Excel, PowerPoint), image, CSV or text file.", "error_code": "E1002" },
+      { "id": "d0c919bdec196a8d", "filename": "notes.txt", "status": "queued", "error": null, "error_code": null }
+    ],
+    "success_count": 2,
+    "failed_count": 1
+  },
+  "error": null,
+  "meta": { "request_id": "bcd03673-174d-4a73-83e6-73bfcdc16061", "api_version": "2.0.1" }
+}
+```
+
+`data.success` is `true` only when every file was queued. Check `data.results` for individual failures.
+
+Files rejected with `E1002` have no ingestion status record. Handle the format error from the upload response.
+
+</Accordion>
+
+## Shared item fields
+
+Items in `document_metadata`, `app_knowledge`, and `memories` share three fields. The per-type tables under [Examples and item fields](#examples-and-item-fields) list only what differs.
+
+| Field | Description |
+| --- | --- |
+| <Field name="id" type="string" /> | The source's ID and its upsert key. Use your application's ID to keep the same identifier in both systems. Must not contain a comma (`,`): the comma is reserved as the ID separator on [Ingestion Status](/api-reference/v2/endpoint/source-status) (`GET /context/status?ids=a,b`), so an item whose `id` contains a comma is rejected with a `400`. |
+| <Field name="metadata" type="object" /> | Database-schema fields for filtering and search. Keys must be declared in `database_metadata_schema`. Send an object, for example `{ "department": "legal" }`. At most 16 KiB. (default=`{}`) |
+| <Field name="additional_metadata" type="object" /> | Free-form per-source fields for display or bookkeeping, sent as an object. To filter on these at query time, nest them under `metadata_filters.additional_metadata`. At most 1 KiB. (default=`{}`) |
+
+See [Metadata and Filters](/essentials/v2/metadata#2-the-two-layers) for choosing metadata fields and filtering on them, and [metadata size limits](/essentials/v2/metadata#stored-metadata) for how HydraDB measures the caps.
+
+## Examples and item fields
+
+<Accordion title="Knowledge documents: upload PDFs, DOCX, CSV, markdown, or text">
+  <CodeGroup>
+
+  ```python Python SDK
+  import json
+
+  with open("/path/to/policy.pdf", "rb") as f1, open("/path/to/runbook.pdf", "rb") as f2:
+      result = client.context.ingest(
+          type="knowledge",
+          database="acme_corp",
+          documents=[
+              ("policy.pdf", f1, "application/pdf"),
+              ("runbook.pdf", f2, "application/pdf"),
+          ],
+          document_metadata=json.dumps([
+              {"id": "policy_main", "metadata": {"department": "legal"}},
+              {"id": "runbook_deploy", "metadata": {"department": "ops"}},
+          ]),
+      )
+  ```
+
+  ```typescript TypeScript SDK
+  const result = await client.context.ingest({
+    type: "knowledge",
+    database: "acme_corp",
+    documents: [
+      { path: "/path/to/policy.pdf", filename: "policy.pdf", contentType: "application/pdf" },
+      { path: "/path/to/runbook.pdf", filename: "runbook.pdf", contentType: "application/pdf" },
+    ],
+    documentMetadata: JSON.stringify([
+      { id: "policy_main", metadata: { department: "legal" } },
+      { id: "runbook_deploy", metadata: { department: "ops" } },
+    ]),
+  });
+  ```
+
+  ```bash cURL
+  curl -X POST 'https://api.hydradb.com/context/ingest' \
+    -H "Authorization: Bearer <your_api_key>" \
+    -H "API-Version: 2" \
+    -F "type=knowledge" \
+    -F "database=acme_corp" \
+    -F "documents=@/path/to/policy.pdf" \
+    -F "documents=@/path/to/runbook.pdf" \
+    -F 'document_metadata=[
+      { "id": "policy_main", "metadata": { "department": "legal" } },
+      { "id": "runbook_deploy", "metadata": { "department": "ops" } }
+    ]'
+  ```
+
+  </CodeGroup>
+
+  | Field | Description |
+  | --- | --- |
+  | <Field name="id" type="string" /> | Optional. If set, becomes the `id` for this document. See [shared item fields](#shared-item-fields). |
+  | <Field name="metadata" type="object" /> | See [shared item fields](#shared-item-fields). |
+  | <Field name="additional_metadata" type="object" /> | See [shared item fields](#shared-item-fields). |
+  | <Field name="relations" type="object" /> | Forceful relations (links you declare between sources). Shape: `{ "ids": ["...", "..."] }`. Linked sources come back in `additional_context` on `mode: "thinking"` queries. |
+  | <Field name="infer" type="boolean" /> | Run model enrichment on this file. (default=`false`) |
+  | <Field name="evidence_kind" type="string" /> | How this content came to be known: `assertion`, `record`, `said`, `done`, `third_party`, or `inferred`. Any other value returns `400`. |
+  | <Field name="evidence_subject" type="string" /> | A stable handle for who or what the content is about. |
+
+  Those seven, plus the deprecated aliases `source_id` and `file_id` (for `id`) and `document_metadata` (for `additional_metadata`), are the only keys accepted. Anything else (including `title`, `type`, `url` and `timestamp`) is rejected with a `400` naming the unsupported key, rather than being silently dropped.
+
+  In particular, a document's **title is derived, not settable**. It defaults to the uploaded filename and is returned as `source_title` on query results and `title` on `/context/list`. It cannot be overridden at ingest, and [`PATCH /context/{id}/metadata`](/api-reference/v2/endpoint/update-source-metadata) only merges `additional_metadata` and `database_metadata`. Use `additional_metadata` for your own display fields, or ingest through `app_knowledge`, whose items carry an explicit `title`.
+
+</Accordion>
+
+<Accordion title="Knowledge documents: upload in-memory text as a .txt file">
 
 If you already have text in memory, create a file-like object and upload it through `documents` as a `text/plain` `.txt` file.
 
@@ -116,176 +289,6 @@ curl -X POST 'https://api.hydradb.com/context/ingest' \
   -F 'document_metadata=[{"id":"meeting_notes_q4","metadata":{"department":"product"}}]'
 ```
 </CodeGroup>
-
-## Form fields
-
-| Name | Description |
-| --- | --- |
-| <Field name="type" type="&#x22;knowledge&#x22; or &#x22;memory&#x22;" /> | Use singular `"memory"` when writing memories. (default=`"knowledge"`) |
-| <Field name="database" type="string" required /> | Target database. |
-| <Field name="collection" type="string" /> | Collection to write to. A new name creates the collection automatically. Omit it to use the default collection. |
-| <Field name="upsert" type="boolean" /> | Replace existing sources with the same ID. Set to `false` to error on conflict: a document or app source whose ID exists comes back `failed` with `error_code: "E9003"`. (default=`true`) |
-| <Field name="documents" type="file[]" /> | Binary uploads, **knowledge only**. Required when `type=knowledge` and you want HydraDB to parse documents. Omit when ingesting memories. See [Supported file formats](#supported-file-formats). (default=`[]`) |
-| <Field name="document_metadata" type="string (JSON array)" /> | One entry per file in `documents`, in the same order. The counts must match, or the request returns `400`. If omitted, documents index with inferred defaults such as filename/title. See the item shape below. |
-| <Field name="app_knowledge" type="string (JSON object or array)" /> | Pre-extracted source objects (Slack, Notion, web pages, etc.), **knowledge only**. See the `app_knowledge` item shape below. |
-| <Field name="graph_payload" type="string (JSON map)" /> | Map of source id to your own entities + relations. Replaces LLM graph extraction for each keyed source. Works for `type=knowledge` (key = a `document_metadata` id or `app_knowledge` item id) and `type=memory` (key = a memory `id`). See [Bring Your Own Graph](/essentials/v2/bring-your-own-graph#using-byog-without-cypher) and the shape below. |
-| <Field name="memories" type="string (JSON array)" /> | Memory items, **memory only**. Required and non-empty when `type=memory`. Use plural `memories` for the form field, even though `type` is singular `memory`. See the `memories` item shape below. |
-
-1. **`id` must not contain a comma (`,`):** The comma is reserved as the id separator on [Ingestion Status](/api-reference/v2/endpoint/source-status) (`GET /context/status?ids=a,b`), so an `id` containing a comma cannot be looked up unambiguously. This applies to every `id` you supply: `document_metadata`, `app_knowledge`, and `memories` items. Ingesting an item whose `id` contains a comma is rejected with a `400`.
-
-2. **`202 Accepted` means queued, not indexed:** Ingestion is asynchronous. A successful response only confirms your sources were accepted, not that they are ready to query. Before querying, poll [`GET /context/status`](/api-reference/v2/endpoint/source-status) with the returned IDs until each source reaches `graph_creation` (searchable), `completed`, or `errored`. Alternatively, register a webhook for `indexing.status_changed` events (see [Webhooks](/essentials/v2/webhooks)).
-
-## Supported file formats
-
-<span id="size-limit"></span>
-
-Each file in `documents` can be up to **50 MB**. A larger file returns `413` with a message naming the file, and no part of the request is processed. Split larger files before uploading.
-
-<Accordion title="View supported and unsupported file formats">
-
-HydraDB accepts these formats through `documents`:
-
-| Type | Formats |
-| --- | --- |
-| Documents | `.pdf` `.doc` `.docx` `.docm` `.dot` `.dotx` `.odt` `.ott` `.rtf` |
-| Spreadsheets | `.xls` `.xlsx` `.xlsm` `.xlsb` `.ods` `.ots` `.csv` `.tsv` |
-| Presentations | `.ppt` `.pptx` `.pptm` `.odp` `.otp` |
-| Apple iWork | `.pages` `.numbers` `.key` |
-| Images | `.png` `.jpg` `.jpeg` `.tif` `.tiff` `.webp` `.gif` `.bmp` |
-| Plain text | `.txt` `.md` `.markdown` `.json` |
-
-What HydraDB extracts differs by type:
-
-| Type | What gets indexed |
-| --- | --- |
-| Documents and presentations | The text, in reading order. Slide titles and body text both come through. |
-| Spreadsheets | Cell values rendered as a table, one per sheet. Formulas are indexed as their computed result, not the formula itself. |
-| Images and scans | Text read out of the picture with OCR. A photo of a page and a scan of a page both work. |
-| Plain text | The file as-is. |
-
-Files with no readable text fail with [`E2002`](/api-reference/v2/error-responses#ingestion-error-codes). Upload a version containing text.
-
-### Formats we cannot read
-
-Unsupported files are rejected in the upload response.
-
-| Format | Upload this instead |
-| --- | --- |
-| `.heic` `.heif` `.avif` | Export the photo as JPEG or PDF |
-| `.svg` `.ico` | Export as PNG or JPEG |
-| `.html` `.htm` `.xml` | Save the page as PDF |
-| `.eml` `.msg` | Save the message as PDF, or send it as an app source |
-| `.epub` `.wpd` | Convert to PDF or DOCX |
-| `.zip` | Upload the files individually |
-
-Use the file's real extension. When the filename has no extension, HydraDB uses the part's `Content-Type`. Renaming an unsupported file does not convert it. A renamed file may fail during processing. Check [Ingestion Status](/api-reference/v2/endpoint/source-status) for that failure.
-
-### When a file is not supported
-
-Unsupported files do not block other files in the upload.
-
-The request returns `202` as usual. The rejected file comes back with `status: "failed"` and `error_code: "E1002"`, and every other file is queued normally:
-
-```json
-{
-  "success": true,
-  "data": {
-    "success": false,
-    "message": "Upload completed with some failures.",
-    "results": [
-      { "id": "6cc7bcd185b044cd", "filename": "report.pdf", "status": "queued", "error": null, "error_code": null },
-      { "id": "f47411c736447126", "filename": "photo.heic", "status": "failed", "error": "This file format isn't supported. Please upload a PDF, Office document (Word, Excel, PowerPoint), image, CSV or text file.", "error_code": "E1002" },
-      { "id": "d0c919bdec196a8d", "filename": "notes.txt", "status": "queued", "error": null, "error_code": null }
-    ],
-    "success_count": 2,
-    "failed_count": 1
-  },
-  "error": null,
-  "meta": { "request_id": "bcd03673-174d-4a73-83e6-73bfcdc16061", "api_version": "2.0.1" }
-}
-```
-
-`data.success` is `true` only when every file was queued. Check `data.results` for individual failures.
-
-Files rejected with `E1002` have no ingestion status record. Handle the format error from the upload response.
-
-</Accordion>
-
-## Examples and item fields
-
-See [Metadata and Filters](/essentials/v2/metadata#2-the-two-layers) for choosing metadata fields and using them to filter results.
-
-### Document metadata
-
-Per-document metadata (`id`, `metadata`, `additional_metadata`, `relations`, `infer`, `evidence_kind`, `evidence_subject`) can be passed alongside each uploaded document to control indexing, filtering, and display. The key list is closed: an item carrying any other key is rejected with a `400` naming it, rather than being silently dropped. See the field reference below.
-
-<Accordion title="Knowledge documents: upload PDFs, DOCX, CSV, markdown, or text">
-  <CodeGroup>
-
-  ```python Python SDK
-  import json
-
-  with open("/path/to/policy.pdf", "rb") as f1, open("/path/to/runbook.pdf", "rb") as f2:
-      result = client.context.ingest(
-          type="knowledge",
-          database="acme_corp",
-          documents=[
-              ("policy.pdf", f1, "application/pdf"),
-              ("runbook.pdf", f2, "application/pdf"),
-          ],
-          document_metadata=json.dumps([
-              {"id": "policy_main", "metadata": {"department": "legal"}},
-              {"id": "runbook_deploy", "metadata": {"department": "ops"}},
-          ]),
-      )
-  ```
-
-  ```typescript TypeScript SDK
-  const result = await client.context.ingest({
-    type: "knowledge",
-    database: "acme_corp",
-    documents: [
-      { path: "/path/to/policy.pdf", filename: "policy.pdf", contentType: "application/pdf" },
-      { path: "/path/to/runbook.pdf", filename: "runbook.pdf", contentType: "application/pdf" },
-    ],
-    documentMetadata: JSON.stringify([
-      { id: "policy_main", metadata: { department: "legal" } },
-      { id: "runbook_deploy", metadata: { department: "ops" } },
-    ]),
-  });
-  ```
-
-  ```bash cURL
-  curl -X POST 'https://api.hydradb.com/context/ingest' \
-    -H "Authorization: Bearer <your_api_key>" \
-    -H "API-Version: 2" \
-    -F "type=knowledge" \
-    -F "database=acme_corp" \
-    -F "documents=@/path/to/policy.pdf" \
-    -F "documents=@/path/to/runbook.pdf" \
-    -F 'document_metadata=[
-      { "id": "policy_main", "metadata": { "department": "legal" } },
-      { "id": "runbook_deploy", "metadata": { "department": "ops" } }
-    ]'
-  ```
-
-  </CodeGroup>
-
-  | Field | Description |
-  | --- | --- |
-  | <Field name="id" type="string" /> | Optional context ID. If set, becomes the `id` for this document (use your app's document ID to keep the same identifier in both systems). Must not contain a comma (`,`). It is reserved as the id separator on `/context/status?ids=`. |
-  | <Field name="metadata" type="object" /> | Database-schema fields for filtering and search. Keys must be declared in `database_metadata_schema`. At most 16 KiB. (default=`{}`) |
-  | <Field name="additional_metadata" type="object" /> | Free-form per-document fields for display or bookkeeping. To filter on these at search time, nest under `metadata_filters.additional_metadata`. At most 1 KiB. (default=`{}`) |
-  | <Field name="relations" type="object" /> | Explicitly link this document to other sources. Shape: `{ "ids": ["...", "..."] }`. Surfaced via `additional_context` in `mode: "thinking"` search. |
-  | <Field name="infer" type="boolean" /> | Run model enrichment on this file. (default=`false`) |
-  | <Field name="evidence_kind" type="string" /> | How this content came to be known: `assertion`, `record`, `said`, `done`, `third_party`, or `inferred`. Any other value returns `400`. |
-  | <Field name="evidence_subject" type="string" /> | A stable handle for who or what the content is about. |
-
-  These limits also apply to `app_knowledge` and `memories` items. See [metadata size limits](/essentials/v2/metadata#stored-metadata) for how HydraDB measures them.
-
-  Those seven, plus the legacy aliases `source_id` and `file_id` (for `id`) and `document_metadata` (for `additional_metadata`), are the only keys accepted. Anything else (including `title`, `type`, `url` and `timestamp`) is rejected with a `400` naming the unsupported key, rather than being silently dropped.
-
-  In particular, a document's **title is derived, not settable**. It defaults to the uploaded filename and is returned as `source_title` on query results and `title` on `/context/list`. It cannot be overridden at ingest, and [`PATCH /context/{id}/metadata`](/api-reference/v2/endpoint/update-source-metadata) only merges `additional_metadata` and `database_metadata`. Use `additional_metadata` for your own display fields, or ingest through `app_knowledge`, whose items carry an explicit `title`.
 
 </Accordion>
 
@@ -356,10 +359,10 @@ Per-document metadata (`id`, `metadata`, `additional_metadata`, `relations`, `in
 
   | Field | Description |
   | --- | --- |
-  | <Field name="id" type="string" required /> | Context ID. Treated as the upsert key. Send an empty string to have one generated upstream. Must not contain a comma (`,`). It is reserved as the id separator on `/context/status?ids=`. |
+  | <Field name="id" type="string" required /> | Required. Send an empty string to have one generated upstream. See [shared item fields](#shared-item-fields). |
   | <Field name="database" type="string" /> | Optional. If sent, must match the form-level `database`. |
   | <Field name="collection" type="string" /> | Optional. If sent, must match the form-level `collection`. |
-  | <Field name="title" type="string" /> | Short title or subject shown in search results. |
+  | <Field name="title" type="string" /> | Short title or subject shown in query results. |
   | <Field name="description" type="string" /> | Optional long-form description. |
   | <Field name="url" type="string" /> | Canonical URL or reference link. |
   | <Field name="timestamp" type="string" /> | ISO-8601 timestamp (creation or last-updated). |
@@ -368,14 +371,14 @@ Per-document metadata (`id`, `metadata`, `additional_metadata`, `relations`, `in
   | <Field name="external_id" type="string" recommended /> | The provider's ID for this exact item. Enables exact lookup and relation resolution. |
   | <Field name="fields" type="object" recommended /> | App-native content and structure (`body`, `description`, `title`, or `data`, by `kind`). `fields.kind` must match `kind`. See [App Sources](/essentials/v2/app-sources). |
   | <Field name="content" type="object" /> | Older generic payload, `{ "text": "..." }`. Prefer `kind` and `fields`, which let app-aware retrieval see authors, threads, and parents. |
-  | <Field name="metadata" type="object" /> | Database-schema fields. At most 16 KiB. (default=`{}`) |
-  | <Field name="additional_metadata" type="object" /> | Free-form per-document fields. At most 1 KiB. (default=`{}`) |
+  | <Field name="metadata" type="object" /> | See [shared item fields](#shared-item-fields). |
+  | <Field name="additional_metadata" type="object" /> | See [shared item fields](#shared-item-fields). |
   | <Field name="attachments" type="array" /> | Optional related attachments. (default=`[]`) |
   | <Field name="relations" type="object or array" /> | Relations to other sources: `{ "ids": [...] }` as on `document_metadata` items, or the typed `[{ "predicate", "target" }]` list described in [App Sources](/essentials/v2/app-sources#explicit-relations-between-sources). |
   | <Field name="acl" type="string[]" /> | Principals allowed to retrieve this source. Omit to leave it unrestricted. A malformed principal rejects the whole request with `400`. See [Access Control](/essentials/v2/access-control). |
 </Accordion>
 
-<Accordion title="User memories: store notes or infer user preferences">
+<Accordion title="Memories: store notes or infer user preferences">
   <CodeGroup>
 
   ```python Python SDK
@@ -430,19 +433,19 @@ Per-document metadata (`id`, `metadata`, `additional_metadata`, `relations`, `in
 
   | Field | Description |
   | --- | --- |
-  | <Field name="id" type="string" /> | Optional unique ID. Acts as the upsert key. Must not contain a comma (`,`). It is reserved as the id separator on `/context/status?ids=`. (default=auto-generated) |
+  | <Field name="id" type="string" /> | Optional. See [shared item fields](#shared-item-fields). (default=auto-generated) |
   | <Field name="title" type="string" /> | Label returned as `title` by List Context and `source_title` by Query. (default=the memory's `id`) |
   | <Field name="text" type="string" recommended /> | Raw text or markdown content. Required unless `user_assistant_pairs` is provided. |
   | <Field name="user_assistant_pairs" type="array" recommended /> | Conversation pairs `{ user, assistant }`. Required unless `text` is provided. |
   | <Field name="is_markdown" type="boolean" /> | Treat `text` as markdown for chunking. (default=`false`) |
-  | <Field name="infer" type="boolean" /> | When `true`, HydraDB extracts the underlying preference from raw signal. (default=`false`) |
+  | <Field name="infer" type="boolean" /> | When `true`, HydraDB extracts the underlying preference from raw signal, using earlier context to improve accuracy. When `false`, it stores the text verbatim. (default=`false`) |
   | <Field name="custom_instructions" type="string" /> | Guides extraction when `infer: true`. Ignored when `infer: false`. |
   | <Field name="user_name" type="string" /> | The user's name. Feeds inference. (default=`"User"`) |
-  | <Field name="metadata" type="object" /> | Database-schema fields as an object (e.g. `{ "department": "legal" }`), the same shape as on `document_metadata` and `app_knowledge` items. At most 16 KiB. (default=`{}`) |
-  | <Field name="additional_metadata" type="object" /> | Free-form per-memory fields as an object, like `metadata` above. At most 1 KiB. (default=`{}`) |
+  | <Field name="metadata" type="object" /> | See [shared item fields](#shared-item-fields). |
+  | <Field name="additional_metadata" type="object" /> | See [shared item fields](#shared-item-fields). |
 </Accordion>
 
-<Accordion title="Chat/LLM conversation pairs: store chat history or support context">
+<Accordion title="Memories: store conversation pairs as chat history or support context">
   <CodeGroup>
 
   ```python Python SDK
@@ -503,7 +506,7 @@ Per-document metadata (`id`, `metadata`, `additional_metadata`, `relations`, `in
 </Accordion>
 
 <Accordion title="Bring your own graph: supply entities and relations">
-  `graph_payload` is a **map of source id to graph** that **replaces LLM graph extraction** for each keyed source. For `type=knowledge`, the key is a `document_metadata` id or an `app_knowledge` item id; for `type=memory`, the key is a memory `id`. Keyed sources are still chunked and embedded, so they stay searchable. See [Bring Your Own Graph](/essentials/v2/bring-your-own-graph#using-byog-without-cypher) for the full guide.
+  Sources keyed in `graph_payload` are still chunked and embedded, so they stay searchable. See [Bring Your Own Graph](/essentials/v2/bring-your-own-graph#using-byog-without-cypher) for the full guide.
 
   <CodeGroup>
 
@@ -595,18 +598,15 @@ Per-document metadata (`id`, `metadata`, `additional_metadata`, `relations`, `in
 
 </Accordion>
 
-## Notes
-
-- **Multipart, not JSON:** This endpoint uses `multipart/form-data`. Stringify all JSON arrays (`document_metadata`, `app_knowledge`, `memories`) before placing them in the form field. A body that is neither a form nor JSON returns `415`.
-- **Memory vs knowledge:** Use `type: "memory"` for memory ingestion, listing, and deletion. Use `type: "all"` on `POST /query` when results should combine both. The multipart field name for memories is always `memories`.
-- **Collections:** A new `collection` name creates the collection on ingestion. Omitting it writes to the default collection. List available collections with [List Collections](/api-reference/v2/endpoint/list-sub-tenants).
-
 <div className="api-before-related-resources" />
 
 ## Related resources
 
-- **Always check** [ingestion status](/api-reference/v2/endpoint/source-status) to ensure context is ready to be retrieved
-- [Query](/api-reference/v2/endpoint/query) once context is ready
-- **Inspect:** [List Context](/api-reference/v2/endpoint/list-documents) to browse what you ingested
-- **Inspect:** [Inspect Context](/api-reference/v2/endpoint/fetch-content) to read one source's original content
-- **Cleanup:** [Delete Context](/api-reference/v2/endpoint/delete-source)
+- **After this:** [Ingestion Status](/api-reference/v2/endpoint/source-status): always confirm sources are indexed before you query
+- **After this:** [Query](/api-reference/v2/endpoint/query): retrieve context once it is indexed
+- **After this:** [List Context](/api-reference/v2/endpoint/list-documents): browse what you ingested
+- **After this:** [Inspect Context](/api-reference/v2/endpoint/fetch-content): read one source's original content
+- **After this:** [Delete Context](/api-reference/v2/endpoint/delete-source): remove sources by ID
+- **Guide:** [Knowledge](/essentials/v2/knowledge): upload files and wait for indexing
+- **Guide:** [App Sources](/essentials/v2/app-sources): kinds, relations, and incremental ingestion
+- **Guide:** [Memories](/essentials/v2/memories): inference and where memories live
