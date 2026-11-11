@@ -92,6 +92,8 @@ class Stubs:
         self.test = test
         self.declared = set()
         self.collections = set()
+        self.restricted = set()  # Collections holding a source that carries an acl.
+        self.status = "completed"
         self.calls = []
         for owner, name, handler in [
             (client.databases, "create", self.create),
@@ -103,7 +105,8 @@ class Stubs:
             (client.connectors, "discover", self.connector_discover),
             (client.connectors, "configure", self.connector_configure),
         ]:
-            setattr(owner, name, self.checked(name, getattr(owner, name), handler))
+            label = name if owner is client else f"{type(owner).__name__}.{name}"
+            setattr(owner, name, self.checked(label, getattr(owner, name), handler))
 
     def checked(self, name, real, handler):
         signature = inspect.signature(real)
@@ -178,6 +181,8 @@ class Stubs:
                     set(item["fields"]) - {"kind"}, KIND_FIELDS[item["kind"]], item["id"]
                 )
                 test.assertLessEqual(set(item.get("metadata", {})), self.declared)
+                if item.get("acl"):
+                    self.restricted.add(collection)
                 ids.append(item["id"])
         test.assertTrue(ids)
         test.assertTrue(all(re.fullmatch(r"[^,\s]+", i) for i in ids), ids)
@@ -192,7 +197,11 @@ class Stubs:
         self.test.assertTrue(ids)
         return sdk.HandlerEnvelopeIngestionV2BatchProcessingStatus(
             data=sdk.IngestionV2BatchProcessingStatus(statuses=[
-                sdk.IngestionV2ProcessingStatus(id=i, indexing_status="completed") for i in ids
+                sdk.IngestionV2ProcessingStatus(
+                    id=i, indexing_status=self.status,
+                    error_code="E2002" if self.status == "errored" else None,
+                    error_message="No readable text" if self.status == "errored" else None,
+                ) for i in ids
             ])
         )
 
@@ -209,6 +218,8 @@ class Stubs:
             test.assertIn(key, self.declared)
             test.assertEqual(1, len(value))
             test.assertLessEqual(set(value), OPERATORS)
+        if self.restricted & set(scopes):
+            test.assertIn("acl", kwargs, "a query over restricted sources must send the caller's acl")
         if "acl" in kwargs:
             test.assertTrue(kwargs["acl"] and all(isinstance(p, str) for p in kwargs["acl"]))
         # Public fields only: `sources` and other internal fields stay unset,
@@ -252,8 +263,46 @@ class CookbookTest(unittest.TestCase):
         for path in COOKBOOKS:
             with self.subTest(cookbook=path.name):
                 stubs = self.run_cookbook(path)
-                for step in ("create", "ingest", "status", "query"):
+                for step in ("DatabasesClient.create", "DatabasesClient.status",
+                             "ContextClient.ingest", "ContextClient.status", "query"):
                     self.assertIn(step, stubs.calls)
+
+    def load_setup(self):
+        """Import hydra.py with stubbed SDK methods, outside any cookbook."""
+        hydra = types.ModuleType("hydra")
+        with mock.patch.dict(os.environ, {"HYDRADB_API_KEY": "test", "OPENAI_API_KEY": "test"}), \
+                mock.patch.dict(sys.modules, {"openai": fake_openai()}):
+            exec(compile(python_blocks(SETUP)["hydra.py"], "hydra.py", "exec"), hydra.__dict__)
+        return hydra, Stubs(self, hydra.client)
+
+    def test_setup_raises_when_indexing_errors(self):
+        hydra, stubs = self.load_setup()
+        stubs.collections.add("docs")
+        stubs.status = "errored"
+        # A loop that misses the errored status must fail here, not spin forever.
+        gave_up = mock.patch("time.sleep", side_effect=AssertionError("wait_indexed kept polling an errored source"))
+        with gave_up, self.assertRaisesRegex(RuntimeError, "E2002: No readable text"):
+            hydra.wait_indexed("db", "docs", ["source_1"])
+
+    def test_setup_waits_for_completed_when_asked(self):
+        hydra, stubs = self.load_setup()
+        stubs.collections.add("docs")
+        stubs.status = "graph_creation"
+        with mock.patch("time.sleep"):
+            hydra.wait_indexed("db", "docs", ["source_1"])  # Searchable is enough by default.
+        with mock.patch("time.sleep", side_effect=TimeoutError), self.assertRaises(TimeoutError):
+            hydra.wait_indexed("db", "docs", ["source_1"], until="completed")
+
+    def test_setup_raises_when_an_item_is_rejected(self):
+        hydra, _ = self.load_setup()
+        rejected = sdk.HandlerEnvelopeIngestionV2IngestResponse(
+            data=sdk.IngestionV2IngestResponse(results=[
+                sdk.IngestionV2IngestResultItem(id="a", filename="auth.py", status="failed",
+                                                error="Unsupported format", error_code="E1002"),
+            ])
+        )
+        with self.assertRaisesRegex(RuntimeError, "auth.py: E1002 Unsupported format"):
+            hydra.source_ids(rejected)
 
     def test_index_links_every_cookbook(self):
         index = (ROOT / "cookbooks/v2/index.mdx").read_text()

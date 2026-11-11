@@ -125,6 +125,7 @@ class FakeHydraDB:
     def __init__(self, test):
         self.test = test
         self.calls = []
+        self.failures = []  # Kept here too: an example may swallow the exception.
 
     def respond(self, template, method, query, body):
         ids = query.get("ids") or query.get("id") or ["source_1"]
@@ -193,6 +194,13 @@ class FakeHydraDB:
             test.assertLessEqual(set(fields) - {"kind"}, KIND_FIELDS[item["kind"]], f"{where}: {item.get('id')}")
 
     def handle(self, request):
+        try:
+            return self.checked(request)
+        except AssertionError as error:
+            self.failures.append(f"{request.method} {request.url.path}: {error}")
+            raise
+
+    def checked(self, request):
         test = self.test
         template, op = operation(request.method, request.url.path)
         where = f"{request.method} {template}"
@@ -271,6 +279,9 @@ class PythonExamples(unittest.TestCase):
     def run_page(self, page, fake, make_client):
         namespace = {"__name__": "__main__", **self.AMBIENT}
         ran = 0
+        before = fake.calls.count("POST /feedback")
+        expected = sum(source.count("feedback.submit(") for _, source in blocks("python", page)
+                       if "for " not in source)
         for line, source in blocks("python", page):
             namespace["client"] = namespace["hydra"] = make_client()
             with self.subTest(example=f"{page.relative_to(ROOT)}:{line}"):
@@ -280,6 +291,9 @@ class PythonExamples(unittest.TestCase):
                     self.assertIn(error.name, self.OPTIONAL_MODULES)
                     continue
                 ran += 1
+        # Feedback calls sit inside try/except, so count the ones that arrived.
+        with self.subTest(page=str(page.relative_to(ROOT)), check="feedback calls reached the API"):
+            self.assertGreaterEqual(fake.calls.count("POST /feedback") - before, expected)
         return ran
 
     def test_every_python_block_runs_through_the_sdk(self):
@@ -326,6 +340,7 @@ class PythonExamples(unittest.TestCase):
                         ran += self.run_page(page, fake, sync_client)
             finally:
                 os.chdir(previous)
+        self.assertEqual([], fake.failures)
         self.assertGreaterEqual(ran, 90)
         for expected in ("POST /databases", "GET /databases/status", "POST /context/ingest",
                          "GET /context/status", "POST /query", "POST /feedback",
@@ -427,6 +442,11 @@ class JsonAndCurlExamples(unittest.TestCase):
                     properties = request_schema(op).get("properties", {})
                     for field in re.findall(r"-F ['\"]?(\w+)=", command):
                         self.assertIn(field, properties)
+                    form = {name: value for name, value in
+                            re.findall(r"-F '(\w+)=(\[.*?\])'", command, re.S)}
+                    if form:
+                        form["type"] = (re.search(r'-F "type=(\w+)"', command) or [None, None])[1]
+                        FakeHydraDB(self).check_ingest_items(form, f"line {line}")
                     declared = {p["name"] for p in op.get("parameters", [])}
                     for field in re.findall(r"--data-urlencode ['\"]?(\w+)=", command):
                         self.assertIn(field, declared)
@@ -436,11 +456,19 @@ class JsonAndCurlExamples(unittest.TestCase):
         self.assertGreaterEqual(calls, 5)
 
     def test_status_values_are_the_documented_ones(self):
-        text = GUIDE.read_text()
-        used = set(re.findall(r'indexing_?[sS]tatus\s*(?:===?|in|==)\s*\(?\[?"(\w+)"', text))
-        self.assertTrue(used)
-        self.assertLessEqual(used, INDEXING_STATUSES)
-        self.assertNotIn("data.sources`", text.replace("Reading `data.sources`", ""))
+        pages = V2_PAGES + sorted((ROOT / "cookbooks/v2").glob("*.mdx")) + sorted((ROOT / "snippets").glob("*.mdx"))
+        used = {}
+        for page in pages:
+            for line in page.read_text().split("\n"):
+                tests_status = re.search(r"indexing_?[sS]tatus\b", line) and \
+                    re.search(r"==|\bin\b|includes\(|has\(", line)
+                names_statuses = re.match(r"\s*(?:const )?(?:terminal|done)\b.*=", line)
+                if not (tests_status or names_statuses):
+                    continue
+                for literal in re.findall(r'"([a-z_]+)"', line):
+                    used.setdefault(literal, page.name)
+        self.assertGreaterEqual(len(used), 3)
+        self.assertEqual({}, {k: v for k, v in used.items() if k not in INDEXING_STATUSES})
 
 
 if __name__ == "__main__":

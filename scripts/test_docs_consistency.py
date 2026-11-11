@@ -194,7 +194,9 @@ class SharedFactsTest(unittest.TestCase):
                     known = own
                 else:
                     known = tagged.get(ROOT / f"{target.strip('/')}.mdx")
-                if known is not None and anchor not in known:
+                if known is None:
+                    missing.append(f"{relative}: {target} is not a page")
+                elif anchor not in known:
                     missing.append(f"{relative}: {target}#{anchor}")
         self.assertEqual([], missing, "\n".join(missing))
 
