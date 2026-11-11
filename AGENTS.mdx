@@ -1,19 +1,20 @@
 ---
 title: "HydraDB Agent Integration Guide"
-description: "LLM-facing reference for building against the current HydraDB docs, API, SDKs, and cookbooks."
+description: "The one page an AI coding agent reads before writing a HydraDB v2 integration: rules, API contracts, and runnable examples."
 ---
 
 This is the complete, maintained agent guide. Continue with the sections below; no separate documentation-index fetch is needed.
 
 ### TL;DR: Critical endpoints
 
-1. **`POST /databases`** (`client.databases.create()`): Provision an isolated database workspace.
-2. **`GET /databases/status`** (`client.databases.status()`): Poll until `infra.ready_for_ingestion` is true.
-3. **`POST /context/ingest`** (`client.context.ingest()`): Ingest documents, app records, or memories under `type="knowledge"` or `type="memory"`.
-4. **`GET /context/status`** (`client.context.status()`): Poll status using `ids` until `indexing_status` is `completed` or `graph_creation`.
-5. **`POST /query`** (`client.query()`): Retrieve context via `type: "knowledge"`, `"memory"`, or `"all"`.
+1. **`POST /databases`** (`client.databases.create()`): Create an isolated database. Creation is asynchronous.
+2. **`GET /databases/status`** (`client.databases.status()`): Poll until `infra.ready_for_ingestion` is true before you ingest or query.
+3. **`POST /context/ingest`** (`client.context.ingest()`): Ingest files, app sources, or memories with `type="knowledge"` or `type="memory"`. Indexing is asynchronous.
+4. **`GET /context/status`** (`client.context.status()`): Poll by `ids` until `indexing_status` is `graph_creation` (searchable, graph still building) or `completed` before you query. `errored` means indexing failed: read `error_code` and `error_message`. Details in [7. Context status and lifecycle](#7-context-status-and-lifecycle).
+5. **`POST /query`** (`client.query()`): Retrieve chunks with `type: "knowledge"`, `"memory"`, or `"all"`.
 6. **`POST /feedback`** (`client.feedback.submit()`): Tell us when a query did not give you what you needed, and once the task is done, how the context held up. See [Sending feedback](#sending-feedback).
 
+Every other endpoint and SDK method is in [15. SDK method reference](#15-sdk-method-reference).
 
 ---
 
@@ -30,7 +31,7 @@ This is the complete, maintained agent guide. Continue with the sections below; 
 
 ### Response envelope
 
-Core raw HTTP responses (`/databases`, `/context/*`, and `/query`) are wrapped:
+Raw HTTP responses are wrapped:
 
 ```json
 {
@@ -44,77 +45,81 @@ Core raw HTTP responses (`/databases`, `/context/*`, and `/query`) are wrapped:
 }
 ```
 
-- Parse core raw HTTP payloads from `data`.
-- The SDKs return the full envelope object; read the payload from its `data` field (e.g. `response.data`). On failure they raise a typed exception rather than returning an envelope with `error` set.
+- Read the payload from `data`, never from the top level. This applies to `/databases`, `/context/*`, `/query`, `/feedback`, and the webhook management endpoints (`/webhooks/indexing*`).
+- The SDKs do not unwrap it: they return the full envelope object, so read `response.data` (for example `response.data.infra`, `response.data.statuses`, `response.data.results`). On failure they raise a typed exception instead of returning an envelope with `error` set.
+- Exceptions: connector endpoints (`/connectors*`) and `PATCH /databases/{database}/metadata-schema` return their success body directly, without the envelope. In the SDKs that is every `connectors.*` method, `list_providers()`, and `update_metadata_schema()`. Their errors still use the envelope.
 - Log `meta.request_id` for failed requests.
-- `meta` may also carry an optional `deprecation` list (with a `Deprecation: true` response header) when a request uses a legacy tenants route (any path under /tenants) or a deprecated field (`tenant_id`/`sub_tenant_id`, or `sub_tenant_ids` on `/query`). Every entry has `deprecated`, `message`, and `deprecated_since`. `deprecated_field` and `preferred_field` are **optional**: the `sub_tenant_ids` notice on `/query` carries them, the `tenant_id`/`sub_tenant_id` notice does not. Read `message` for the migration, and do not key logic off the two optional fields. It is a non-breaking nudge. The status code is unchanged. Prefer the `/databases` routes and `database`/`collection`/`collections` fields to avoid it. Treat `meta` as an open object: ignore keys you do not recognize.
-- Webhook management endpoints (`/webhooks/indexing*`) and `/feedback` use the same envelope. Read their documented response object from `data`.
-- Exceptions: connector endpoints (`/connectors*`) and `PATCH /databases/{database}/metadata-schema` return their success body directly, without the envelope. Their errors still use the envelope.
+- Treat `meta` as an open object: ignore keys you do not recognize.
+- `meta` carries an optional `deprecation` list (with a `Deprecation: true` response header) when a request uses a legacy tenants route (any path under /tenants) or a deprecated field (`tenant_id`/`sub_tenant_id`, or `sub_tenant_ids` on `/query`). It is a non-breaking nudge: the status code is unchanged. Every entry has `deprecated`, `message`, and `deprecated_since`. `deprecated_field` and `preferred_field` are **optional**: the `sub_tenant_ids` notice on `/query` carries them, the `tenant_id`/`sub_tenant_id` notice does not. Read `message` for the migration, and do not key logic off the two optional fields. To avoid the notice, use the `/databases` routes and the `database`/`collection`/`collections` fields.
 
-### Core endpoints
+### Query parameter naming
 
-| Task | Use this endpoint / SDK method |
-|---|---|
-| Create database | `POST /databases` · `client.databases.create()` |
-| Check database readiness | `GET /databases/status` · `client.databases.status()` |
-| List databases | `GET /databases` · `client.databases.list()` |
-| List collections | `GET /databases/collections` · TS `client.databases.collections()` / Python `client.databases.collections()` |
-| Database stats | `GET /databases/stats` · `client.databases.stats()` |
-| Ingest documents, app sources, memories | `POST /context/ingest` · `client.context.ingest()` |
-| Check indexing | `GET /context/status` · `client.context.status()` |
-| Search knowledge/memories/both | `POST /query` · `client.query()` |
-| Report back on query results | `POST /feedback` · `client.feedback.submit()` |
-| List sources/memories | `POST /context/list` · `client.context.list()` |
-| Inspect source content | `GET /context/inspect` · `client.context.inspect()` |
-| Delete sources/memories | `DELETE /context` · `client.context.delete()` |
-| Inspect graph relations | `GET /context/relations` · `client.context.relations()` |
-| Indexing webhooks | `/webhooks/indexing*` |
-
-### Async lifecycle
-
-Two operations are asynchronous:
-
-1. **Database creation**: after `POST /databases`, poll `GET /databases/status` until infrastructure is ready.
-2. **Ingestion**: after `POST /context/ingest`, poll `GET /context/status` until the content is searchable or fully complete.
-
-Searchable status:
-
-- `graph_creation`: searchable, graph may still be incomplete.
-- `completed`: fully indexed and graphed.
-
-Failure status:
-
-- `errored`: indexing failed. Read `error_code` and `error_message`.
-
-### Search parameter naming
-
-The canonical request field for `POST /query` is `type`:
-
-- `type: "knowledge"`
-- `type: "memory"`
-- `type: "all"`
-
-Use the same `type` enum across context lifecycle APIs and search. Search additionally accepts `"all"` to query knowledge and memories together.
+`type` selects the store on `POST /query` and on the context lifecycle APIs, with the same values: `"knowledge"` or `"memory"`. `POST /query` also accepts `"all"` to query knowledge and memories together.
 
 ### Metadata naming
 
-- `metadata`: schema-aligned, declared at database creation, fast filter path. Set it per source on `/context/ingest`: on each `document_metadata[]` item (file uploads), each `app_knowledge[]` item, or each memory item. There is no top-level `metadata` form field.
-- `additional_metadata`: canonical free-form metadata; anything not present in the `metadata` schema. Set it in the same places as `metadata`.
-- `document_metadata`: file uploads only. A JSON array with one entry per file in `documents`, in the same order. Each entry carries the source `id` and that file's `metadata` and `additional_metadata`.
-- `metadata_filters` top-level keys match the `metadata` schema.
-- `metadata_filters.additional_metadata` scopes free-form metadata.
+- `metadata`: schema-aligned fields, declared at database creation; the fast filter path. Filter on them with top-level `metadata_filters` keys.
+- `additional_metadata`: free-form fields; anything not in the `metadata` schema. Filter on them with `metadata_filters.additional_metadata`.
+- Set both per source on `/context/ingest`: on each `document_metadata[]` item (file uploads), each `app_knowledge[]` item, or each memory item. There is no top-level `metadata` or `additional_metadata` form field.
+
+Schema fields, placement, and filter operators are in [10. Metadata guide](#10-metadata-guide).
+
+### Do not mix scopes accidentally
+
+- `database` (formerly `tenant_id`) is the hard isolation boundary.
+- `collection` (formerly `sub_tenant_id`) is an optional group inside a database. Use separate collections only for context that must never meet in one query, such as each user's memories. Otherwise keep one collection and isolate results with `metadata_filters` and `acl`. Patterns are in [Databases and collections](#databases-and-collections).
+- Use the same `collection` on writes, status checks, and reads. Context written under one collection does not appear in a query that names another.
+
+### Send `acl` on user queries
+
+- If your application answers on behalf of signed-in users, send the caller's identity as `acl` on every `POST /query`, for example `"acl": ["grace@acme.com"]`.
+- A query with no `acl`, `[]`, or `["*"]` is not filtered: it returns everything in scope, including sources restricted to other people.
+- Derive `acl` from your authenticated session, never from client input. See [Access control](#access-control).
 
 ### Sending feedback
 
-**If a query did not give you what you needed (nothing relevant came back, the top result was wrong, or you had to fall back to another source), please tell us with `POST /feedback`.** You are the only party that knows whether the retrieved context actually answered the question, and that judgement is what tunes retrieval.
+`POST /feedback` (`client.feedback.submit()`) records how a query performed. It is optional, and there is no penalty for skipping it. You are the only party that knows whether the retrieved context answered the question, and that judgement is what tunes retrieval.
 
-It is entirely optional, and there is no penalty for skipping it. Send it when you have something specific to report; a report on a query that disappointed you is worth far more than a stream of routine ones. If a query worked well and you want to say so, `rating: "positive"` is welcome too. It tells us what to preserve.
+Send it when you have something specific to report:
 
-**Once you have finished the task, a short report on how the context actually performed is recommended.** The end of the task is when you know something you could not know at retrieval time: whether a chunk that looked plausible turned out to be stale, contradicted by another source, or never used at all. A single report then is worth more than one per query.
+- **A query did not give you what you needed:** nothing relevant came back, the top result was wrong, or you had to fall back to another source. One report on a query that disappointed you is worth far more than a stream of routine ones.
+- **A query worked well:** `rating: "positive"` tells us what to preserve.
+- **The task is finished (recommended):** send one short report on how the context performed. See [End-of-task report](#end-of-task-report).
 
-Give it context. We see only a `request_id` and whatever prose you send, nothing about what you were doing. A report that stands on its own is far more useful than one that assumes the session can be reconstructed. Worth a sentence each:
+Rules:
 
-- What the user was actually trying to do.
+- **Take `request_id` from the query's own response. Never invent one.** It is in `meta.request_id` and in the `X-Request-ID` response header. Send it back **verbatim**: an ID you made up, or one from another query, correlates to nothing.
+- Set `source: "agent"`. It separates your reports from human ones, which fail in different ways.
+- Say **what** was wrong, not that something was wrong. "Returned the 2023 policy, current one is in the Q3 handbook" is actionable; "bad results" is not.
+- Do not block the user on it. Feedback is fire-and-forget: if the **feedback call itself** fails, drop it and carry on. Never retry in a loop, and never surface that error to the user.
+- Catch broadly, so that **nothing** escapes. Narrowing to the SDK error type would still let a timeout or a DNS failure surface an error the user cannot act on, from a call they did not ask for.
+- Feedback never changes the query's result. It is a signal, not a correction, and you cannot read it back.
+- Each submission is its own record. A second report about the same query adds to the first instead of replacing it, so refine as you learn more.
+
+```python
+result = client.query(database="acme_corp", query="What is our refund policy?")
+
+# ... use result.data.chunks to answer the user ...
+
+try:
+    client.feedback.submit(
+        request_id=result.meta.request_id,
+        feedback="Top chunk was the 2023 policy; the current one is in the Q3 handbook.",
+        rating="negative",
+        source="agent",
+        database="acme_corp",
+    )
+except Exception:
+    pass  # fire-and-forget: a failed report must never reach the user
+```
+
+#### End-of-task report
+
+At the end of the task you know what you could not know at query time: whether a chunk that looked plausible turned out to be stale, contradicted by another source, or never used at all. A single report then is worth more than one per query, and `rating: "positive"` is as valuable as a negative one, because you know which part of the context did the work.
+
+Make the report stand on its own. We see only a `request_id` and the prose you send, nothing about what you were doing. Worth a sentence each:
+
+- What the user was trying to do.
 - Which chunks carried the answer, and which you discarded and why.
 - Whether you had to go outside HydraDB to finish, and what was missing when you did.
 
@@ -135,38 +140,9 @@ except Exception:
     pass  # fire-and-forget, exactly as above
 ```
 
-At the end of a task `rating: "positive"` is as valuable as a negative one, because by then you know which part of the context did the work, and that is what tells us what to keep.
+#### Ground truth
 
-Rules, when you do send it:
-
-- **Take `request_id` from the query's own response. Never invent one:** It is in `meta.request_id`, and in the `X-Request-ID` response header. Send it back **verbatim**: an id you made up, or one from another query, correlates to nothing.
-- Set `source: "agent"`. It separates your reports from human ones, which fail in different ways.
-- Say **what** was wrong, not that something was wrong. "Returned the 2023 policy, current one is in the Q3 handbook" is actionable; "bad results" is not.
-- Do not block the user on it. Feedback is fire-and-forget: if the **feedback call itself** fails, drop it and carry on. Never retry in a loop, and never surface that error to the user.
-- Feedback never changes the query's result. It is a signal, not a correction, and reading it back is not possible.
-
-```python
-result = client.query(database="acme_corp", query="What is our refund policy?")
-
-# ... use result.data.chunks to answer the user ...
-
-try:
-    client.feedback.submit(
-        request_id=result.meta.request_id,
-        feedback="Top chunk was the 2023 policy; the current one is in the Q3 handbook.",
-        rating="negative",
-        source="agent",
-        database="acme_corp",
-    )
-except Exception:
-    pass  # fire-and-forget: a failed report must never reach the user
-```
-
-Catch broadly. The point is that **nothing** escapes. Narrowing to the SDK error type would still let a timeout or a DNS failure surface an error the user cannot act on, from a call they did not ask for.
-
-**"Did not give me what I needed" is not the same as "errored".** A query that returned `200` with unhelpful results is exactly what this endpoint is for. A query that never returned (`4xx`/`5xx`, or the SDK raised) is not: handle the error and move on rather than reporting it. Feedback is a judgement about retrieval quality, and a failed request has no successful retrieval response to judge. Fix the request instead: a `404` means the database name is wrong, a `429` means back off, a `400` means the body was malformed.
-
-**If you know the right answer, send it as `ground_truth`.** When you are running against a labelled set, or you know which document should have been returned, that is a far stronger signal than a comment. It can be scored without a human reading it. With `ground_truth` present, `feedback` prose is optional:
+**If you know the right answer, send it as `ground_truth`.** When you run against a labelled set, or you know which source should have been returned, that is a far stronger signal than a comment, because it can be scored without a human reading it. With `ground_truth` present, `feedback` prose is optional:
 
 ```python
 try:
@@ -182,82 +158,13 @@ except Exception:
     pass
 ```
 
-Send `answer`, `source_ids`, or both. Do **not** guess: only send ground truth you actually have. A fabricated answer key is worse than none, because it is scored as if it were true.
+Send `answer`, `source_ids`, or both. Do **not** guess: only send ground truth you have. A fabricated answer key is worse than none, because it is scored as if it were true.
 
-Limit: 100 submissions per minute per organization, far above what reporting only the queries that fell short will ever reach. If you do hit `429`, honour `Retry-After` or simply skip that report. Never spin.
+#### Failed requests are not feedback
 
-### Do not mix scopes accidentally
+**"Did not give me what I needed" is not the same as "errored".** A query that returned `200` with unhelpful results is what this endpoint is for. A query that never returned (`4xx`/`5xx`, or the SDK raised) is not: a failed request has no retrieval result to judge. Fix the request instead: a `404` means the database name is wrong, a `429` means back off, a `400` means the body was malformed.
 
-- `database` (formerly `tenant_id`) is the hard isolation boundary.
-- `collection` (formerly `sub_tenant_id`) is an optional group inside a database. For a company brain, keep all knowledge and connectors in one collection and isolate results with `metadata_filters` and `acl`. Use separate collections only for data that must never meet in one search, such as each user's memories.
-- Use the same `collection` on writes, status checks, and reads. Data written under one collection does not appear in a query that names another.
-
-### Send `acl` for end users
-
-- If your app answers on behalf of signed-in users, send the caller's identity as `acl` on every `POST /query`, for example `"acl": ["grace@acme.com"]`.
-- A query without `acl` is not filtered: it returns everything in scope, including documents restricted to other people.
-- Derive `acl` from your authenticated session, never from client input. See [Access control](#access-control).
-
----
-
-## 2. Core primitives
-
-### Databases and collections
-
-A database is an isolated workspace. A collection partitions data inside a database.
-
-Recommended patterns:
-
-| Use case | Pattern |
-|---|---|
-| Company brain | one `database`, one collection for all documents and connectors; isolate with `metadata_filters` and `acl` |
-| B2B SaaS | one `database` per customer; one collection for that customer's knowledge; isolate teams with `metadata_filters` and `acl` |
-| B2C app | one `database`; shared knowledge in one collection; `collection = user_id` for each user's memories |
-| Environment isolation | separate `database`s for prod/staging |
-| User memories | `collection = user_id`, and the same collection on every read |
-
-### Knowledge
-
-Knowledge is the documents, app sources, and facts your AI reasons over: PDFs, Markdown, CSVs, Slack threads, Notion pages, Gmail threads, tickets, webpages, etc.
-
-- Ingest with `POST /context/ingest`, `type=knowledge`.
-- Search with `POST /query`, `type: "knowledge"`.
-- It can be private: restrict documents with `acl` (see [Access control](#access-control)).
-- Mutability is explicit: re-ingest with the same ID and `upsert: true`, edit metadata in place with `PATCH /context/{id}/metadata`, or delete.
-
-### Memories
-
-Memories are preferences, decisions, past conversations, behavioral signals, and inferred traits, saved in the collection you will query them from.
-
-- Ingest with `POST /context/ingest`, `type=memory`.
-- Search with `POST /query`, `type: "memory"` or `type: "all"`.
-- Always pass the same `collection` used at ingestion.
-- Use `infer: true` when the input is raw signal and HydraDB should extract the durable preference/fact.
-- Use `infer: false` when the memory is already structured and should be stored verbatim.
-
-### Query
-
-`POST /query` is the single retrieval endpoint.
-
-It can search:
-
-- Knowledge only: `type: "knowledge"`
-- Memories only: `type: "memory"`
-- Both stores together: `type: "all"`
-
-It supports:
-
-- `query_by: "hybrid"` for semantic + BM25 retrieval.
-- `query_by: "text"` for BM25 keyword/phrase search.
-- `mode: "fast"` for low latency.
-- `mode: "thinking"` for query expansion, reranking, richer graph traversal, and forceful-relation expansion.
-- `mode: "auto"` (the default when `mode` is omitted) to pick fast or thinking per query.
-
-`type: "all"` reads both stores from the same scope. When shared knowledge lives in its own collection, send `collections: ["<shared>", "<user>"]`; every listed collection must exist.
-
-### Feedback
-
-`POST /feedback` records how a query performed. It is the loop that closes retrieval quality, and it is open to agents whenever a query falls short. Once a task is finished, it also takes a short report on how the context held up. See [Sending feedback](#sending-feedback).
+#### Request fields and limits
 
 | Field | Required | Notes |
 |---|---|---|
@@ -269,21 +176,52 @@ It supports:
 | `ground_truth` | no | `{ answer, source_ids }`: what the right answer was, when you know it. Makes `feedback` optional |
 | `metadata` | no | Up to 20 string pairs of your own context (agent name, conversation id) |
 
-Each submission is its own record. A second report about the same query adds to it rather than replacing it, so refine as you learn more.
+Limit: 100 submissions per minute per organization, far above what reporting only the queries that fell short reaches. If you do hit `429`, honour `Retry-After` or skip that report. Never spin.
+
+---
+
+## 2. Core primitives
+
+### Databases and collections
+
+Scoping rules are in [Do not mix scopes accidentally](#do-not-mix-scopes-accidentally). Recommended patterns:
+
+| Use case | Pattern |
+|---|---|
+| Company brain | one `database`, one collection for all documents and connectors; isolate with `metadata_filters` and `acl` |
+| B2B SaaS | one `database` per customer; one collection for that customer's knowledge; isolate teams with `metadata_filters` and `acl` |
+| B2C app | one `database`; shared knowledge in one collection; `collection = user_id` for each user's memories |
+| Environment isolation | separate `database`s for prod/staging |
+| User memories | `collection = user_id`, and the same collection on every read |
+
+### Knowledge
+
+Knowledge is the documents, app sources, and facts your AI reasons over: PDFs, Markdown, CSVs, Slack threads, Notion pages, Gmail threads, tickets, webpages, and so on. Ingest and query it with `type: "knowledge"`.
+
+- It can be private: restrict sources with `acl` (see [Access control](#access-control)).
+- Mutability is explicit: re-ingest with the same ID and `upsert: true`, edit metadata in place with `PATCH /context/{id}/metadata`, or delete.
+
+### Memories
+
+Memories are preferences, decisions, past conversations, behavioral signals, and inferred traits. Ingest them with `type: "memory"` into the collection you will query them from, and query with `type: "memory"` or `type: "all"`. Item fields, including `infer`, are in [6. Source ingestion](#6-source-ingestion).
+
+### Query
+
+`POST /query` is the single retrieval endpoint for knowledge, memories, or both. Fields, recommended configurations, and the response shape are in [8. Query API](#8-query-api).
 
 ### Context graph
 
-HydraDB builds a graph of entity/relation triplets from ingested content. When `graph_context: true` (default), search can return:
+HydraDB builds a graph of entity/relation triplets from ingested content. When `graph_context: true` (default), a query can return:
 
 - `graph_context.query_paths`
 - `graph_context.chunk_relations`
 - `graph_context.chunk_id_to_group_ids`
 
-Graph context augments retrieval; `chunks` remain the primary search output.
+Graph context augments the result; it does not replace `chunks`.
 
 ### Forceful relations
 
-At ingestion, sources can declare explicit relations:
+Forceful relations are links you declare between sources at ingest:
 
 ```json
 {
@@ -294,29 +232,25 @@ At ingestion, sources can declare explicit relations:
 }
 ```
 
-At search time, set or rely on default `query_forceful_relations: true` with `mode: "thinking"` to pull related chunks into `additional_context`.
-
-Rules:
-
-- Forceful relation expansion only takes effect in `mode: "thinking"`.
 - Use `ids`.
-- Declared relations link knowledge sources (`relations` on `document_metadata[]` and `app_knowledge[]` items). Memory items do not take `relations`.
+- Declare `relations` on `document_metadata[]` and `app_knowledge[]` items. They link knowledge sources; memory items do not take `relations`.
+- A query pulls the related chunks into `additional_context` only in `mode: "thinking"` with `query_forceful_relations: true` (the default).
 
 ### Access control
 
-A document's `acl` lists who may retrieve it; a query's `acl` says who is asking.
+A source's `acl` lists who may retrieve it; a query's `acl` says who is asking. The query-side rule is in [Send `acl` on user queries](#send-acl-on-user-queries).
 
 - Set `acl` on `app_knowledge[]` items at ingest, or on any existing source with `PATCH /context/{id}/metadata`, where it replaces the stored list.
 - Connectors copy permissions from Slack, Google Drive, GitHub, Confluence, Jira, and other providers on every sync.
 - Principals: an email (`grace@acme.com`), `domain:acme.com`, `group:<provider>:<id>`, or `__public__`.
 - On a query, the caller's email also matches its `domain:` principal and `__public__` automatically. Group membership is never derived from an email; send `group:` principals yourself.
-- A document with no `acl` is unrestricted. A query with no `acl`, `[]`, or `["*"]` is not filtered.
+- A source with no `acl` is unrestricted.
 
-Example: a document with `"acl": ["grace@acme.com"]` comes back for a query with `"acl": ["grace@acme.com"]` and stays hidden from `"acl": ["bob@acme.com"]`. A document with `"acl": ["domain:acme.com"]` comes back for both.
+Example: a source with `"acl": ["grace@acme.com"]` comes back for a query with `"acl": ["grace@acme.com"]` and stays hidden from `"acl": ["bob@acme.com"]`. A source with `"acl": ["domain:acme.com"]` comes back for both.
 
 ### Connectors
 
-Connectors sync data from 70 apps, including Slack, Gmail, Google Drive, Notion, Jira, Confluence, GitHub, Linear, HubSpot, and Zendesk, into a database on a schedule, with no ingestion code. Prefer a connector over hand-written `app_knowledge` ingestion when the app is in the catalog; `GET /connectors/providers` lists it.
+Connectors sync context from 70 apps, including Slack, Gmail, Google Drive, Notion, Jira, Confluence, GitHub, Linear, HubSpot, and Zendesk, into a database on a schedule, with no ingestion code. Prefer a connector over hand-written `app_knowledge` ingestion when the app is in the catalog; `GET /connectors/providers` lists it.
 
 Setup is four calls, made once:
 
@@ -369,9 +303,8 @@ const status = await client.connectors.status({ id });
 
 Rules:
 
-- Connector endpoints return their body directly, without the `{ success, data }` envelope.
 - To change one resource, use `PATCH /connectors/{id}/resources/{resource_id}`. `POST /connectors/{id}/resources` on an existing resource replaces it and syncs it again from the beginning.
-- Every synced object carries `connector_id` and `provider` in `metadata`, and `connector_id` and `resource_id` in `additional_metadata`; filter on them to scope a query.
+- Every synced source carries `connector_id` and `provider` in `metadata`, and `connector_id` and `resource_id` in `additional_metadata`; filter on them to scope a query.
 - `custom_instructions` on the connector or one resource tells HydraDB how to read its documents, from the next sync on.
 
 ---
@@ -416,10 +349,9 @@ const client = new HydraDBClient({
 
 SDK naming:
 
-- Python methods and fields: snake_case, e.g. `client.databases.collections()`, `database`, `collection`, `page_size`, `query_by`.
-- TypeScript methods and fields: camelCase, e.g. `client.databases.collections()`, `database`, `collection`, `pageSize`, `queryBy`.
-- Both SDKs return a `{ success, data, error, meta }` envelope; the payload is under `.data` (e.g. `response.data.infra`, `response.data.statuses`, `response.data.results`).
-- Values that are passed as JSON strings (`memories`, `app_knowledge`, `document_metadata`) keep snake_case keys inside the stringified payload in both SDKs, since that is raw wire data.
+- Python methods and fields are snake_case: `databases.get_metadata_schema()`, `page_size`, `query_by`.
+- TypeScript methods and fields are camelCase: `databases.getMetadataSchema()`, `pageSize`, `queryBy`.
+- Values passed as JSON strings (`memories`, `app_knowledge`, `document_metadata`) keep snake_case keys inside the stringified payload in both SDKs, because that is raw wire data.
 
 ---
 
@@ -584,38 +516,30 @@ console.log(result.data.chunks);
 
 Notes:
 
-- Database creation is async.
-- `database` should be stable; docs recommend lowercase letters, numbers, and underscores for portability.
-- Plan `database_metadata_schema` before ingestion. Add filter fields later with `PATCH /databases/{database}/metadata-schema`; changing existing field definitions requires a new database and re-ingestion.
+- `database` should be stable. Use lowercase letters, numbers, and underscores for portability.
+- Plan `database_metadata_schema` before ingestion. What you can change later is in [10. Metadata guide](#10-metadata-guide).
 - `POST /databases` may return `409 DATABASE_ALREADY_EXISTS` for duplicate database IDs and `403 FORBIDDEN` when the API key or plan cannot create more databases.
 
 ### Check readiness
 
 `GET /databases/status?database=...` · `client.databases.status()`
 
-Ready when infrastructure reports usable status. Current docs show `infra.ready_for_ingestion`; SDK examples also check:
+The database is ready when `infra.ready_for_ingestion` is true. The response also carries the underlying signals:
 
 - `infra.scheduler_status`
 - `infra.graph_status`
 - `infra.vectorstore_status.knowledge`
 - `infra.vectorstore_status.memories`
 
-Use SDK autocomplete/returned object shape for the exact field spelling.
-
 ### Other database endpoints
 
-| Endpoint | Purpose |
-|---|---|
-| `GET /databases` | list database IDs |
-| `DELETE /databases?database=...` | delete a database and all data |
-| `GET /databases/collections?database=...` | list active collections |
-| `GET /databases/stats?database=...` | knowledge and memory row counts |
+The collections, stats, and delete routes also take `database` as a query parameter, for example `GET /databases/collections?database=...`. `DELETE /databases?database=...` deletes the database and all its data. The full list is in [15. SDK method reference](#15-sdk-method-reference).
 
 ---
 
 ## 6. Source ingestion
 
-`POST /context/ingest` is the unified write endpoint for knowledge and memories.
+`POST /context/ingest` is the single write endpoint for knowledge and memories. It takes multipart form data.
 
 ### Common form fields
 
@@ -623,14 +547,12 @@ Use SDK autocomplete/returned object shape for the exact field spelling.
 |---|---|
 | `type` | `"knowledge"` or `"memory"`; default is `"knowledge"` |
 | `database` | target database |
-| `collection` | optional logical partition; default collection if omitted |
-| `upsert` | default `true`; replaces existing sources with same ID |
-| `documents` | binary uploads for knowledge |
-| `document_metadata` | JSON-stringified array, one item per uploaded file, same order as `documents`; carries each file's `id`, `metadata`, `additional_metadata`, and `relations` |
+| `collection` | optional; the default collection if omitted |
+| `upsert` | default `true`; replaces existing sources with the same ID |
+| `documents` | binary file uploads for knowledge |
+| `document_metadata` | JSON-stringified array, one item per uploaded file; see [Knowledge from files](#knowledge-from-files) |
 | `app_knowledge` | JSON-stringified object/array of pre-extracted app sources |
 | `memories` | JSON-stringified array of memory items |
-
-There is no top-level `metadata` or `additional_metadata` form field. Set them per source: inside each `document_metadata[]` item for files, each `app_knowledge[]` item, or each memory item.
 
 ### Knowledge from files
 
@@ -654,22 +576,18 @@ with open("policy.pdf", "rb") as f:
     )
 ```
 
-`metadata` carries the schema-aligned fields declared on the database; top-level `metadata_filters` match these. Anything you want as metadata that is not present in the `metadata` schema goes in `additional_metadata`.
+`document_metadata` is how you attach anything to an uploaded file. Send one item per file, in the same order as `documents`. The item count must match the file count, and an unrecognized key returns `400`.
 
-`document_metadata` is how you attach anything to an uploaded file: its source `id` (otherwise HydraDB assigns one), its metadata, and its relations. Send one item per file, in the same order as `documents`. The item count must match the file count, and an unrecognized key returns `400`.
-
-`document_metadata` item fields:
-
-| Field | Purpose |
+| `document_metadata` item field | Purpose |
 |---|---|
-| `id` | stable source ID / upsert key for the uploaded file |
+| `id` | stable source ID / upsert key for the uploaded file; HydraDB assigns one if omitted |
 | `metadata` | schema-aligned fields for this file (max 16 KiB compact JSON) |
 | `additional_metadata` | free-form fields for this file (max 1 KiB compact JSON) |
 | `relations` | relations you declare to other sources, e.g. `{ "ids": [...] }` |
 
 ### Knowledge from app sources
 
-Use `app_knowledge` when your connector already extracted text from Slack, Gmail, Jira, Linear, Zendesk, Notion, Confluence, Salesforce, webpages, etc.
+Use `app_knowledge` when you already extracted the text from Slack, Gmail, Jira, Linear, Zendesk, Notion, Confluence, Salesforce, webpages, and so on.
 
 ```ts
 await client.context.ingest({
@@ -711,22 +629,13 @@ Recommended app-source fields:
 | `title` | readable result/citation title |
 | `type` | category such as `slack`, `gmail`, `jira`, `notion`, `webpage` |
 | `content.text` / `content.markdown` | primary searchable content |
-| `tenant_metadata` | fast filters such as channel, project, region, workspace |
+| `metadata` | fast filters such as channel, project, region, workspace. `tenant_metadata`, used in the example, is a still-accepted older alias |
 | `additional_metadata` | provider IDs, author, status, assignee, timestamps |
 | `url` | citation / navigation link |
 | `timestamp` | freshness and chronology |
 | `relations.ids` | thread, parent/child, linked issue, related source expansion |
 
-App-source object kinds in OpenAPI include:
-
-- `email`
-- `message`
-- `ticket`
-- `knowledge_base`
-- `comment`
-- `custom`
-
-Modern docs show both a generic `content` shape and a richer app shape with `kind`, `provider`, `external_id`, `fields`, `attachments`, `comments`, and `relations`. Use the richer shape when building app-aware search; at minimum provide stable IDs, content, source type, metadata, and relations.
+An app source takes either the generic `content` shape above or a richer app shape with `kind`, `provider`, `external_id`, `fields`, `attachments`, `comments`, and `relations`. Kinds in OpenAPI include `email`, `message`, `ticket`, `knowledge_base`, `comment`, and `custom`. Use the richer shape for app-aware retrieval (see [App sources](https://docs.hydradb.com/essentials/v2/app-sources.md)); at minimum provide stable IDs, content, source type, metadata, and relations.
 
 ### Memories
 
@@ -758,11 +667,11 @@ Memory item fields:
 | Field | Description |
 |---|---|
 | `id` | optional stable upsert key |
-| `title` | label for listing/search display |
+| `title` | label for listing and result display |
 | `text` | raw text or Markdown; required unless `user_assistant_pairs` provided |
 | `user_assistant_pairs` | dialogue pairs `{ user, assistant }`; useful for implied preferences |
 | `is_markdown` | preserve Markdown structure during chunking |
-| `infer` | extract durable preference/fact from raw signal |
+| `infer` | `true`: the input is raw signal and HydraDB extracts the durable preference or fact. `false`: the memory is already structured and is stored verbatim |
 | `custom_instructions` | guide inference when `infer: true` |
 | `user_name` | helps inference |
 | `metadata` | schema-aligned fields, as an object (do not stringify it again inside `memories`). `tenant_metadata` is not read on memory items. |
@@ -778,11 +687,9 @@ Memory item fields:
 
 Parameters:
 
-- `database` required
-- `ids` required array
-- `collection`: **required if you ingested into one.** The lookup is scoped: omitting `collection`, or sending the wrong one, returns `indexing_status: "errored"` with `error_code: "FILE_NOT_FOUND"` and `message: "ID not found"` for a source that exists and is fully searchable. That is a scope miss, not an indexing failure, and it is indistinguishable from one unless you read `error_code`.
-
-Status meanings from docs:
+- `database`: required.
+- `ids`: required array.
+- `collection`: **required if you ingested into one.** The lookup is scoped: omitting `collection`, or sending the wrong one, returns `indexing_status: "errored"` with `error_code: "FILE_NOT_FOUND"` and `message: "ID not found"` for a source that exists and is fully searchable. That is a scope miss, not an indexing failure, and you can tell the two apart only by reading `error_code`.
 
 | Status | Searchable? | Meaning |
 |---|---:|---|
@@ -790,9 +697,9 @@ Status meanings from docs:
 | `processing` | No | parsing/chunking/embedding |
 | `graph_creation` | Yes | chunks indexed; graph still building |
 | `completed` | Yes | fully indexed and graphed |
-| `errored` / `failed` | No | terminal failure |
+| `errored` / `failed` | No | terminal failure; read `error_code` and `error_message` |
 
-Pattern:
+`error_message` is `""`, not null, on some failures (including a scope miss), so branch on `error_code`, and in TypeScript fall back with `||`, not `??`.
 
 ```ts
 while (true) {
@@ -818,25 +725,9 @@ while (true) {
 
 ### Webhooks instead of polling
 
-Use `/webhooks/indexing` to receive terminal indexing events.
+Register a webhook on `/webhooks/indexing` to receive terminal indexing events instead of polling. The management endpoints and SDK methods are in [15. SDK method reference](#15-sdk-method-reference).
 
-Endpoints:
-
-| Endpoint | Purpose |
-|---|---|
-| `GET /webhooks/indexing` | get current webhook registration |
-| `POST /webhooks/indexing` | register or replace webhook |
-| `DELETE /webhooks/indexing` | delete webhook |
-| `POST /webhooks/indexing/test` | send test delivery |
-| `GET /webhooks/indexing/deliveries` | list delivery attempts |
-| `GET /webhooks/indexing/deliveries/{delivery_id}` | get one delivery |
-| `POST /webhooks/indexing/deliveries/{delivery_id}/retry` | retry delivery |
-
-Supported event:
-
-- `indexing.status_changed`
-
-Payload shape:
+Supported event: `indexing.status_changed`. Payload shape:
 
 ```json
 {
@@ -852,11 +743,7 @@ Payload shape:
 }
 ```
 
-Headers:
-
-- `X-HydraDB-Delivery-ID`
-- `X-HydraDB-Event`
-- `X-HydraDB-Signature` when a signing secret is configured
+Headers: `X-HydraDB-Delivery-ID`, `X-HydraDB-Event`, and `X-HydraDB-Signature` when a signing secret is configured.
 
 Signature scheme:
 
@@ -877,10 +764,10 @@ Managing the secret:
 
 Rules:
 
-- Webhook URL must be public HTTPS; localhost/private networks are blocked.
+- The webhook URL must be public HTTPS; localhost and private networks are blocked.
 - Store `delivery_id` to deduplicate retries.
 - Verify `X-HydraDB-Signature` with a constant-time comparison. Use `verify_webhook_signature` (Python SDK) or `verifyWebhookSignature` (TypeScript SDK) from the SDK helpers module.
-- Fail closed: reject the request when the signing secret is absent from the environment, rather than skipping verification.
+- Fail closed: reject the request when the signing secret is absent from the environment, instead of skipping verification.
 
 ---
 
@@ -893,12 +780,14 @@ Rules:
 | Field | Values | Notes |
 |---|---|---|
 | `database` | string | required |
-| `collection` | string/null | the collection the content was saved in; default collection if omitted |
+| `collection` | string/null | the collection the context was saved in; default collection if omitted |
+| `collections` | list of collection IDs | query several collections at once; every listed collection must exist |
 | `query` | string | required |
 | `type` | `knowledge`, `memory`, `all` | store selector for knowledge, memories, or both |
-| `query_by` | `hybrid`, `text` | default hybrid |
+| `acl` | list of principals | who is asking; see [Send `acl` on user queries](#send-acl-on-user-queries) |
+| `query_by` | `hybrid`, `text` | default `hybrid` (semantic + BM25); `text` is BM25 keyword/phrase search |
 | `operator` | `or`, `and`, `phrase` | only for `query_by: "text"` |
-| `mode` | `fast`, `thinking`, `auto` | applies to hybrid; omitted means `auto`, which picks fast or thinking per query (thinking when unsure); thinking improves quality but adds latency |
+| `mode` | `fast`, `thinking`, `auto` | applies to hybrid; omitted means `auto`, which picks fast or thinking per query (thinking when unsure). `fast` is low latency. `thinking` adds query expansion, reranking, richer graph traversal, and forceful-relation expansion; it improves quality but adds latency |
 | `max_results` | integer/null | default 10; max 250 |
 | `alpha` | `0.0` to `1.0`, or `auto` | hybrid weight; `1.0` semantic, `0.0` BM25 |
 | `recency_bias` | `0.0` to `1.0` | boost newer content; omitted means `0.4`, send `0` to disable |
@@ -907,6 +796,8 @@ Rules:
 | `additional_context` | string | short factual hint; not a hard filter |
 | `metadata_filters` | object | deterministic filters before/around ranking |
 | `query_apps` | boolean | app-aware retrieval lane for app sources; still searches the full selected knowledge scope; defaults to `true` on `/query`, send `false` to disable |
+
+`type: "all"` reads both stores from the same scope. When shared knowledge lives in its own collection, send `collections: ["<shared>", "<user>"]`.
 
 ### Recommended configurations
 
@@ -920,7 +811,7 @@ Rules:
 | Recent operational updates | `query_by: "hybrid"`, `recency_bias: 0.2-0.4`, metadata filter to doc type/status |
 | App search | `type: "knowledge"`, `query_by: "hybrid"`, `mode: "thinking"`, `query_apps: true`; still searches non-app knowledge too |
 
-### Search examples
+### Query examples
 
 Knowledge RAG:
 
@@ -962,7 +853,7 @@ result = client.query(
 )
 ```
 
-Metadata-scoped search:
+Metadata-scoped query:
 
 ```json
 {
@@ -979,7 +870,7 @@ Metadata-scoped search:
 }
 ```
 
-### Search response
+### Query response
 
 The successful `data` object / SDK return is a `RetrievalResult`:
 
@@ -1023,25 +914,18 @@ The successful `data` object / SDK return is a `RetrievalResult`:
 }
 ```
 
-Use `chunks` as the primary LLM context. Preserve server order; do not re-sort unless you have a deliberate reranking step.
+Use `chunks` as the primary LLM context. Preserve server order, which is the ranking; do not re-sort unless you have a deliberate reranking step.
 
 ---
 
-## 9. Turning search results into LLM prompts
+## 9. Turning query results into LLM prompts
 
-Practical guidance from `essentials/v2/api-results.mdx`:
-
-- Preserve the order of `chunks`; it is the server ranking.
+- Do not pass raw result JSON to the LLM if token budget matters. Use the SDK formatting helper to produce a compact context string: `build_string(result)` from `hydra_db.helpers` (Python) or `buildString(result)` from `@hydradb/sdk/helpers` (TypeScript).
+- Include a grounding instruction: answer only from the provided context, and say when the context is insufficient.
+- Start with `max_results: 10`; reduce it for tight context windows.
 - Use graph context only when it helps the question.
 - Use `additional_context` to attach forcefully related chunks by `chunk_uuid` / `extra_context_ids`.
 - For personalized answers, `type: "all"` is simplest: one result set already merges knowledge and memories.
-- Do not pass raw JSON directly to the LLM if token budget matters; use the SDK formatting helper to produce a compact context string.
-- Include a grounding instruction: answer only from provided context, and say when context is insufficient.
-
-Use the SDK helper from `essentials/v2/api-results.mdx`:
-
-- Python: `build_string(result)` from `hydra_db.helpers`
-- TypeScript: `buildString(result)` from `@hydradb/sdk`
 
 Python:
 
@@ -1114,22 +998,11 @@ const messages = [
 ];
 ```
 
-Common mistakes:
-
-| Mistake | Fix |
-|---|---|
-| Passing raw retrieval JSON to the LLM | Use SDK `build_string(result)` / `buildString(result)` |
-| Omitting `collection` for memories | Use the same scope as ingestion |
-| Including too many chunks | Start with `max_results: 10`; reduce for tight windows |
-| Re-sorting chunks client-side | Preserve HydraDB ranking |
-| Setting `graph_context: false` then expecting graph fields | Leave default true or set true explicitly |
-| Using `query_forceful_relations` in `fast` mode | Use `mode: "thinking"` |
-
 ---
 
 ## 10. Metadata guide
 
-### Database schema
+### Metadata schema
 
 Declared at `POST /databases`:
 
@@ -1168,16 +1041,16 @@ Field options:
 
 Rules:
 
-- Plan hot filter fields before first ingest. `PATCH /databases/{database}/metadata-schema` can add fields later, but cannot rename, retype, or reflag existing ones, and rejects `enable_dense_embedding` / `enable_sparse_embedding` (declare those at database creation).
-- Top-level `metadata` filters support `equals`, `contains`, and `contains_any`. Range and fuzzy matching belong in the query or a downstream reranker.
-- To change metadata on an indexed context item, call `PATCH /context/{id}/metadata` (merges keys), or re-ingest with the same `id` and `upsert: true`.
-- Do not rename metadata keys without re-ingesting affected sources.
+- Plan hot filter fields before the first ingest. `PATCH /databases/{database}/metadata-schema` can add fields later, but cannot rename, retype, or reflag existing ones, and rejects `enable_dense_embedding` / `enable_sparse_embedding` (declare those at database creation). Changing an existing field definition requires a new database and re-ingestion.
+- Top-level `metadata_filters` keys must be declared in the metadata schema. They support `equals`, `contains`, and `contains_any`. Range and fuzzy matching belong in the query or a downstream reranker.
+- To change metadata on an indexed source, call `PATCH /context/{id}/metadata` (merges keys), or re-ingest with the same `id` and `upsert: true`.
+- Do not rename metadata keys without re-ingesting the affected sources.
 
 ---
 
 ## 11. Browse, fetch, relations, delete
 
-### List documents or memories
+### List sources
 
 `POST /context/list` · `client.context.list()`
 
@@ -1195,17 +1068,7 @@ const sources = await client.context.list({
 });
 ```
 
-Parameters:
-
-- `database`
-- `collection`
-- `type: "knowledge" | "memory"`
-- `ids`
-- `page`, `page_size` (1 to 100)
-- `filters.metadata`
-- `filters.additional_metadata`
-- `filters.source_fields`
-- `include_fields` for projection
+Parameters: `database`, `collection`, `type: "knowledge" | "memory"`, `ids`, `page`, `page_size` (1 to 100), `filters.metadata`, `filters.additional_metadata`, `filters.source_fields`, and `include_fields` for projection.
 
 ### Fetch original content
 
@@ -1219,8 +1082,6 @@ file = client.context.inspect(
     expiry_seconds=3600,
 )
 ```
-
-Modes:
 
 | Mode | Returns |
 |---|---|
@@ -1241,9 +1102,9 @@ const relations = await client.context.relations({
 });
 ```
 
-Use it for graph debugging and provenance inspection. It supports pagination via `cursor`.
+Use it for graph debugging and provenance inspection. It paginates with `cursor`.
 
-### Delete sources or memories
+### Delete sources
 
 `DELETE /context` · `client.context.delete()`
 
@@ -1268,8 +1129,8 @@ Use `type: "memory"` to delete memory IDs.
 | `400` | invalid parameters / malformed request | No |
 | `401` | missing/invalid API key | No |
 | `403` | authenticated but not permitted | No |
-| `404` | database/context item/memory not found | No |
-| `409` | conflict, e.g. existing database or context item ID | Usually no |
+| `404` | database or source not found | No |
+| `409` | conflict, e.g. existing database or source ID | Usually no |
 | `413` | upload too large | No |
 | `422` | semantic validation failure, including `TENANT_INFRA_NOT_READY` | Only for `TENANT_INFRA_NOT_READY`, after polling readiness |
 | `429` | rate limited | Yes with backoff |
@@ -1277,18 +1138,22 @@ Use `type: "memory"` to delete memory IDs.
 | `502` | upstream dependency error (`BACKEND_ERROR`) | Yes with backoff |
 | `503` | temporary unavailability | Yes with backoff |
 
+Retry only `429`, `500`, `502`, and `503`, with bounded exponential backoff and jitter.
+
+The SDKs already retry `408`, `429`, and `5xx` responses twice with exponential backoff before raising, and the Python SDK also retries `409`. Do not wrap SDK calls in a second retry loop: raise the count with `request_options={"max_retries": 5}` on a Python call, or `maxRetries` on the TypeScript client or call.
+
 ### Common error codes
 
 | Code | Meaning |
 |---|---|
 | `INVALID_INPUT` | required, malformed, or conflicting parameter. This is the code for essentially every `400`. Branch on it, not on a generic name |
 | `VALIDATION_ERROR` | request shape valid but failed validation |
-| `UNAUTHORIZED` | missing/invalid bearer token |
+| `UNAUTHORIZED` | missing/invalid API key |
 | `FORBIDDEN` | key lacks access |
 | `DATABASE_ALREADY_EXISTS` | duplicate database ID |
 | `DATABASE_NOT_FOUND` | database missing/not visible |
 | `TENANT_INFRA_NOT_READY` | `422`: the database exists but its infrastructure is still provisioning. This is what querying before polling readiness returns |
-| `FILE_NOT_FOUND` | id not found **in the selected scope**, usually a `collection` mismatch rather than a missing source |
+| `FILE_NOT_FOUND` | ID not found **in the selected scope**, usually a `collection` mismatch, not a missing source |
 | `SOURCE_PROCESSING` | the source is still indexing and cannot serve this request yet |
 | `NOT_FOUND` | requested resource does not exist |
 | `PARSE_ERROR` | a document could not be parsed |
@@ -1298,11 +1163,7 @@ Use `type: "memory"` to delete memory IDs.
 | `BACKEND_ERROR` | `502`: an upstream dependency returned an error |
 | `SERVICE_UNAVAILABLE` | dependency unavailable / under load |
 
-There is no `INVALID_PARAMETERS` and no `SOURCE_NOT_FOUND`. Earlier revisions of this guide listed both, and no HydraDB response has ever carried either. Match on `INVALID_INPUT` and `FILE_NOT_FOUND` instead.
-
-Retry only `429`, `500`, `502`, and `503`, with bounded exponential backoff and jitter.
-
-The SDKs already retry `408`, `429`, and `5xx` responses twice with exponential backoff before raising, and the Python SDK also retries `409`. Raise the count with `request_options={"max_retries": 5}` on a Python call or `maxRetries` on the TypeScript client or call, rather than wrapping SDK calls in a second retry loop.
+There is no `INVALID_PARAMETERS` and no `SOURCE_NOT_FOUND`: no HydraDB response carries either. Match on `INVALID_INPUT` and `FILE_NOT_FOUND`.
 
 SDK errors:
 
@@ -1350,31 +1211,17 @@ try {
 
 ---
 
-## 13. Cookbook patterns
+<a id="13-cookbook-patterns"></a>
 
-The cookbooks show production patterns. Each link opens the raw Markdown guide, with complete setup code and schemas:
+## 13. Common integration patterns
 
-| Cookbook Guide | Purpose & Retrieval Patterns | Link to Guide |
-|---|---|---|
-| **Cursor for Docs** | Ingest codebase, PRs, Slack; multi-hop reasoning | [Guide Link](https://docs.hydradb.com/cookbooks/v2/cookbook-01-build-cursor-for-docs.md) |
-| **Build your own Glean** | Enterprise workplace search across SaaS platforms | [Guide Link](https://docs.hydradb.com/cookbooks/v2/glean-clone.md) |
-| **Internal Search Perplexity** | Citations and answer synthesis over Confluence/Slack | [Guide Link](https://docs.hydradb.com/cookbooks/v2/internal-search-perplexity.md) |
-| **Customer Support Agent** | Personalizing help with user/plan-specific memory | [Guide Link](https://docs.hydradb.com/cookbooks/v2/customer-support-agent.md) |
-| **Notion AI for Your Workspace** | Relational reasoning across Notion and Slack threads | [Guide Link](https://docs.hydradb.com/cookbooks/v2/cookbook-04-build-notion-ai.md) |
-| **Financial Analyst** | Trend analysis, temporal metadata, precise citations | [Guide Link](https://docs.hydradb.com/cookbooks/v2/cookbook-10-ai-financial-analyst.md) |
-| **LinkedIn Recruiter** | Exact skill/experience matching and post-filtering | [Guide Link](https://docs.hydradb.com/cookbooks/v2/ai-linkedin-recruiter.md) |
-| **AI Travel Planner** | Collaborative planning using personalized context | [Guide Link](https://docs.hydradb.com/cookbooks/v2/ai-travel-planner.md) |
-| **AI Onboarding Agent** | Org charts, specifications, and meeting transcripts | [Guide Link](https://docs.hydradb.com/cookbooks/v2/ai-onboarding-agent.md) |
-| **Competitive Intelligence** | Competitor announcements, job listings, pricing | [Guide Link](https://docs.hydradb.com/cookbooks/v2/competitive-intelligence-agent.md) |
-| **Chief of Staff / Actions** | Function routing, task tracking, and planning | [Guide Link](https://docs.hydradb.com/cookbooks/v2/ai-chief-of-staff.md) |
+Most integrations follow the same architecture:
 
-Common architecture across cookbooks:
-
-1. Create database and schema for hot filters.
-2. Ingest shared knowledge/app sources with stable IDs.
-3. Ingest user/session memories with `collection`.
+1. Create a database with a metadata schema for hot filters.
+2. Ingest shared knowledge and app sources with stable IDs.
+3. Ingest user and session memories with `collection`.
 4. Poll status or use webhooks.
-5. Query `/query` with `type: "knowledge"`, `"memory"`, or `"all"`.
+5. Query with `type: "knowledge"`, `"memory"`, or `"all"`.
 6. Format chunks, graph paths, and additional context into an LLM prompt.
 7. Cite sources and handle missing context explicitly.
 
@@ -1382,56 +1229,64 @@ Common architecture across cookbooks:
 
 ## 14. Common mistakes checklist
 
+Each item is a rule stated in full in the section named. Check all of them before you finish.
+
+Section 1, critical rules:
+
 - [ ] Forgetting `API-Version: 2` in raw HTTP calls.
-- [ ] Parsing raw HTTP response from the top level instead of `data`.
-- [ ] Assuming the SDK unwraps the envelope; it returns the full envelope, so read the payload from `data`.
-- [ ] Searching immediately after database creation without polling readiness.
-- [ ] Searching immediately after ingestion without polling `context.status` or using webhooks.
-- [ ] Treating `processing`/`queued` content as searchable.
-- [ ] Not handling both `errored` and `failed` as failure statuses.
-- [ ] Omitting `collection` on `context.status` and reading the resulting `FILE_NOT_FOUND` as a genuine indexing failure.
-- [ ] Using `??` on `errorMessage`, which is `""` rather than null on some failures, so the fallback never fires.
-- [ ] Omitting `collection` for user memories.
-- [ ] Writing with one `collection` and reading with another.
+- [ ] Reading a payload from the top level instead of `data`, in raw HTTP or in the SDKs.
+- [ ] Writing with one `collection` and reading with another, or omitting `collection` for user memories.
 - [ ] Splitting a company brain into many collections instead of one collection with `metadata_filters` and `acl`.
-- [ ] Querying on behalf of an end user without `acl`, which returns everything in scope.
+- [ ] Querying on behalf of a user without `acl`, which returns everything in scope.
+- [ ] Using undeclared `metadata` keys in `metadata_filters`.
+
+Sections 2 to 7, ingestion and lifecycle:
+
 - [ ] Hand-writing `app_knowledge` ingestion for an app a connector already syncs.
 - [ ] Editing an existing connector resource with `POST /connectors/{id}/resources`, which replaces it.
-- [ ] Using undeclared `tenant_metadata` keys in `metadata_filters`.
-- [ ] Putting hot filters in free-form metadata instead of database schema.
+- [ ] Querying right after database creation without polling readiness.
+- [ ] Querying right after ingestion without polling `context.status` or using webhooks.
+- [ ] Treating `processing` or `queued` context as searchable.
+- [ ] Not handling both `errored` and `failed` as failure statuses.
+- [ ] Omitting `collection` on `context.status` and reading the resulting `FILE_NOT_FOUND` as a genuine indexing failure.
+- [ ] Using `??` on `errorMessage`, which is `""`, not null, on some failures, so the fallback never fires.
+- [ ] Forgetting to verify webhook signatures when a signing secret is configured.
+
+Sections 8 to 10, query and metadata:
+
+- [ ] Using `operator` without `query_by: "text"`.
 - [ ] Expecting `query_forceful_relations` to work in `mode: "fast"`.
 - [ ] Setting `graph_context: false` and expecting graph fields.
 - [ ] Re-sorting chunks before prompting without a deliberate reranker.
-- [ ] Passing too many chunks to the LLM.
-- [ ] Using `operator` without `query_by: "text"`.
-- [ ] Forgetting to verify webhook signatures when a signing secret is configured.
+- [ ] Passing raw result JSON or too many chunks to the LLM.
+- [ ] Putting hot filters in free-form metadata instead of the metadata schema.
 
 ---
 
-## 15. SDK Method Reference
+## 15. SDK method reference
 
-Every method is on the client: `client.<method>` in both SDKs. Python takes snake_case arguments; TypeScript takes camelCase request fields. Connector methods, `list_providers()`, and `update_metadata_schema()` return the body directly; every other method returns the envelope, so read `.data`.
+Every method is on the client: `client.<method>` in both SDKs. Return shapes are in [Response envelope](#response-envelope); naming is in [3. Installation and client setup](#3-installation-and-client-setup).
 
 | Group | Python | TypeScript | Endpoint | Purpose |
 |---|---|---|---|---|
 | Databases | `databases.create()` | `databases.create()` | `POST /databases` | Create a database |
 | Databases | `databases.status()` | `databases.status()` | `GET /databases/status` | Check provisioning readiness |
-| Databases | `databases.list()` | `databases.list()` | `GET /databases` | List databases |
-| Databases | `databases.stats()` | `databases.stats()` | `GET /databases/stats` | Row counts for a database |
+| Databases | `databases.list()` | `databases.list()` | `GET /databases` | List database IDs |
+| Databases | `databases.stats()` | `databases.stats()` | `GET /databases/stats` | Knowledge and memory row counts for a database |
 | Databases | `databases.get_metadata_schema()` | `databases.getMetadataSchema()` | `GET /databases/{database}/metadata-schema` | Read the metadata schema |
 | Databases | `databases.update_metadata_schema()` | `databases.updateMetadataSchema()` | `PATCH /databases/{database}/metadata-schema` | Add metadata schema fields |
-| Databases | `databases.collections()` | `databases.collections()` | `GET /databases/collections` | List collections |
+| Databases | `databases.collections()` | `databases.collections()` | `GET /databases/collections` | List active collections |
 | Databases | `databases.delete_collection()` | `databases.deleteCollection()` | `DELETE /databases/collections` | Delete a collection |
-| Databases | `databases.delete()` | `databases.delete()` | `DELETE /databases` | Delete a database |
-| Context | `context.ingest()` | `context.ingest()` | `POST /context/ingest` | Ingest documents, app sources, or memories |
+| Databases | `databases.delete()` | `databases.delete()` | `DELETE /databases` | Delete a database and all its data |
+| Context | `context.ingest()` | `context.ingest()` | `POST /context/ingest` | Ingest files, app sources, or memories |
 | Context | `context.status()` | `context.status()` | `GET /context/status` | Check indexing status |
 | Context | `context.list()` | `context.list()` | `POST /context/list` | Browse knowledge or memories |
 | Context | `context.inspect()` | `context.inspect()` | `GET /context/inspect` | Original content or a presigned URL |
 | Context | `context.update_source_metadata()` | `context.updateSourceMetadata()` | `PATCH /context/{id}/metadata` | Edit metadata or `acl` without re-ingesting |
 | Context | `context.relations()` | `context.relations()` | `GET /context/relations` | Graph relations for a source or collection |
-| Context | `context.subgraph()` | `context.subgraph()` | `GET /context/{id}/subgraph` | Items connected to one source |
+| Context | `context.subgraph()` | `context.subgraph()` | `GET /context/{id}/subgraph` | Sources connected to one source |
 | Context | `context.delete()` | `context.delete()` | `DELETE /context` | Delete sources or memories |
-| Query | `query()` | `query()` | `POST /query` | Search knowledge, memories, or both |
+| Query | `query()` | `query()` | `POST /query` | Query knowledge, memories, or both |
 | Query | `feedback.submit()` | `feedback.submit()` | `POST /feedback` | Report how a query performed |
 | Connectors | `list_providers()` | `listProviders()` | `GET /connectors/providers` | Provider catalog, or one provider's credentials |
 | Connectors | `connectors.create()` | `connectors.create()` | `POST /connectors` | Store credentials for one account |
@@ -1452,7 +1307,7 @@ Every method is on the client: `client.<method>` in both SDKs. Python takes snak
 | Webhooks | `webhooks.register()` | `webhooks.register()` | `POST /webhooks/indexing` | Register or replace the webhook |
 | Webhooks | `webhooks.get()` | `webhooks.get()` | `GET /webhooks/indexing` | Current registration |
 | Webhooks | `webhooks.test()` | `webhooks.test()` | `POST /webhooks/indexing/test` | Send a test delivery |
-| Webhooks | `webhooks.list_deliveries()` | `webhooks.listDeliveries()` | `GET /webhooks/indexing/deliveries` | Delivery history |
+| Webhooks | `webhooks.list_deliveries()` | `webhooks.listDeliveries()` | `GET /webhooks/indexing/deliveries` | List delivery attempts |
 | Webhooks | `webhooks.get_delivery()` | `webhooks.getDelivery()` | `GET /webhooks/indexing/deliveries/{delivery_id}` | One delivery |
 | Webhooks | `webhooks.retry_delivery()` | `webhooks.retryDelivery()` | `POST /webhooks/indexing/deliveries/{delivery_id}/retry` | Retry a failed delivery |
 | Webhooks | `webhooks.set_signing_secret()` | `webhooks.setSigningSecret()` | `POST /webhooks/indexing/signing-secret` | Generate or set the signing secret |
@@ -1461,7 +1316,7 @@ Every method is on the client: `client.<method>` in both SDKs. Python takes snak
 
 ### 15.1 Minimal cURL example
 
-Use `type` on raw `/query` requests to select `knowledge`, `memory`, or `all`. The raw API response is wrapped; read payloads from `.data`.
+The flow from [4. Minimal end-to-end flow](#4-minimal-end-to-end-flow) over raw HTTP:
 
 ```bash
 export HYDRADB_API_KEY="your_api_key"
@@ -1510,7 +1365,7 @@ curl -s -X POST 'https://api.hydradb.com/query' \
 
 ### 15.2 Raw HTTP: ingest app-source knowledge
 
-Use this for connector output where your app already extracted the text. `app_knowledge` must be a JSON string in multipart form data.
+The raw HTTP form of [Knowledge from app sources](#knowledge-from-app-sources). `app_knowledge` must be a JSON string in multipart form data.
 
 ```bash
 curl -s -X POST 'https://api.hydradb.com/context/ingest' \
@@ -1546,7 +1401,7 @@ curl -s -X POST 'https://api.hydradb.com/context/ingest' \
   ]'
 ```
 
-Search it with app-aware retrieval:
+Query it with app-aware retrieval:
 
 ```bash
 curl -s -X POST 'https://api.hydradb.com/query' \
@@ -1568,9 +1423,7 @@ curl -s -X POST 'https://api.hydradb.com/query' \
 
 ## 16. Navigation and support
 
-- Docs root for v2: `get-started/v2`, `essentials/v2`, `api-reference/v2`, `cookbooks/v2`
+- Docs root for v2: `get-started/v2`, `essentials/v2`, `api-reference/v2`
 - API reference OpenAPI: `api-reference/v2/openapi.json`
-- Python package: `hydradb-sdk>=2,<3`
-- TypeScript package: `@hydradb/sdk@^2`
 - Dashboard/API keys: `https://dashboard.hydradb.com`
-- Support email in docs: `founders@hydradb.com`
+- Support email: `founders@hydradb.com`
