@@ -7,6 +7,7 @@ returns the SDK's own response model for that method, filled with public fields
 only. A cookbook that reads a field the public API does not return fails here.
 """
 
+import ast
 import inspect
 import json
 import os
@@ -234,6 +235,43 @@ class Stubs:
 
 
 class CookbookTest(unittest.TestCase):
+    def test_cursor_search_preserves_graph_linked_context_and_file_paths(self):
+        source = python_blocks(ROOT / "cookbooks/v2/cursor.mdx")["cursor.py"]
+        search = next(node for node in ast.parse(source).body
+                      if isinstance(node, ast.FunctionDef) and node.name == "search_code")
+        result = sdk.HandlerEnvelopeSearchV2RetrievalResult(
+            data=sdk.SearchV2RetrievalResult(
+                chunks=[sdk.SearchV2Chunk(
+                    id="auth", source_title="auth.py.txt", chunk_content="Validate the token.",
+                    additional_metadata={"path": "src/auth.py"},
+                )],
+                graph_context=sdk.SearchGraphContext(query_paths=[
+                    sdk.SearchScoredPathResponse(combined_context="Router calls validate_token."),
+                ]),
+                additional_context={"policy": sdk.SearchV2Chunk(
+                    id="policy", chunk_content="Service tokens require the admin scope.",
+                )},
+                sources=[],  # Internal SDK fields must not leak into the tool response.
+            ),
+        )
+        scope = {"json": json, "DATABASE": "code", "COLLECTION": "repo",
+                 "client": NS(query=lambda **kwargs: result)}
+        exec(compile(ast.Module(body=[search], type_ignores=[]), "cursor.py", "exec"), scope)
+
+        context = json.loads(scope["search_code"]("How is authentication enforced?"))
+
+        self.assertEqual({
+            "chunks": [{
+                "id": "auth", "source_title": "auth.py.txt",
+                "chunk_content": "Validate the token.",
+                "additional_metadata": {"path": "src/auth.py"}, "path": "src/auth.py",
+            }],
+            "graph_context": {"query_paths": [{"combined_context": "Router calls validate_token."}]},
+            "additional_context": {"policy": {
+                "id": "policy", "chunk_content": "Service tokens require the admin scope.",
+            }},
+        }, context)
+
     def run_cookbook(self, path):
         setup = python_blocks(SETUP)["hydra.py"]
         files = python_blocks(path)
