@@ -75,6 +75,7 @@ Schema fields, placement, and filter operators are in [10. Metadata guide](#10-m
 - If your application answers on behalf of signed-in users, send the caller's identity as `acl` on every `POST /query`, for example `"acl": ["grace@acme.com"]`.
 - A query with no `acl`, `[]`, or `["*"]` is not filtered: it returns everything in scope, including sources restricted to other people.
 - Derive `acl` from your authenticated session, never from client input. See [Access control](#access-control).
+- Do not turn on a connector's `enforce_acl` for an application that serves many users through one API key. With `enforce_acl` on, HydraDB ignores the request's `acl` for that connector's content and uses the email of whoever created the API key, so every user sees what the key's creator may see. Leave it off and send `acl` yourself.
 
 ### Sending feedback
 
@@ -441,7 +442,7 @@ await client.databases.create({ database: database });
 
 while (true) {
   const status = await client.databases.status({ database: database });
-  if (status.data.infra.readyForIngestion) break;
+  if (status.data?.infra?.readyForIngestion) break;
   await new Promise((resolve) => setTimeout(resolve, 5_000));
 }
 
@@ -459,14 +460,16 @@ const ingest = await client.context.ingest({
   ]),
 });
 
-const ingestId = ingest.data.results[0].id;
+const ingestId = ingest.data?.results?.[0]?.id;
+if (!ingestId) throw new Error("Ingest returned no id");
 
 while (true) {
   const status = (await client.context.status({
     database: database,
     collection: "user_alex",
     ids: [ingestId],
-  })).data.statuses[0];
+  })).data?.statuses?.[0];
+  if (!status) throw new Error("No status returned");
 
   if (["graph_creation", "completed"].includes(status.indexingStatus as string)) break;
   if (status.indexingStatus === "errored") {
@@ -556,7 +559,20 @@ The collections, stats, and delete routes also take `database` as a query parame
 
 ### Knowledge from files
 
-Use for PDFs, DOCX, Markdown, CSV, TXT, and other files HydraDB should parse.
+Use for files HydraDB should parse. Supported extensions:
+
+| Type | Extensions |
+|---|---|
+| Documents | `.pdf` `.doc` `.docx` `.docm` `.dot` `.dotx` `.odt` `.ott` `.rtf` |
+| Spreadsheets | `.xls` `.xlsx` `.xlsm` `.xlsb` `.ods` `.ots` `.csv` `.tsv` |
+| Presentations | `.ppt` `.pptx` `.pptm` `.odp` `.otp` |
+| Apple iWork | `.pages` `.numbers` `.key` |
+| Images (text is read with OCR) | `.png` `.jpg` `.jpeg` `.tif` `.tiff` `.webp` `.gif` `.bmp` |
+| Plain text | `.txt` `.md` `.markdown` `.json` |
+
+- Any other extension, including source code (`.py`, `.ts`, `.go`), `.html`, and `.zip`, is rejected. The request still returns `202`; the rejected file comes back in `data.results` with `status: "failed"` and `error_code: "E1002"`, and has no status record to poll. Check every result item before polling.
+- To ingest source code, upload it with `.txt` added to the filename (`auth.py.txt`) and keep the real path in `additional_metadata`, or send its text as an app source.
+- The `Content-Type` of the part is used only when the filename has no extension.
 
 ```python
 import json
@@ -707,7 +723,8 @@ while (true) {
     database: "acme_corp",
     collection: "support_docs", // must match the ingestion scope, or you get FILE_NOT_FOUND
     ids: ["policy_v2"],
-  })).data.statuses[0];
+  })).data?.statuses?.[0];
+  if (!status) throw new Error("No status returned");
 
   if (["graph_creation", "completed"].includes(status.indexingStatus as string)) break;
   if (status.indexingStatus === "errored") {
@@ -891,20 +908,6 @@ The successful `data` object / SDK return is a `RetrievalResult`:
       "extra_context_ids": []
     }
   ],
-  "sources": [
-    {
-      "id": "...",
-      "title": "...",
-      "type": "...",
-      "url": "...",
-      "timestamp": "...",
-      "metadata": {},
-      "additional_metadata": {},
-      "app_kind": "message",
-      "app_provider": "slack",
-      "app_external_id": "..."
-    }
-  ],
   "graph_context": {
     "query_paths": [],
     "chunk_relations": [],
@@ -913,6 +916,8 @@ The successful `data` object / SDK return is a `RetrievalResult`:
   "additional_context": {}
 }
 ```
+
+Each chunk's `id` is the ID of the source it came from, and `source_title` is that source's title: cite with these. The public result has no `sources` array.
 
 Use `chunks` as the primary LLM context. Preserve server order, which is the ranking; do not re-sort unless you have a deliberate reranking step.
 
@@ -954,7 +959,7 @@ context = build_string(result)
 messages = [
     {
         "role": "system",
-        "content": "Answer using only the provided HydraDB context. If the answer is not in the context, say so. Cite source titles or URLs when available.",
+        "content": "Answer using only the provided HydraDB context. If the answer is not in the context, say so. Cite source titles.",
     },
     {
         "role": "user",
@@ -989,7 +994,7 @@ const context = buildString(result);
 const messages = [
   {
     role: "system",
-    content: "Answer using only the provided HydraDB context. If the answer is not in the context, say so. Cite source titles or URLs when available.",
+    content: "Answer using only the provided HydraDB context. If the answer is not in the context, say so. Cite source titles.",
   },
   {
     role: "user",
@@ -1063,7 +1068,7 @@ const sources = await client.context.list({
   filters: {
     metadata: { department: "support" },
     additionalMetadata: { author: "alice" },
-    sourceFields: { app_provider: "slack" },
+    sourceFields: { appProvider: "slack" },
   },
 });
 ```
@@ -1238,9 +1243,11 @@ Section 1, critical rules:
 - [ ] Writing with one `collection` and reading with another, or omitting `collection` for user memories.
 - [ ] Splitting a company brain into many collections instead of one collection with `metadata_filters` and `acl`.
 - [ ] Querying on behalf of a user without `acl`, which returns everything in scope.
+- [ ] Turning on a connector's `enforce_acl` behind one shared API key, which runs every query as the key's creator.
 
 Sections 2 to 7, ingestion and lifecycle:
 
+- [ ] Uploading a file with an unsupported extension, such as source code, and polling an ID that was rejected with `E1002`.
 - [ ] Hand-writing `app_knowledge` ingestion for an app a connector already syncs.
 - [ ] Editing an existing connector resource with `POST /connectors/{id}/resources`, which returns `409` and changes nothing.
 - [ ] Querying right after database creation without polling readiness.
@@ -1257,6 +1264,7 @@ Sections 8 to 10, query and metadata:
 - [ ] Using `operator` without `query_by: "text"`.
 - [ ] Expecting `query_forceful_relations` to work in `mode: "fast"`.
 - [ ] Setting `graph_context: false` and expecting graph fields.
+- [ ] Reading `data.sources`, which the public result does not return; cite from each chunk's `id` and `source_title`.
 - [ ] Re-sorting chunks before prompting without a deliberate reranker.
 - [ ] Passing raw result JSON or too many chunks to the LLM.
 - [ ] Putting hot filters in free-form metadata instead of the metadata schema.
@@ -1423,7 +1431,8 @@ curl -s -X POST 'https://api.hydradb.com/query' \
 
 ## 16. Navigation and support
 
-- Docs root for v2: `get-started/v2`, `essentials/v2`, `api-reference/v2`
-- API reference OpenAPI: `api-reference/v2/openapi.json`
+- Guides: `https://docs.hydradb.com/essentials/v2/context` and the other Core Concepts pages
+- API reference: `https://docs.hydradb.com/api-reference/v2`
+- OpenAPI spec: `https://docs.hydradb.com/api-reference/v2/openapi.json`
 - Dashboard/API keys: `https://dashboard.hydradb.com`
 - Support email: `founders@hydradb.com`
