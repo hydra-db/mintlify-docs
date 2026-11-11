@@ -1,13 +1,13 @@
 ---
 title: "Knowledge"
-description: "Add files, app records, and connected apps to HydraDB, then search them."
+description: "Ingest files, app sources, and connected apps as knowledge, wait for indexing, then query them."
 ---
 
 import { Field } from "/snippets/field.jsx";
 
 <a id="1-what-it-is"></a>
 
-Knowledge is what your AI reasons over: product docs, policy PDFs, runbooks, wiki pages, Slack threads, tickets, and emails. There are three ways to add it:
+Knowledge is what your AI reasons over: product docs, policy PDFs, runbooks, wiki pages, Slack threads, tickets, and emails. There are three ways to ingest it:
 
 - **Files:** upload PDF, DOCX, Markdown, CSV, or TXT files, and HydraDB reads them for you.
 - **App sources:** send records your application already parsed from an app, such as a Slack message or a Jira ticket.
@@ -17,23 +17,11 @@ Files and app sources go to [`POST /context/ingest`](/api-reference/v2/endpoint/
 
 Preferences, decisions, and past conversations are [memories](/essentials/v2/memories), not knowledge. For a company brain, ingest everything into one collection and use [metadata filters](/essentials/v2/metadata) to narrow results.
 
-In this guide:
-
-1. [Upload files](#1-upload-files): PDFs, Word documents, Markdown, CSV, and text.
-2. [Ingest app sources](#2-ingest-app-sources): records from Slack, Jira, Notion, Gmail, and other apps.
-3. [Wait for indexing](#3-wait-for-indexing): polling until a source is searchable.
-4. [Retrieve knowledge](#4-retrieve-knowledge): querying what you ingested.
-5. [Add metadata for filtering](#5-add-metadata-for-filtering).
-6. [Link documents that belong together](#6-link-documents-that-belong-together).
-7. [Field reference](#field-reference) and [common mistakes](#common-mistakes).
-
 <a id="path-a-files"></a>
 
 ## 1. Upload files
 
-This request uploads two PDFs. HydraDB accepts PDF, DOCX, Markdown, CSV, and TXT files.
-
-The request is **multipart/form-data** with these fields:
+This request uploads two PDFs. It is **multipart/form-data** with these fields:
 
 | Form field | What to send |
 |---|---|
@@ -124,18 +112,18 @@ The response lists each file in `data.results` with its `id` and a `status` of `
 
 | Property | What it is |
 |---|---|
-| `id` | Your stable ID for the file. Send the same `id` later to replace the file, or use it to check status and delete. Leave it out to have one generated; the response returns it either way. |
-| `metadata` | Values you filter on at query time, such as `document_type`. Declare the keys in the [database metadata schema](/essentials/v2/metadata). Up to 16 KiB as compact JSON. |
-| `additional_metadata` | Free-form values for display and bookkeeping. Up to 1 KiB as compact JSON. |
-| `relations` | Other sources this file belongs with, as `{ "ids": [...] }`. [Section 6](#6-link-documents-that-belong-together) explains it. |
+| `id` | Your stable ID for the file, and the upsert key. Send the same `id` later to replace the file, or use it to check status and delete. Leave it out to have one generated; the response returns it either way. |
+| `metadata` | Values you filter on at query time, such as `document_type`. Declare the keys in the database's [metadata schema](/essentials/v2/metadata). Up to 16 KiB as compact JSON. |
+| `additional_metadata` | Free-form values for display and bookkeeping. Filterable only when nested under `additional_metadata` in `metadata_filters`. Up to 1 KiB as compact JSON. |
+| `relations` | Other sources this file belongs with, as `{ "ids": [...] }`. See [Link documents that belong together](#6-link-documents-that-belong-together). |
 
-The key list is closed. Any other key, including `title`, `type`, `url`, and `timestamp`, returns `400`.
+The key list is closed. Any other key, including `title`, `type`, `url`, and `timestamp`, returns `400`. App sources do accept `title`, `url`, and `timestamp`.
 
 ## 2. Ingest app sources
 
-When your application already holds the text and fields of a Slack message, a Jira ticket, a Notion page, or a CRM record, send it as an **app source** instead of a file. HydraDB keeps the app's structure: the author, the thread, the ticket's status, and the links between items. See [App Sources](/essentials/v2/app-sources) for every class and a ready-to-use pattern for each app.
+When your application already holds the text and fields of a Slack message, a Jira ticket, a Notion page, or a CRM record, send it as an **app source** instead of a file. HydraDB keeps the app's structure: the author, the thread, the ticket's status, and the links between records.
 
-The request goes to the same endpoint, with `app_knowledge` in place of `documents`. One request can carry both. An app source can also carry an `acl`, the list of people allowed to retrieve it; see [Access Control](/essentials/v2/access-control).
+The request goes to the same endpoint, with `app_knowledge` in place of `documents`. One request can carry both. An app source can also carry an `acl`, the list of principals allowed to retrieve it; see [Access Control](/essentials/v2/access-control). [App Sources](/essentials/v2/app-sources) covers every kind of app source, with a ready-to-use pattern for each app.
 
 <Accordion title="Ingest a Slack message: Python, TypeScript, or cURL">
 <CodeGroup>
@@ -224,7 +212,14 @@ The response has the same shape as a file upload, with one entry per app source 
 
 ## 3. Wait for indexing
 
-Ingestion runs in the background: HydraDB parses each source, splits it into chunks, finds the people, teams, and topics it mentions and how they relate (see [Context Graphs](/essentials/v2/context-graphs)), and builds the search indexes. The response returns `202 Accepted` with each source's `id`. Poll [`GET /context/status`](/api-reference/v2/endpoint/source-status) with those ids and the same `collection` until every source reaches `completed` or `errored`.
+Indexing runs in the background: HydraDB parses each source, splits it into chunks, finds the people, teams, and topics it mentions and how they relate (see [Context Graphs](/essentials/v2/context-graphs)), and builds the search indexes. The ingest request returns `202 Accepted` with each source's `id`.
+
+Poll [`GET /context/status`](/api-reference/v2/endpoint/source-status) with those ids and the same `collection` every few seconds. A source's `indexing_status` moves forward through `queued`, `processing`, `graph_creation`, and `completed`, or lands in `errored` on failure:
+
+- At `graph_creation` the source is already searchable.
+- Wait for `completed` only when you need full graph traversal. Most documents complete in 1 to 5 minutes.
+
+[Ingestion Status](/api-reference/v2/endpoint/source-status) has the full status table. To skip polling, [register a webhook](/essentials/v2/webhooks).
 
 <Accordion title="Poll until indexed: Python, TypeScript, or cURL">
 <CodeGroup>
@@ -299,13 +294,11 @@ Each status in the `data` payload looks like this:
 
 </Accordion>
 
-Status values move forward through `queued`, `processing`, `graph_creation`, and `completed`, or land in `errored` on failure. A source is already searchable at `graph_creation`; wait for `completed` only when you need full graph traversal. Poll every few seconds; most documents complete in 1 to 5 minutes. The full table is on [Ingestion Status](/api-reference/v2/endpoint/source-status). If you would rather not poll, [register a webhook](/essentials/v2/webhooks).
-
 ## 4. Retrieve knowledge
 
-Search with [`POST /query`](/api-reference/v2/endpoint/query), using `type: "knowledge"`. Use `type: "all"` to search a user's memories in the same call. Both stores are read from the same collection, so if the documents live in their own collection, list it next to the user's in `collections`. App sources are searched too; `query_apps` (on by default) adds thread and link expansion for them.
+Query with [`POST /query`](/api-reference/v2/endpoint/query), using `type: "knowledge"`. Use `type: "all"` to query a user's memories in the same call. Both stores are read from the same collection, so if the documents live in their own collection, list it next to the user's in `collections`. App sources are searched too; `query_apps` (on by default) adds thread and link expansion for them.
 
-If some documents carry an `acl`, from a connector or an app source, send the caller's identity as `acl` on every query. A query without it ignores those permissions, and a metadata filter does not replace it. See [Access Control](/essentials/v2/access-control).
+If some sources carry an `acl`, from a connector or an app source, send the caller's identity as `acl` on every query. A query without it ignores those permissions, and a metadata filter does not replace it. See [Access Control](/essentials/v2/access-control).
 
 <Accordion title="Query knowledge: Python, TypeScript, or cURL">
 <CodeGroup>
@@ -352,7 +345,7 @@ Matching chunks come back in `data.chunks`, ranked by relevance, each with its `
 
 ## 5. Add metadata for filtering
 
-[Metadata](/essentials/v2/metadata) is how you bridge structured filters and semantic search. Attach `metadata` at ingestion, and narrow a query to matching sources with `metadata_filters`.
+Attach `metadata` when you ingest, and narrow a query to matching sources with `metadata_filters`.
 
 <Accordion title="Filter by metadata: ingest, then query">
 
@@ -378,17 +371,17 @@ Then at query time:
 
 </Accordion>
 
-Declare the `metadata` keys you filter on in the database metadata schema. A database with a schema rejects undeclared keys at ingest, so a filter on one returns nothing. To filter on `additional_metadata`, nest the keys under `additional_metadata` in `metadata_filters`, for example `{"metadata_filters": {"additional_metadata": {"author": "Alice"}}}`. `document_metadata` is accepted only as a legacy alias for that nested filter namespace.
+Declare the `metadata` keys you filter on in the database's metadata schema. A database with a schema rejects undeclared keys at ingest, so a filter on one returns nothing. To filter on `additional_metadata`, nest the keys under `additional_metadata` in `metadata_filters`, for example `{"metadata_filters": {"additional_metadata": {"author": "Alice"}}}`. `document_metadata` is accepted only as a legacy alias for that nested filter namespace.
 
-See [Metadata](/essentials/v2/metadata) for schema design, filter examples, and the `metadata` vs `additional_metadata` decision rule. See [Create Database](/api-reference/v2/endpoint/create-tenant) for the schema field configuration (`enable_dense_embedding`, `enable_sparse_embedding`).
+See [Metadata](/essentials/v2/metadata) for schema design, filter operators, and when to use `metadata` or `additional_metadata`. See [Create Database](/api-reference/v2/endpoint/create-tenant) for the schema field configuration (`enable_dense_embedding`, `enable_sparse_embedding`).
 
 <a id="7-forceful-relations"></a>
 
 ## 6. Link documents that belong together
 
-Forceful relations let you **declare** links between knowledge sources at ingestion time. When a query matches a source that has forceful relations attached, HydraDB pulls the linked sources into the `additional_context` field of the query response alongside the primary chunks.
+Forceful relations are links you declare between knowledge sources when you ingest them. When a query matches a source that has forceful relations, HydraDB returns the linked sources in the `additional_context` field of the response, alongside the primary chunks.
 
-This is separate from the [context graph](/essentials/v2/context-graphs) HydraDB builds on its own. Forceful relations are declared by you, for documents that belong together when the text does not say so: a contract and its addendum, or a runbook and its troubleshooting guide. They link whole **sources**. To declare the entity and relation graph within one document, replacing extraction for it, use [Bring Your Own Graph](/essentials/v2/bring-your-own-graph#using-byog-without-cypher).
+This is separate from the [context graph](/essentials/v2/context-graphs) HydraDB builds on its own. Use forceful relations for documents that belong together when the text does not say so: a contract and its addendum, or a runbook and its troubleshooting guide. They link whole **sources**. To declare the entity and relation graph within one document, replacing extraction for it, use [Bring Your Own Graph](/essentials/v2/bring-your-own-graph#using-byog-without-cypher).
 
 On a file, set `relations.ids` on its `document_metadata` item. On an app source, set `relations.ids` the same way, and name the relationship in `app_relations` so the link also carries a predicate. `relations.ids` is what makes the linked text come back with query results; a named relationship alone connects the sources without requesting their text. [App Sources](/essentials/v2/app-sources#4-relate-messages-tickets-and-records) covers typed targets in full.
 
@@ -464,14 +457,13 @@ curl -X POST 'https://api.hydradb.com/context/ingest' \
 
 `query_forceful_relations` defaults to `true`; set it to `false` to skip the linked sources.
 
-<Warning>
-**Knowledge sources, thinking mode only:** Forceful relations stay within one store, so pointing a knowledge source at a memory ID silently returns nothing. Linked context is fetched only when `mode: "thinking"` is set on the query, or when `mode: "auto"` routes to thinking. In `fast` mode, `query_forceful_relations` is ignored even if set to `true`.
-</Warning>
+<Note>
+**Knowledge sources, `thinking` mode only:** Forceful relations stay within one store, so pointing a knowledge source at a memory ID silently returns nothing. Linked context is fetched only when `mode: "thinking"` is set on the query, or when `mode: "auto"` routes to thinking. In `fast` mode, `query_forceful_relations` is ignored even if set to `true`.
+</Note>
 
 ## Field reference
 
-<AccordionGroup>
-<Accordion title="Request fields">
+These are the form fields of the ingest request. The properties of a `document_metadata` item are listed under [Upload files](#1-upload-files).
 
 | Field | Default | Description |
 |---|---|---|
@@ -480,31 +472,16 @@ curl -X POST 'https://api.hydradb.com/context/ingest' \
 | <Field name="collection" type="string" /> | default collection | Scope this knowledge to a collection. If omitted, knowledge goes to the database's default collection, which a query naming another `collection` does not read. |
 | <Field name="documents" type="file[]" /> | None | Files for HydraDB to parse: PDF, DOCX, Markdown, CSV, TXT. |
 | <Field name="document_metadata" type="string (JSON array)" /> | None | One item per file in `documents`, in the same order. The item count must match the file count. |
-| <Field name="app_knowledge" type="string (JSON array)" /> | None | App source items. See the [App Sources field reference](/essentials/v2/app-sources#field-reference). |
-| <Field name="upsert" type="boolean" /> | `true` | Replace existing items with the same `id`. |
-
-</Accordion>
-<Accordion title="document_metadata item fields">
-
-| Field | Description |
-|---|---|
-| <Field name="id" type="string" /> | Optional stable identifier. Used as the upsert key when `upsert: true`. |
-| <Field name="metadata" type="object" /> | Filterable fields. Keys must match the database metadata schema. Up to 16 KiB as compact JSON. |
-| <Field name="additional_metadata" type="object" /> | Free-form fields for display and bookkeeping. Filterable only when nested under `additional_metadata` in `metadata_filters`. Up to 1 KiB as compact JSON. |
-| <Field name="relations" type="object" /> | Forcefully connect this source to others with `{ "ids": [...] }`. |
-
-App sources accept `title`, `url`, and `timestamp`.
-
-</Accordion>
-</AccordionGroup>
+| <Field name="app_knowledge" type="string (JSON array)" /> | None | App sources. See the [App Sources field reference](/essentials/v2/app-sources#field-reference). |
+| <Field name="upsert" type="boolean" /> | `true` | Replace existing sources with the same `id`. |
 
 ## Common mistakes
 
 | Mistake | What goes wrong | Fix |
 |---|---|---|
 | Querying knowledge with `type: "memory"` | Nothing returned: wrong store | Use `type: "knowledge"` (or `"all"`) on [`POST /query`](/api-reference/v2/endpoint/query). |
-| Using `additional_metadata` for hot filterable fields | Filters work only with nested syntax and are less efficient than schema-backed metadata filters | Put hot filter keys in `metadata` and declare them in the [database schema](/api-reference/v2/endpoint/create-tenant), or filter under `metadata_filters: {"additional_metadata": {...}}` for occasional/free-form fields. See [Metadata](/essentials/v2/metadata). |
-| Not polling [`/context/status`](/api-reference/v2/endpoint/source-status) before querying | Chunks aren't indexed yet, so query results are empty | Wait for `indexing_status: completed` (or `graph_creation` for partial availability). |
+| Using `additional_metadata` for hot filterable fields | Filters work only with nested syntax and are less efficient than schema-backed metadata filters | Put hot filter keys in `metadata` and declare them in the [metadata schema](/api-reference/v2/endpoint/create-tenant), or filter under `metadata_filters: {"additional_metadata": {...}}` for occasional or free-form fields. See [Metadata](/essentials/v2/metadata). |
+| Not polling [`/context/status`](/api-reference/v2/endpoint/source-status) before querying | Chunks are not indexed yet, so query results are empty | Wait for `indexing_status: completed` (or `graph_creation` for partial availability). |
 | Sending `document_metadata` as a JSON object instead of a JSON string | `multipart/form-data` validation fails | Stringify `document_metadata` before sending in the `-F` field. |
 | Omitting `database` | `400` error (`database is required`) | Required on every call. |
 
