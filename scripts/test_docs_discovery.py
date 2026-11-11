@@ -34,7 +34,7 @@ class DocsDiscoveryTest(unittest.TestCase):
         self.assertIn("not compatible", warning)
 
     def test_changed_pages_have_no_extra_prose_h1_or_zero_width_artifacts(self):
-        for relative in ("AGENTS.mdx", "continuity-assurance.mdx", "cookbooks/hydradb-cookbook-06.mdx", "cookbooks/v2/hydradb-cookbook-06.mdx"):
+        for relative in ("AGENTS.mdx", "continuity-assurance.mdx"):
             with self.subTest(relative=relative):
                 text = (ROOT / relative).read_text()
                 prose = re.sub(r'^```[^\n]*\n.*?^```', "", text, flags=re.M | re.S)

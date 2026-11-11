@@ -1,0 +1,74 @@
+## Prerequisites
+
+- A HydraDB API key from [dashboard.hydradb.com](https://dashboard.hydradb.com), set as `HYDRADB_API_KEY`.
+- An OpenAI API key, set as `OPENAI_API_KEY`. HydraDB returns context, not answers, so any model works; swap the `answer` function below for your own.
+- Python 3.10 or later, with the SDKs: `pip install "hydradb-sdk>=2.1.7,<3" openai`.
+
+Save this as `hydra.py`. Every cookbook imports it. It holds what every HydraDB application does around its own logic: wait for the database, check what an ingest accepted, wait for indexing, and pass query results to a model.
+
+```python hydra.py
+import os
+import time
+
+from hydra_db import HydraDB
+from hydra_db.errors import ConflictError
+from hydra_db.helpers import build_string
+from openai import OpenAI
+
+client = HydraDB(token=os.environ["HYDRADB_API_KEY"])
+llm = OpenAI()
+
+
+def create_database(database, schema=None):
+    """Create the database if it is new, then wait until it accepts context."""
+    try:
+        if schema:
+            client.databases.create(database=database, database_metadata_schema=schema)
+        else:
+            client.databases.create(database=database)
+    except ConflictError:
+        pass  # The database already exists.
+    while not client.databases.status(database=database).data.infra.ready_for_ingestion:
+        time.sleep(5)
+
+
+def source_ids(result):
+    """Return the IDs an ingest accepted. Raise if it rejected any item."""
+    for item in result.data.results:
+        if item.error_code:
+            raise RuntimeError(f"{item.filename or item.id}: {item.error_code} {item.error}")
+    return [item.id for item in result.data.results]
+
+
+def wait_indexed(database, collection, ids):
+    """Block until every source has finished indexing. Indexing runs in the background."""
+    while True:
+        statuses = client.context.status(
+            database=database, collection=collection, ids=ids
+        ).data.statuses
+        for status in statuses:
+            if status.indexing_status == "errored":
+                raise RuntimeError(f"{status.error_code}: {status.error_message}")
+        if all(s.indexing_status == "completed" for s in statuses):
+            return
+        time.sleep(2)
+
+
+def answer(question, result, instructions=""):
+    """Send a query result to the model and return its answer."""
+    completion = llm.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {
+                "role": "system",
+                "content": "Answer using only the context provided. If the answer "
+                "is not in the context, say you don't know. " + instructions,
+            },
+            {
+                "role": "user",
+                "content": f"Context:\n{build_string(result)}\n\nQuestion: {question}",
+            },
+        ],
+    )
+    return completion.choices[0].message.content
+```
