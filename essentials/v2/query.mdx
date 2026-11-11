@@ -1,9 +1,9 @@
 ---
 title: "Query"
-description: "Search knowledge, memories, or both, and tune what comes back."
+description: "Search knowledge, memories, or both, tune what comes back, and pass the result to a model."
 ---
 
-[`POST /query`](/api-reference/v2/endpoint/query) searches your [knowledge](/essentials/v2/knowledge), your [memories](/essentials/v2/memories), or both, and returns ranked passages, called **chunks**, with their source details and the context graph around them. Your application puts them in the model's prompt; the model writes the answer.
+[`POST /query`](/api-reference/v2/endpoint/query) searches your [context](/essentials/v2/context): knowledge, memories, or both. It returns ranked passages, called **chunks**, with their source details and the context graph around them. Your application puts them in the model's prompt; the model writes the answer.
 
 The defaults work without tuning.
 
@@ -73,9 +73,6 @@ The response is wrapped in the standard envelope, so read the result from `data`
         "metadata": { "document_type": "runbook" }
       }
     ],
-    "sources": [
-      { "id": "runbook_keys", "title": "API key runbook", "type": "pdf", "url": "" }
-    ],
     "graph_context": {
       "query_paths": [],
       "chunk_relations": [],
@@ -107,11 +104,11 @@ The full response schema is on the [Query API reference](/api-reference/v2/endpo
 
 ### What comes back
 
-- **`data.chunks`:** the matching chunks, ranked by relevance, each with its `chunk_content`, `source_title`, `relevancy_score`, and `metadata`. Keep the order.
-- **`data.sources`:** one entry per source, with its `id`, `title`, and `url` for citations.
+- **`data.llm_prompt`:** the question, the matching chunks, and citation instructions as one Markdown string, ready for a model.
+- **`data.chunks`:** the matching chunks, ranked by relevance, each with its source `id`, `chunk_content`, `source_title`, `relevancy_score`, and `metadata`. Keep the order.
 - **`data.graph_context`** and **`data.additional_context`:** relationships and linked chunks, covered in [section 5](#5-add-relationships).
 
-Pass the whole result to `build_string` (Python) or `buildString` (TypeScript) for a prompt-ready string. See [Use Query Results](/essentials/v2/api-results). New context is searchable once its [indexing status](/api-reference/v2/endpoint/source-status) reaches `graph_creation`.
+[Section 7](#7-use-the-results) shows how to pass the result to a model. New context is searchable once its [indexing status](/api-reference/v2/endpoint/source-status) reaches `graph_creation`.
 
 ## 2. Pick a recipe
 
@@ -209,9 +206,9 @@ Knowledge and memories come back together in `data.chunks`, ranked as one list. 
 
 Three fields bring in context beyond the chunks that matched. All three are on by default.
 
-- **`graph_context`:** the relationships HydraDB extracted from your context, such as "Payments team owns billing service", in `data.graph_context`. `false` drops it, but only in fast mode; thinking always includes it. [Use Query Results](/essentials/v2/api-results) explains how to read it.
-- **`query_forceful_relations`:** forceful relations (links you declare between sources at ingest with `relations.ids`), such as a contract and its addendum, returned in `data.additional_context`. Thinking mode only; fast mode skips it without an error. [Knowledge](/essentials/v2/knowledge#6-link-documents-that-belong-together) shows how to declare the links.
-- **`query_apps`:** for [app sources](/essentials/v2/app-sources), an extra lane that rebuilds Slack threads, follows ticket and parent links, and matches exact ids and people. It still searches everything else, and has no effect on memories.
+- **`graph_context`:** the relationships HydraDB extracted from your context, such as "Payments team owns billing service", in `data.graph_context`. `false` drops it, but only in fast mode; thinking always includes it. [Query](/essentials/v2/query#7-use-the-results) explains how to read it.
+- **`query_forceful_relations`:** forceful relations (links you declare between sources at ingest with `relations.ids`), such as a contract and its addendum, returned in `data.additional_context`. Thinking mode only; fast mode skips it without an error. [Context](/essentials/v2/context#6-link-sources-that-belong-together) shows how to declare the links.
+- **`query_apps`:** for [app sources](/essentials/v2/context#send-app-sources), an extra lane that rebuilds Slack threads, follows ticket and parent links, and matches exact ids and people. It still searches everything else, and has no effect on memories.
 
 ## 6. Query on behalf of a user
 
@@ -220,7 +217,100 @@ Which identity a query runs as depends on where the content came from:
 - **Directly ingested knowledge, and connectors without ACL enforcement:** send the caller's email in `acl`, such as `"acl": ["grace@acme.com"]`, to filter results to documents that person may retrieve, plus public and unrestricted ones. Without `acl`, this content is not filtered by caller identity.
 - **Connectors with `enforce_acl` enabled:** HydraDB uses the authenticated caller and ignores a request `acl` for that connector's content. API keys use the key creator's email; MCP OAuth and dashboard requests use the signed-in user. If you send `acl` anyway, a successful response includes one `meta.warnings` entry with code `acl_ignored_by_connector_enforcement`.
 
-See [Access Control](/essentials/v2/access-control) and [ACL on synced content](/essentials/v2/connectors#enforce-acl).
+An `acl` entry on a source or a query is a **principal**:
+
+| Principal | Meaning |
+|---|---|
+| `grace@acme.com` | One person, by email. |
+| `domain:acme.com` | Everyone whose email is under that domain. A query as `grace@acme.com` matches it automatically. |
+| `group:<provider>:<id>` | A group in the source app, such as `group:slack:C0123`. Group membership is never derived from an email; send it on the query. |
+| `__public__` | Every identified caller. |
+
+A source with no `acl` is unrestricted. On a query, omitting `acl`, sending `[]`, or sending `["*"]` all mean no caller filtering. See [ACL on synced content](/essentials/v2/connectors#enforce-acl) for connectors.
+
+## 7. Use the results
+
+HydraDB returns context, not answers: your application passes the result to a model. `build_string(result)` in Python and `buildString(result)` in TypeScript return `data.llm_prompt`, which numbers the ranked results `[1]`, `[2]`, and so on, so ask the model to keep those labels when it cites. Tell the model to answer only from the context, and keep the chunks in the order returned. To format the prompt yourself, read `data.chunks`; set `response_format` to `"structured"` to leave `llm_prompt` out, or to `"markdown"` to get only the prompt text as `data`.
+
+<CodeGroup>
+```python Python SDK
+import os
+from hydra_db import HydraDB
+from hydra_db.helpers import build_string
+from openai import OpenAI
+
+hydra = HydraDB(token=os.environ["HYDRADB_API_KEY"])
+openai_client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+
+question = "How does authentication work?"
+
+result = hydra.query(
+    database="your-database",
+    collection="your-collection",
+    query=question,
+    type="knowledge",
+    query_by="hybrid",
+    mode="fast",
+    graph_context=True,
+)
+
+context = build_string(result)
+
+completion = openai_client.chat.completions.create(
+    model="gpt-4o",
+    messages=[
+        {
+            "role": "system",
+            "content": "You are a helpful assistant. Answer the user's question using only the context provided. If the answer is not in the context, say you don't know.",
+        },
+        {
+            "role": "user",
+            "content": f"Context:\n{context}\n\nQuestion: {question}",
+        },
+    ],
+)
+
+print(completion.choices[0].message.content)
+```
+```typescript TypeScript SDK
+import { HydraDBClient } from "@hydradb/sdk";
+import { buildString } from "@hydradb/sdk/helpers";
+import OpenAI from "openai";
+
+const hydra = new HydraDBClient({ token: process.env.HYDRADB_API_KEY });
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+const question = "How does authentication work?";
+
+const result = await hydra.query({
+  database: "your-database",
+  collection: "your-collection",
+  query: question,
+  type: "knowledge",
+  queryBy: "hybrid",
+  mode: "fast",
+  graphContext: true,
+});
+
+const context = buildString(result);
+
+const completion = await openai.chat.completions.create({
+  model: "gpt-4o",
+  messages: [
+    {
+      role: "system",
+      content: "You are a helpful assistant. Answer the user's question using only the context provided. If the answer is not in the context, say you don't know.",
+    },
+    {
+      role: "user",
+      content: `Context:\n${context}\n\nQuestion: ${question}`,
+    },
+  ],
+});
+
+console.log(completion.choices[0].message.content);
+```
+</CodeGroup>
 
 ## Common mistakes
 
@@ -239,9 +329,6 @@ See [Access Control](/essentials/v2/access-control) and [ACL on synced content](
 
 ## Related
 
-- [Knowledge](/essentials/v2/knowledge): the documents and app sources a query searches
-- [Memories](/essentials/v2/memories): preferences, decisions, and past conversations
-- [Use Query Results](/essentials/v2/api-results): turning the response into a model prompt
-- [Metadata](/essentials/v2/metadata): designing filterable fields
-- [Access Control](/essentials/v2/access-control): giving documents ACLs and querying as a caller
+- [Context](/essentials/v2/context): the knowledge and memories a query searches
+- [Metadata Filters](/essentials/v2/metadata): designing filterable fields
 - [Query: API Reference](/api-reference/v2/endpoint/query): the full parameter and response schema

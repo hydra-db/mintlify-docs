@@ -174,7 +174,7 @@ require(graph_source.get("entity_id") == graph_relation.get("source_entity_id") 
 
 internal_fields = {"attributes", "graph_vector_prune", "graph_vector_prune_spacy_entities", "temporal_intent", "temporal_now"}
 legacy_fields = {"tenant_id", "sub_tenant_id", "sub_tenant_ids", "tenant_metadata_keys", "milvus_sync_required", "milvus_synced", "milvus_rows_synced"}
-pages = sorted((ROOT / "api-reference/v2").rglob("*.mdx")) + [ROOT / "essentials/v2/api-results.mdx"]
+pages = sorted((ROOT / "api-reference/v2").rglob("*.mdx")) + [ROOT / "essentials/v2/query.mdx"]
 operation_count = 0
 json_count = 0
 response_count = 0

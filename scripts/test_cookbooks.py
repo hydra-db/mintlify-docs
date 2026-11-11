@@ -37,7 +37,7 @@ MEMORY_KEYS = {
     "custom_instructions", "user_name", "metadata", "additional_metadata",
 }
 OPERATORS = {"equals", "contains", "contains_any"}
-# fields.* per kind, from the field reference in essentials/v2/app-sources.mdx.
+# fields.* per kind, from the field reference in essentials/v2/context.mdx.
 KIND_FIELDS = {
     "email": {"subject", "body", "from", "to", "cc", "bcc", "thread_id", "reply_to_id",
               "forwarded_from_id", "created_at", "url"},
