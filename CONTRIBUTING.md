@@ -166,7 +166,7 @@ Every commit must include the DCO sign-off.
 
 ### Terminology
 
-Use one term per concept. Literal field names, SDK identifiers, and error codes stay as they are, in backticks, even when they contain a deprecated word (`tenant_id`, `app_knowledge`). The [Glossary](essentials/v2/glossary.mdx) defines each term for readers.
+Use one term per concept. Literal field names, SDK identifiers, and error codes stay as they are, in backticks, even when they contain a deprecated word (`tenant_id`, `app_knowledge`).
 
 | Use | Not | Notes |
 | --- | --- | --- |
