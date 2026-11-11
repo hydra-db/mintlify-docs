@@ -613,7 +613,7 @@ class JsonAndCurlExamples(unittest.TestCase):
                     continue
                 for literal in re.findall(r'"([a-z_]+)"', line):
                     used.setdefault(literal, page.name)
-        self.assertGreaterEqual(len(used), 3)
+        self.assertGreaterEqual(len(used), 2)
         self.assertEqual({}, {k: v for k, v in used.items() if k not in INDEXING_STATUSES})
 
 

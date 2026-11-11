@@ -284,14 +284,17 @@ class CookbookTest(unittest.TestCase):
         with gave_up, self.assertRaisesRegex(RuntimeError, "E2002: No readable text"):
             hydra.wait_indexed("db", "docs", ["source_1"])
 
-    def test_setup_waits_for_completed_when_asked(self):
+    def test_setup_waits_for_completed(self):
+        # On the live API a source at graph_creation can still be missed by a
+        # query for a few seconds, so the helper must not return early.
         hydra, stubs = self.load_setup()
         stubs.collections.add("docs")
         stubs.status = "graph_creation"
-        with mock.patch("time.sleep"):
-            hydra.wait_indexed("db", "docs", ["source_1"])  # Searchable is enough by default.
         with mock.patch("time.sleep", side_effect=TimeoutError), self.assertRaises(TimeoutError):
-            hydra.wait_indexed("db", "docs", ["source_1"], until="completed")
+            hydra.wait_indexed("db", "docs", ["source_1"])
+        stubs.status = "completed"
+        with mock.patch("time.sleep", side_effect=TimeoutError):
+            hydra.wait_indexed("db", "docs", ["source_1"])
 
     def test_setup_raises_when_an_item_is_rejected(self):
         hydra, _ = self.load_setup()
