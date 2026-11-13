@@ -954,7 +954,7 @@ def wait_for_sources_searchable(
     client: ApiClient, recorder: Recorder, source_ids: list[str]
 ) -> bool:
     deadline = time.time() + SOURCE_READY_TIMEOUT_SECONDS
-    terminal_failures = {"errored", "failed"}
+    terminal_failures = {"errored"}
     searchable = {"graph_creation", "completed"}
     last_statuses = None
     while time.time() < deadline:
