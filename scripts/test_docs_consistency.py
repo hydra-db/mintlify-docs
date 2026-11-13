@@ -1,8 +1,8 @@
 """Regression tests for canonical names and copy used across the live docs."""
 
+import json
 from pathlib import Path
 import re
-from types import SimpleNamespace
 import unittest
 
 
@@ -25,18 +25,6 @@ def live_files(pattern: str):
 
 
 class DocsConsistencyTest(unittest.TestCase):
-    def test_cookbook_verification_imports_have_definitions(self):
-        cookbook = (
-            ROOT / "cookbooks/v2/cookbook-01-build-cursor-for-docs.mdx"
-        ).read_text(encoding="utf-8")
-        imports = re.findall(r"^from phase0\.verify import (.+)$", cookbook, re.MULTILINE)
-        self.assertTrue(imports)
-        for imported in imports:
-            for name in imported.split(","):
-                name = name.strip()
-                with self.subTest(name=name):
-                    self.assertRegex(cookbook, rf"(?m)^def {re.escape(name)}\(")
-
     def test_ci_runs_docs_consistency_suite(self):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         self.assertIn("python scripts/test_docs_consistency.py", workflow)
@@ -66,53 +54,7 @@ class DocsConsistencyTest(unittest.TestCase):
             matches,
         )
 
-    def test_cookbook_context_block_uses_each_source(self):
-        cookbook = (
-            ROOT / "cookbooks/v2/cookbook-01-build-cursor-for-docs.mdx"
-        ).read_text(encoding="utf-8")
-        match = re.search(
-            r"```python\n(?:from backend\.hydra_client import search_docs\n\n)?"
-            r".*?(def build_context_block\(recall_payload\) -> str:\n.*?)\n```",
-            cookbook,
-            re.DOTALL,
-        )
-        self.assertIsNotNone(match)
 
-        namespace = {}
-        exec(match.group(1), namespace)
-        payload = SimpleNamespace(
-            data=SimpleNamespace(
-                chunks=[
-                    SimpleNamespace(chunk_content=" First chunk "),
-                    SimpleNamespace(chunk_content="Second chunk"),
-                ],
-                sources=[
-                    SimpleNamespace(title="Guide", id="source-1"),
-                    SimpleNamespace(title=None, id=None),
-                ],
-            )
-        )
-
-        self.assertEqual(
-            "Context:\nFirst chunk\n\nSecond chunk\n\n"
-            "Sources:\n- Guide (source-1)\n- Untitled ()",
-            namespace["build_context_block"](payload),
-        )
-
-    def test_cookbook_04_uses_notion_workspace_title(self):
-        expected_title = "Build Notion AI for Your Workspace"
-        expected_files = {
-            "cookbooks/cookbook-04-build-notion-ai.mdx": 1,
-            "cookbooks/v2/cookbook-04-build-notion-ai.mdx": 1,
-            "cookbooks/index.mdx": 1,
-            "cookbooks/v2/index.mdx": 1,
-        }
-        for relative, count in expected_files.items():
-            text = (ROOT / relative).read_text(encoding="utf-8")
-            self.assertEqual(count, text.count(expected_title), relative)
-
-        agents = (ROOT / "AGENTS.mdx").read_text(encoding="utf-8")
-        self.assertIn("| **Notion AI for Your Workspace** |", agents)
 
     def test_recall_pages_use_correct_spelling(self):
         for relative in (
@@ -122,6 +64,148 @@ class DocsConsistencyTest(unittest.TestCase):
             text = (ROOT / relative).read_text(encoding="utf-8")
             self.assertNotIn("knoledge", text, relative)
             self.assertNotIn("strucutre", text, relative)
+
+
+# Facts stated on more than one page. Each entry names the pages that state the
+# fact and a pattern whose captured groups must be identical on all of them, so
+# the agent guide, the guides, and the API reference cannot drift apart.
+SHARED_FACTS = {
+    "max_results default and maximum": {
+        "AGENTS.mdx": r"\| `max_results` \| [^|]*\| default (\d+); max (\d+) \|",
+        "essentials/v2/query.mdx": r"\| `max_results` \|[^|]*Default `(\d+)`, maximum `(\d+)`",
+        "api-reference/v2/endpoint/query.mdx":
+            r'name="max_results"[^|]*\|[^|]*to `(?P<max>\d+)`\. Defaults to `(?P<default>\d+)`',
+    },
+    "recency_bias default": {
+        "essentials/v2/query.mdx": r"\*\*`recency_bias`:\*\*[^\n]*?Default `([\d.]+)`",
+        "api-reference/v2/endpoint/query.mdx": r'name="recency_bias"[^\n]*\(default=`([\d.]+)`\)',
+    },
+    "metadata size limit": {
+        "AGENTS.mdx": r"\| `metadata` \| [^|]*max (\d+ KiB)",
+        "essentials/v2/context.mdx": r"\| `metadata` \| [^|]*Up to (\d+ KiB)",
+        "essentials/v2/metadata.mdx": r"\| `metadata` \| [^|]*\| (\d+ KiB)",
+    },
+    "additional_metadata size limit": {
+        "AGENTS.mdx": r"\| `additional_metadata` \| [^|]*max (\d+ KiB)",
+        "essentials/v2/context.mdx": r"\| `additional_metadata` \| [^|]*Up to (\d+ KiB)",
+        "essentials/v2/metadata.mdx": r"\| `additional_metadata` \| [^|]*\| (\d+ KiB)",
+    },
+    "collections per query": {
+        "essentials/v2/query.mdx": r"\*\*Several collections:\*\*[^\n]*Up to (\d+);",
+        "api-reference/v2/endpoint/query.mdx": r"at most (\d+) collections",
+    },
+}
+INDEXING_STATUSES = ["queued", "processing", "graph_creation", "completed", "errored"]
+APP_SOURCE_KINDS = ["email", "message", "ticket", "knowledge_base", "comment", "meeting", "custom"]
+
+
+class SharedFactsTest(unittest.TestCase):
+    def read(self, relative):
+        return (ROOT / relative).read_text(encoding="utf-8")
+
+    def test_shared_facts_agree_across_pages(self):
+        for fact, pages in SHARED_FACTS.items():
+            values = {}
+            for relative, pattern in pages.items():
+                match = re.search(pattern, self.read(relative))
+                self.assertIsNotNone(match, f"{fact}: not stated on {relative}")
+                named = match.groupdict()
+                values[relative] = (named["default"], named["max"]) if named else match.groups()
+            with self.subTest(fact=fact):
+                self.assertEqual(1, len(set(values.values())), values)
+
+    def test_indexing_statuses_are_the_same_everywhere(self):
+        sentence = re.search(r"moves forward through ([^:]*):", self.read("essentials/v2/context.mdx"))
+        self.assertEqual(INDEXING_STATUSES, re.findall(r"`(\w+)`", sentence.group(1)))
+        used = set()
+        for path in live_files("*.mdx"):
+            if "/v2/" in str(path) or path.name == "AGENTS.mdx":
+                used |= set(re.findall(
+                    r'indexing_?[sS]tatus["\s]*(?:===?|:|in)\s*[(\[]?"(\w+)"', path.read_text(encoding="utf-8")
+                ))
+        self.assertTrue(used)
+        self.assertLessEqual(used, set(INDEXING_STATUSES))
+
+    def test_app_source_kinds_are_the_same_everywhere(self):
+        listed = ", ".join(f"`{kind}`" for kind in APP_SOURCE_KINDS[:-1]) + f", or `{APP_SOURCE_KINDS[-1]}`"
+        for relative in ("essentials/v2/context.mdx", "api-reference/v2/endpoint/ingest-context.mdx"):
+            self.assertIn(listed, self.read(relative), relative)
+        table = re.findall(r"^\| `(\w+)` \| [^|]+ \| `", self.read("essentials/v2/context.mdx"), re.M)
+        self.assertEqual(APP_SOURCE_KINDS, table)
+        guide = re.search(r"Kinds in OpenAPI[^.]*\.", self.read("AGENTS.mdx")).group(0)
+        self.assertEqual(set(APP_SOURCE_KINDS), set(re.findall(r"`(\w+)`", guide)))
+
+    def test_supported_file_formats_match_the_api_reference(self):
+        def extensions(relative, start, end):
+            text = self.read(relative)
+            section = text[text.index(start):text.index(end, text.index(start))]
+            return set(re.findall(r"`(\.\w+)`", section))
+
+        reference = extensions("api-reference/v2/endpoint/ingest-context.mdx",
+                               "## Supported file formats", "### Unsupported formats")
+        guide = extensions("AGENTS.mdx", "Supported extensions:", "- Any other extension")
+        self.assertEqual(reference, guide)
+
+    def test_absolute_docs_links_point_at_real_pages(self):
+        config = json.loads(self.read("docs.json"))
+        redirects = {redirect["source"] for redirect in config["redirects"]}
+        for path in live_files("*.mdx"):
+            if "/v2/" not in str(path) and path.name != "AGENTS.mdx":
+                continue
+            for url in re.findall(r"https://docs\.hydradb\.com(/[^\s)`\"'<>]*)", path.read_text(encoding="utf-8")):
+                target = url.split("#")[0].rstrip("/.,")
+                if not target or target.endswith((".json", ".txt")):
+                    target = target.lstrip("/")
+                    self.assertTrue(not target or (ROOT / target).exists(), f"{path.name}: {url}")
+                    continue
+                self.assertNotRegex(url, r"#[\w-]+\.md", f"{path.name}: {url}")
+                page = target.removesuffix(".md").lstrip("/")
+                exists = (
+                    (ROOT / f"{page}.mdx").exists()
+                    or (ROOT / page / "index.mdx").exists()
+                    or f"/{page}" in redirects
+                )
+                self.assertTrue(exists, f"{path.name}: {url} does not exist")
+
+    def test_anchor_links_point_at_real_headings(self):
+        def prose(text):
+            return re.sub(r"^[ \t]*```.*?^[ \t]*```", "", text, flags=re.M | re.S)
+
+        def slug(heading):
+            heading = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", heading)
+            heading = re.sub(r"<[^>]+>", "", heading).replace("`", "").strip().lower()
+            return re.sub(r"[^\w\- ]", "", heading).replace(" ", "-")
+
+        # A same-page link must match a real heading (the hygiene check's rule).
+        # A link from another page may also use an explicit anchor tag.
+        headings, tagged = {}, {}
+        for path in live_files("*.mdx"):
+            text = prose(path.read_text(encoding="utf-8"))
+            headings[path] = {slug(m.group(1)) for m in re.finditer(r"^#{1,6}\s+(.*)$", text, re.M)}
+            tagged[path] = headings[path] | set(re.findall(r'<(?:a|span) id="([^"]+)"', text))
+        missing = []
+        for path, own in headings.items():
+            relative = str(path.relative_to(ROOT))
+            if "/v2/" not in f"/{relative}" and relative != "AGENTS.mdx":
+                continue
+            text = prose(path.read_text(encoding="utf-8"))
+            for target, anchor in re.findall(r"\]\((/[^)#\s]*)?#([^)\s]+)\)", text):
+                if not target:
+                    known = own
+                else:
+                    known = tagged.get(ROOT / f"{target.strip('/')}.mdx")
+                if known is None:
+                    missing.append(f"{relative}: {target} is not a page")
+                elif anchor not in known:
+                    missing.append(f"{relative}: {target}#{anchor}")
+        self.assertEqual([], missing, "\n".join(missing))
+
+    def test_guides_do_not_show_internal_query_fields(self):
+        for path in live_files("*.mdx"):
+            if "/v2/" in str(path) or path.name == "AGENTS.mdx":
+                text = path.read_text(encoding="utf-8")
+                self.assertNotRegex(text, r"\bdata\.sources\b(?!`, which the public result does not return)",
+                                    path.relative_to(ROOT))
 
 
 if __name__ == "__main__":

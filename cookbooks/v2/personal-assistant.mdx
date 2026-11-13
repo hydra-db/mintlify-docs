@@ -1,0 +1,150 @@
+---
+title: "Build your own personal assistant"
+sidebarTitle: "Personal assistant"
+description: "An assistant that remembers one person across sessions and finds the right email or photo among years of their history."
+---
+
+import Setup from "/snippets/cookbook-setup.mdx";
+
+A personal assistant has two jobs: remember what a person tells it, across sessions, and find the one item they mean among years of their email and photos. This cookbook builds both in one collection per user.
+
+| Benchmark | Result | What it shows here |
+| --- | --- | --- |
+| [LongMemEval-S](https://benchmarks.hydradb.com/longmemeval) | 90.79% overall, 97.43% on knowledge updates | Facts and preferences kept current across about 50 sessions |
+| [BEAM 1M](https://benchmarks.hydradb.com/beam-1m) | 82% overall | Memory that holds up over months of history |
+| [ATM-Bench](https://benchmarks.hydradb.com/atm-bench) | 0.918 recall@10 | The one right email, photo, or video found among 11,034 look-alikes |
+
+<Setup />
+
+## 1. Create a database with one collection per user
+
+Each user's context lives in their own collection, named by their user ID. Nothing one user saves can appear in another user's query.
+
+```python assistant.py
+import json
+
+from hydra import answer, client, create_database, source_ids, wait_indexed
+
+DATABASE = "assistant"
+USER = "user_maya"
+
+create_database(DATABASE)
+```
+
+## 2. Remember each session
+
+When a session ends, save its turns as a [memory](/essentials/v2/context#2-save-memories). Send the dialogue as `user_assistant_pairs` with `infer: true`: HydraDB extracts the preferences and facts, including ones that are implied, and reconciles them with what it already holds. Saving session by session is how the LongMemEval run ingested its conversations.
+
+```python assistant.py
+def remember_session(turns):
+    """turns is a list of (user message, assistant reply) pairs."""
+    result = client.context.ingest(
+        type="memory",
+        database=DATABASE,
+        collection=USER,
+        memories=json.dumps([{
+            "user_assistant_pairs": [{"user": u, "assistant": a} for u, a in turns],
+            "infer": True,
+            "user_name": "Maya",
+        }]),
+    )
+    wait_indexed(DATABASE, USER, source_ids(result))
+
+
+remember_session([
+    ("I'm vegetarian, and I usually cook on weeknights.", "Noted."),
+    ("Book me a table Friday somewhere near the office in Shoreditch.", "Done."),
+])
+remember_session([
+    ("We moved offices last week. I'm in King's Cross now.", "Got it."),
+])
+```
+
+## 3. Add the person's email and photos
+
+Email and media are knowledge, saved in the same collection. Send an email as an `email` app source. Send a photo or video as a `custom` app source: put the caption and any text read from the image in `fields.body`, and the date and place in `fields.data`. This mirrors the ATM-Bench setup, where every item is text plus its timestamp, location, and tags.
+
+```python assistant.py
+items = [
+    {
+        "id": "gmail_msg_771",
+        "title": "Your booking at The Lighthouse, Whitstable",
+        "kind": "email",
+        "provider": "gmail",
+        "external_id": "msg_771",
+        "timestamp": "2026-06-14T08:12:00Z",
+        "fields": {
+            "kind": "email",
+            "subject": "Your booking at The Lighthouse, Whitstable",
+            "body": "Two nights, June 20 to 22. Total paid: 312 GBP.",
+            "from": "bookings@thelighthouse.example",
+            "created_at": "2026-06-14T08:12:00Z",
+        },
+    },
+    {
+        "id": "photo_2026_06_21_0934",
+        "title": "Photo: oyster stall, Whitstable harbour",
+        "kind": "custom",
+        "provider": "photos",
+        "external_id": "IMG_0934",
+        "timestamp": "2026-06-21T12:40:00Z",
+        "fields": {
+            "kind": "custom",
+            "body": "A blue oyster stall on the harbour wall. Sign reads 'Wheelers'.",
+            "data": {"taken_at": "2026-06-21", "place": "Whitstable", "tags": "harbour, food, sea"},
+        },
+    },
+]
+
+result = client.context.ingest(
+    type="knowledge",
+    database=DATABASE,
+    collection=USER,
+    app_knowledge=json.dumps(items),
+)
+wait_indexed(DATABASE, USER, source_ids(result))
+```
+
+## 4. Answer from memories and items together
+
+`type: "all"` searches the user's memories and knowledge in one call.
+
+```python assistant.py
+def ask(question):
+    result = client.query(
+        database=DATABASE,
+        collection=USER,
+        query=question,
+        type="all",
+        mode="thinking",
+    )
+    return answer(question, result, "When facts conflict, the most recent one is current.")
+
+
+print(ask("Suggest somewhere for a team dinner near my office."))
+print(ask("How much did I pay for the place in Whitstable?"))
+print(ask("What was the name on that oyster stall?"))
+```
+
+## Run it
+
+```bash
+python assistant.py
+```
+
+The first answer should suggest vegetarian options near King's Cross, not Shoreditch. The second should give 312 GBP from the booking email. The third should give "Wheelers" from the photo.
+
+## Use real data
+
+Connect Gmail and Google Drive with [connectors](/essentials/v2/connectors) to keep email and files in sync, with each user's connector pointing at that user's collection. For photos and video, caption them with a vision model in your application, then ingest them as in step 3.
+
+## Common mistakes
+
+- **Saving a transcript with `infer: false`:** that stores the dialogue word for word, and the preference inside it is harder to find. Use `infer: true` for raw conversation.
+- **Forgetting `collection` on the query:** a query without it reads the default collection, which holds nothing for this user.
+- **Ingesting images without text:** queries match text. Put a caption, any text in the image, and the date and place into the app source.
+
+## Next steps
+
+- [Context](/essentials/v2/context#2-save-memories): `infer`, `custom_instructions`, and deleting a memory.
+- [Build your own AI Chief of Staff](/cookbooks/v2/chief-of-staff): the same memory, applied to meetings and commitments.
