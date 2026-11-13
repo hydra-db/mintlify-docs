@@ -1,0 +1,644 @@
+---
+title: "Connectors"
+description: "Connect Slack, GitHub, Notion, or any of 70 apps, and HydraDB keeps their data synced into your database."
+---
+
+HydraDB syncs data from 70 apps into your database without ingestion code on your side. You connect an account once, choose which resources (channels, repositories, pages) to sync, and HydraDB keeps them indexed as searchable [app sources](/essentials/context#send-app-sources). The catalog includes Slack, Gmail, Google Drive, Notion, Jira, Confluence, GitHub, Linear, HubSpot, Zendesk, Supabase, Microsoft Teams, Outlook, Zoom, Gong, and Fireflies. It grows often; call [`GET /connectors/providers`](/api-reference/endpoint/list-connector-providers) for the current list.
+
+If an app is not in the catalog, or you already have your own integration, ingest its data yourself as [app sources](/essentials/context#send-app-sources).
+
+<a id="how-it-works"></a>
+
+## 1. Set up a connector
+
+Setting up a connector takes four calls, made once. The example connects one Slack workspace; every provider uses the same calls, and only the credentials and resource types change. Set up your [SDK client](/api-reference/sdks#client-setup) before running the Python or TypeScript examples.
+
+### Step 1: Pick a provider
+
+[`GET /connectors/providers`](/api-reference/endpoint/list-connector-providers) returns the catalog; use an entry's `provider` value in the next call. With `?id={provider}`, it describes one provider, including `credential_schema`, the credentials it needs.
+
+<Accordion title="List providers and describe one: Python, TypeScript, or cURL">
+
+<CodeGroup>
+```python Python SDK
+catalog = client.list_providers()
+slack = client.list_providers(id="slack")
+```
+```typescript TypeScript SDK
+const catalog = await client.listProviders();
+const slack = await client.listProviders({ id: "slack" });
+```
+```bash cURL
+curl 'https://api.hydradb.com/connectors/providers' \
+  -H "Authorization: Bearer $HYDRADB_API_KEY" \
+  -H "API-Version: 2"
+
+curl 'https://api.hydradb.com/connectors/providers?id=slack' \
+  -H "Authorization: Bearer $HYDRADB_API_KEY" \
+  -H "API-Version: 2"
+```
+</CodeGroup>
+
+A catalog entry looks like this:
+
+```json
+{
+  "providers": [
+    {
+      "provider": "slack",
+      "category": "Communication",
+      "supported": true,
+      "webhook_support": false,
+      "rank": 2
+    }
+  ]
+}
+```
+
+`webhook_support` is `true` for providers whose data arrives by webhook instead of scheduled syncs, such as Supabase.
+
+</Accordion>
+
+### Step 2: Create the connector
+
+[`POST /connectors`](/api-reference/endpoint/create-connector) stores the credentials for one provider account and says which database and collection the synced data goes to. Nothing syncs yet.
+
+<Accordion title="Create a Slack connector: Python, TypeScript, or cURL">
+
+<CodeGroup>
+```python Python SDK
+connector = client.connectors.create(
+    provider="slack",
+    name="acme-engineering",
+    database="acme_corp",
+    collection="company_docs",
+    provider_account_scope="T12345ACME",
+    credentials={"access_token": "xoxp-..."},
+)
+connector_id = connector.connector_id
+```
+```typescript TypeScript SDK
+const connector = await client.connectors.create({
+  provider: "slack",
+  name: "acme-engineering",
+  database: "acme_corp",
+  collection: "company_docs",
+  providerAccountScope: "T12345ACME",
+  credentials: { access_token: "xoxp-..." },
+});
+const connectorId = connector.connectorId!;
+```
+```bash cURL
+curl -X POST 'https://api.hydradb.com/connectors' \
+  -H "Authorization: Bearer $HYDRADB_API_KEY" \
+  -H "API-Version: 2" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "provider": "slack",
+    "name": "acme-engineering",
+    "database": "acme_corp",
+    "collection": "company_docs",
+    "provider_account_scope": "T12345ACME",
+    "credentials": { "access_token": "xoxp-..." }
+  }'
+```
+</CodeGroup>
+
+The response returns the new connector:
+
+```json
+{
+  "connector_id": "{connector_id}",
+  "provider": "slack",
+  "name": "acme-engineering",
+  "database": "acme_corp",
+  "collection": "company_docs",
+  "provider_account_scope": "T12345ACME",
+  "lifecycle": "pending_setup",
+  "sync_status": "idle",
+  "sync_interval_seconds": 3600,
+  "message": "Connector created. Configure resources to start syncing; the first scheduled sync runs in about 5 minutes."
+}
+```
+
+Keep `connector_id`: every later call uses it.
+
+</Accordion>
+
+### Step 3: Discover what the credentials can reach
+
+[`GET /connectors/{id}/discover`](/api-reference/endpoint/discover-connector-resources) asks Slack which channels the token can see; for GitHub it returns repositories, and for Notion it returns pages and databases. Each entry has an `id`, a `name`, and a `resource_type`, which you pass to the next call. Providers that sync a whole account return one entry with `id` `all`.
+
+<Accordion title="Discover Slack channels: Python, TypeScript, or cURL">
+
+<CodeGroup>
+```python Python SDK
+found = client.connectors.discover(connector_id)
+for resource in found.resources:
+    print(resource.id, resource.name, resource.resource_type)
+```
+```typescript TypeScript SDK
+const found = await client.connectors.discover({ id: connectorId });
+for (const resource of found.resources ?? []) {
+  console.log(resource.id, resource.name, resource.resourceType);
+}
+```
+```bash cURL
+curl 'https://api.hydradb.com/connectors/{id}/discover' \
+  -H "Authorization: Bearer $HYDRADB_API_KEY" \
+  -H "API-Version: 2"
+```
+</CodeGroup>
+
+```json
+{
+  "provider": "slack",
+  "resources": [
+    { "id": "C_GENERAL", "name": "general", "resource_type": "channel" },
+    { "id": "C_ENG", "name": "engineering", "resource_type": "channel" }
+  ]
+}
+```
+
+For providers with many resources, page with `limit` (1 to 100) and `cursor`, and keep going while `has_more` is `true`.
+
+</Accordion>
+
+### Step 4: Configure the resources to sync
+
+[`POST /connectors/{id}/configure`](/api-reference/endpoint/configure-connector) activates the resources you choose and starts the first sync right away. The example keeps both channels in the connector's collection and tags each with a `department`, so one query searches both and a filter can narrow to one.
+
+<Accordion title="Configure two channels: Python, TypeScript, or cURL">
+
+<CodeGroup>
+```python Python SDK
+result = client.connectors.configure(
+    connector_id,
+    lookback_days=30,
+    resources=[
+        {
+            "resource_id": "C_GENERAL",
+            "resource_type": "channel",
+            "name": "general",
+            "metadata": {"department": "all-hands"},
+            "additional_metadata": {"internal_label": "general-slack"},
+        },
+        {
+            "resource_id": "C_ENG",
+            "resource_type": "channel",
+            "name": "engineering",
+            "metadata": {"department": "engineering"},
+        },
+    ],
+)
+print(result.configured)
+```
+```typescript TypeScript SDK
+const result = await client.connectors.configure({
+  id: connectorId,
+  lookbackDays: 30,
+  resources: [
+    {
+      resourceId: "C_GENERAL",
+      resourceType: "channel",
+      name: "general",
+      metadata: { department: "all-hands" },
+      additionalMetadata: { internal_label: "general-slack" },
+    },
+    {
+      resourceId: "C_ENG",
+      resourceType: "channel",
+      name: "engineering",
+      metadata: { department: "engineering" },
+    },
+  ],
+});
+console.log(result.configured);
+```
+```bash cURL
+curl -X POST 'https://api.hydradb.com/connectors/{id}/configure' \
+  -H "Authorization: Bearer $HYDRADB_API_KEY" \
+  -H "API-Version: 2" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "lookback_days": 30,
+    "resources": [
+      {
+        "resource_id": "C_GENERAL",
+        "resource_type": "channel",
+        "name": "general",
+        "metadata": { "department": "all-hands" },
+        "additional_metadata": { "internal_label": "general-slack" }
+      },
+      {
+        "resource_id": "C_ENG",
+        "resource_type": "channel",
+        "name": "engineering",
+        "metadata": { "department": "engineering" }
+      }
+    ]
+  }'
+```
+</CodeGroup>
+
+```json
+{
+  "connector_id": "{connector_id}",
+  "configured": 2,
+  "backfill": false,
+  "first_sync_at": "2026-06-01T13:00:00Z",
+  "message": "First sync is running. Data usually appears within a few minutes; the connector reports lifecycle 'ingesting' until data has synced."
+}
+```
+
+`configured` is the number of resources saved. A `warnings` list names resources that were saved but returned no records when HydraDB tested them; they stay configured and index nothing until they have data.
+
+</Accordion>
+
+### What each property means
+
+| Property | Call | What it is |
+|---|---|---|
+| `provider` | create | A `provider` value from the catalog, such as `slack`, `github`, or `notion`. |
+| `name` | create | A label for this connector. Optional, and it cannot be changed later. |
+| `database`, `collection` | create | Where synced data goes. `database` must already exist. Each resource can route somewhere else with its own `collection` or `database`. |
+| `provider_account_scope` | create | Which external account this connector belongs to, such as a Slack workspace id. It is part of the deduplication key of every synced source, so sources from two accounts never overwrite each other. [Set it per provider](#set-the-account-scope-per-provider). |
+| `credentials` | create | The provider's credentials, in the shape of its `credential_schema`. Credentials that do not match the schema are rejected with `422`. |
+| `custom_instructions` | create, configure | Guidance for how synced documents are interpreted, for the whole connector or for one resource. See [section 4](#4-custom-ingestion-instructions). |
+| `sync_interval_seconds` | create | How often scheduled syncs run. Omit it for the provider default, one hour for most providers. |
+| `enforce_acl` | create, update | Whether reads from this connector always enforce ACL for the authenticated caller. Optional and `false` by default. Only workspace owners and writers can set it, and enabling it requires a provider with `acl_supported`. See [ACL enforcement](#enforce-acl). |
+| `lookback_days` | configure | How much history the first sync fetches (default `30`). After that, each sync fetches only what is new. Above 30, some providers fetch the older history in the background and the response reports `backfill: true`. |
+| `resource_id`, `resource_type`, `name` | configure | The `id`, `resource_type`, and `name` of an entry from discover. Send all three every time you list a resource. |
+| `metadata` | configure | Fields merged into the database metadata of every source from this resource. Declare the ones you filter on in your database's [metadata schema](/essentials/metadata). |
+| `additional_metadata` | configure | Free-form fields merged into the additional metadata of every source from this resource. No schema needed. |
+| `acl` | configure | Your own rule for who can read this resource's sources. Omitted means unrestricted. See [Set your own rule on a resource](#set-your-own-rule-on-a-resource). |
+
+<a id="provider_account_scope"></a>
+
+### Set the account scope per provider
+
+- **Slack:** the workspace id, which starts with `T`. Open Slack in a browser: it is the `T...` segment of `app.slack.com/client/T.../`.
+- **GitHub:** the organization or user login from your GitHub URL, as in `github.com/my-github-org`.
+- **Linear:** the workspace name shown in Settings, under Workspace.
+- **Notion:** the workspace name shown at the top of Settings, under Workspace.
+- **Gmail:** leave it empty. To scope queries to one mailbox, filter on `account_email` in `additional_metadata` instead.
+
+<a id="linear-workspace-documents"></a>
+
+### Linear workspace documents
+
+Linear documents do not belong to one team or project, so they sync as one always-present resource. Discovery returns it alongside the teams and projects, and you configure it like any other resource. Each document is indexed as a `knowledge_base` app source. Its Markdown body is searchable, and files uploaded to it (hosted on `uploads.linear.app`) are downloaded, parsed, and indexed too. Links to external URLs are kept as metadata, not fetched.
+
+<Accordion title="The Linear workspace resource in discover and configure: JSON">
+
+<CodeGroup>
+```json Discover entry
+{
+  "id": "linear_workspace",
+  "name": "Workspace Documents",
+  "resource_type": "linear_workspace"
+}
+```
+```json Configure entry
+{
+  "resource_id": "linear_workspace",
+  "resource_type": "linear_workspace",
+  "name": "Workspace Documents"
+}
+```
+</CodeGroup>
+
+The documents go to the connector's collection; add `collection` to route them elsewhere. In the dashboard, tick "Workspace Documents" in the resource list, the same way you tick a team or project.
+
+</Accordion>
+
+## 2. Check that it is syncing
+
+Data usually appears within a few minutes of configure. [`GET /connectors/{id}/status`](/api-reference/endpoint/get-connector-status) reports the connector and each resource in one call.
+
+<Accordion title="Check connector status: Python, TypeScript, or cURL">
+
+<CodeGroup>
+```python Python SDK
+status = client.connectors.status(connector_id)
+print(status.status, status.lifecycle)
+```
+```typescript TypeScript SDK
+const status = await client.connectors.status({ id: connectorId });
+console.log(status.status, status.lifecycle);
+```
+```bash cURL
+curl 'https://api.hydradb.com/connectors/{id}/status' \
+  -H "Authorization: Bearer $HYDRADB_API_KEY" \
+  -H "API-Version: 2"
+```
+</CodeGroup>
+
+</Accordion>
+
+`status` is the overall health, such as `healthy`, `degraded`, or `failed`, and `lifecycle` is what the connector is doing: `ingesting` until the first sync lands data, then `active`. Each resource reports its own result, with an `action` when it failed. [Get Connector Status](/api-reference/endpoint/get-connector-status) explains every value.
+
+From then on, HydraDB syncs every active resource every `sync_interval_seconds` (one hour by default). Each sync fetches only what changed since the resource's saved position (its cursor) and ingests it as app sources. Call [`POST /connectors/{id}/sync`](/api-reference/endpoint/sync-connector) when you need data sooner; a `202` means the sync was started, not that it finished.
+
+Once `lifecycle` is `active`, query the data with [`POST /query`](/api-reference/endpoint/query) like any other knowledge. [Section 5](#5-filter-on-what-hydradb-writes) shows how to scope a query to one connector or one channel.
+
+<a id="changing-a-connector-after-setup"></a>
+
+## 3. Change a connector after setup
+
+Use the call that matches what you want to change. The update calls change only the fields you send.
+
+- **One resource's instructions or ACL:** [Update Connector Resource](/api-reference/endpoint/update-connector-resource), `PATCH /connectors/{id}/resources/{resource_id}`.
+- **The connector's instructions, sync interval, or credentials:** [Update Connector](/api-reference/endpoint/update-connector), `PATCH /connectors/{id}`. Sending `credentials` reconnects the connector after a token expired or was revoked; it keeps its id, resources, and sync positions.
+- **Which resources sync, and their collection or metadata:** call [Configure Connector](/api-reference/endpoint/configure-connector) again. Resources you leave out are not touched. For each resource you list, send `name` and `resource_type` again, because omitted values are cleared. Its sync position, instructions, and ACL are kept.
+- **Stop syncing a resource:** [Delete Connector Resource](/api-reference/endpoint/delete-connector-resource).
+- **Stop syncing for a while:** [Pause Connector](/api-reference/endpoint/pause-connector), then [Resume Connector](/api-reference/endpoint/resume-connector). Each resource resumes from its saved position, so nothing created in the meantime is skipped.
+- **Remove the connector:** [Delete Connector](/api-reference/endpoint/delete-connector).
+
+<Warning>
+  `POST /connectors/{id}/resources` adds new resources only. On a `resource_id` that already exists, it returns `409` and changes nothing. To edit a resource, use configure or `PATCH /connectors/{id}/resources/{resource_id}`.
+</Warning>
+
+<a id="custom-ingestion-instructions"></a>
+
+## 4. Custom ingestion instructions
+
+A custom ingestion instruction is free text that a connector reads at sync time and includes when it extracts entities and relationships from every document it syncs. Use one to explain what the documents do not spell out: a product rename, what a channel is for, or what an internal term means.
+
+Suppose your product was renamed from *Aurora* to *Nimbus*. Years of Slack threads and Confluence pages mention only the old name, so a search for "Nimbus" misses them. One instruction on the connector fixes that at ingestion time, with no reconnection.
+
+<Accordion title="Set an instruction on a connector: Python, TypeScript, or cURL">
+
+<CodeGroup>
+```python Python SDK
+client.connectors.update(
+    connector_id,
+    custom_instructions=(
+        "Aurora was renamed to Nimbus in January 2025; they are the same product. "
+        "Index all Aurora content under the canonical name Nimbus and record Aurora as a former name."
+    ),
+)
+```
+```typescript TypeScript SDK
+await client.connectors.update({
+  id: connectorId,
+  customInstructions:
+    "Aurora was renamed to Nimbus in January 2025; they are the same product. " +
+    "Index all Aurora content under the canonical name Nimbus and record Aurora as a former name.",
+});
+```
+```bash cURL
+curl -X PATCH 'https://api.hydradb.com/connectors/{id}' \
+  -H "Authorization: Bearer $HYDRADB_API_KEY" \
+  -H "API-Version: 2" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "custom_instructions": "Aurora was renamed to Nimbus in January 2025; they are the same product. Index all Aurora content under the canonical name Nimbus and record Aurora as a former name."
+  }'
+```
+</CodeGroup>
+
+</Accordion>
+
+From the next sync, documents that mention only Aurora are extracted under the Nimbus entity, with alias links to the old name, so new-name queries reach old-name documents through the context graph. The same works for focus ("prioritize decisions, owners, and deadlines; ignore social chatter"), interpretation ("threads in this workspace are incident retros; extract root cause and remediation"), and vocabulary ("SEV1 and SEV2 are incident severities, not product names"). An instruction can also be set when you create the connector, or from the dashboard's **Instructions** button.
+
+**Connector default and resource override:** an instruction on the connector applies to every resource without one of its own. An instruction on a resource, such as one Slack channel or one Jira project, **replaces** the connector default for that resource's documents rather than adding to it. Set a resource's instruction with `custom_instructions` in configure, or afterwards on its own:
+
+<Accordion title="Override one channel, then clear the override: Python, TypeScript, or cURL">
+
+<CodeGroup>
+```python Python SDK
+client.connectors.update_resource_acl(
+    connector_id,
+    "C_INCIDENTS",
+    request={"custom_instructions": "These are incident retros; extract root cause, impact, and owner."},
+)
+
+# Clear it, so the channel uses the connector default again.
+client.connectors.update_resource_acl(
+    connector_id, "C_INCIDENTS", request={"custom_instructions": ""}
+)
+```
+```typescript TypeScript SDK
+await client.connectors.updateResourceAcl({
+  id: connectorId,
+  resourceId: "C_INCIDENTS",
+  customInstructions: "These are incident retros; extract root cause, impact, and owner.",
+});
+
+// Clear it, so the channel uses the connector default again.
+await client.connectors.updateResourceAcl({
+  id: connectorId,
+  resourceId: "C_INCIDENTS",
+  customInstructions: "",
+});
+```
+```bash cURL
+curl -X PATCH 'https://api.hydradb.com/connectors/{id}/resources/C_INCIDENTS' \
+  -H "Authorization: Bearer $HYDRADB_API_KEY" \
+  -H "API-Version: 2" \
+  -H "Content-Type: application/json" \
+  -d '{ "custom_instructions": "These are incident retros; extract root cause, impact, and owner." }'
+
+# Clear it, so the channel uses the connector default again.
+curl -X PATCH 'https://api.hydradb.com/connectors/{id}/resources/C_INCIDENTS' \
+  -H "Authorization: Bearer $HYDRADB_API_KEY" \
+  -H "API-Version: 2" \
+  -H "Content-Type: application/json" \
+  -d '{ "custom_instructions": "" }'
+```
+</CodeGroup>
+
+In TypeScript (SDK 2.1.8 or later), `updateResourceAcl` takes `customInstructions` and `acl` as top-level fields.
+
+</Accordion>
+
+An empty string clears an instruction; leaving the field out keeps it, so configuring again never strips a tuned resource. [`GET /connectors/{id}`](/api-reference/endpoint/get-connector) returns the connector's instruction, and [`GET /connectors/{id}/resources`](/api-reference/endpoint/connector-resources) returns each resource's, absent when the resource inherits. In the dashboard, the **Instructions** dialog lists both levels, each resource marked **override** or **inherits**.
+
+Before you write one:
+
+- **Future syncs only:** documents already indexed are not indexed again; each keeps the instruction it was ingested under. Set instructions before the first sync when you can.
+- **Up to 4,000 characters:** longer values are rejected with `400`, and the stored value stays as it was.
+- **Cost:** the text goes into the extraction prompt for every synced document, so a long instruction on a busy connector costs on every sync. Say what matters and stop.
+- **Be explicit:** "X was renamed to Y; they are the same product; index under Y" works far better than vague guidance. Name the exact terms and keep unrelated rules in separate sentences.
+- **Interpretation only:** instructions do not change which documents sync, where they are stored, or who can read them. Use resource selection, collections, and [ACLs](/essentials/query#6-query-on-behalf-of-a-user) for those.
+
+<a id="metadata-on-synced-objects"></a>
+<a id="inspect-what-a-connector-stores"></a>
+<a id="4-filter-on-what-hydradb-writes"></a>
+
+## 5. Filter on what HydraDB writes
+
+Every source a connector syncs carries two metadata layers, the same two that [Metadata](/essentials/metadata) describes for all context.
+
+`metadata` contains fields declared in your database's metadata schema. Filter them with top-level `metadata_filters` keys. HydraDB always writes `connector_id` and `provider` here for every synced source. Your own `metadata` from configure is merged first, so `connector_id` and `provider` win on conflict.
+
+`additional_metadata` contains free-form fields and needs no schema. HydraDB always writes `connector_id` and `resource_id` here, plus provider-native fields such as a Slack message timestamp, a GitHub issue number, or a Linear identifier. Your own `additional_metadata` from configure is merged first, so provider-generated fields win on conflict.
+
+This is the layer to filter on to scope a query to one connector, channel, repository, or table:
+
+<Accordion title="Scope a query to one connector: JSON">
+
+```json Querying with a metadata filter
+{
+  "database": "acme_corp",
+  "query": "deployment checklist",
+  "metadata_filters": {
+    "additional_metadata": {
+      "connector_id": "{connector_id}"
+    }
+  }
+}
+```
+
+Filter on `resource_id` the same way to scope to one channel, repository, or table.
+
+</Accordion>
+
+To see which provider-native fields a connector writes, call [`GET /connectors/providers?id={provider}`](/api-reference/endpoint/list-connector-providers). Its `filterable_fields` each carry the `filter_key` to use in `metadata_filters`. Its `searchable_fields` are combined into each document's searchable text, so you search them together, not one at a time.
+
+## 6. ACL on synced content
+
+For supported providers, HydraDB captures the provider's ACL on every sync, so you do not maintain a second access model. Capture and enforcement are separate: the connector's `enforce_acl` setting controls ACL enforcement on reads. [Query](/essentials/query#6-query-on-behalf-of-a-user) explains principals and what a query's `acl` matches. To change a source's ACL, use [Update Source Metadata](/api-reference/endpoint/update-source-metadata).
+
+`enforce_acl` is `false` by default. Omitting it on create leaves the new connector unenforced, and existing connectors remain unenforced until an owner or writer enables it. While it is `false`, access control is opt-in on each request: send the caller's identity in `acl` to filter content, and a request without `acl` is not filtered by caller identity. This holds for content from a non-enforced connector even when the same request also reads content from an enforced connector. MCP OAuth does not enforce caller identity for a non-enforced connector; send `acl` when that request needs caller filtering.
+
+### What each provider captures
+
+| Provider | ACL HydraDB captures |
+|---|---|
+| **Slack** | Public channels are visible workspace-wide; private channels only to their members, resolved to member emails. |
+| **Google Drive** | Per-file sharing: user, group, domain, and public grants. ACL-only changes are picked up through the Drive changes feed, even when the file content does not change. |
+| **GitHub** | Repository visibility. Private repos additionally capture the collaborator list when every collaborator has a visible public email; otherwise your resource rule governs. |
+| **Confluence** | Space-level view ACLs, with groups expanded to member emails, plus per-page view restrictions. |
+| **Jira** | Who holds Browse access per project, plus per-issue security levels. |
+
+Capture is also built for GitLab, Linear, Dropbox, Zendesk, PagerDuty, Typeform, Attio, LaunchDarkly, ServiceNow, Microsoft Teams, and Outlook, and is switched on per provider. The [provider catalog](/api-reference/endpoint/list-connector-providers) reports capture support in `acl_supported` and summarizes it in `acl_description`. Check [Get Connector Status](/api-reference/endpoint/get-connector-status) for an `acl_warning` after the first sync. For any other provider, [set your own rule on the resource](#set-your-own-rule-on-a-resource).
+
+### Google Drive files shared with a group
+
+This section applies only to Google Drive. No other connector expands groups this way or reports this check.
+
+A Drive file shared with a Google Group carries the grant `group:google:<group email>`. To let group members read it, HydraDB reads the group's members through the Google Workspace Directory API. That needs a Drive connection made by a Workspace admin with Directory access.
+
+When you connect Google Drive, HydraDB checks this access once. The connection check reports the result as `google_group_membership_resolves`, and the dashboard shows it as a notice:
+
+- `true`: group membership can be read. Members of a group can read the files shared with that group.
+- `false`: group membership cannot be read. A file shared only through a group keeps its `group:google:` grant, which no caller matches, so the file stays restricted. With ACL enforcement on, group members cannot see it. A request `acl` sees it only if it names the group. The same applies to a group too large to expand.
+
+To fix `false`, reconnect Google Drive as a Workspace admin with Directory access.
+
+### Enforce ACL
+
+Set `enforce_acl` to `true` to make reads from this connector use the authenticated caller's identity against the ACL HydraDB captured. The provider must report `acl_supported: true` in [List Connector Providers](/api-reference/endpoint/list-connector-providers). Set it on [`POST /connectors`](/api-reference/endpoint/create-connector), or enable or change it later with [`PATCH /connectors/{id}`](/api-reference/endpoint/update-connector). In the dashboard, an owner or writer can use the **Enforce ACL** control in the connector settings. A change takes effect on the next content request for already-synced sources and does not require re-ingestion.
+
+HydraDB decides which providers report `acl_supported`. If it stops reporting it for a provider, that provider's connectors stop enforcing within about a minute and keep their stored `enforce_acl` value. Enforcement resumes when support returns.
+
+Only workspace owners and writers can set or change `enforce_acl`; readers can view it. The API requires an owner or writer in a signed-in dashboard session: a request authenticated with an API key can create a connector with the default `false` value, but cannot choose or change the setting.
+
+When enforcement is enabled, HydraDB selects the identity from authentication rather than trusting a caller-supplied `acl`:
+
+- **API key or pasted-key MCP:** the email of the person who created the key.
+- **MCP OAuth:** the signed-in user.
+- **Dashboard:** the signed-in user.
+
+If a content-read request includes `acl`, HydraDB ignores it for content from connectors with enforcement enabled; the `acl` still scopes content from non-enforced connectors. A successful response includes exactly one machine-readable warning for the override in `meta.warnings`:
+
+```json
+{
+  "meta": {
+    "warnings": [
+      {
+        "code": "acl_ignored_by_connector_enforcement",
+        "message": "This connector enforces ACL, so the request's acl was ignored."
+      }
+    ]
+  }
+}
+```
+
+An API key stays tied to its creator. When a member is removed from the workspace, or leaves it, every API key they created in that workspace is revoked. Re-inviting them does not restore those keys; they create new ones. Another member must use a key created under their own account.
+
+### Set your own rule on a resource
+
+Every source synced from a resource inherits the resource's rule. Set it in `acl` at configure time, or afterwards on its own:
+
+<Accordion title="Restrict one channel to one person: Python, TypeScript, or cURL">
+
+<CodeGroup>
+```python Python SDK
+client.connectors.update_resource_acl(
+    connector_id, "C_LEADERSHIP", request={"acl": ["grace@acme.com"]}
+)
+```
+```typescript TypeScript SDK
+await client.connectors.updateResourceAcl({
+  id: connectorId,
+  resourceId: "C_LEADERSHIP",
+  acl: ["grace@acme.com"],
+});
+```
+```bash cURL
+curl -X PATCH 'https://api.hydradb.com/connectors/{id}/resources/C_LEADERSHIP' \
+  -H "Authorization: Bearer $HYDRADB_API_KEY" \
+  -H "API-Version: 2" \
+  -H "Content-Type: application/json" \
+  -d '{ "acl": ["grace@acme.com"] }'
+```
+</CodeGroup>
+
+</Accordion>
+
+The change applies to already-synced sources on the next query, with no re-sync. A source's own ACL from the provider wins at the next sync.
+
+If HydraDB cannot read a resource ACL from the provider, [Get Connector Status](/api-reference/endpoint/get-connector-status) reports an `acl_warning` until the next successful read. Your own resource rule still applies; a resource with no rule is readable by everyone.
+
+### Restore resource permissions
+
+To remove a source's own ACL and use its connector resource permissions again, send `acl_inherit: true` without `acl` to [Update Source Metadata](/api-reference/endpoint/update-source-metadata). Use the ID of a source synced by a configured connector. Uploads and manually ingested sources have no connector resource to inherit from.
+
+```bash cURL
+curl -X PATCH 'https://api.hydradb.com/context/confluence-page-9f62/metadata' \
+  -H "Authorization: Bearer $HYDRADB_API_KEY" \
+  -H "API-Version: 2" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "database": "acme_corp",
+    "collection": "engineering",
+    "acl_inherit": true
+  }'
+```
+
+`acl` combined with `acl_inherit: true` is invalid. `acl_inherit: false` or an omitted `acl_inherit` is a no-op and can accompany `acl`. HydraDB rejects inheritance for uploads and sources without connector resource attribution.
+
+<Warning>
+Inheritance takes effect immediately and can widen access if the resource allows more people than the source's own ACL. The source then follows future permission changes from that resource. Provider-specific source permissions can replace the inherited state on a later sync because ACL writes use last-writer-wins behavior.
+</Warning>
+
+Deleting a connector resource rule does not widen access on its own. To open a restricted resource, set its ACL to `["__public__"]`.
+
+<a id="multiple-connectors-per-provider"></a>
+<a id="6-connect-several-accounts-of-one-provider"></a>
+
+## 7. Connect several accounts of one provider
+
+One provider can have several connectors: two Slack workspaces, two GitHub organizations, or a personal and a work Gmail. Each is independent, with its own credentials and resources. Give each Slack, GitHub, Linear, or Notion connector a distinct `provider_account_scope`; otherwise sources from two accounts that share an external id overwrite each other in the same database and collection. Gmail has no account scope; tell mailboxes apart with `account_email`.
+
+All of them can sync into the same collection, so one query searches every account; filter on `connector_id` to narrow to one. If one account's data must never meet the others in a query, set `collection` per resource in [configure](#step-4-configure-the-resources-to-sync).
+
+## Common mistakes
+
+- **Editing an existing resource with `POST /connectors/{id}/resources`:** the call returns `409` and changes nothing. Use `PATCH /connectors/{id}/resources/{resource_id}` for instructions and ACLs, or configure again for routing and metadata.
+- **Reconfiguring without `name` and `resource_type`:** omitted values are cleared. Send both every time you list a resource.
+- **Expecting a resource instruction to add to the connector default:** the resource instruction replaces the connector default. Repeat anything from the default that the resource still needs.
+- **Two accounts of one provider with the same `provider_account_scope`:** sources that share an external id overwrite each other. Set a distinct scope per account.
+- **Filtering on a provider field as a top-level key:** provider-native fields live in `additional_metadata`. Use the `filter_key` from the provider description.
+- **Querying before the first sync has landed:** `lifecycle` reads `ingesting` until then. Wait for `active`, or check `GET /connectors/{id}/status`.
+
+## Related
+
+- [Connectors API reference](/api-reference/endpoint/connectors-overview): every endpoint, and which one changes what
+- [Context](/essentials/context#send-app-sources): the ingestion model synced sources use, and how to ingest from your own integration
+- [Metadata](/essentials/metadata): schema-backed and free-form metadata
+- [Databases and Collections](/essentials/databases-and-collections): routing resources to databases and collections
+- [Query](/essentials/query): querying connector-synced data

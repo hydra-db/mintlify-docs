@@ -20,9 +20,8 @@ def page_paths(value):
 
 def generate():
     config = json.loads((ROOT / "docs.json").read_text())
-    versions = {version["version"]: page_paths(version) for version in config["navigation"]["versions"]}
-    legacy = versions["v1"] - versions["v2"] - {"continuity-assurance"}
-    groups = {"Current v2 documentation": [], "Integration and connector details": [], "Site information": [], "Legacy v1 reference (not maintained)": []}
+    current_pages = page_paths(config["navigation"])
+    groups = {"Documentation": [], "Integration and connector details": [], "Site information": []}
     for directory, subdirs, files in os.walk(ROOT):
         subdirs[:] = sorted(name for name in subdirs if not name.startswith(".") and name not in {"node_modules", "archive", "snippets"})
         for filename in sorted(files):
@@ -33,17 +32,17 @@ def generate():
             title = re.search(r'^title:\s*[\'\"]?(.*?)[\'\"]?\s*$', path.read_text(), re.M)
             title = title.group(1) if title else slug
             title = title.replace("[", "\\[").replace("]", "\\]")
-            if slug in legacy:
-                group = "Legacy v1 reference (not maintained)"
-            elif slug in versions["v2"] or "/v2/" in slug:
-                group = "Current v2 documentation"
+            if slug in current_pages or slug.startswith(("get-started/", "essentials/", "api-reference/", "cookbooks/")):
+                group = "Documentation"
             elif slug.startswith(("plugins/", "connectors/")):
                 group = "Integration and connector details"
             else:
                 group = "Site information"
             groups[group].append((slug, f"- [{title}](https://docs.hydradb.com/{slug}.md)"))
-    lines = ["# HydraDB Documentation", "", "> Documentation for HydraDB's supported v2 API, SDKs, integrations, and cookbooks. Legacy v1 pages are listed separately and aren't compatible with current SDK installs.", "", "Start with the v2 quickstart. The Agent Integration Guide explains the API contract; this index lists every non-archive documentation page, including linked detail pages outside the navigation."]
+    lines = ["# HydraDB Documentation", "", "> Documentation for HydraDB's API, SDKs, integrations, and cookbooks.", "", "Start with the quickstart. The Agent Integration Guide explains the API contract; this index lists every non-archive documentation page, including linked detail pages outside the navigation."]
     for heading, pages in groups.items():
+        if not pages:
+            continue
         lines.extend(["", f"## {heading}", ""])
         lines.extend(line for _, line in sorted(pages))
     return "\n".join(lines) + "\n"

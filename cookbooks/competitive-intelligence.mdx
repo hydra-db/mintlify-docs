@@ -1,0 +1,160 @@
+---
+title: "Build your own competitive intelligence agent"
+sidebarTitle: "Revenue engine"
+description: "A tracker that ingests competitor pricing pages, releases, and job posts, and always answers from the current version."
+---
+
+import Setup from "/snippets/cookbook-setup.mdx";
+
+Competitor signals go stale fast: a pricing page changes, and last quarter's version is now the wrong answer that looks most like the right one. This cookbook builds a tracker around two ideas: a stable ID per page, so a new version replaces the old one, and a metadata filter per competitor, so one company's signals never answer a question about another.
+
+| Benchmark | Result | What it shows here |
+| --- | --- | --- |
+| [KyroBench](https://benchmarks.hydradb.com/kyrobench) | 0.776 nDCG, 0.338 above the best baseline | The current, in-scope source ranked above stale and out-of-scope look-alikes |
+| [FinanceBench](https://benchmarks.hydradb.com/financebench) | 91.4% recall@10 | Exact figures found in dense filings |
+
+<Setup />
+
+## 1. Create a database with a metadata schema
+
+Declare the fields you will filter on when you create the database. [Metadata filters](/essentials/metadata) work only on declared fields.
+
+```python intel.py
+import json
+
+from hydra import answer, client, create_database, source_ids, wait_indexed
+
+DATABASE, COLLECTION = "market_intel", "signals"
+
+
+def text_field(name):
+    return {
+        "name": name,
+        "data_type": "VARCHAR",
+        "max_length": 128,
+        "enable_dense_embedding": False,
+        "enable_sparse_embedding": False,
+    }
+
+
+create_database(DATABASE, schema=[text_field("competitor"), text_field("signal")])
+```
+
+## 2. Ingest signals with stable IDs
+
+Send each page as an [app source](/essentials/context#send-app-sources) with the competitor and signal type in `metadata`. Build the `id` from the page, not from the day you fetched it: ingesting the same `id` again replaces the stored version, because `upsert` defaults to `true`.
+
+```python intel.py
+def signal(source_id, competitor, kind_of_signal, title, body, fetched_at, url):
+    return {
+        "id": source_id,
+        "title": title,
+        "kind": "knowledge_base",
+        "provider": "web",
+        "external_id": source_id,
+        "url": url,
+        "timestamp": fetched_at,
+        "fields": {"kind": "knowledge_base", "title": title, "body": body, "updated_at": fetched_at},
+        "metadata": {"competitor": competitor, "signal": kind_of_signal},
+    }
+
+
+def ingest(signals):
+    result = client.context.ingest(
+        type="knowledge",
+        database=DATABASE,
+        collection=COLLECTION,
+        app_knowledge=json.dumps(signals),
+    )
+    # A source must finish indexing before the same id is ingested again.
+    wait_indexed(DATABASE, COLLECTION, source_ids(result))
+
+
+ingest([
+    signal("northwind_pricing", "northwind", "pricing", "Northwind pricing",
+           "Team plan: $20 per seat per month. Annual billing only.",
+           "2026-07-01T00:00:00Z", "https://northwind.example/pricing"),
+    signal("northwind_job_ml_lead", "northwind", "hiring", "Northwind: ML Lead, Search",
+           "Lead a new team building semantic search for the Northwind platform.",
+           "2026-09-20T00:00:00Z", "https://northwind.example/careers/ml-lead"),
+    signal("contoso_pricing", "contoso", "pricing", "Contoso pricing",
+           "Team plan: $18 per seat per month, billed monthly or annually.",
+           "2026-08-15T00:00:00Z", "https://contoso.example/pricing"),
+])
+
+# The Northwind pricing page changed. Same id, so this replaces the July version.
+ingest([
+    signal("northwind_pricing", "northwind", "pricing", "Northwind pricing",
+           "Team plan: $24 per seat per month. Monthly billing now available.",
+           "2026-10-05T00:00:00Z", "https://northwind.example/pricing"),
+])
+```
+
+## 3. Query one competitor at a time
+
+Filter on `competitor` so the two near-identical pricing pages cannot be confused. These are the KyroBench settings: hybrid matching, `fast` mode, eight results, graph context off, and a metadata filter for scope. In that report, removing the scope filter dropped recall from 0.917 to 0.185.
+
+```python intel.py
+def ask(competitor, question):
+    result = client.query(
+        database=DATABASE,
+        collection=COLLECTION,
+        query=question,
+        type="knowledge",
+        query_by="hybrid",
+        mode="fast",
+        graph_context=False,
+        max_results=8,
+        metadata_filters={"competitor": {"equals": competitor}},
+    )
+    return answer(question, result, "Cite the source title and its date for every claim.")
+
+
+print(ask("northwind", "What does the Team plan cost?"))
+```
+
+## 4. Write the weekly digest
+
+For a question that spans every signal type, keep the `competitor` filter, switch to `thinking` mode, and raise `recency_bias` so newer signals rank first.
+
+```python intel.py
+def digest(competitor):
+    question = f"What changed at {competitor} recently, and what does it suggest about their roadmap?"
+    result = client.query(
+        database=DATABASE,
+        collection=COLLECTION,
+        query=question,
+        type="knowledge",
+        mode="thinking",
+        recency_bias=0.7,
+        metadata_filters={"competitor": {"equals": competitor}},
+    )
+    return answer(question, result, "Separate what the sources state from what you infer.")
+
+
+print(digest("northwind"))
+```
+
+## Run it
+
+```bash
+python intel.py
+```
+
+The pricing answer should give $24, not $20 and not Contoso's $18. The digest should connect the price rise with the search hiring, and label the roadmap reading as inference.
+
+## Use real data
+
+Run your fetcher on a schedule and call `ingest` with whatever it finds. Unchanged pages can be sent again safely. To be told when a batch finishes indexing instead of polling, register a [webhook](/api-reference/endpoint/webhooks-overview).
+
+## Common mistakes
+
+- **Putting the date in the `id`:** every fetch then adds a new source, and the stale versions compete with the current one.
+- **Filtering on an undeclared field:** the filter matches nothing. Declare the field in the metadata schema first.
+- **A bare filter value:** write `{"competitor": {"equals": "northwind"}}`. Filters without an operator are deprecated.
+
+## Next steps
+
+- [Metadata Filters](/essentials/metadata): operators, multi-value fields, and adding schema fields later.
+- [Query](/essentials/query): `recency_bias` and when to use each `mode`.
+- [Build your own Glean](/cookbooks/glean): the same pattern for knowledge inside your company.

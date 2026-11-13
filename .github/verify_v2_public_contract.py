@@ -10,7 +10,7 @@ from referencing.jsonschema import DRAFT202012
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-SPEC_PATH = ROOT / "api-reference/v2/openapi.json"
+SPEC_PATH = ROOT / "api-reference/openapi.json"
 SPEC = json.loads(SPEC_PATH.read_text())
 SCHEMAS = SPEC["components"]["schemas"]
 ERRORS = []
@@ -77,7 +77,7 @@ def check_schema_types(schema, path):
     shape_keys = {"type", "$ref", "properties", "additionalProperties", "allOf", "oneOf", "anyOf", "enum", "const", "not"}
     passthrough = {
         f"{name}.{field}"
-        for name in ("list.V2SourceItem", "list.V2MemoryItem")
+        for name in ("list.SourceItem", "list.MemoryItem")
         for field in ("relations", "app_relations")
     }
     require(bool(shape_keys & schema.keys()) or path in passthrough,
@@ -134,7 +134,7 @@ list_filters = SCHEMAS["list.ContentFilter"]["properties"]
 require("attributes" not in list_filters, "List Context must not expose unlaunched attributes")
 require("metadata" in list_filters, "List Context must preserve filters.metadata")
 require(not list_filters.get("metadata", {}).get("deprecated"), "List Context filters.metadata must remain supported")
-result = SCHEMAS["search.V2RetrievalResult"]["properties"]
+result = SCHEMAS["search.RetrievalResult"]["properties"]
 for field in ("source_facts", "source_filter", "sources", "app_search_fusion", "temporal_filter"):
     require(field not in result, f"Query result exposes internal field {field}")
 for field in ("chunks", "graph_context", "additional_context", "llm_prompt"):
@@ -156,7 +156,7 @@ security = SPEC["components"]["securitySchemes"]["BearerAuth"]
 require("prefix.secret" not in security.get("description", ""), "Bearer auth must describe the user's API key")
 providers = SPEC["paths"]["/connectors/providers"]["get"]
 require(any("BearerAuth" in rule for rule in providers.get("security", [])), "Provider catalog requires Bearer authentication")
-for name in ("list.V2ListContentRequest", "sources.V2SourceDeleteRequest"):
+for name in ("list.ListContentRequest", "sources.SourceDeleteRequest"):
     require(SCHEMAS[name]["properties"]["type"].get("enum") == ["knowledge", "memory", "all"], f"{name}: preserve combined knowledge and memory requests")
 for path in ("/context/relations", "/context/{id}/subgraph", "/context/subgraph"):
     for parameter in SPEC["paths"][path]["get"].get("parameters", []):
@@ -174,7 +174,7 @@ require(graph_source.get("entity_id") == graph_relation.get("source_entity_id") 
 
 internal_fields = {"attributes", "graph_vector_prune", "graph_vector_prune_spacy_entities", "temporal_intent", "temporal_now"}
 legacy_fields = {"tenant_id", "sub_tenant_id", "sub_tenant_ids", "tenant_metadata_keys", "milvus_sync_required", "milvus_synced", "milvus_rows_synced"}
-pages = sorted((ROOT / "api-reference/v2").rglob("*.mdx")) + [ROOT / "essentials/v2/query.mdx"]
+pages = sorted((ROOT / "api-reference").rglob("*.mdx")) + [ROOT / "essentials/query.mdx"]
 operation_count = 0
 json_count = 0
 response_count = 0
@@ -183,7 +183,7 @@ for page in pages:
     relative = page.relative_to(ROOT)
     require(not re.search(r'<a\s+id="[^"]+"\s*></a>', source), f"{relative}: empty link anchor adds an orange rule")
     require(not re.search(r'<Field name="attributes"', source), f"{relative}: unlaunched attributes parameter")
-    binding = re.search(r'^openapi:\s*"api-reference/v2/openapi.json (\w+) ([^"]+)"', source, re.M)
+    binding = re.search(r'^openapi:\s*"api-reference/openapi.json (\w+) ([^"]+)"', source, re.M)
     if binding:
         method, path = binding.groups()
         require(method.lower() in SPEC.get("paths", {}).get(path, {}), f"{relative}: missing {method} {path}")
@@ -231,4 +231,4 @@ for page in pages:
 if ERRORS:
     print("\n".join(ERRORS), file=sys.stderr)
     sys.exit(1)
-print(f"Verified {len(pages)} V2 pages, {operation_count} endpoint bindings, {json_count} JSON examples, {response_count} response shapes, and all schema references.")
+print(f"Verified {len(pages)} API pages, {operation_count} endpoint bindings, {json_count} JSON examples, {response_count} response shapes, and all schema references.")

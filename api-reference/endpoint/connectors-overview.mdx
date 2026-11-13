@@ -1,0 +1,113 @@
+---
+title: "Connectors: Overview"
+description: "Connect third-party apps and manage the context they sync into your database."
+---
+
+A connector is an authenticated connection to one provider account, such as a Slack workspace or a GitHub organization. It syncs the resources you choose (channels, repositories, tables, folders) into your database on a schedule, with no ingestion code on your side. The [Connectors guide](/essentials/connectors) explains the concepts and walks through setup. This page lists the endpoints, their call sequence, and which endpoint changes what.
+
+## Endpoint references
+
+SDK methods are listed by their Python names. The TypeScript SDK uses the same names in camelCase, such as `connectors.listResources`. `list_providers` is a method on the client itself.
+
+Set up a connector:
+
+| Endpoint | SDK method | Purpose |
+|---|---|---|
+| [`GET /connectors/providers`](/api-reference/endpoint/list-connector-providers) | `list_providers` | List the providers you can connect. Add `?id={provider}` to describe one, including the credentials it needs. |
+| [`POST /connectors`](/api-reference/endpoint/create-connector) | `connectors.create` | Store credentials for one provider account. |
+| [`GET /connectors/{id}/discover`](/api-reference/endpoint/discover-connector-resources) | `connectors.discover` | List the resources the credentials can reach. |
+| [`POST /connectors/{id}/configure`](/api-reference/endpoint/configure-connector) | `connectors.configure` | Activate resources and start the first sync. |
+
+Check on it:
+
+| Endpoint | SDK method | Purpose |
+|---|---|---|
+| [`GET /connectors/{id}/status`](/api-reference/endpoint/get-connector-status) | `connectors.status` | Check whether the connector and each resource are working. |
+| [`GET /connectors`](/api-reference/endpoint/list-connectors) | `connectors.list` | List your connectors and their sync state. |
+| [`GET /connectors/{id}`](/api-reference/endpoint/get-connector) | `connectors.get` | Read one connector's settings. |
+| [`GET /connectors/{id}/resources`](/api-reference/endpoint/connector-resources) | `connectors.list_resources` | Read each resource's settings. |
+| [`POST /connectors/{id}/sync`](/api-reference/endpoint/sync-connector) | `connectors.sync` | Sync now instead of waiting for the schedule. Asynchronous: `202` means the sync started, not that it finished. |
+| [`POST /connectors/{id}/pause`](/api-reference/endpoint/pause-connector) | `connectors.pause` | Pause scheduled syncs. |
+| [`POST /connectors/{id}/resume`](/api-reference/endpoint/resume-connector) | `connectors.resume` | Resume scheduled syncs. |
+
+Change it:
+
+| Endpoint | SDK method | Purpose |
+|---|---|---|
+| [`PATCH /connectors/{id}`](/api-reference/endpoint/update-connector) | `connectors.update` | Change the sync interval, connector-level instructions, credentials, or ACL enforcement. |
+| [`PATCH /connectors/{id}/resources/{resource_id}`](/api-reference/endpoint/update-connector-resource) | `connectors.update_resource_acl` | Change one resource's instructions or ACL. |
+| [`POST /connectors/{id}/resources`](/api-reference/endpoint/add-connector-resource) | `connectors.create_resource` | Add one new resource. |
+| [`DELETE /connectors/{id}/resources/{resource_id}`](/api-reference/endpoint/delete-connector-resource) | `connectors.delete_resource` | Stop syncing a resource. |
+| [`DELETE /connectors/{id}`](/api-reference/endpoint/delete-connector) | `connectors.delete` | Delete the connector. |
+
+## Typical call sequence
+
+1. `POST /connectors` with the provider's credentials.
+2. `GET /connectors/{id}/discover` to see which resources are available.
+3. `POST /connectors/{id}/configure` with the resources to sync. This starts the first sync.
+4. `GET /connectors/{id}/status` until `status` is `healthy` and `lifecycle` is `active`.
+5. `POST /query` to search the database and collection chosen during configuration. `query_apps` is enabled by default. For content from connectors without ACL enforcement, send the caller's identity as `acl`; omitting it leaves those results unfiltered. Connectors with ACL enforcement use the authenticated caller instead. See [ACL on synced content](/essentials/connectors#enforce-acl).
+
+After that, syncs run every `sync_interval_seconds` (one hour by default). Syncs are incremental: each one fetches only what changed since each resource's saved sync position. Call `POST /connectors/{id}/sync` only when you need data sooner.
+
+## Which endpoint changes what
+
+The `PATCH` endpoints change only the fields you send.
+
+- **Instructions or ACL on one resource:** `PATCH /connectors/{id}/resources/{resource_id}`.
+- **Instructions, sync interval, credentials, or ACL enforcement for the whole connector:** `PATCH /connectors/{id}`. Setting `enforce_acl` needs a dashboard session; see [Authentication](#authentication).
+- **Name, type, database, collection, or metadata of a resource:** `POST /connectors/{id}/configure`. Resources you leave out of the list are not touched. For each resource you list, send `name` and `resource_type` every time, and `collection` if the resource has one, because omitted values are cleared. Its sync position, instructions, and ACL are kept.
+- **A new resource:** `POST /connectors/{id}/configure` or `POST /connectors/{id}/resources`. `POST /connectors/{id}/resources` adds new resources only: on an existing `resource_id` it returns `409` and changes nothing.
+
+In paths, `{resource_id}` is the resource's id as returned by `GET /connectors/{id}/discover` and `GET /connectors/{id}/resources`, for example a Slack channel id or a Supabase `schema.table` name. URL-encode it when it contains spaces or other reserved characters.
+
+## Authentication
+
+Connector API requests use your HydraDB API key:
+
+```http
+Authorization: Bearer $HYDRADB_API_KEY
+API-Version: 2
+```
+
+`enforce_acl` is the exception. Only workspace owners and writers in a signed-in dashboard session can set it. Readers can view the current setting but cannot change it, and API-key-authenticated requests cannot set it.
+
+## Metadata on synced sources
+
+Every source a connector syncs carries two metadata layers. The guide covers both in [Filter on what HydraDB writes](/essentials/connectors#metadata-on-synced-objects).
+
+`metadata` contains fields declared in your database's metadata schema and indexed for exact-match filtering. HydraDB always writes `connector_id` and `provider` here. Add your own fields per resource with `metadata` on [Configure Connector](/api-reference/endpoint/configure-connector). The system fields win on conflict.
+
+`additional_metadata` contains free-form fields and needs no schema. HydraDB always writes `connector_id` and `resource_id` here, plus provider-specific fields that [List Connector Providers](/api-reference/endpoint/list-connector-providers) shows under `filterable_fields` when called with `?id={provider}`. Add your own per resource with `additional_metadata` on Configure Connector. Provider-generated fields win on conflict.
+
+To scope a query to one connector, filter on `connector_id`:
+
+```json Querying with a metadata filter
+{
+  "database": "acme_corp",
+  "collection": "company_docs",
+  "query": "deployment checklist",
+  "metadata_filters": {
+    "additional_metadata": {
+      "connector_id": "{connector_id}"
+    }
+  }
+}
+```
+
+Filter on `resource_id` the same way to scope to one channel, repository, or table.
+
+## Multiple connectors per provider
+
+You can create more than one connector for the same provider, such as two Slack workspaces. Each has its own credentials and resources. Give each a distinct `provider_account_scope`, an identifier for the external account such as a Slack workspace id. It is part of every synced source's deduplication key, so sources from two accounts that share an external id and scope can collide. See [Connect several accounts of one provider](/essentials/connectors#multiple-connectors-per-provider).
+
+You can also route resources from one connector into different collections with [Configure Connector](/api-reference/endpoint/configure-connector):
+
+```json
+{
+  "resources": [
+    { "resource_id": "C_GENERAL", "resource_type": "channel", "name": "general", "collection": "all-hands" },
+    { "resource_id": "C_ENG", "resource_type": "channel", "name": "engineering", "collection": "engineering" }
+  ]
+}
+```

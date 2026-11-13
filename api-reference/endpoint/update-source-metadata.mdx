@@ -1,0 +1,183 @@
+---
+title: "Update Source Metadata"
+description: "Merge database metadata and additional metadata into one existing source, without re-ingesting it."
+openapi: "api-reference/openapi.json PATCH /context/{id}/metadata"
+---
+
+Update one existing source's metadata or ACL without re-ingesting its content. Changes also apply to the indexed chunks used by Query and List Context. See [Metadata Filters](/essentials/metadata#6-update-metadata-without-re-ingesting) for the metadata workflow.
+
+```http
+PATCH /context/{id}/metadata
+```
+
+`id` is the ID you supplied at ingest, or the source ID HydraDB returned. The route `PATCH /context/sources/{source_id}/metadata` is a deprecated alias that still works; migrate to the route above. `source_id` and `id` identify the same source.
+
+<RequestExample>
+
+```python Python SDK
+response = client.context.update_source_metadata(
+    "policy_main",
+    database="acme_corp",
+    collection="team_docs",
+    database_metadata={"department": "legal", "priority": 7},
+    additional_metadata={"author": "Legal Team", "doc_version": 3},
+)
+```
+
+```typescript TypeScript SDK
+const response = await client.context.updateSourceMetadata({
+  id: "policy_main",
+  database: "acme_corp",
+  collection: "team_docs",
+  databaseMetadata: { department: "legal", priority: 7 },
+  additionalMetadata: { author: "Legal Team", doc_version: 3 },
+});
+```
+
+```bash cURL
+curl -X PATCH 'https://api.hydradb.com/context/policy_main/metadata' \
+  -H "Authorization: Bearer $HYDRADB_API_KEY" \
+  -H "API-Version: 2" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "database": "acme_corp",
+    "collection": "team_docs",
+    "database_metadata": {
+      "department": "legal",
+      "priority": 7
+    },
+    "additional_metadata": {
+      "author": "Legal Team",
+      "doc_version": 3
+    }
+  }'
+```
+
+</RequestExample>
+
+<ResponseExample>
+
+```json Success
+{
+  "success": true,
+  "data": {
+    "id": "policy_main",
+    "database": "acme_corp",
+    "collection": "team_docs",
+    "updated": true,
+    "database_metadata_keys": ["department", "priority"],
+    "additional_metadata_keys": ["author", "doc_version"],
+    "vector_sync_required": false,
+    "chunk_rows_matched": 4,
+    "chunk_rows_modified": 4
+  },
+  "error": null,
+  "meta": {
+    "request_id": "9d13aef4-02f4-4e73-8c62-4c2601d04f9d",
+    "latency_ms": 12.3
+  }
+}
+```
+
+```json Dense or sparse metadata sync
+{
+  "success": true,
+  "data": {
+    "id": "policy_main",
+    "database": "acme_corp",
+    "collection": "team_docs",
+    "updated": true,
+    "database_metadata_keys": ["summary_label"],
+    "additional_metadata_keys": [],
+    "vector_sync_required": true,
+    "vector_synced": true,
+    "vector_rows_synced": 4,
+    "chunk_rows_matched": 4,
+    "chunk_rows_modified": 4
+  },
+  "error": null,
+  "meta": {
+    "request_id": "9d13aef4-02f4-4e73-8c62-4c2601d04f9d",
+    "latency_ms": 28.9
+  }
+}
+```
+
+```json Failure
+{
+  "success": false,
+  "data": null,
+  "error": {
+    "code": "INVALID_INPUT",
+    "message": "invalid metadata edit: metadata field \"department\" must be of type string, got number"
+  },
+  "meta": {
+    "request_id": "9d13aef4-02f4-4e73-8c62-4c2601d04f9d",
+    "latency_ms": 4.8
+  }
+}
+```
+
+</ResponseExample>
+
+## Request rules
+
+- `collection` is required. This endpoint does not default it.
+- At least one of `database_metadata`, `additional_metadata`, `acl`, or `acl_inherit: true` is required.
+- `acl` combined with `acl_inherit: true` is invalid. `acl_inherit: false` or omitted is a no-op and can accompany `acl`. Inheritance is rejected for uploads and sources without connector resource attribution.
+- `database_metadata` merges into the source's `metadata`, and its keys must satisfy the database metadata schema when one exists. `additional_metadata` merges into the source's free-form `additional_metadata`.
+- The endpoint does not accept `metadata` or `document_metadata`.
+
+<span id="behavior"></span>
+
+## How updates apply
+
+- Metadata keys included in the request are added or overwritten. Omitted keys keep their existing values.
+- Sending `acl` replaces the entire stored ACL, so send the complete new list. `[]` or `null` revokes access for everyone. Omit `acl` to keep the stored list. See [Query](/essentials/query#6-query-on-behalf-of-a-user).
+- Sending `acl_inherit: true` removes the source's own ACL and immediately uses its connector resource permissions. This can widen access. Later connector syncs can replace the ACL because ACL writes use last-writer-wins behavior. See [Restore resource permissions](/essentials/connectors#restore-resource-permissions).
+- The source must already exist. This endpoint does not create sources.
+- The endpoint edits one source at a time. Bulk metadata edits are not supported.
+- Updated metadata is visible to [`/query`](/api-reference/endpoint/query) metadata filters and [`/context/list`](/api-reference/endpoint/list-context) filters.
+- If an edited database metadata field has `enable_dense_embedding` or `enable_sparse_embedding`, HydraDB synchronously refreshes the relevant metadata search index and the response has `vector_sync_required: true`. Otherwise no vector refresh is needed and `vector_sync_required` is `false`.
+
+## Partial failures
+
+A `200` response can still report an incomplete edit:
+
+- **`vector_sync_error`:** The metadata was saved but the dense or sparse vector store sync failed. `vector_synced` is absent. Retry the same idempotent edit to converge.
+- **`partial_commit`:** The edit was saved in one store but a later write failed. Retry the same edit.
+- **`vector_acl_synced` absent after an `acl` edit:** The new list is still enforced, but an added principal may miss this source in results until it is re-indexed.
+
+## Validation and errors
+
+| Status | When it happens |
+| --- | --- |
+| `400` | Missing `database`, missing `collection`, empty metadata payload, `acl` combined with `acl_inherit: true`, `acl_inherit: true` on a source without connector resource attribution, `document_metadata` supplied, unknown database metadata key when a schema exists, wrong type, reserved key, over-size payload, too-deep nesting, or `null` for a dense/sparse-enabled field. |
+| `404` | Source does not exist for the `(database, collection, id)` scope. |
+| `500` | The edit failed. Retry the same idempotent edit to converge. |
+
+### Size limits
+
+`database_metadata` is capped at **16 KiB**. `additional_metadata` is capped at **1 KiB**. See [metadata size limits](/essentials/metadata#stored-metadata) for how HydraDB measures these caps.
+
+Limits apply to the request payload, before merging with stored metadata. An oversized request returns `400` with the actual and maximum sizes:
+
+```json
+{
+  "success": false,
+  "data": null,
+  "error": {
+    "code": "INVALID_INPUT",
+    "message": "invalid metadata edit: additional_metadata is too large (1065 bytes when serialized; the maximum is 1024). Reduce the number or size of metadata fields."
+  }
+}
+```
+
+<div className="api-before-related-resources" />
+
+## Related resources
+
+- **Before this:** [Ingest Context](/api-reference/endpoint/ingest-context): create the source and set its initial metadata
+- **Before this:** [List Context](/api-reference/endpoint/list-context): find the source ID and its collection
+- **After this:** [Query](/api-reference/endpoint/query): filter on the updated metadata
+- **Guide:** [Metadata Filters](/essentials/metadata)

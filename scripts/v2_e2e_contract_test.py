@@ -3,7 +3,7 @@
 
 What this script checks:
 1. Static docs contract:
-   - Every endpoint page under api-reference/v2/endpoint with an `openapi:` directive
+   - Every endpoint page under api-reference/endpoint with an `openapi:` directive
      points at a real OpenAPI operation.
    - cURL blocks on those pages use the same HTTP method/path as the directive.
    - cURL blocks include `Authorization: Bearer ...` and `API-Version: 2`.
@@ -12,7 +12,7 @@ What this script checks:
    - Creates/polls a tenant.
    - Ingests knowledge and memory data.
    - Polls source status until searchable.
-   - Exercises all canonical v2 endpoints documented in api-reference/v2 and AGENTS.md:
+   - Exercises all canonical v2 endpoints documented in api-reference and AGENTS.md:
        POST   /tenants
        GET    /tenants
        DELETE /tenants
@@ -73,10 +73,10 @@ SEARCH_SELECTOR_FIELD = os.getenv("HYDRADB_SEARCH_SELECTOR_FIELD", "type")
 
 API_VERSION = "2"
 OPENAPI_PATH = (
-    Path(__file__).resolve().parents[1] / "api-reference" / "v2" / "openapi.json"
+    Path(__file__).resolve().parents[1] / "api-reference" / "openapi.json"
 )
 ENDPOINT_DOCS_DIR = (
-    Path(__file__).resolve().parents[1] / "api-reference" / "v2" / "endpoint"
+    Path(__file__).resolve().parents[1] / "api-reference" / "endpoint"
 )
 
 RUN_WEBHOOK_TESTS = os.getenv("HYDRADB_RUN_WEBHOOK_TESTS", "1") == "1"
@@ -436,7 +436,7 @@ class ApiClient:
             "Authorization": f"Bearer {self.api_key}",
             "API-Version": API_VERSION,
             "Accept": "application/json",
-            "User-Agent": "hydradb-v2-docs-e2e-contract-test/1.0",
+            "User-Agent": "hydradb-docs-e2e-contract-test/1.0",
         }
         if extra:
             headers.update(extra)

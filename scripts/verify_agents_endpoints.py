@@ -59,7 +59,7 @@ def path_exists(path: str, openapi_paths: set[str]) -> bool:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--docs", default="AGENTS.mdx", help="Path to the agents MDX file")
-    parser.add_argument("--openapi", default="api-reference/v2/openapi.json", help="Path to OpenAPI JSON")
+    parser.add_argument("--openapi", default="api-reference/openapi.json", help="Path to OpenAPI JSON")
     args = parser.parse_args()
 
     docs_path = Path(args.docs)

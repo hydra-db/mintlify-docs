@@ -4,7 +4,7 @@ Sync the website FAQ knowledge base in HydraDB.
 
 Builds one `knowledge_base` app source per page from three sources:
 
-  1. Docs    -- the v2 "Guides" tab pages listed in docs.json. The body is
+  1. Docs    -- the "Guides" tab pages listed in docs.json. The body is
                 read from the repo's MDX files (not the deployed site, which
                 has not redeployed yet when a push to main triggers the sync).
                 url = https://docs.hydradb.com/<page path>
@@ -253,7 +253,7 @@ def html_title(html: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# docs.json -> v2 Guides tab pages
+# docs.json -> Guides tab pages
 # ---------------------------------------------------------------------------
 
 def collect_pages(nodes) -> list[str]:
@@ -276,13 +276,10 @@ def collect_pages(nodes) -> list[str]:
 
 def docs_guides_pages(docs_json_path: Path) -> list[str]:
     data = json.loads(docs_json_path.read_text(encoding="utf-8"))
-    versions = data.get("navigation", {}).get("versions", [])
-    v2 = next((v for v in versions if v.get("version") == "v2"), None)
-    if not v2:
-        raise RuntimeError("docs.json has no v2 version section")
-    guides_tab = next((t for t in v2.get("tabs", []) if t.get("tab") == "Guides"), None)
+    tabs = data.get("navigation", {}).get("tabs", [])
+    guides_tab = next((t for t in tabs if t.get("tab") == "Guides"), None)
     if not guides_tab:
-        raise RuntimeError("docs.json v2 has no 'Guides' tab")
+        raise RuntimeError("docs.json has no 'Guides' tab")
     pages = collect_pages(guides_tab.get("groups", []))
     # De-duplicate while preserving order (AGENTS appears once; some pages
     # could be referenced from multiple groups).
@@ -740,7 +737,7 @@ def main() -> int:
     # 1. Build the item set.
     step("Building item set")
     docs_pages = docs_guides_pages(repo_root / "docs.json")
-    info(f"docs.json v2 Guides tab: {len(docs_pages)} pages")
+    info(f"docs.json Guides tab: {len(docs_pages)} pages")
     items: list[dict] = []
     items.extend(build_docs_items(docs_pages, repo_root, docs_base, database))
     items.extend(build_site_items(site_base, database))

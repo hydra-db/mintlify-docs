@@ -35,7 +35,7 @@ make dev         # starts local dev server at http://localhost:3000
 
 ## Documentation regression checks
 
-CI checks the docs against the public v2 contract: endpoint bindings, JSON examples, canonical names, and the agent guide's endpoint mentions. It runs without real vendor calls or credentials.
+CI checks the docs against the public API contract: endpoint bindings, JSON examples, canonical names, and the agent guide's endpoint mentions. It runs without real vendor calls or credentials.
 
 ```bash
 python -m venv .venv
@@ -96,7 +96,7 @@ mintlify-docs/
 
 3. **Update navigation** - All page ordering and grouping is controlled in `docs.json` under `navigation.tabs`.
 
-4. **API reference pages** - Endpoint docs live in `api-reference/endpoint/`. The OpenAPI spec is at `api-reference/openapi.json`.
+4. **API reference pages** - Endpoint docs live in `api-reference/endpoint/`. The canonical OpenAPI spec is at `api-reference/openapi.json`. Keep the static compatibility copy current with `cp api-reference/openapi.json api-reference/v2/openapi.json`; CI checks that both files match.
 
 5. **Reusable content** - Shared snippets go in the `snippets/` directory and can be imported into any page.
 

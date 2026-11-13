@@ -1,506 +1,238 @@
 ---
 title: "Error Responses"
-description: "HTTP error codes, response shapes, and handling patterns across all HydraDB endpoints."
+description: "Response envelope, HTTP status codes, error codes, and retry patterns."
 ---
 
-import V1Legacy from "/snippets/v1-legacy.mdx";
+Every HydraDB error arrives in the same envelope. Branch on `error.code`, log `meta.request_id`, and retry only the failures listed under [Retry pattern](#retry-pattern).
 
-<V1Legacy />
+## Response envelope
 
-{/*
-  PRO-1276 — DEFERRED, NOT FIXED.
-
-  The DX audit found 2 broken code blocks on this page: `from hydra_db import HydraDBError` raises ImportError — HydraDBError is the TypeScript class name, and the Python SDK has no equivalent.
-
-  They are deliberately left broken. v1 is being deprecated and the decision
-  (PRO-1268) is to signal that rather than repair v1 content — the equivalent v2
-  page has been fixed instead. Since 2026-06-01 an unpinned `pip install
-  hydradb-sdk` serves the v2 SDK, which is the root cause of most of these.
-
-  Per-block list: FAILING-SNIPPETS.md, attached to PRO-1259.
-*/}
-
-## Standard error response format
-
-Every error response follows this structure:
+HydraDB core endpoints (`/databases`, `/context/*`, `/query`, `/feedback`, and `/webhooks/indexing*`) use the same top-level envelope for successful and failed requests. Connector endpoints (`/connectors*`) and `PATCH /databases/{database}/metadata-schema` return their success body without this envelope, but their errors use it too.
 
 ```json
 {
-  "detail": {
-    "success": false,
-    "message": "Error description",
-    "error_code": "SPECIFIC_ERROR_CODE"
+  "success": false,
+  "data": null,
+  "error": {
+    "code": "VALIDATION_ERROR",
+    "message": "Request validation failed"
+  },
+  "meta": {
+    "request_id": "9d13aef4-02f4-4e73-8c62-4c2601d04f9d",
+    "latency_ms": 4.8
   }
 }
 ```
 
 | Field | Description |
 |---|---|
-| `detail.success` | Always `false` for errors. |
-| `detail.message` | Human-readable description of the error. |
-| `detail.error_code` | Machine-readable code. Use this for programmatic handling. May be `null` for generic errors. |
+| `success` | `false` for errors. |
+| `data` | Usually `null`. Some `DELETE /context` errors include per-ID results. |
+| `error.code` | Machine-readable code for programmatic handling. |
+| `error.message` | Human-readable explanation of what failed. |
+| `meta.request_id` | Request identifier. Include it when contacting support. |
+| `meta.latency_ms` | Server-side processing time in milliseconds. |
 
-<Info>
-Always read `detail.message` and `detail.error_code` for the actual error context. The HTTP status alone is not specific enough to handle errors well.
-</Info>
+The HTTP status tells you the class of failure; the error code tells you what to do.
 
 ## HTTP status codes
 
-| Code | Name | When |
+| Code | Meaning | Retry? |
 |---|---|---|
-| `200` | OK | Success |
-| `202` | Accepted | Async operation queued (tenant creation, ingestion) |
-| `400` | Bad Request | Invalid input parameters |
-| `401` | Unauthorized | Missing or invalid API key |
-| `403` | Forbidden | Authenticated, but lacks permission |
-| `404` | Not Found | Resource does not exist |
-| `409` | Conflict | Resource already exists |
-| `422` | Unprocessable Entity | Well-formed request, semantic validation failed |
-| `429` | Too Many Requests | Rate limit exceeded |
-| `500` | Internal Server Error | Unexpected server-side failure |
-| `503` | Service Unavailable | Temporary service unavailability |
+| `400` | Invalid parameters or malformed request | No |
+| `401` | Missing, expired, or invalid API key | No |
+| `402` | Your plan does not allow the request, for example one connector too many | No. Upgrade |
+| `403` | Authenticated, but not permitted for the resource, or the plan's database limit is reached | No |
+| `404` | Database, source, memory, or related resource was not found | No |
+| `409` | Conflict: the database already exists, a source is still indexing when you delete it, or a schema field conflicts | Only `SOURCE_PROCESSING`, after `Retry-After` |
+| `413` | Request body or upload too large | No |
+| `415` | Unsupported `Content-Type`, such as a `POST /context/ingest` body that is neither a multipart form nor JSON | No |
+| `422` | Well-formed request that failed validation, or a query sent before the database finished provisioning | Only `TENANT_INFRA_NOT_READY`, once the database is ready |
+| `429` | Rate limit exceeded | Yes, with backoff |
+| `500` | Internal server error | Yes, with backoff |
+| `503` | Temporary service unavailability | Yes, with backoff |
 
----
+## Common error codes
 
-### 400 Bad Request
-
-Invalid input parameters or malformed requests.
-
-```json
-{
-  "detail": {
-    "success": false,
-    "message": "Invalid request parameters",
-    "error_code": "INVALID_PARAMETERS"
-  }
-}
-```
-
-**Common scenarios:**
-
-- Missing required parameters (`tenant_id`, `query`, etc.)
-- Invalid parameter formats
-- Malformed JSON in request body
-- Mutually exclusive parameters both provided (e.g., both `source_id` and `chunk_ids`)
-
----
-
-### 401 Unauthorized
-
-Authentication required or invalid.
-
-```json
-{
-  "detail": {
-    "success": false,
-    "message": "Authentication required",
-    "error_code": "UNAUTHORIZED"
-  }
-}
-```
-
-**Common scenarios:**
-
-- Missing `Authorization: Bearer $HYDRADB_API_KEY` header (or any `Authorization` header at all)
-- Invalid API key
-- Expired API key
-
----
-
-### 403 Forbidden
-
-Authenticated, but the request is not permitted.
-
-```json
-{
-  "detail": {
-    "success": false,
-    "message": "Access denied",
-    "error_code": "FORBIDDEN"
-  }
-}
-```
-
-**Common scenarios:**
-
-- API key lacks required scopes
-- Tenant access restrictions
-- Cross-organization access attempts
-
----
-
-### 404 Not Found
-
-Requested resource does not exist.
-
-```json
-{
-  "detail": {
-    "success": false,
-    "message": "Tenant not found",
-    "error_code": "TENANT_NOT_FOUND"
-  }
-}
-```
-
-**Common scenarios:**
-
-- `TENANT_NOT_FOUND` – tenant ID does not exist
-- `SOURCE_NOT_FOUND` – source/document not found
-- `MEMORY_NOT_FOUND` – memory ID does not exist
-- `FILE_NOT_FOUND` – file ID does not exist
-
----
-
-### 409 Conflict
-
-Resource already exists or conflicts with existing data.
-
-```json
-{
-  "detail": {
-    "success": false,
-    "message": "Tenant already exists",
-    "error_code": "TENANT_ALREADY_EXISTS"
-  }
-}
-```
-
-**Common scenarios:**
-
-- `TENANT_ALREADY_EXISTS` – attempting to create a tenant with an in-use ID
-
----
-
-### 422 Unprocessable Entity
-
-Request is well-formed, but contains semantic errors.
-
-```json
-{
-  "detail": {
-    "success": false,
-    "message": "Validation failed",
-    "error_code": "VALIDATION_ERROR"
-  }
-}
-```
-
-**Common scenarios:**
-
-- Embedding vector dimension doesn't match tenant configuration
-- Invalid `tenant_metadata_schema` field type
-- `MemoryItem` content fields all empty (no `text` and no `user_assistant_pairs`)
-- File metadata array length doesn't match files array length
-
----
-
-### 429 Too Many Requests
-
-Rate limit exceeded.
-
-```json
-{
-  "detail": {
-    "success": false,
-    "message": "Rate limit exceeded",
-    "error_code": "RATE_LIMITED"
-  }
-}
-```
-
-**When it occurs:**
-
-Currently documented on recall endpoints (`/recall/full_recall`, `/recall/recall_preferences`, `/recall/boolean_recall`). Other endpoints may also return 429 under sustained load.
-
-**How to handle:**
-
-Implement exponential backoff. See [Retry pattern](#retry-pattern) below.
-
-For current rate limit values, contact [founders@hydradb.com](mailto:founders@hydradb.com).
-
----
-
-### 500 Internal Server Error
-
-Unexpected server-side failure.
-
-```json
-{
-  "detail": {
-    "success": false,
-    "message": "Internal server error",
-    "error_code": "INTERNAL_ERROR"
-  }
-}
-```
-
-**How to handle:** Retry with exponential backoff. If the error persists, contact support with the response payload.
-
----
-
-### 503 Service Unavailable
-
-Service temporarily unavailable, often during deployments or under high load.
-
-```json
-{
-  "detail": {
-    "success": false,
-    "message": "Service unavailable",
-    "error_code": "SERVICE_UNAVAILABLE"
-  }
-}
-```
-
-**How to handle:** Retry with exponential backoff. Most 503s resolve within seconds.
-
----
-
-## Endpoint-specific error codes
-
-These error codes are returned in the `detail.error_code` field of error responses. The list is non-exhaustive; new codes may be added.
-
-### Tenants
-
-| Code | Status | When |
+| Code | Typical status | Meaning |
 |---|---|---|
-| `TENANT_ALREADY_EXISTS` | 409 | Creating a tenant with an existing ID |
-| `TENANT_NOT_FOUND` | 404 | Tenant does not exist or has been deleted |
-| `INVALID_TENANT_ID` | 400 | Tenant ID format is invalid |
+| `INVALID_INPUT` | `400` | The default for a bad request: a required parameter is missing, malformed, or mutually incompatible with another parameter. Also used for `413` and `415`. |
+| `UNAUTHORIZED` | `401` | The `Authorization: Bearer <your_api_key>` header is missing or invalid. |
+| `PAYMENT_REQUIRED` | `402` | A plan limit refused the write, for example the connector count. |
+| `FREE_PLAN_DEPRECATED` | `402` | The organization is on the deprecated Free plan. The message and `detail.upgrade_url` carry the upgrade link. |
+| `FORBIDDEN` | `403` | The API key is valid but does not have access to the requested route or resource, or the plan's database limit prevents the operation. |
+| `DATABASE_ALREADY_EXISTS` | `409` | `POST /databases` received a `database` (formerly `tenant_id`) that is already in use. |
+| `DATABASE_NOT_FOUND` | `404` | The requested database does not exist or is not visible to the current API key. |
+| `NOT_FOUND` | `404` | The requested resource does not exist, for example a source ID in `DELETE /context`. |
+| `SOURCE_PROCESSING` | `409` | `DELETE /context` hit a source that is still indexing. Retry after `Retry-After`. |
+| `VALIDATION_ERROR` | `400` or `422` | A field has an invalid value. Query filter errors return `400`. Invalid connector credentials return `422`. |
+| `TENANT_INFRA_NOT_READY` | `422` | `POST /query` reached a database that is still provisioning. Poll [Database Status](/api-reference/endpoint/database-status) until `ready_for_ingestion` is `true`, then retry. |
+| `CORPUS_TYPE_UNSUPPORTED` | `400` | The `type` value does not fit this endpoint or database, for example `type: "all"` on ingest. |
+| `RATE_LIMITED` | `429` | The API key exceeded its current rate limit. |
+| `INTERNAL_ERROR` | `500` | HydraDB hit an unexpected server-side error. A rare auth-layer failure reports `INTERNAL_SERVER_ERROR` instead. |
+| `SERVICE_UNAVAILABLE` | `503` | A dependency is temporarily unavailable or the service is under load. |
 
-### Ingestion
+Endpoint pages list the most common codes for that operation. New codes may be added over time, so handle unknown `error.code` values gracefully.
 
-| Code | Status | When |
+`PATCH /databases/{database}/metadata-schema` currently returns `INTERNAL_ERROR` for its `400` and `409` errors too, so branch on the HTTP status there.
+
+For deprecated route and field behavior, see [Migrating from tenant fields](/essentials/databases-and-collections#7-migrating-from-the-legacy-tenant-and-sub-tenant-fields).
+
+## Ingestion error codes
+
+Asynchronous ingestion failures surface a numeric `E####` code in the `error_code` field of [`GET /context/status`](/api-reference/endpoint/source-status) responses and `indexing.status_changed` [webhook](/api-reference/endpoint/webhooks-overview) payloads. The HTTP `error.code` values above describe why a *request* was rejected. These codes describe why a specific *source* failed to index.
+
+Many storage- and capacity-related ingestion errors are **transient**: the pipeline retries them automatically with backoff, and they typically resolve within minutes. A code in `error_code` does not by itself mean the source has failed permanently. Treat a source as failed only once it reaches the terminal `errored` status.
+
+| Code | Meaning | What to do |
 |---|---|---|
-| `INVALID_FILE_FORMAT` | 400 | Unsupported file format |
-| `FILE_TOO_LARGE` | 400 | File exceeds size limits |
-| `PROCESSING_FAILED` | – | Returned in `verify_processing` response with `indexing_status: errored` |
+| `E1002` | Unsupported file format. Read this code in the upload response. The file is not queued. | Upload a supported format. |
+| `E2002` | The file contains no readable text. | Upload a version with text. |
+| `E6001` | Processed data could not be stored. | Retried automatically. |
+| `E9003` | A source with this ID already exists and the request set `upsert` to `false`. Read this code in the ingest response. | Send a new ID, or leave `upsert` on to replace the source. |
+| `E9004` | The status record expired before the source finished indexing. | Ingest the source again. |
 
-### Memories
-
-| Code | Status | When |
-|---|---|---|
-| `MEMORY_NOT_FOUND` | 404 | Memory ID does not exist |
-| `INVALID_MEMORY_FORMAT` | 422 | Memory content format is invalid |
-
-### Recall
-
-| Code | Status | When |
-|---|---|---|
-| `INVALID_SEARCH_PARAMETERS` | 400 | Search query parameters are invalid |
-| `RATE_LIMITED` | 429 | Rate limit exceeded |
-
-### Embeddings
-
-| Code | Status | When |
-|---|---|---|
-| `INVALID_EMBEDDING_FORMAT` | 422 | Embedding data format is invalid |
-| `INVALID_PARAMETERS` | 400 | Both or neither of `source_id`/`chunk_ids` provided when one is required |
-
----
+Files rejected with `E1002` have no ingestion status record. Handle this code from the upload response. See [Supported file formats](/api-reference/endpoint/ingest-context#supported-file-formats).
 
 ## Retry pattern
 
-For transient errors (`429`, `500`, `503`), implement exponential backoff:
+Retry only transient failures: `429`, `500`, and `503`. Use exponential backoff with jitter and keep retries bounded. Two other codes clear on their own, so wait instead of backing off blindly: `409 SOURCE_PROCESSING` (wait for `Retry-After`) and `422 TENANT_INFRA_NOT_READY` (wait until the database is ready).
+
+**The SDKs already retry:** both retry `408`, `429`, and `5xx` responses twice with exponential backoff before raising, and the Python SDK also retries `409`. Raise the count with `request_options={"max_retries": 5}` on a Python call, or `maxRetries` on the TypeScript client or call. The SDK examples below increase that limit. The raw HTTP example implements retries directly. Retry writes only when repeating the operation is safe.
 
 <CodeGroup>
-```typescript TypeScript (SDK)
-import { HydraDBError } from "@hydradb/sdk";
-
-async function withRetry<T>(
-  operation: () => Promise<T>,
-  maxRetries = 3
-): Promise<T> {
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    try {
-      return await operation();
-    } catch (error) {
-      if (error instanceof HydraDBError) {
-        const status = error.statusCode;
-        const isRetryable = [429, 500, 503].includes(status);
-
-        if (!isRetryable || attempt === maxRetries) {
-          throw error;
-        }
-
-        const delay = Math.pow(2, attempt) * 1000;
-        await new Promise(resolve => setTimeout(resolve, delay));
-      } else {
-        throw error;
-      }
-    }
-  }
-  throw new Error("unreachable");
-}
-
-// Usage:
-const result = await withRetry(() =>
-  client.recall.fullRecall({
-    tenant_id: "my_tenant",
-    query: "..."
-  })
-);
+```python Python SDK
+result = client.query(
+    database="my_first_database",
+    query="What are the pricing tiers?",
+    type="knowledge",
+    request_options={"max_retries": 5},
+)
 ```
-```python Python (SDK)
-import time
-
-from hydra_db import HydraDBError
-
-def with_retry(operation, max_retries=3):
-    for attempt in range(1, max_retries + 1):
-        try:
-            return operation()
-        except HydraDBError as e:
-            status = e.status_code
-            is_retryable = status in (429, 500, 503)
-
-            if not is_retryable or attempt == max_retries:
-                raise
-
-            delay = 2 ** attempt
-            time.sleep(delay)
-
-# Usage:
-result = with_retry(lambda: client.recall.full_recall(
-    tenant_id="my_tenant",
-    query="...",
-))
+```typescript TypeScript SDK
+const result = await client.query({
+  database: "my_first_database",
+  query: "What are the pricing tiers?",
+  type: "knowledge",
+}, { maxRetries: 5 });
 ```
-```javascript Raw HTTP (cURL/fetch)
-async function retryRequest(url, options, maxRetries = 3) {
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+```typescript fetch
+async function hydraRequest(url: string, options: RequestInit, maxRetries = 3) {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
     const response = await fetch(url, options);
+    if (response.ok) return response.json();
 
-    // Success or non-retryable error
-    if (response.ok || ![429, 500, 503].includes(response.status)) {
-      return response;
+    const retryable = [429, 500, 503].includes(response.status);
+    if (!retryable || attempt === maxRetries) {
+      throw await response.json();
     }
 
-    if (attempt === maxRetries) {
-      throw new Error(`Request failed after ${maxRetries} attempts`);
-    }
-
-    // Exponential backoff
-    const delay = Math.pow(2, attempt) * 1000;
-    await new Promise(resolve => setTimeout(resolve, delay));
+    const baseDelayMs = 2 ** attempt * 1000;
+    const jitterMs = Math.floor(Math.random() * 250);
+    await new Promise((resolve) => setTimeout(resolve, baseDelayMs + jitterMs));
   }
 }
 ```
 </CodeGroup>
 
-## Error handling patterns
+## Handle errors in code
 
-### Catching specific errors
+Both SDKs raise an exception for a non-2xx response. Read the code and request ID from the exception's response body. See [SDKs](/api-reference/sdks#error-handling) for the exception classes.
 
 <CodeGroup>
-```typescript TypeScript (SDK)
+```typescript TypeScript SDK
 import { HydraDBError } from "@hydradb/sdk";
 
 try {
-  const result = await client.recall.fullRecall({
-    tenant_id: "my_tenant",
-    query: "What's our refund policy?"
+  await client.context.ingest({
+    type: "knowledge",
+    database: "my_first_database",
+    documents: [{ path: "policy.pdf", filename: "policy.pdf" }],
   });
 } catch (error) {
   if (error instanceof HydraDBError) {
-    switch (error.body?.detail?.error_code) {
-      case "TENANT_NOT_FOUND":
-        // Tenant doesn't exist - prompt user to create it
-        break;
-      case "RATE_LIMITED":
-        // Back off and retry
-        break;
-      case "UNAUTHORIZED":
-        // Refresh API key
-        break;
-      default:
-        // Generic error handling
-        throw error;
+    // error.body is typed `unknown`; it holds the raw snake_case error envelope.
+    const body = error.body as
+      | { error?: { code?: string }; meta?: { request_id?: string } }
+      | undefined;
+    const code = body?.error?.code;
+    const requestId = body?.meta?.request_id;
+
+    if (code === "DATABASE_NOT_FOUND") {
+      // Create or select a valid database before ingesting.
+    } else if (error.statusCode === 429) {
+      // Retry with backoff.
+    } else {
+      console.error({ code, requestId });
+      throw error;
     }
   } else {
     throw error;
   }
 }
 ```
-```python Python (SDK)
-from hydra_db import HydraDBError
+```python Python SDK
+from hydra_db.core.api_error import ApiError
 
 try:
-    result = client.recall.full_recall(
-        tenant_id="my_tenant",
-        query="What's our refund policy?",
+    client.context.ingest(
+        type="knowledge",
+        database="my_first_database",
+        documents=[("policy.pdf", open("policy.pdf", "rb"), "application/pdf")],
     )
-except HydraDBError as e:
-    if e.error_code == "TENANT_NOT_FOUND":
-        # Tenant doesn't exist - prompt user to create it
+except ApiError as exc:
+    # The machine-readable code lives in the response envelope, not on the
+    # exception: ApiError carries status_code, headers and the parsed body.
+    error_code = (exc.body or {}).get("error", {}).get("code")
+
+    if error_code == "DATABASE_NOT_FOUND":
+        # Create or select a valid database before ingesting.
         pass
-    elif e.error_code == "RATE_LIMITED":
-        # Back off and retry
-        pass
-    elif e.error_code == "UNAUTHORIZED":
-        # Refresh API key
+    elif exc.status_code == 429:
+        # Retry with backoff.
         pass
     else:
         raise
 ```
 </CodeGroup>
 
-### Inspecting partial successes
+## Troubleshooting
 
-Some bulk endpoints (e.g., `POST /knowledge/delete_knowledge`, `POST /memories/add_memory`) can return `200 OK` with partial successes inside the response. Always inspect per-item results:
+### `401 UNAUTHORIZED` on every request
 
-```python
-response = client.data.delete(
-    tenant_id="my_tenant",
-    ids=["doc_1", "doc_2", "doc_3"],
-)
+Send exactly one `Authorization` header:
 
-# response.success is True even if some IDs weren't found
-for item in response.results:
-    if not item.deleted:
-        log.warning(f"Failed to delete {item.id}: {item.error}")
+```http
+Authorization: Bearer <your_api_key>
 ```
 
-## Troubleshooting common issues
+Also send `API-Version: 2` on raw HTTP requests. The SDKs set the version header automatically.
 
-### Authentication failures
+### `422 TENANT_INFRA_NOT_READY` right after creating a database
 
-1. **Header format:** `Authorization: Bearer $HYDRADB_API_KEY` – exactly one space between `Bearer` and the key value
-2. **Key validity:** Verify in [app.hydradb.com](https://app.hydradb.com)
-3. **Key permissions:** Confirm scopes match your operation
+Database creation is asynchronous, and a query sent before provisioning finishes returns this error. After `POST /databases`, poll [`GET /databases/status`](/api-reference/endpoint/database-status) until `infra.ready_for_ingestion` is `true`, then retry.
 
-### Tenant not found after creation
-
-Tenant creation is asynchronous. Poll [`GET /tenants/infra/status`](/api-reference/endpoint/infra-status) until `infra.scheduler_status`, `infra.graph_status`, and **both** elements of `infra.vectorstore_status` are `true` before ingesting. Allow up to 5 minutes (Enterprise plans take longer than Free/Ship).
-
-### 422 Validation Error on ingestion
+### Validation errors on ingest
 
 Common causes:
 
-- `file_metadata` array length doesn't match `files` array length on `/ingestion/upload_knowledge`
-- Sending `app_knowledge` as a JSON object instead of a JSON-encoded string in multipart form data
-- `MemoryItem` with no `text` and no `user_assistant_pairs`
+- `document_metadata` length does not match the `documents` array length.
+- `app_knowledge`, `memories`, or `document_metadata` was sent as an object instead of a JSON-stringified multipart field.
+- A memory item has neither `text` nor `user_assistant_pairs`.
+- A typed metadata value does not match the database metadata schema.
 
-### Empty results from recall
+### Empty query results
 
-Not an error, but a common confusion:
+An empty result is a successful response, not an error. Common causes:
 
-- Content may still be in `processing` or `graph_creation` state. Check via [`POST /ingestion/verify_processing`](/api-reference/endpoint/verify-processing).
-- `metadata_filters` may be too restrictive. Try without filters first.
-- Wrong endpoint: use `/recall/recall_preferences` for memories, `/recall/full_recall` for knowledge.
-- Wrong sub-tenant: pass `sub_tenant_id` explicitly if you stored under a non-default sub-tenant.
+- The source is still `queued` or `processing`. Poll [`GET /context/status`](/api-reference/endpoint/source-status).
+- `metadata_filters` is too restrictive or targets the wrong metadata namespace.
+- The query is scoped to the wrong `database` or `collection`.
+- The `type` value excludes the store you need. Use `type: "all"` to combine knowledge and memories in `POST /query`.
 
-### Rate limiting
+## Related
 
-For high-throughput workloads:
-
-1. **Use bulk endpoints** when possible (e.g., delete by array of IDs rather than one at a time)
-2. **Implement exponential backoff** for `429` responses
-3. **Cache recall results** when query patterns repeat
-4. Contact [founders@hydradb.com](mailto:founders@hydradb.com) for current limits
-
-## Related sections
-
-- [API Reference](/api-reference) – endpoint-specific error codes are listed in each reference page
-- [Quickstart](/get-started/quickstart) – first-time setup guide
+- [API Reference](/api-reference/index): endpoint map and conventions
+- [SDKs](/api-reference/sdks): client setup and SDK exception classes
+- [Ingestion Status](/api-reference/endpoint/source-status): indexing status for ingested sources
+- [Query](/api-reference/endpoint/query): query parameters and response shape
