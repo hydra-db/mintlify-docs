@@ -446,6 +446,278 @@ The primary endpoint is `POST /` (with `/mcp` supported as an alias); `GET /heal
   with their own key rather than sharing yours.
 </Warning>
 
+## Tools
+
+These tools cover search, ingest, list, and metadata updates.
+
+### hydradb_query
+
+Every response includes a `request_id`, including a query with no matches. Pass
+that ID to `hydradb_feedback` when the result was wrong or incomplete.
+
+| Parameter | Type | Required | Description |
+| --------- | ---- | -------- | ----------- |
+| `query` | string | Yes | The search query to find relevant memories |
+| `kind` | string | No | Which family to search: `memory`, `knowledge`, or `all` (default: `all`) |
+| `max_results` | number | No | Chunks to return, 1 to 50 (default: `10`) |
+| `mode` | string | No | `fast` for a quick single pass, `thinking` for deeper recall with query expansion and graph traversal, or `auto` to pick per query (default: `thinking`) |
+| `graph_context` | boolean | No | Include knowledge graph relations in the results (default: `true`) |
+| `titles` | string[] | No | Restrict the search to documents whose **complete** title exactly matches any value, ignoring case |
+| `metadata_filters` | object | No | Exact-match metadata filters as `{key: value}` |
+| `acl` | string[] | No | End-user principals to answer as. Results include unrestricted documents and documents that admit at least one principal |
+| `database` | string | No | Database (tenant) scope override for this request |
+| `collection` | string | No | Collection (sub-tenant) scope override for this request |
+
+#### Filtering by document title
+
+Use `titles` when you know document names but not their source IDs. The titles are
+resolved to source IDs first, then the normal semantic or keyword query runs inside
+those sources.
+
+```json
+{
+  "query": "What changed in the rollout plan?",
+  "titles": ["Q3 Roadmap.md", "Launch Plan.md"]
+}
+```
+
+- **Exact, complete titles:** `last-usage` does not match `last-usage.csv`.
+- **Case-insensitive:** `q3 roadmap.md` matches `Q3 Roadmap.md`.
+- **Several titles are ORed:** Surrounding whitespace is trimmed; punctuation such
+  as commas is part of the title.
+- **No match returns an empty result** rather than widening to the whole corpus.
+
+<Note>
+Because matching ignores case, two documents whose names differ only by case
+(`Report.md` and `report.md`) are treated as the same title and both are returned.
+</Note>
+
+### hydradb_ingest
+
+Provide exactly one of `text`, `turns`, `items`, `app_knowledge`, or `file`. Batches
+contain 1 to 100 items and send one API request. All entries in an `items` batch
+share the request's `kind` (`memory` or `knowledge`). The complete serialized
+non-file ingest arguments have an 8 MiB UTF-8 limit.
+
+| Parameter | Type | Required | Description |
+| --------- | ---- | -------- | ----------- |
+| `text` | string | No* | The information to store |
+| `turns` | array | No* | Conversation turns to ingest instead of `text`, each with a `user` and an `assistant` field |
+| `items` | array | No* | Batch of 1 to 100 items; each item has exactly one of `text` or `turns` |
+| `app_knowledge` | array | No* | Batch of 1 to 100 structured app records with `kind`, `fields`, and optional ACL data; split databases only |
+| `file` | object | No* | File to ingest as knowledge. Set `filename` and exactly one of `content_base64` or `path` |
+| `kind` | string | No | What to write: `memory` (default) or `knowledge` |
+| `title` | string | No | Title for the entry |
+| `source_id` | string | No | Optional identifier for this entry. Reusing one replaces what is stored under it |
+| `overwrite` | boolean | No | Replace an existing entry with the same `source_id` (default: `true`) |
+| `infer` | boolean | No | Let HydraDB extract insights and build the knowledge graph (default: `true`) |
+| `is_markdown` | boolean | No | Treat `text` as markdown (default: `false`) |
+| `metadata` | object | No | Key/value metadata stored with memory or knowledge, matchable later via `metadata_filters`; 16 KiB compact-JSON limit |
+| `additional_metadata` | object | No | Free-form document metadata stored with memory or knowledge; 1 KiB compact-JSON limit |
+| `relations` | object | No | Knowledge relations with an `ids` array and optional `properties` map |
+| `evidence_kind` | string | No | Knowledge provenance: `assertion`, `record`, `said`, `done`, `third_party`, or `inferred` |
+| `evidence_subject` | string | No | Stable handle for the entity a knowledge document describes |
+| `custom_instructions` | string | No | Memory extraction guidance, up to 4,000 characters; replaces the MCP default and requires inference |
+| `graph` | object | No | Caller graph with a nonempty `entities` map (`name`, `type`, optional `namespace` and `identifier`) and a `relations` array (`source`, `target`, `predicate`, optional `context` and `temporal_details`) |
+| `observation_date` | string | No | Calendar date YYYY-MM-DD when the fact was true |
+| `user_name` | string | No | Name of the user, used with `turns` for personalisation (default: `User`) |
+| `database` | string | No | Database (tenant) scope override for this request |
+| `collection` | string | No | Collection (sub-tenant) scope override for this request |
+
+Set content and item-specific options on each `items` entry. Set `kind`,
+`overwrite`, `database`, and `collection` on the request. Request-level
+`custom_instructions` applies unless an entry overrides it. Knowledge entries
+require `text` and reject `turns`, `is_markdown`, `user_name`, `observation_date`,
+and `custom_instructions`.
+
+[Metadata size rules](/essentials/v2/metadata#4-size-limits) count UTF-8 bytes
+for the whole compact JSON map, including keys and punctuation. An oversized map
+rejects the complete ingest request before HydraDB stores any item.
+
+```json Batch memory ingest
+{
+  "kind": "memory",
+  "items": [
+    {
+      "text": "Deploy on Friday",
+      "title": "Deployment date",
+      "additional_metadata": {
+        "team": "platform"
+      },
+      "custom_instructions": "Extract the date and responsible team."
+    },
+    {
+      "text": "Infra owns production deploys",
+      "title": "Deployment owner"
+    }
+  ]
+}
+```
+
+Use plain `text` with `kind: "knowledge"` for an unstructured document. Use
+`app_knowledge` for structured `email`, `message`, `ticket`, `knowledge_base`,
+`comment`, `meeting`, or `custom` records. Each app record supports `id`, `title`,
+`description`, `url`, `timestamp`, `provider`, `external_id`, `fields`, `metadata`,
+`additional_metadata`, `attachments`, `relations`, and `acl`. App records are
+always knowledge: omit `kind` on the request or set it to `"knowledge"`;
+`kind: "memory"` with `app_knowledge` is refused. Set each record's `kind` and
+repeat it as `fields.kind`, and use the keys the
+[field reference](/essentials/v2/context#field-reference) lists for that kind.
+
+```json Structured app knowledge with access
+{
+  "kind": "knowledge",
+  "app_knowledge": [
+    {
+      "id": "ticket-4821",
+      "kind": "ticket",
+      "title": "Retry queue saturation",
+      "provider": "linear",
+      "external_id": "ENG-4821",
+      "fields": {
+        "kind": "ticket",
+        "description": "The retry queue reached capacity.",
+        "status": "open"
+      },
+      "additional_metadata": {
+        "team": "platform"
+      },
+      "acl": ["alice@example.com"]
+    }
+  ]
+}
+```
+
+An omitted app-record `acl` makes the item unrestricted. Send `["__private__"]`
+for private ingest or `["__public__"]` for public ingest. An empty list is
+refused. Re-ingesting an existing `id` without `acl` removes its previous access
+list. If `__public__` appears with other principals, the item is public and
+HydraDB drops the other principals. Principals use the same forms as the read
+side: a plain email (stored as `user_email:<email>`, so both spellings name the
+same person), `domain:<domain>`, or `group:<provider>:<id>`.
+
+<Warning>
+  An access list scopes permission-aware reads; it does not authenticate the
+  caller. A normal API-key read that omits `acl` can still see the item. An empty
+  read-side `acl` is also unrestricted. Pass the authenticated end user's real
+  principals to each read tool.
+</Warning>
+
+#### File ingest
+
+Set `file.filename` to the real filename, including its extension. Then provide
+exactly one file source:
+
+- `content_base64`: base64-encoded bytes with an 8 MiB decoded-size limit. This
+  works on local and hosted servers.
+- `path`: an absolute local path with a 50 MiB file-size limit. This works only
+  with the local stdio server; the hosted server cannot read your disk.
+
+Files are always ingested as knowledge. The document title uses `title` when
+provided and otherwise uses `filename`. A supplied title replaces the filename
+stem but keeps the original extension, so `Q3 plan` becomes `Q3 plan.pdf`.
+`source_id` sets the document ID, and `overwrite` controls replacement. Other
+text, conversation, inference, graph, and metadata fields cannot be combined
+with `file`.
+
+```json Upload a file
+{
+  "file": {
+    "filename": "q3-plan.pdf",
+    "content_base64": "JVBERi0xLjQK..."
+  },
+  "title": "Q3 plan"
+}
+```
+
+Check the ingest response before polling. It reports accepted and rejected
+counts, `accepted_ids`, `rejected_items`, `indexing_pending`, each item's ID and
+acceptance state, and the server's `stored_title` where applicable. MCP generates
+missing IDs for `items` batches; HydraDB can assign IDs for app records. Use the
+IDs returned in the response. An all-failed ingest is an MCP error. A partial
+success keeps its accepted items and reports the rejected items. Acceptance
+means queued for asynchronous indexing, not yet searchable; use
+`hydradb_status` only for accepted IDs before you query or update newly ingested
+knowledge. A knowledge title that already ends in `.md` keeps one suffix;
+queries remain compatible with older doubled-title forms.
+
+Some batch responses contain only aggregate success and failure counts. In that
+case, individual items report `status: "unknown"` and `accepted: null`, and
+`accepted_ids` can be empty even when `success_count` is positive. Do not treat
+unknown items as rejected, infer accepted IDs from submitted IDs, or blindly
+retry the complete batch. Reconcile the batch with a later list or status read.
+For exact-title queries after file ingest, use the returned `stored_title`, which
+includes the retained extension.
+
+### hydradb_update
+
+<Note>
+  `hydradb_update` requires a hydradb-mcp release later than 1.7.0. Version
+  1.7.0 and earlier do not have this tool.
+</Note>
+
+Edits one existing item without re-ingesting it. Copy `id` from `hydradb_query`,
+`hydradb_list`, or `hydradb_inspect`; never guess an ID.
+
+| Parameter | Type | Required | Description |
+| --------- | ---- | -------- | ----------- |
+| `id` | string | Yes | Existing context ID to edit |
+| `database_metadata` | object | No* | Keys to merge into schema-controlled database metadata; 16 KiB compact-JSON limit |
+| `additional_metadata` | object | No* | Free-form keys to merge into additional metadata; 1 KiB compact-JSON limit |
+| `acl` | array or null | No* | Complete replacement ACL. `[]` or `null` makes the item private; `["__public__"]` makes it public to identified callers; omission leaves access unchanged |
+| `database` | string | No | Database (tenant) scope override for this request |
+| `collection` | string | Conditional | Collection (sub-tenant) scope for this request |
+
+\* Provide at least one of `database_metadata`, `additional_metadata`, or `acl`.
+Metadata maps merge only the supplied keys. ACL updates replace the complete
+list, so include every principal that must retain access.
+
+The [metadata size rules](/essentials/v2/metadata#4-size-limits) count UTF-8
+bytes for the complete compact JSON map, including keys and punctuation. An
+oversized map rejects the complete edit.
+
+A collection must resolve from the request or MCP connection configuration.
+Copy the collection attached to the source returned by `hydradb_query` or
+`hydradb_list`.
+
+```json Merge metadata and replace access
+{
+  "id": "ticket-4821",
+  "collection": "support-tickets",
+  "database_metadata": {
+    "priority": "urgent"
+  },
+  "additional_metadata": {
+    "reviewed": true
+  },
+  "acl": [
+    "alice@example.com",
+    "group:linear:platform"
+  ]
+}
+```
+
+The write is idempotent. Retry the identical request if HydraDB reports a partial
+commit or an unconfirmed vector or ACL synchronization. The tool returns an MCP
+error until the edit is fully converged.
+
+### hydradb_list
+
+| Parameter | Type | Required | Description |
+| --------- | ---- | -------- | ----------- |
+| `kind` | string | Yes | Which family to list: `memory`, `knowledge`, or `all` |
+| `ids` | array | No | Specific IDs to filter by |
+| `page` | number | No | Page number, 1-indexed (default: `1`) |
+| `page_size` | number | No | Items per page, 1 to 100 |
+| `acl` | string[] | No | End-user principals to answer as. Results include unrestricted documents and documents that admit at least one principal |
+| `database` | string | No | Database (tenant) scope override for this request |
+| `collection` | string | No | Collection (sub-tenant) scope override for this request |
+
+HydraDB failures stay failures: degraded stores, malformed success responses,
+and proxy login pages return an MCP error instead of an empty list. This
+requires a hydradb-mcp release later than 1.7.0. Version 1.7.0 and earlier can
+show these failures as an empty list.
+
 ## Feedback and contributions
 
 The MCP server is open source. [Raise an issue](https://github.com/hydra-db/hydradb-mcp/issues) or [contribute on GitHub](https://github.com/hydra-db/hydradb-mcp).
