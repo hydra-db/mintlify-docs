@@ -2,7 +2,7 @@ import json
 import re
 import unittest
 
-from generate_llms_index import generate, page_paths, ROOT
+from generate_llms_index import generate, ROOT
 
 
 class DocsDiscoveryTest(unittest.TestCase):
@@ -16,22 +16,20 @@ class DocsDiscoveryTest(unittest.TestCase):
         self.assertEqual(len(links), len(set(links)))
         self.assertIn("AGENTS", links)
         self.assertIn("plugins/cursor", links)
-        self.assertIn("api-reference/v2/endpoint/sync-connector", links)
+        self.assertIn("api-reference/endpoint/sync-connector", links)
         for slug in links:
             self.assertTrue((ROOT / f"{slug}.mdx").is_file(), slug)
             self.assertFalse(slug.startswith(("archive/", "snippets/")), slug)
 
-    def test_each_legacy_api_page_has_the_shared_rendered_warning(self):
+    def test_legacy_pages_are_replaced_by_redirects_not_a_rendered_warning(self):
         config = json.loads((ROOT / "docs.json").read_text())
-        versions = {version["version"]: page_paths(version) for version in config["navigation"]["versions"]}
-        for slug in versions["v1"] - versions["v2"] - {"continuity-assurance"}:
-            with self.subTest(slug=slug):
-                text = (ROOT / f"{slug}.mdx").read_text()
-                self.assertIn('import V1Legacy from "/snippets/v1-legacy.mdx";', text)
-                self.assertIn("<V1Legacy />", text)
-        warning = (ROOT / "snippets/v1-legacy.mdx").read_text()
-        self.assertIn("/get-started/v2/introduction", warning)
-        self.assertIn("not compatible", warning)
+        self.assertFalse((ROOT / "snippets/v1-legacy.mdx").exists())
+        for redirect in config["redirects"]:
+            source = redirect["source"].lstrip("/")
+            if source.startswith(("get-started/", "essentials/", "api-reference/", "cookbooks/")):
+                with self.subTest(source=source):
+                    self.assertFalse((ROOT / f"{source}.mdx").exists())
+                    self.assertNotIn("/v2/", redirect["destination"])
 
     def test_changed_pages_have_no_extra_prose_h1_or_zero_width_artifacts(self):
         for relative in ("AGENTS.mdx", "continuity-assurance.mdx"):

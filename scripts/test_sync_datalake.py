@@ -7,6 +7,33 @@ import sync_datalake as sync
 
 
 class DataLakeTests(unittest.TestCase):
+    def test_moved_pages_keep_their_product_area_tags(self):
+        root = Path(__file__).resolve().parents[1]
+        taxonomy = json.loads((root / "scripts/datalake_taxonomy.json").read_text())
+        with patch.object(sync, "git", return_value="test-commit"):
+            items = sync.build_items(root, taxonomy, "https://docs.hydradb.com", "db", "collection")
+        areas = {item["external_id"]: item["metadata"]["product_area"] for item in items}
+        expected = {
+            "essentials/context": "ingestion",
+            "essentials/connectors": "connectors",
+            "essentials/query": "retrieval",
+            "essentials/bring-your-own-graph": "graph,ingestion",
+            "essentials/databases-and-collections": "multi_tenancy",
+            "essentials/metadata": "metadata",
+            "api-reference/sdks": "api,sdk",
+            "api-reference/endpoint/databases-overview": "api,multi_tenancy",
+            "api-reference/endpoint/context-overview": "api,ingestion",
+            "api-reference/endpoint/query-overview": "api,retrieval",
+            "api-reference/endpoint/connectors-overview": "api,connectors",
+            "api-reference/endpoint/webhooks-overview": "api,webhooks"
+        }
+        for page, expected_areas in expected.items():
+            with self.subTest(page=page):
+                self.assertEqual(expected_areas, areas[page])
+        for prefix, _ in taxonomy["pages"]:
+            with self.subTest(prefix=prefix):
+                self.assertTrue(any(page.startswith(prefix) for page in areas))
+
     def test_invalid_comparison_aborts(self):
         with self.assertRaises((RuntimeError, sync.subprocess.CalledProcessError)):
             sync.git(Path.cwd(), "diff", "--name-only", "nonexistent-ref...HEAD")

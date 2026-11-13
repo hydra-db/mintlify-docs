@@ -2,7 +2,7 @@
 """
 Sync the public docs into the team's internal knowledge data lake.
 
-Every page in the v2 navigation of docs.json (Guides, Cookbooks, API Reference)
+Every page in the navigation of docs.json (Guides, Cookbooks, API Reference)
 becomes one `knowledge_base` app source in HydraDB, tagged with the shared
 data-lake metadata from scripts/datalake_taxonomy.json so the team's MCP can
 narrow a search to, say, public API reference pages about connectors:
@@ -69,7 +69,7 @@ STATUS_POLL_SECONDS = 10
 STATUS_TIMEOUT_SECONDS = 20 * 60
 FULL_SYNC_TRIGGERS = {
     "docs.json",
-    "api-reference/v2/openapi.json",
+    "api-reference/openapi.json",
     "scripts/datalake_taxonomy.json",
     "scripts/sync_datalake.py",
     "scripts/sync_faq.py",
@@ -77,14 +77,13 @@ FULL_SYNC_TRIGGERS = {
 
 
 def nav_pages(docs_json: dict) -> list[tuple[str, str, str]]:
-    """(tab, group, page) for every page in the v2 navigation, first occurrence wins."""
-    v2 = next((v for v in docs_json.get("navigation", {}).get("versions", [])
-               if v.get("version") == "v2"), None)
-    if not v2:
-        raise RuntimeError("docs.json has no v2 version section")
+    """(tab, group, page) for every navigation page, first occurrence wins."""
+    tabs = docs_json.get("navigation", {}).get("tabs", [])
+    if not tabs:
+        raise RuntimeError("docs.json has no navigation tabs")
     seen: set[str] = set()
     out: list[tuple[str, str, str]] = []
-    for tab in v2.get("tabs", []):
+    for tab in tabs:
         for group in tab.get("groups", []):
             for page in collect_pages(group):
                 if page not in seen:
@@ -214,7 +213,7 @@ def page_tickets(repo_root: Path, rel_path: str) -> str:
 def build_items(repo_root: Path, taxonomy: dict, docs_base: str,
                 database: str, collection: str) -> list[dict]:
     docs_json = json.loads((repo_root / "docs.json").read_text(encoding="utf-8"))
-    spec = json.loads((repo_root / "api-reference/v2/openapi.json").read_text(encoding="utf-8"))
+    spec = json.loads((repo_root / "api-reference/openapi.json").read_text(encoding="utf-8"))
     vocab = taxonomy["vocabulary"]
     commit = git(repo_root, "rev-parse", "HEAD").strip()
     synced_at = datetime.now(timezone.utc).isoformat()
@@ -417,7 +416,7 @@ def main() -> int:
     step("Building item set")
     items = build_items(repo_root, taxonomy, docs_base, database, collection)
     expected = {it["id"] for it in items}
-    info(f"{len(items)} pages in the v2 navigation")
+    info(f"{len(items)} pages in the navigation")
 
     to_ingest = items
     if args.since_ref and not args.full:

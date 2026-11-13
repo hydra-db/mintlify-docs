@@ -25,6 +25,16 @@ def live_files(pattern: str):
 
 
 class DocsConsistencyTest(unittest.TestCase):
+    def test_schema_conflict_example_links_to_the_current_endpoint(self):
+        page = ROOT / "api-reference/endpoint/update-metadata-schema.mdx"
+        conflict = re.search(r"```json Conflict\n(.*?)\n```", page.read_text(), re.S)
+        self.assertIsNotNone(conflict)
+        message = json.loads(conflict.group(1))["error"]["message"]
+        links = re.findall(r"https://docs\.hydradb\.com/([a-z0-9/-]+)", message)
+        self.assertEqual(["api-reference/endpoint/update-metadata-schema"], links)
+        for slug in links:
+            self.assertTrue((ROOT / f"{slug}.mdx").is_file())
+
     def test_ci_runs_docs_consistency_suite(self):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         self.assertIn("python scripts/test_docs_consistency.py", workflow)
@@ -61,6 +71,9 @@ class DocsConsistencyTest(unittest.TestCase):
             "api-reference/endpoint/full-recall.mdx",
             "api-reference/endpoint/recall-preferences.mdx",
         ):
+            redirects = {item["source"]: item["destination"] for item in json.loads((ROOT / "docs.json").read_text())["redirects"]}
+            source = "/" + relative.removesuffix(".mdx")
+            relative = redirects.get(source, source).split("#")[0].lstrip("/") + ".mdx"
             text = (ROOT / relative).read_text(encoding="utf-8")
             self.assertNotIn("knoledge", text, relative)
             self.assertNotIn("strucutre", text, relative)
@@ -72,27 +85,27 @@ class DocsConsistencyTest(unittest.TestCase):
 SHARED_FACTS = {
     "max_results default and maximum": {
         "AGENTS.mdx": r"\| `max_results` \| [^|]*\| default (\d+); max (\d+) \|",
-        "essentials/v2/query.mdx": r"\| `max_results` \|[^|]*Default `(\d+)`, maximum `(\d+)`",
-        "api-reference/v2/endpoint/query.mdx":
+        "essentials/query.mdx": r"\| `max_results` \|[^|]*Default `(\d+)`, maximum `(\d+)`",
+        "api-reference/endpoint/query.mdx":
             r'name="max_results"[^|]*\|[^|]*to `(?P<max>\d+)`\. Defaults to `(?P<default>\d+)`',
     },
     "recency_bias default": {
-        "essentials/v2/query.mdx": r"\*\*`recency_bias`:\*\*[^\n]*?Default `([\d.]+)`",
-        "api-reference/v2/endpoint/query.mdx": r'name="recency_bias"[^\n]*\(default=`([\d.]+)`\)',
+        "essentials/query.mdx": r"\*\*`recency_bias`:\*\*[^\n]*?Default `([\d.]+)`",
+        "api-reference/endpoint/query.mdx": r'name="recency_bias"[^\n]*\(default=`([\d.]+)`\)',
     },
     "metadata size limit": {
         "AGENTS.mdx": r"\| `metadata` \| [^|]*max (\d+ KiB)",
-        "essentials/v2/context.mdx": r"\| `metadata` \| [^|]*Up to (\d+ KiB)",
-        "essentials/v2/metadata.mdx": r"\| `metadata` \| [^|]*\| (\d+ KiB)",
+        "essentials/context.mdx": r"\| `metadata` \| [^|]*Up to (\d+ KiB)",
+        "essentials/metadata.mdx": r"\| `metadata` \| [^|]*\| (\d+ KiB)",
     },
     "additional_metadata size limit": {
         "AGENTS.mdx": r"\| `additional_metadata` \| [^|]*max (\d+ KiB)",
-        "essentials/v2/context.mdx": r"\| `additional_metadata` \| [^|]*Up to (\d+ KiB)",
-        "essentials/v2/metadata.mdx": r"\| `additional_metadata` \| [^|]*\| (\d+ KiB)",
+        "essentials/context.mdx": r"\| `additional_metadata` \| [^|]*Up to (\d+ KiB)",
+        "essentials/metadata.mdx": r"\| `additional_metadata` \| [^|]*\| (\d+ KiB)",
     },
     "collections per query": {
-        "essentials/v2/query.mdx": r"\*\*Several collections:\*\*[^\n]*Up to (\d+);",
-        "api-reference/v2/endpoint/query.mdx": r"at most (\d+) collections",
+        "essentials/query.mdx": r"\*\*Several collections:\*\*[^\n]*Up to (\d+);",
+        "api-reference/endpoint/query.mdx": r"at most (\d+) collections",
     },
 }
 INDEXING_STATUSES = ["queued", "processing", "graph_creation", "completed", "errored"]
@@ -115,11 +128,11 @@ class SharedFactsTest(unittest.TestCase):
                 self.assertEqual(1, len(set(values.values())), values)
 
     def test_indexing_statuses_are_the_same_everywhere(self):
-        sentence = re.search(r"moves forward through ([^:]*):", self.read("essentials/v2/context.mdx"))
+        sentence = re.search(r"moves forward through ([^:]*):", self.read("essentials/context.mdx"))
         self.assertEqual(INDEXING_STATUSES, re.findall(r"`(\w+)`", sentence.group(1)))
         used = set()
         for path in live_files("*.mdx"):
-            if "/v2/" in str(path) or path.name == "AGENTS.mdx":
+            if path.relative_to(ROOT).parts[0] in {"get-started", "essentials", "api-reference", "cookbooks"} or path.name == "AGENTS.mdx":
                 used |= set(re.findall(
                     r'indexing_?[sS]tatus["\s]*(?:===?|:|in)\s*[(\[]?"(\w+)"', path.read_text(encoding="utf-8")
                 ))
@@ -128,9 +141,9 @@ class SharedFactsTest(unittest.TestCase):
 
     def test_app_source_kinds_are_the_same_everywhere(self):
         listed = ", ".join(f"`{kind}`" for kind in APP_SOURCE_KINDS[:-1]) + f", or `{APP_SOURCE_KINDS[-1]}`"
-        for relative in ("essentials/v2/context.mdx", "api-reference/v2/endpoint/ingest-context.mdx"):
+        for relative in ("essentials/context.mdx", "api-reference/endpoint/ingest-context.mdx"):
             self.assertIn(listed, self.read(relative), relative)
-        table = re.findall(r"^\| `(\w+)` \| [^|]+ \| `", self.read("essentials/v2/context.mdx"), re.M)
+        table = re.findall(r"^\| `(\w+)` \| [^|]+ \| `", self.read("essentials/context.mdx"), re.M)
         self.assertEqual(APP_SOURCE_KINDS, table)
         guide = re.search(r"Kinds in OpenAPI[^.]*\.", self.read("AGENTS.mdx")).group(0)
         self.assertEqual(set(APP_SOURCE_KINDS), set(re.findall(r"`(\w+)`", guide)))
@@ -141,7 +154,7 @@ class SharedFactsTest(unittest.TestCase):
             section = text[text.index(start):text.index(end, text.index(start))]
             return set(re.findall(r"`(\.\w+)`", section))
 
-        reference = extensions("api-reference/v2/endpoint/ingest-context.mdx",
+        reference = extensions("api-reference/endpoint/ingest-context.mdx",
                                "## Supported file formats", "### Unsupported formats")
         guide = extensions("AGENTS.mdx", "Supported extensions:", "- Any other extension")
         self.assertEqual(reference, guide)
@@ -150,7 +163,7 @@ class SharedFactsTest(unittest.TestCase):
         config = json.loads(self.read("docs.json"))
         redirects = {redirect["source"] for redirect in config["redirects"]}
         for path in live_files("*.mdx"):
-            if "/v2/" not in str(path) and path.name != "AGENTS.mdx":
+            if not path.relative_to(ROOT).parts[0] in {"get-started", "essentials", "api-reference", "cookbooks"} and path.name != "AGENTS.mdx":
                 continue
             for url in re.findall(r"https://docs\.hydradb\.com(/[^\s)`\"'<>]*)", path.read_text(encoding="utf-8")):
                 target = url.split("#")[0].rstrip("/.,")
@@ -186,7 +199,7 @@ class SharedFactsTest(unittest.TestCase):
         missing = []
         for path, own in headings.items():
             relative = str(path.relative_to(ROOT))
-            if "/v2/" not in f"/{relative}" and relative != "AGENTS.mdx":
+            if not path.relative_to(ROOT).parts[0] in {"get-started", "essentials", "api-reference", "cookbooks"} and relative != "AGENTS.mdx":
                 continue
             text = prose(path.read_text(encoding="utf-8"))
             for target, anchor in re.findall(r"\]\((/[^)#\s]*)?#([^)\s]+)\)", text):
@@ -202,7 +215,7 @@ class SharedFactsTest(unittest.TestCase):
 
     def test_guides_do_not_show_internal_query_fields(self):
         for path in live_files("*.mdx"):
-            if "/v2/" in str(path) or path.name == "AGENTS.mdx":
+            if path.relative_to(ROOT).parts[0] in {"get-started", "essentials", "api-reference", "cookbooks"} or path.name == "AGENTS.mdx":
                 text = path.read_text(encoding="utf-8")
                 self.assertNotRegex(text, r"\bdata\.sources\b(?!`, which the public result does not return)",
                                     path.relative_to(ROOT))

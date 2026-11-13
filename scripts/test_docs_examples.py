@@ -3,7 +3,7 @@
 Python blocks, here and on every other v2 page, run through the real
 `hydradb-sdk` client. Only the HTTP layer is
 replaced: every request the SDK sends is checked against
-api-reference/v2/openapi.json (the path and method exist, and every query
+api-reference/openapi.json (the path and method exist, and every query
 parameter, JSON key, and form field is declared), and every canned response is
 checked against the operation's response schema before the SDK parses it. An
 example that sends an unknown field, or reads one the public API does not
@@ -39,7 +39,7 @@ from test_cookbooks import (  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 GUIDE = ROOT / "AGENTS.mdx"
-SPEC = json.loads((ROOT / "api-reference/v2/openapi.json").read_text())
+SPEC = json.loads((ROOT / "api-reference/openapi.json").read_text())
 SCHEMAS = SPEC["components"]["schemas"]
 SPEC_TEXT = json.dumps(SPEC)
 FULL_TEXT = {}
@@ -122,7 +122,7 @@ SAME_ROUTE = {("GET", "/context/{id}/subgraph"): ("GET", "/context/subgraph")}
 
 def binding(page):
     """Return (METHOD, path template) for an endpoint page, or None."""
-    match = re.search(r'^openapi: "api-reference/v2/openapi.json (\w+) ([^"]+)"', page.read_text(), re.M)
+    match = re.search(r'^openapi: "api-reference/openapi.json (\w+) ([^"]+)"', page.read_text(), re.M)
     return match.groups() if match else None
 
 
@@ -294,7 +294,7 @@ def fake_openai():
 
 V2_PAGES = [GUIDE] + sorted(
     page
-    for folder in ("get-started/v2", "essentials/v2", "api-reference/v2", "plugins")
+    for folder in ("get-started", "essentials", "api-reference", "plugins")
     for page in (ROOT / folder).rglob("*.mdx")
 )
 
@@ -310,7 +310,7 @@ class PythonExamples(unittest.TestCase):
     # Pages whose examples need a third-party package or a helper defined in
     # prose. The plugin pages are skipped too: they call agent frameworks.
     SKIP = {
-        "essentials/v2/bring-your-own-graph.mdx": "raw HTTP client built on requests and neo4j",
+        "essentials/bring-your-own-graph.mdx": "raw HTTP client built on requests and neo4j",
     }
     OPTIONAL_MODULES = {"fastapi", "flask", "requests", "neo4j"}
 
@@ -413,7 +413,7 @@ class PythonExamples(unittest.TestCase):
 class TypeScriptExamples(unittest.TestCase):
     """Type-check every TypeScript example in the v2 docs against @hydradb/sdk."""
 
-    PAGES = V2_PAGES + sorted((ROOT / "cookbooks/v2").glob("*.mdx"))
+    PAGES = V2_PAGES + sorted((ROOT / "cookbooks").glob("*.mdx"))
     # Names an example may use without declaring: each is set up in an earlier
     # block on the same page, or is a placeholder the reader supplies.
     AMBIENT = {
@@ -543,7 +543,7 @@ class JsonAndCurlExamples(unittest.TestCase):
                     data = sample.get("data", sample) if isinstance(sample, dict) else {}
                     if isinstance(data, dict) and "chunks" in data:
                         self.assertFalse(set(data) & INTERNAL_RESPONSE)
-                        self.assertEqual([], unknown_keys(data, SCHEMAS["search.V2RetrievalResult"]))
+                        self.assertEqual([], unknown_keys(data, SCHEMAS["search.RetrievalResult"]))
                     if isinstance(sample, dict) and "query" in sample and "database" in sample \
                             and "params" not in sample:
                         self.assertEqual([], unknown_keys(sample, request_schema(operation("POST", "/query")[1])))
@@ -602,7 +602,7 @@ class JsonAndCurlExamples(unittest.TestCase):
         self.assertGreaterEqual(calls, 80)
 
     def test_status_values_are_the_documented_ones(self):
-        pages = V2_PAGES + sorted((ROOT / "cookbooks/v2").glob("*.mdx")) + sorted((ROOT / "snippets").glob("*.mdx"))
+        pages = V2_PAGES + sorted((ROOT / "cookbooks").glob("*.mdx")) + sorted((ROOT / "snippets").glob("*.mdx"))
         used = {}
         for page in pages:
             for line in page.read_text().split("\n"):

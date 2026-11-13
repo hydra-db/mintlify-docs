@@ -1,532 +1,295 @@
 ---
 title: "Quickstart"
-description: "Build your first working recall in five minutes."
+description: "Create a database, ingest a document and a memory, and query them, in five minutes."
 ---
 
-import V1Legacy from "/snippets/v1-legacy.mdx";
+Install the SDK, create a database, ingest a document and a memory, and query both in one call.
 
-<V1Legacy />
+Working with a coding agent such as Claude Code, Cursor, or Codex? Copy this prompt instead, and it builds the integration from the [Agent Integration Guide](/AGENTS).
 
----
+<Prompt description="Integrate HydraDB into this project with your coding agent." actions={["copy"]}>
+Integrate HydraDB into this project.
 
-## What you'll build
+1. Read https://docs.hydradb.com/AGENTS.md before writing any code.
+2. Ask me for my HydraDB database name, and ask me to set my API key in `HYDRADB_API_KEY` myself rather than paste it here. Read the key from that variable; never hard-code it.
+3. Use the official SDK for this project's language: `hydradb-sdk` for Python or `@hydradb/sdk` for TypeScript.
+4. Ingest my documents as knowledge, wait until they are indexed, and add a query step that passes the results to the model. If the app has signed-in users, send each user's identity as `acl` on every query.
+5. Show me your plan and the files you will change before changing anything.
+</Prompt>
+
+## 1. Install and initialize
+
+Get an API key from [dashboard.hydradb.com](https://dashboard.hydradb.com), then set it in the terminal where you run the examples:
+
+```bash
+export HYDRADB_API_KEY="your_api_key"
+```
+
+Install the SDK and create a client:
+
+<CodeGroup>
+```python Python SDK
+# Install: pip install "hydradb-sdk>=2,<3"
+import os
+from hydra_db import HydraDB
+from hydra_db.helpers import build_string
+
+client = HydraDB(token=os.environ["HYDRADB_API_KEY"])
+```
+```typescript TypeScript SDK
+// Install: npm install @hydradb/sdk@^2
+// Needs a Node.js project with top-level await (ESM).
+import { HydraDBClient } from "@hydradb/sdk";
+import { buildString } from "@hydradb/sdk/helpers";
+
+const client = new HydraDBClient({
+  token: process.env.HYDRADB_API_KEY!,
+});
+```
+```bash cURL
+# Confirm your key works by listing databases. The later steps use jq to read responses.
+curl 'https://api.hydradb.com/databases' \
+  -H "Authorization: Bearer $HYDRADB_API_KEY" \
+  -H "API-Version: 2"
+```
+</CodeGroup>
+
+## 2. Create a database, ingest context, and query it
+
+Create a database, ingest a refund policy and a customer memory, wait until both are indexed, then query them together. Indexing runs in the background, which is why the code waits before querying. If you already created a database, set `database` to its name and skip the create call.
+
+<CodeGroup>
+```python Python SDK
+import json, time
+
+database = "my_first_database"
+
+# 1. Create a database and wait until it can accept data.
+client.databases.create(database=database)
+while not client.databases.status(database=database).data.infra.ready_for_ingestion:
+    time.sleep(5)
+
+# 2. Ingest a knowledge document into the shared collection.
+with open("refund-policy.md", "w") as f:
+    f.write("# Refund policy\n\nRefunds are available within 30 days of purchase. Annual plans are refunded pro rata.\n")
+
+with open("refund-policy.md", "rb") as f:
+    doc = client.context.ingest(
+        type="knowledge",
+        database=database,
+        collection="company_docs",
+        documents=[("refund-policy.md", f, "text/markdown")],
+        document_metadata=json.dumps([{"id": "refund_policy"}]),
+    )
+
+# 3. Save one customer's memory in that customer's collection.
+mem = client.context.ingest(
+    type="memory",
+    database=database,
+    collection="user_123",
+    memories=json.dumps([
+        {"text": "Customer asked for a refund on 2026-09-30 and was told to wait for the billing cycle to close."}
+    ]),
+)
+
+# 4. Wait until both are indexed.
+def wait_for(collection, id):
+    while True:
+        status = client.context.status(
+            database=database, collection=collection, ids=[id]
+        ).data.statuses[0]
+        if status.indexing_status == "completed":
+            return
+        if status.indexing_status == "errored":
+            raise RuntimeError(status.error_message)
+        time.sleep(2)
+
+wait_for("company_docs", doc.data.results[0].id)
+wait_for("user_123", mem.data.results[0].id)
+
+# 5. Query knowledge and the customer's memory together.
+results = client.query(
+    database=database,
+    collections=["company_docs", "user_123"],
+    type="all",
+    query="Can this customer get a refund, and what have we told them so far?",
+)
+
+print(build_string(results))
+```
+```typescript TypeScript SDK
+import { writeFileSync } from "node:fs";
+
+const database = "my_first_database";
+
+// 1. Create a database and wait until it can accept data.
+await client.databases.create({ database });
+while (true) {
+  const { data } = await client.databases.status({ database });
+  if (data?.infra?.readyForIngestion) break;
+  await new Promise((resolve) => setTimeout(resolve, 5_000));
+}
+
+// 2. Ingest a knowledge document into the shared collection.
+writeFileSync(
+  "refund-policy.md",
+  "# Refund policy\n\nRefunds are available within 30 days of purchase. Annual plans are refunded pro rata.\n",
+);
+
+const doc = await client.context.ingest({
+  type: "knowledge",
+  database,
+  collection: "company_docs",
+  documents: [{ path: "refund-policy.md", filename: "refund-policy.md", contentType: "text/markdown" }],
+  documentMetadata: JSON.stringify([{ id: "refund_policy" }]),
+});
+
+// 3. Save one customer's memory in that customer's collection.
+const mem = await client.context.ingest({
+  type: "memory",
+  database,
+  collection: "user_123",
+  memories: JSON.stringify([
+    { text: "Customer asked for a refund on 2026-09-30 and was told to wait for the billing cycle to close." },
+  ]),
+});
+
+// 4. Wait until both are indexed.
+async function waitFor(collection: string, id: string | undefined) {
+  if (!id) throw new Error("Ingestion returned no id");
+  while (true) {
+    const status = (await client.context.status({ database, collection, ids: [id] })).data?.statuses?.[0];
+    if (!status) throw new Error("Status is missing");
+    if (status.indexingStatus === "completed") return;
+    if (status.indexingStatus === "errored") throw new Error(status.errorMessage ?? "Indexing failed");
+    await new Promise((resolve) => setTimeout(resolve, 2_000));
+  }
+}
+
+await waitFor("company_docs", doc.data?.results?.[0]?.id);
+await waitFor("user_123", mem.data?.results?.[0]?.id);
+
+// 5. Query knowledge and the customer's memory together.
+const results = await client.query({
+  database,
+  collections: ["company_docs", "user_123"],
+  type: "all",
+  query: "Can this customer get a refund, and what have we told them so far?",
+});
+
+console.log(buildString(results));
+```
+```bash cURL
+DATABASE="my_first_database"
+API="https://api.hydradb.com"
+AUTH=(-H "Authorization: Bearer $HYDRADB_API_KEY" -H "API-Version: 2")
+
+# 1. Create a database and wait until it can accept data.
+curl -s -X POST "$API/databases" "${AUTH[@]}" \
+  -H "Content-Type: application/json" \
+  -d "{\"database\":\"${DATABASE}\"}"
+
+until curl -s "$API/databases/status?database=${DATABASE}" "${AUTH[@]}" \
+  | jq -e '.data.infra.ready_for_ingestion' > /dev/null; do
+  sleep 5
+done
+
+# 2. Ingest a knowledge document into the shared collection.
+cat > refund-policy.md <<'EOF'
+# Refund policy
+
+Refunds are available within 30 days of purchase. Annual plans are refunded pro rata.
+EOF
+
+DOC_ID=$(curl -s -X POST "$API/context/ingest" "${AUTH[@]}" \
+  -F "type=knowledge" \
+  -F "database=${DATABASE}" \
+  -F "collection=company_docs" \
+  -F "documents=@refund-policy.md" \
+  -F 'document_metadata=[{"id":"refund_policy"}]' \
+  | jq -r '.data.results[0].id')
+
+# 3. Save one customer's memory in that customer's collection.
+MEM_ID=$(curl -s -X POST "$API/context/ingest" "${AUTH[@]}" \
+  -F "type=memory" \
+  -F "database=${DATABASE}" \
+  -F "collection=user_123" \
+  -F 'memories=[{"text":"Customer asked for a refund on 2026-09-30 and was told to wait for the billing cycle to close."}]' \
+  | jq -r '.data.results[0].id')
+
+# 4. Wait until both are indexed.
+wait_for() {
+  while true; do
+    STATUS=$(curl -s -G "$API/context/status" "${AUTH[@]}" \
+      --data-urlencode "database=${DATABASE}" \
+      --data-urlencode "collection=$1" \
+      --data-urlencode "ids=$2")
+    STATE=$(echo "$STATUS" | jq -r '.data.statuses[0].indexing_status')
+    if [ "$STATE" = "completed" ]; then return; fi
+    if [ "$STATE" = "errored" ]; then
+      echo "$STATUS" | jq -r '.data.statuses[0].error_message'; exit 1
+    fi
+    sleep 2
+  done
+}
+wait_for company_docs "$DOC_ID"
+wait_for user_123 "$MEM_ID"
+
+# 5. Query knowledge and the customer's memory together.
+curl -s -X POST "$API/query" "${AUTH[@]}" \
+  -H "Content-Type: application/json" \
+  --data-binary @- <<EOF | jq -r '.data.chunks[].chunk_content'
+{
+  "database": "${DATABASE}",
+  "collections": ["company_docs", "user_123"],
+  "type": "all",
+  "query": "Can this customer get a refund, and what have we told them so far?"
+}
+EOF
+```
+</CodeGroup>
+
+## 3. Check the result
+
+The query returns chunks (passages of your sources), not a generated answer. The SDK examples print formatted context; cURL prints the chunk text. Both should include the policy and the memory:
+
+```text
+Refunds are available within 30 days of purchase. Annual plans are refunded pro rata.
+Customer asked for a refund on 2026-09-30 and was told to wait for the billing cycle to close.
+```
+
+Send these chunks to your model as context. `build_string` in Python and `buildString` in TypeScript format them for a prompt. See [Query](/essentials/query#7-use-the-results).
+
+## What you have built
+
+That is the full loop: create a database, ingest context, wait for indexing, query it, and pass the result to a model. HydraDB handles parsing, chunking, embedding, graph building, and search.
 
 ```mermaid
 flowchart LR
-  A([1. Create Tenant]) --> B([2. Ingest Data])
-  B --> C([3. Verify Processing])
-  C --> D([4. Recall Context])
-  D --> E([5. Pass to LLM])
+  A([1. Create Database]) --> B([2. Ingest Context])
+  B --> C([3. Wait for Indexing])
+  C --> D([4. Query])
+  D --> E([5. Pass to Model])
 
   style A fill:#0f172a,stroke:#334155,stroke-width:2px,color:#f8fafc,stroke-linecap:round
   style B fill:#0f172a,stroke:#334155,stroke-width:2px,color:#f8fafc,stroke-linecap:round
-  style C fill:#FF571A,stroke:#FF571A,stroke-width:2.5px,color:#f8fafc,stroke-linecap:round
+  style C fill:#0f172a,stroke:#334155,stroke-width:2px,color:#f8fafc,stroke-linecap:round
   style D fill:#0f172a,stroke:#334155,stroke-width:2px,color:#f8fafc,stroke-linecap:round
   style E fill:#0f172a,stroke:#334155,stroke-width:2px,color:#f8fafc,stroke-linecap:round
 ```
 
-Step 3 is async - HydraDB parses, chunks, embeds, and graphs your content in the background. Steps 1, 2, 4, and 5 run in real time.
-
----
-
-## Prerequisites
-
-- An API key from [app.hydradb.com](https://app.hydradb.com)
-- A backend that can make HTTP calls, or one of the HydraDB SDKs
-
-**Base URL:** `https://api.hydradb.com`  
-**Authentication:** `Authorization: Bearer $HYDRADB_API_KEY` on every request (substitute the actual key value)
-
-### Install the SDK (optional)
-
-<CodeGroup>
-```bash cURL
-# No install needed - use curl directly
-```
-```bash TypeScript SDK
-npm install @hydradb/sdk
-```
-```bash Python SDK
-pip install hydradb-sdk
-```
-</CodeGroup>
-
-Initialize a client:
-
-<CodeGroup>
-```bash cURL
-# Set your key as an environment variable
-export HYDRADB_API_KEY="your_api_key"
-```
-```typescript TypeScript SDK
-import { HydraDBClient } from "@hydradb/sdk";
-
-const client = new HydraDBClient({
-  token: process.env.HYDRADB_API_KEY
-});
-```
-```python Python SDK
-import os
-from hydra_db import HydraDB
-
-client = HydraDB(token=os.environ["HYDRADB_API_KEY"])
-```
-</CodeGroup>
-
----
-
-<Steps>
-
-<Step title="Step 1 - Create a Tenant">
-
-A tenant is your fully isolated workspace. Everything you ingest and recall lives inside it.
-
-<CodeGroup>
-```bash cURL
-curl -X POST 'https://api.hydradb.com/tenants/create' \
-  -H "Authorization: Bearer $HYDRADB_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"tenant_id": "my_first_tenant"}'
-```
-```typescript TypeScript SDK
-const response = await client.tenant.create({
-  tenant_id: "my_first_tenant",
-});
-```
-```python Python SDK
-response = client.tenant.create(tenant_id="my_first_tenant")
-```
-</CodeGroup>
-
-**Response:**
-
-```json
-{
-  "status": "accepted",
-  "tenant_id": "my_first_tenant",
-  "message": "Tenant creation started in the background. Use GET /tenants/infra/status?tenant_id=... to check progress."
-}
-```
-
-<Info>
-Receiving a `"status": "accepted"` response indicates that the creation process has successfully started, but it does not imply that the tenant is fully provisioned.
-</Info>
-
-Tenant creation is **asynchronous**. Poll until provisioning completes before ingesting:
-
-<CodeGroup>
-```bash cURL
-curl 'https://api.hydradb.com/tenants/infra/status?tenant_id=my_first_tenant' \
-  -H "Authorization: Bearer $HYDRADB_API_KEY"
-```
-```typescript TypeScript SDK
-const status = await client.tenant.getInfraStatus({
-  tenant_id: "my_first_tenant"
-});
-```
-```python Python SDK
-status = client.tenant.get_infra_status(tenant_id="my_first_tenant")
-```
-</CodeGroup>
-
-**Response:**
-
-```json
-{
-  "tenant_id": "my_first_tenant",
-  "org_id": "free",
-  "infra": {
-    "scheduler_status": true,
-    "graph_status": true,
-    "vectorstore_status": [true, true]
-  },
-  "message": "Deployed infrastructure status"
-}
-```
-
-Wait until `infra.scheduler_status`, `infra.graph_status`, and **both** values in `infra.vectorstore_status` are `true` before ingesting.
-
-<Note>
-**Typical provisioning time depends on plan:** 1–2 minutes for Free and Ship plans, 4–5 minutes for Enterprise plans (which provision physically-isolated infrastructure). Allow up to ~5 minutes in any polling loop you write.
-</Note>
-
-</Step>
-
-<Step title="Step 2 - Ingest Data">
-
-HydraDB has two distinct data primitives. Pick the one that matches what you're ingesting.
-
-### Knowledge - documents and app sources
-
-[Knowledge](/essentials/knowledge) is shared, tenant-wide content that all users can recall: PDFs, DOCX files, Slack threads, Notion pages, CSVs.
-
-<CodeGroup>
-```bash cURL
-curl -X POST 'https://api.hydradb.com/ingestion/upload_knowledge' \
-  -H "Authorization: Bearer $HYDRADB_API_KEY" \
-  -F "tenant_id=my_first_tenant" \
-  -F "files=@/path/to/contract.pdf"
-```
-```typescript TypeScript SDK
-const result = await client.upload.knowledge({
-  tenant_id: "my_first_tenant",
-  files: [{ path: "/path/to/contract.pdf", filename: "contract.pdf", contentType: "application/pdf" }]
-});
-```
-```python Python SDK
-with open("/path/to/contract.pdf", "rb") as f:
-    result = client.upload.knowledge(
-        tenant_id="my_first_tenant",
-        files=[("contract.pdf", f, "application/pdf")]
-    )
-```
-</CodeGroup>
-
-**Response:**
-
-```json
-{
-  "success": true,
-  "results": [
-    { "source_id": "ef3ea754019855e2b39e9ab5c2d26096", "filename": "contract.pdf", "status": "queued" }
-  ],
-  "success_count": 1,
-  "failed_count": 0
-}
-```
-
-### Memories - user preferences and conversation history
-
-[Memories](/essentials/memories) are user-specific, dynamic context: preferences, chat history, behavioral signals, inferred traits. Each memory is scoped to a `sub_tenant_id` and is fully isolated from other users.
-
-<CodeGroup>
-```bash cURL
-curl -X POST 'https://api.hydradb.com/memories/add_memory' \
-  -H "Authorization: Bearer $HYDRADB_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "tenant_id": "my_first_tenant",
-    "sub_tenant_id": "user_alex_123",
-    "memories": [
-      {
-        "text": "User prefers detailed technical explanations and dark mode",
-        "infer": true,
-        "user_name": "Alex"
-      }
-    ]
-  }'
-```
-```typescript TypeScript SDK
-const result = await client.upload.addMemory({
-  tenant_id: "my_first_tenant",
-  sub_tenant_id: "user_alex_123",
-  memories: [
-    {
-      text: "User prefers detailed technical explanations and dark mode",
-      infer: true,
-      user_name: "Alex",
-    },
-  ],
-});
-```
-```python Python SDK
-result = client.upload.add_memory(
-    tenant_id="my_first_tenant",
-    sub_tenant_id="user_alex_123",
-    memories=[
-        {
-            "text": "User prefers detailed technical explanations and dark mode",
-            "infer": True,
-            "user_name": "Alex",
-        }
-    ],
-)
-```
-</CodeGroup>
-
-**Response:**
-
-```json
-{
-  "success": true,
-  "results": [
-    { "source_id": "1d50e5cd7c196a2bbcc1a59b037b3a44", "status": "queued", "infer": true }
-  ],
-  "success_count": 1,
-  "failed_count": 0
-}
-```
-
-Both paths return a `source_id` you can use to track processing in the next step.
-
-</Step>
-
-<Step title="Step 3 - Verify Processing">
-
-Ingestion is asynchronous. Content passes through a pipeline before it is searchable:
-
-```mermaid
-flowchart LR
-  Q([Queued]) --> P([Processing])
-  P --> G([Graph Creation])
-  G --> C([Completed])
-  P -.failure.-> E([Error])
-  G -.failure.-> E
-
-  style Q fill:#0f172a,stroke:#334155,stroke-width:2px,color:#f8fafc,stroke-linecap:round
-  style P fill:#0f172a,stroke:#334155,stroke-width:2px,color:#f8fafc,stroke-linecap:round
-  style G fill:#FF571A,stroke:#FF571A,stroke-width:2.5px,color:#f8fafc,stroke-linecap:round
-  style C fill:#22c55e,stroke:#166534,stroke-width:2px,color:#f8fafc,stroke-linecap:round
-  style E fill:#ef4444,stroke:#b91c1c,stroke-width:2px,color:#f8fafc,stroke-linecap:round
-```
-
-<CodeGroup>
-```bash cURL
-curl -X POST \
-  'https://api.hydradb.com/ingestion/verify_processing?file_ids=<source_id>&tenant_id=my_first_tenant' \
-  -H "Authorization: Bearer $HYDRADB_API_KEY"
-```
-```typescript TypeScript SDK
-const status = await client.upload.verifyProcessing({
-  tenant_id: "my_first_tenant",
-  sub_tenant_id: "my_first_tenant",
-  file_ids: ["<source_id>"],
-});
-```
-```python Python SDK
-status = client.upload.verify_processing(
-    tenant_id="my_first_tenant",
-    sub_tenant_id="my_first_tenant",
-    file_ids=["<source_id>"],
-)
-```
-</CodeGroup>
-
-**Response:**
-
-```json
-{
-  "statuses": [
-    {
-      "file_id": "<source_id>",
-      "indexing_status": "completed",
-      "success": true
-    }
-  ]
-}
-```
-
-Poll every few seconds until `indexing_status` is `"completed"`. Most documents index in under 60 seconds; larger documents may take up to 5 minutes.
-
-</Step>
-
-<Step title="Step 4 - Recall Context">
-
-HydraDB exposes two recall endpoints - one per store. Use the one that matches what you ingested.
-
-### For Knowledge - documents
-
-<CodeGroup>
-```bash cURL
-curl -X POST 'https://api.hydradb.com/recall/full_recall' \
-  -H "Authorization: Bearer $HYDRADB_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "tenant_id": "my_first_tenant",
-    "query": "What are the pricing tiers?",
-    "max_results": 5,
-    "mode": "fast",
-    "graph_context": true
-  }'
-```
-```typescript TypeScript SDK
-const result = await client.recall.fullRecall({
-  tenant_id: "my_first_tenant",
-  query: "What are the pricing tiers?",
-  max_results: 5,
-  mode: "fast",
-  graph_context: true
-});
-```
-```python Python SDK
-result = client.recall.full_recall(
-    tenant_id="my_first_tenant",
-    query="What are the pricing tiers?",
-    max_results=5,
-    mode="fast",
-    graph_context=True
-)
-```
-</CodeGroup>
-
-### For Memories - user preferences
-
-<CodeGroup>
-```bash cURL
-curl -X POST 'https://api.hydradb.com/recall/recall_preferences' \
-  -H "Authorization: Bearer $HYDRADB_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "tenant_id": "my_first_tenant",
-    "sub_tenant_id": "user_alex_123",
-    "query": "answer style and tone preferences",
-    "mode": "fast",
-    "max_results": 3
-  }'
-```
-```typescript TypeScript SDK
-const memories = await client.recall.recallPreferences({
-  tenant_id: "my_first_tenant",
-  sub_tenant_id: "user_alex_123",
-  query: "answer style and tone preferences",
-  mode: "fast",
-  max_results: 3,
-});
-```
-```python Python SDK
-memories = client.recall.recall_preferences(
-    tenant_id="my_first_tenant",
-    sub_tenant_id="user_alex_123",
-    query="answer style and tone preferences",
-    mode="fast",
-    max_results=3,
-)
-```
-</CodeGroup>
-
-**Key flags:**
-
-- `mode: "thinking"` - multi-stage recall with query expansion and reranking. Better results, higher latency. Default is `"fast"`.
-- `graph_context: true` - enriches results with entity relationships from the knowledge graph. Only applies to `full_recall`.
-
-**Sample response** (`full_recall`):
-
-```json
-{
-  "chunks": [
-    {
-      "chunk_uuid": "a1b2c3d4-...",
-      "source_id": "doc_12345",
-      "chunk_content": "Tiered pricing: $29/month Starter, $79/month Pro, $199/month Enterprise...",
-      "source_title": "Q4 Pricing Strategy",
-      "relevancy_score": 0.92
-    }
-  ],
-  "graph_context": {
-    "query_paths": [
-      {
-        "triplets": [
-          {
-            "source": { "name": "Pricing Strategy" },
-            "relation": { "canonical_predicate": "OWNED_BY" },
-            "target": { "name": "Product Team" }
-          }
-        ]
-      }
-    ],
-    "chunk_relations": [],
-    "chunk_id_to_group_ids": {}
-  }
-}
-```
-
-<Note>
-  **`relevancy_score`:** A metric to evaluate each chunk's relevance to the query. Ranges from `0.0` to `2.0`.
-</Note>
-
-`chunks` is retrieved content ranked by relevance. `graph_context` contains entity relationships extracted from your data - useful for reasoning about *how* things connect, not just *what* was said.
-
-</Step>
-
-<Step title="Step 5 - Pass it to your LLM">
-
-For personalized, grounded answers, call both `full_recall` and `recall_preferences` in parallel and merge the results into one prompt:
-
-<CodeGroup>
-```bash cURL
-# Run both recall calls, then merge in your application layer
-```
-```typescript TypeScript SDK
-const [knowledge, memories] = await Promise.all([
-  client.recall.fullRecall({
-    tenant_id: "my_first_tenant",
-    query: "What are the pricing tiers?",
-    mode: "thinking",
-    max_results: 5,
-    graph_context: true,
-  }),
-  client.recall.recallPreferences({
-    tenant_id: "my_first_tenant",
-    sub_tenant_id: "user_alex_123",
-    query: "answer style and tone preferences",
-    mode: "thinking",
-    max_results: 3,
-  }),
-]);
-
-const knowledgeCtx = buildContextString(knowledge);
-const memoryCtx = buildContextString(memories);
-
-const completion = await openai.chat.completions.create({
-  model: "gpt-4o",
-  messages: [
-    {
-      role: "system",
-      content: "Answer using only the provided context. Match the user's preferred style.",
-    },
-    {
-      role: "user",
-      content: `User preferences:\n${memoryCtx}\n\nRelevant docs:\n${knowledgeCtx}\n\nQuestion: What are the pricing tiers?`,
-    },
-  ],
-});
-```
-```python Python SDK
-import asyncio
-from hydra_db import AsyncHydraDB
-
-async_client = AsyncHydraDB(token=os.environ["HYDRADB_API_KEY"])
-
-async def run():
-    knowledge, memories = await asyncio.gather(
-        async_client.recall.full_recall(
-            tenant_id="my_first_tenant",
-            query="What are the pricing tiers?",
-            mode="thinking",
-            max_results=5,
-            graph_context=True,
-        ),
-        async_client.recall.recall_preferences(
-            tenant_id="my_first_tenant",
-            sub_tenant_id="user_alex_123",
-            query="answer style and tone preferences",
-            mode="thinking",
-            max_results=3,
-        ),
-    )
-    knowledge_ctx = build_context_string(knowledge)
-    memory_ctx = build_context_string(memories)
-    return knowledge_ctx, memory_ctx
-```
-</CodeGroup>
-
-For the `build_context_string()` helper, see [How to Use API Results](/essentials/api-results).
-
-</Step>
-
-</Steps>
-
----
-
-## You're done
-
-That's the full loop: create a tenant, ingest Knowledge and Memories, wait for processing, recall context, feed it to an LLM. Everything else in HydraDB - metadata filters, sub-tenants, graph traversal, personalization - builds on this foundation.
-
-**Where to go next:**
-
-- [Essentials → Memories](/essentials/memories) - how user-scoped memory works
-- [Essentials → Knowledge](/essentials/knowledge) - how document ingestion works
-- [Essentials → Recall](/essentials/recall) - parameters, modes, and tuning
-- [API Reference](/api-reference) - full endpoint documentation
-
-Stuck? Reach out at [founders@hydradb.com](mailto:founders@hydradb.com).
+HydraDB is serverless: there is nothing to provision, and the same code works at any scale, whether the context is a Markdown file or a Slack workspace synced by a [connector](/essentials/connectors).
+
+## Next steps
+
+| If you want to | Read |
+|---|---|
+| Ingest files, app sources, or memories | [Context](/essentials/context) |
+| Sync apps such as Slack, Gmail, and Notion automatically | [Connectors](/essentials/connectors) |
+| Tune query behavior (`alpha`, `mode`, `recency_bias`) | [Query](/essentials/query) |
+| Design a filterable metadata schema | [Metadata](/essentials/metadata) |
+| Organize context across databases and collections | [Databases and Collections](/essentials/databases-and-collections) |
+| Turn query results into a model prompt | [Query](/essentials/query#7-use-the-results) |
+| See the full endpoint reference | [API Reference](/api-reference/index) |
+
+Stuck? Email [founders@hydradb.com](mailto:founders@hydradb.com).

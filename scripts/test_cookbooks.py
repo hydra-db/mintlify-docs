@@ -23,7 +23,7 @@ from unittest import mock
 from hydra_db import types as sdk
 
 ROOT = Path(__file__).resolve().parents[1]
-COOKBOOKS = sorted(p for p in (ROOT / "cookbooks/v2").glob("*.mdx") if p.name != "index.mdx")
+COOKBOOKS = sorted(p for p in (ROOT / "cookbooks").glob("*.mdx") if p.name != "index.mdx")
 SETUP = ROOT / "snippets/cookbook-setup.mdx"
 
 APP_SOURCE_KEYS = {
@@ -38,7 +38,7 @@ MEMORY_KEYS = {
     "custom_instructions", "user_name", "metadata", "additional_metadata",
 }
 OPERATORS = {"equals", "contains", "contains_any"}
-# fields.* per kind, from the field reference in essentials/v2/context.mdx.
+# fields.* per kind, from the field reference in essentials/context.mdx.
 KIND_FIELDS = {
     "email": {"subject", "body", "from", "to", "cc", "bcc", "thread_id", "reply_to_id",
               "forwarded_from_id", "created_at", "url"},
@@ -55,7 +55,7 @@ KIND_FIELDS = {
     "custom": {"body", "parent_id", "thread_id", "data"},
 }
 # Plain-text and document extensions POST /context/ingest accepts
-# (api-reference/v2/endpoint/ingest-context.mdx#supported-file-formats).
+# (api-reference/endpoint/ingest-context.mdx#supported-file-formats).
 UPLOAD_EXTENSIONS = {".txt", ".md", ".markdown", ".json", ".pdf", ".docx", ".csv"}
 
 
@@ -236,7 +236,7 @@ class Stubs:
 
 class CookbookTest(unittest.TestCase):
     def test_cursor_search_preserves_graph_linked_context_and_file_paths(self):
-        source = python_blocks(ROOT / "cookbooks/v2/cursor.mdx")["cursor.py"]
+        source = python_blocks(ROOT / "cookbooks/cursor.mdx")["cursor.py"]
         search = next(node for node in ast.parse(source).body
                       if isinstance(node, ast.FunctionDef) and node.name == "search_code")
         result = sdk.HandlerEnvelopeSearchV2RetrievalResult(
@@ -346,9 +346,9 @@ class CookbookTest(unittest.TestCase):
             hydra.source_ids(rejected)
 
     def test_index_links_every_cookbook(self):
-        index = (ROOT / "cookbooks/v2/index.mdx").read_text()
+        index = (ROOT / "cookbooks/index.mdx").read_text()
         for path in COOKBOOKS:
-            self.assertIn(f'href="/cookbooks/v2/{path.stem}"', index)
+            self.assertIn(f'href="/cookbooks/{path.stem}"', index)
 
 
 if __name__ == "__main__":
