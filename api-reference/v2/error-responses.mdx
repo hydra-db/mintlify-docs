@@ -3,6 +3,8 @@ title: "Error Responses"
 description: "Response envelope, HTTP status codes, error codes, and retry patterns."
 ---
 
+Every HydraDB error arrives in the same envelope. Branch on `error.code`, log `meta.request_id`, and retry only the failures listed under [Retry pattern](#retry-pattern).
+
 ## Response envelope
 
 HydraDB core endpoints (`/databases`, `/context/*`, `/query`, `/feedback`, and `/webhooks/indexing*`) use the same top-level envelope for successful and failed requests. Connector endpoints (`/connectors*`) and `PATCH /databases/{database}/metadata-schema` return their success body without this envelope, but their errors use it too.
@@ -31,7 +33,7 @@ HydraDB core endpoints (`/databases`, `/context/*`, `/query`, `/feedback`, and `
 | `meta.request_id` | Request identifier. Include it when contacting support. |
 | `meta.latency_ms` | Server-side processing time in milliseconds. |
 
-Use `error.code` for branching and log `meta.request_id` for every failed request. The HTTP status tells you the class of failure; the error code tells you what to do.
+The HTTP status tells you the class of failure; the error code tells you what to do.
 
 ## HTTP status codes
 
@@ -64,29 +66,31 @@ Use `error.code` for branching and log `meta.request_id` for every failed reques
 | `NOT_FOUND` | `404` | The requested resource does not exist, for example a source ID in `DELETE /context`. |
 | `SOURCE_PROCESSING` | `409` | `DELETE /context` hit a source that is still indexing. Retry after `Retry-After`. |
 | `VALIDATION_ERROR` | `400` or `422` | A field has an invalid value. Query filter errors return `400`. Invalid connector credentials return `422`. |
-| `TENANT_INFRA_NOT_READY` | `422` | `POST /query` reached a database that is still provisioning. Poll [Database Status](/api-reference/v2/endpoint/tenant-status) until `ready_for_ingestion` is `true`, then retry. |
+| `TENANT_INFRA_NOT_READY` | `422` | `POST /query` reached a database that is still provisioning. Poll [Database Status](/api-reference/v2/endpoint/database-status) until `ready_for_ingestion` is `true`, then retry. |
 | `CORPUS_TYPE_UNSUPPORTED` | `400` | The `type` value does not fit this endpoint or database, for example `type: "all"` on ingest. |
 | `RATE_LIMITED` | `429` | The API key exceeded its current rate limit. |
 | `INTERNAL_ERROR` | `500` | HydraDB hit an unexpected server-side error. A rare auth-layer failure reports `INTERNAL_SERVER_ERROR` instead. |
 | `SERVICE_UNAVAILABLE` | `503` | A dependency is temporarily unavailable or the service is under load. |
 
-Endpoint pages list the most common codes for that operation. New codes may be added over time, so clients should handle unknown `error.code` values gracefully.
+Endpoint pages list the most common codes for that operation. New codes may be added over time, so handle unknown `error.code` values gracefully.
 
 `PATCH /databases/{database}/metadata-schema` currently returns `INTERNAL_ERROR` for its `400` and `409` errors too, so branch on the HTTP status there.
 
-For legacy route and field behavior, see [Migrating from tenant fields](/essentials/v2/multi-tenant#7-migrating-from-the-legacy-tenant-and-sub-tenant-fields).
+For deprecated route and field behavior, see [Migrating from tenant fields](/essentials/v2/databases-and-collections#7-migrating-from-the-legacy-tenant-and-sub-tenant-fields).
 
 ## Ingestion error codes
 
-Asynchronous ingestion failures surface a numeric `E####` code in the `error_code` field of [`GET /context/status`](/api-reference/v2/endpoint/source-status) responses and `indexing.status_changed` [webhook](/essentials/v2/webhooks) payloads. Unlike the HTTP `error.code` values above (which describe why a *request* was rejected), these describe why a specific *item* failed to index.
+Asynchronous ingestion failures surface a numeric `E####` code in the `error_code` field of [`GET /context/status`](/api-reference/v2/endpoint/source-status) responses and `indexing.status_changed` [webhook](/api-reference/v2/endpoint/webhooks-overview) payloads. The HTTP `error.code` values above describe why a *request* was rejected. These codes describe why a specific *source* failed to index.
 
-Many storage- and capacity-related ingestion errors are **transient**: the pipeline retries them automatically with backoff, and they typically self-resolve within minutes. A code appearing in `error_code` does not by itself mean the item has failed permanently; only treat an item as a real failure once it reaches the terminal `errored` status.
+Many storage- and capacity-related ingestion errors are **transient**: the pipeline retries them automatically with backoff, and they typically resolve within minutes. A code in `error_code` does not by itself mean the source has failed permanently. Treat a source as failed only once it reaches the terminal `errored` status.
 
 | Code | Meaning | What to do |
 |---|---|---|
 | `E1002` | Unsupported file format. Read this code in the upload response. The file is not queued. | Upload a supported format. |
 | `E2002` | The file contains no readable text. | Upload a version with text. |
 | `E6001` | Processed data could not be stored. | Retried automatically. |
+| `E9003` | A source with this ID already exists and the request set `upsert` to `false`. Read this code in the ingest response. | Send a new ID, or leave `upsert` on to replace the source. |
+| `E9004` | The status record expired before the source finished indexing. | Ingest the source again. |
 
 Files rejected with `E1002` have no ingestion status record. Handle this code from the upload response. See [Supported file formats](/api-reference/v2/endpoint/ingest-context#supported-file-formats).
 
@@ -131,7 +135,9 @@ async function hydraRequest(url: string, options: RequestInit, maxRetries = 3) {
 ```
 </CodeGroup>
 
-## Handling errors
+## Handle errors in code
+
+Both SDKs raise an exception for a non-2xx response. Read the code and request ID from the exception's response body. See [SDKs](/api-reference/v2/sdks#error-handling) for the exception classes.
 
 <CodeGroup>
 ```typescript TypeScript SDK
@@ -192,7 +198,7 @@ except ApiError as exc:
 
 ## Troubleshooting
 
-### Authentication failures
+### `401 UNAUTHORIZED` on every request
 
 Send exactly one `Authorization` header:
 
@@ -200,13 +206,13 @@ Send exactly one `Authorization` header:
 Authorization: Bearer <your_api_key>
 ```
 
-Also send `API-Version: 2` on raw HTTP requests. The official SDKs set the version header automatically.
+Also send `API-Version: 2` on raw HTTP requests. The SDKs set the version header automatically.
 
-### Database not found after creation
+### `422 TENANT_INFRA_NOT_READY` right after creating a database
 
-Database creation is asynchronous. After `POST /databases`, poll [`GET /databases/status`](/api-reference/v2/endpoint/tenant-status) until `infra.scheduler_status`, `infra.graph_status`, `infra.vectorstore_status.knowledge`, and `infra.vectorstore_status.memories` are all `true` (`infra.ready_for_ingestion` combines them). A query sent earlier returns `422 TENANT_INFRA_NOT_READY`.
+Database creation is asynchronous, and a query sent before provisioning finishes returns this error. After `POST /databases`, poll [`GET /databases/status`](/api-reference/v2/endpoint/database-status) until `infra.ready_for_ingestion` is `true`, then retry.
 
-### Ingestion validation errors
+### Validation errors on ingest
 
 Common causes:
 
@@ -217,15 +223,16 @@ Common causes:
 
 ### Empty query results
 
-Empty results are not always errors. Check these first:
+An empty result is a successful response, not an error. Common causes:
 
-- Context status may still be `queued` or `processing`; poll [`GET /context/status`](/api-reference/v2/endpoint/source-status).
-- `metadata_filters` may be too restrictive or may target the wrong metadata namespace.
-- The query may be scoped to the wrong `database` or `collection` (formerly `tenant_id` / `sub_tenant_id`).
-- The `type` value may exclude the store you need. Use `type: "all"` when combining knowledge and memories in `POST /query`.
+- The source is still `queued` or `processing`. Poll [`GET /context/status`](/api-reference/v2/endpoint/source-status).
+- `metadata_filters` is too restrictive or targets the wrong metadata namespace.
+- The query is scoped to the wrong `database` or `collection`.
+- The `type` value excludes the store you need. Use `type: "all"` to combine knowledge and memories in `POST /query`.
 
-## Related sections
+## Related
 
-- [API Reference](/api-reference/v2): endpoint inventory and conventions
-- [Ingestion Status](/api-reference/v2/endpoint/source-status): async ingestion state
-- [Query](/api-reference/v2/endpoint/query): retrieval parameters and response shape
+- [API Reference](/api-reference/v2): endpoint map and conventions
+- [SDKs](/api-reference/v2/sdks): client setup and SDK exception classes
+- [Ingestion Status](/api-reference/v2/endpoint/source-status): indexing status for ingested sources
+- [Query](/api-reference/v2/endpoint/query): query parameters and response shape

@@ -35,7 +35,7 @@ make dev         # starts local dev server at http://localhost:3000
 
 ## Documentation regression checks
 
-CI executes the cookbook functions extracted directly from the MDX against pinned released SDKs and isolated HTTP fixtures. It checks approval enforcement, per-item ingestion outcomes, Notion pagination, JSON schema loading, and multipart memory serialization without real vendor calls or credentials. TypeScript checks compile the exact cookbook `upsert` expressions against the released SDK's request type; they don't treat every explanatory fragment as a complete application.
+CI checks the docs against the public v2 contract: endpoint bindings, JSON examples, canonical names, and the agent guide's endpoint mentions. It runs without real vendor calls or credentials.
 
 ```bash
 python -m venv .venv
@@ -45,7 +45,6 @@ python -m unittest discover -s scripts -p 'test_*.py'
 python .github/verify_v2_public_contract.py
 python -m unittest discover -s .github -p 'test_v2_schema_types.py'
 python scripts/verify_agents_endpoints.py
-node scripts/test_cookbook_types.mjs
 python scripts/generate_llms_index.py --check
 pnpm mintlify validate
 ```

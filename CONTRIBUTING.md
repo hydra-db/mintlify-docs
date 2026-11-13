@@ -150,11 +150,47 @@ Every commit must include the DCO sign-off.
 
 ## Content Guidelines
 
-- **Write clearly and concisely.** Use simple language and short sentences.
-- **Use MDX components** provided by Mintlify (callouts, code blocks, tabs, etc.) where appropriate.
 - **Include code examples** for all API endpoints and SDK methods.
 - **No internal details.** Do not include internal architecture, infrastructure details, or security configurations in public docs.
-- **No hardcoded credentials.** Use placeholder values like `sk_live_your_api_key` in examples.
+- **No hardcoded credentials.** Read the key from `HYDRADB_API_KEY` in examples.
+
+### Style
+
+- **Lead with the task.** Open a page with one or two sentences on what the reader can do. Do not restate the title or list the headings; Mintlify renders the table of contents.
+- **Say each thing once.** Each concept has one owner page. Elsewhere, write one sentence and link to it.
+- **Match the format to the content.** Prose for concepts, numbered steps for procedures, tables for reference, code for examples.
+- **Write plainly.** Second person, present tense, active voice. No filler ("simply", "just", "easily"), no marketing adjectives, no em dashes.
+- **Headings** use sentence case and name the task ("Wait for indexing"). Guides close with `## Common mistakes`, then `## Related`. Endpoint pages close with `## Related resources`. Get-started pages close with `## Next steps`.
+- **Callouts are rare.** `<Warning>` for data loss, security, or irreversible actions. `<Note>` for non-obvious behavior.
+- **Endpoint pages** carry what the OpenAPI schema cannot: when to call, sequencing, non-obvious rules, and examples. Do not restate parameter types.
+
+### Terminology
+
+Use one term per concept. Literal field names, SDK identifiers, and error codes stay as they are, in backticks, even when they contain a deprecated word (`tenant_id`, `app_knowledge`).
+
+| Use | Not | Notes |
+| --- | --- | --- |
+| HydraDB | Hydra, Hydra DB | |
+| database | tenant, workspace, instance | "Workspace" is fine for a third-party workspace, such as Slack. |
+| collection | sub-tenant, namespace | |
+| context | data | Everything stored: knowledge and memories. |
+| source | item, object, doc | One stored unit with an `id`. "Document" and "file" are for uploaded files only. |
+| app source | app knowledge, app record | The request field is `app_knowledge`. |
+| kind | class | The type of an app source, set in `kind`. |
+| chunk | passage, snippet | Gloss once per page if needed: "chunks (passages of a source)". |
+| query | recall, search request | The operation behind `POST /query`. "Search" is fine as a plain verb. |
+| ingest | add, push, load | "Upload" for files only. "Sync" for connectors only. |
+| index, indexing | process, processing | What HydraDB does after ingest. |
+| context graph | knowledge graph | |
+| forceful relations | explicit links | Gloss on first use: "links you declare between sources". |
+| metadata schema, metadata filter | database schema, where filter | |
+| ACL, principal | allow-list, permission list | "Access control" is the feature. |
+| connector, provider, resource | integration, sync pipeline | Provider is the app type. Resource is a channel, repo, or folder. |
+| your application | your app, your service | "App" means a third-party app, such as Slack or Jira. |
+| user | end user | |
+| API key | token, API token | |
+| Python SDK, TypeScript SDK | Node SDK, JS SDK | Code tab labels: `Python SDK`, `TypeScript SDK`, `cURL`. |
+| Quickstart | Quick Start | |
 
 ---
 
