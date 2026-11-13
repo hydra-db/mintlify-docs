@@ -26,37 +26,33 @@ ROOT = Path(__file__).resolve().parents[1]
 COOKBOOKS = sorted(p for p in (ROOT / "cookbooks/v2").glob("*.mdx") if p.name != "index.mdx")
 SETUP = ROOT / "snippets/cookbook-setup.mdx"
 
-APP_SOURCE_KEYS = {
-    "id", "database", "collection", "title", "kind", "provider", "external_id", "url",
-    "timestamp", "fields", "metadata", "additional_metadata", "relations",
-    "app_relations", "acl", "attachments", "comments",
-}
-KINDS = {"email", "message", "ticket", "knowledge_base", "comment", "meeting", "custom"}
 DOCUMENT_METADATA_KEYS = {"id", "metadata", "additional_metadata", "relations"}
 MEMORY_KEYS = {
     "id", "title", "text", "user_assistant_pairs", "is_markdown", "infer",
     "custom_instructions", "user_name", "metadata", "additional_metadata",
 }
 OPERATORS = {"equals", "contains", "contains_any"}
-# fields.* per kind, from the field reference in essentials/v2/context.mdx.
-KIND_FIELDS = {
-    "email": {"subject", "body", "from", "to", "cc", "bcc", "thread_id", "reply_to_id",
-              "forwarded_from_id", "created_at", "url"},
-    "message": {"body", "author", "thread_id", "parent_id", "mentions", "created_at",
-                "edited_at", "url"},
-    "ticket": {"title", "description", "status", "priority", "assignee", "reporter",
-               "parent_id", "linked_issue_ids", "created_at", "updated_at", "url"},
-    "knowledge_base": {"title", "body", "parent_id", "created_by", "updated_by",
-                       "created_at", "updated_at", "url"},
-    "comment": {"body", "author", "parent_id", "thread_id", "created_at", "updated_at",
-                "url", "properties"},
-    "meeting": {"title", "body", "host", "host_email", "participants", "started_at",
-                "updated_at", "labels", "url"},
-    "custom": {"body", "parent_id", "thread_id", "data"},
+# Cookbooks that bring app content in through connectors, and the variables they read.
+CONNECTOR_COOKBOOKS = {"glean", "chief-of-staff", "personal-assistant"}
+APP_CREDENTIALS = {
+    "SLACK_TOKEN": "xoxp-test", "SLACK_WORKSPACE_ID": "T12345ACME",
+    "GMAIL_CREDENTIALS": '{"refresh_token": "test"}',
+    "EXECUTIVE_EMAIL": "dana@acme.com", "USER_EMAIL": "maya@example.com",
 }
 # Plain-text and document extensions POST /context/ingest accepts
 # (api-reference/v2/endpoint/ingest-context.mdx#supported-file-formats).
 UPLOAD_EXTENSIONS = {".txt", ".md", ".markdown", ".json", ".pdf", ".docx", ".csv"}
+
+
+def bounded_sleep(limit=200):
+    """Patch time.sleep so a polling loop that never ends fails instead of hanging the suite."""
+    calls = iter(range(limit))
+
+    def sleep(seconds):
+        if next(calls, None) is None:
+            raise AssertionError("a polling loop did not finish")
+
+    return mock.patch("time.sleep", side_effect=sleep)
 
 
 def python_blocks(path):
@@ -93,7 +89,11 @@ class Stubs:
         self.test = test
         self.declared = set()
         self.collections = set()
-        self.restricted = set()  # Collections holding a source that carries an acl.
+        self.restricted = set()  # Collections a connector syncs into: their sources carry ACLs.
+        self.connectors = []
+        self.configured = {}  # connector_id -> resources, or None before configure.
+        self.discovered = [["C1", "C2"], ["C3"]]  # Two pages, so pagination is exercised.
+        self.connector_status = ("active", "healthy")
         self.status = "completed"
         self.calls = []
         for owner, name, handler in [
@@ -105,6 +105,8 @@ class Stubs:
             (client.connectors, "create", self.connector_create),
             (client.connectors, "discover", self.connector_discover),
             (client.connectors, "configure", self.connector_configure),
+            (client.connectors, "status", self.connector_status_call),
+            (client.connectors, "list", self.connector_list),
         ]:
             label = name if owner is client else f"{type(owner).__name__}.{name}"
             setattr(owner, name, self.checked(label, getattr(owner, name), handler))
@@ -135,28 +137,75 @@ class Stubs:
             )
         )
 
-    def connector_create(self, **kwargs):
-        self.test.assertNotIn("enforce_acl", kwargs)  # Needs a dashboard session.
-        return sdk.HandlerConnectorCreateResponse(connector_id="conn_1")
+    # Providers that copy the app's permissions onto each source, per
+    # "What each provider captures" in essentials/v2/connectors.mdx.
+    CAPTURES_ACL = {"slack", "google_drive", "github", "confluence", "jira"}
 
-    def connector_discover(self, id):
-        return sdk.HandlerDiscoverResponseBody(resources=[
-            sdk.HandlerDiscoveredResourceDto(id="C1", resource_type="channel", name="general")
-        ])
+    def connector_create(self, provider, name, database, collection, credentials,
+                         provider_account_scope=None):
+        self.test.assertTrue(credentials and all(credentials.values()), "credentials must not be empty")
+        connector_id = f"conn_{len(self.connectors) + 1}"
+        self.connectors.append(sdk.HandlerConnectorApiView(
+            connector_id=connector_id, provider=provider, name=name, database=database,
+            collection=collection, provider_account_scope=provider_account_scope,
+            lifecycle="pending_setup",
+        ))
+        self.configured[connector_id] = None
+        self.collections.add(collection)
+        self.restricted.add(collection)
+        return sdk.HandlerConnectorCreateResponse(connector_id=connector_id)
 
-    def connector_configure(self, id, resources):
+    def connector_list(self, provider=None):
+        return sdk.HandlerConnectorListResponse(
+            connectors=[c for c in self.connectors if provider in (None, c.provider)]
+        )
+
+    def connector(self, connector_id):
+        found = [c for c in self.connectors if c.connector_id == connector_id]
+        self.test.assertTrue(found, f"unknown connector {connector_id}")
+        return found[0]
+
+    def connector_status_call(self, id):
+        self.connector(id)
+        if self.configured[id] is None:
+            return sdk.HandlerConnectorStatusResponse(
+                connector_id=id, lifecycle="pending_setup", status="degraded")
+        lifecycle, status = self.connector_status
+        return sdk.HandlerConnectorStatusResponse(connector_id=id, lifecycle=lifecycle, status=status)
+
+    def connector_discover(self, id, cursor=None, limit=None):
+        self.connector(id)
+        self.test.assertLessEqual(limit or 100, 100)
+        pages = self.discovered
+        index = 0 if cursor is None else int(cursor)
+        return sdk.HandlerDiscoverResponseBody(
+            resources=[sdk.HandlerDiscoveredResourceDto(id=r, resource_type="channel", name=r.lower())
+                       for r in pages[index]],
+            has_more=index + 1 < len(pages),
+            next_cursor=str(index + 1) if index + 1 < len(pages) else None,
+        )
+
+    def connector_configure(self, id, resources, lookback_days=None):
+        test = self.test
+        connector = self.connector(id)
+        test.assertTrue(resources, "configure rejects an empty resources list")
+        wanted = {r for page in self.discovered for r in page}
+        test.assertEqual(wanted, {r["resource_id"] for r in resources}, "configure every discovered resource")
         for resource in resources:
             sdk.HandlerResourceMapping(**resource)
-            self.test.assertLessEqual(set(resource), {"resource_id", "resource_type", "name"})
+            test.assertLessEqual(set(resource), {"resource_id", "resource_type", "name", "acl"})
+            if connector.provider not in self.CAPTURES_ACL:
+                test.assertTrue(resource.get("acl"),
+                                f"{connector.provider} captures no permissions: set acl on its resources")
+        self.configured[id] = resources
         return sdk.HandlerConfigureResponse()
 
     def ingest(self, type, database, collection, documents=None, document_metadata=None,
-               app_knowledge=None, memories=None):
+               memories=None):  # No app_knowledge: app content comes through connectors.
         test = self.test
         self.collections.add(collection)
         ids = []
         if type == "memory":
-            test.assertIsNone(app_knowledge)
             for item in json.loads(memories):
                 test.assertLessEqual(set(item), MEMORY_KEYS)
                 test.assertEqual(1, ("text" in item) + ("user_assistant_pairs" in item))
@@ -171,20 +220,10 @@ class Stubs:
                 test.assertEqual(len(documents), len(items))
                 for (filename, handle, content_type), item in zip(documents, items):
                     test.assertLessEqual(set(item), DOCUMENT_METADATA_KEYS)
+                    test.assertLessEqual(set(item.get("metadata", {})), self.declared)
                     test.assertIn(Path(filename).suffix, UPLOAD_EXTENSIONS, filename)
                     test.assertTrue(handle.read(), f"{filename} is empty")
                     ids.append(item["id"])
-            for item in json.loads(app_knowledge or "[]"):
-                test.assertLessEqual(set(item), APP_SOURCE_KEYS)
-                test.assertIn(item["kind"], KINDS)
-                test.assertEqual(item["kind"], item["fields"]["kind"])
-                test.assertLessEqual(
-                    set(item["fields"]) - {"kind"}, KIND_FIELDS[item["kind"]], item["id"]
-                )
-                test.assertLessEqual(set(item.get("metadata", {})), self.declared)
-                if item.get("acl"):
-                    self.restricted.add(collection)
-                ids.append(item["id"])
         test.assertTrue(ids)
         test.assertTrue(all(re.fullmatch(r"[^,\s]+", i) for i in ids), ids)
         return sdk.HandlerEnvelopeIngestionV2IngestResponse(
@@ -220,9 +259,11 @@ class Stubs:
             test.assertEqual(1, len(value))
             test.assertLessEqual(set(value), OPERATORS)
         if self.restricted & set(scopes):
-            test.assertIn("acl", kwargs, "a query over restricted sources must send the caller's acl")
+            test.assertIn("acl", kwargs, "a query over connector-synced sources must send the caller's acl")
         if "acl" in kwargs:
-            test.assertTrue(kwargs["acl"] and all(isinstance(p, str) for p in kwargs["acl"]))
+            test.assertTrue(kwargs["acl"])
+            for principal in kwargs["acl"]:
+                test.assertRegex(principal, r"^(?:[^@\s]+@[^@\s]+\.\w+|domain:\S+|group:\S+:\S+)$")
         # Public fields only: `sources` and other internal fields stay unset,
         # as .github/verify_v2_public_contract.py requires of the public result.
         chunk = sdk.SearchV2Chunk(
@@ -272,13 +313,21 @@ class CookbookTest(unittest.TestCase):
             }},
         }, context)
 
+    @staticmethod
+    def optional_credentials(source):
+        """Environment variables for providers a cookbook connects only when they are set."""
+        names = re.findall(r'for provider in \(([^)]*)\)', source)
+        providers = re.findall(r'"(\w+)"', " ".join(names))
+        return {f"{p.upper()}_CREDENTIALS": '{"api_token": "test"}' for p in providers}
+
     def run_cookbook(self, path):
         setup = python_blocks(SETUP)["hydra.py"]
         files = python_blocks(path)
         self.assertTrue(files, f"{path.name} has no labelled Python blocks")
         with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
-            os.environ, {"HYDRADB_API_KEY": "test", "OPENAI_API_KEY": "test"}
-        ), mock.patch.dict(sys.modules, {"openai": fake_openai()}), mock.patch("time.sleep"), \
+            os.environ, {"HYDRADB_API_KEY": "test", "OPENAI_API_KEY": "test", **APP_CREDENTIALS,
+                         **self.optional_credentials(path.read_text())}
+        ), mock.patch.dict(sys.modules, {"openai": fake_openai()}), bounded_sleep(), \
                 mock.patch("builtins.print"):
             previous = os.getcwd()
             os.chdir(directory)
@@ -301,9 +350,71 @@ class CookbookTest(unittest.TestCase):
         for path in COOKBOOKS:
             with self.subTest(cookbook=path.name):
                 stubs = self.run_cookbook(path)
-                for step in ("DatabasesClient.create", "DatabasesClient.status",
-                             "ContextClient.ingest", "ContextClient.status", "query"):
+                steps = ["DatabasesClient.create", "DatabasesClient.status", "query"]
+                if path.stem in CONNECTOR_COOKBOOKS:
+                    steps += ["ConnectorsClient.list", "ConnectorsClient.create", "ConnectorsClient.discover",
+                              "ConnectorsClient.configure", "ConnectorsClient.status"]
+                else:
+                    steps += ["ContextClient.ingest", "ContextClient.status"]
+                    self.assertNotIn("ConnectorsClient.create", stubs.calls)
+                for step in steps:
                     self.assertIn(step, stubs.calls)
+
+    def test_connect_reuses_only_the_same_account(self):
+        hydra, stubs = self.load_setup()
+        token = {"access_token": "x"}
+        with bounded_sleep():
+            first = hydra.connect("slack", "db", "docs", token, account_scope="T1")
+            again = hydra.connect("slack", "db", "docs", token, account_scope="T1")
+            workspace = hydra.connect("slack", "db", "docs", token, account_scope="T2")
+            collection = hydra.connect("slack", "db", "other", token, account_scope="T1")
+        self.assertEqual(first, again)
+        self.assertEqual(3, len({first, workspace, collection}))
+        self.assertEqual(3, stubs.calls.count("ConnectorsClient.create"))
+        self.assertEqual(3, stubs.calls.count("ConnectorsClient.configure"))
+
+    def test_connect_configures_every_page_of_resources(self):
+        hydra, stubs = self.load_setup()
+        with bounded_sleep():
+            connector_id = hydra.connect("slack", "db", "docs", {"access_token": "x"}, lookback_days=90)
+        self.assertEqual(["C1", "C2", "C3"], [r["resource_id"] for r in stubs.configured[connector_id]])
+        self.assertEqual(2, stubs.calls.count("ConnectorsClient.discover"))
+
+    def test_connect_finishes_a_connector_left_unconfigured(self):
+        hydra, stubs = self.load_setup()
+        stubs.discovered = [[]]  # The first run finds nothing and stops before configure.
+        with bounded_sleep(), self.assertRaisesRegex(RuntimeError, "can reach nothing to sync"):
+            hydra.connect("slack", "db", "docs", {"access_token": "x"})
+        stubs.discovered = [["C1"]]
+        with bounded_sleep():
+            connector_id = hydra.connect("slack", "db", "docs", {"access_token": "x"})
+        self.assertEqual(1, stubs.calls.count("ConnectorsClient.create"))
+        self.assertEqual(["C1"], [r["resource_id"] for r in stubs.configured[connector_id]])
+
+    def test_connect_sets_acl_for_a_provider_that_captures_none(self):
+        hydra, stubs = self.load_setup()
+        with bounded_sleep():
+            connector_id = hydra.connect("gmail", "db", "docs", {"refresh_token": "x"}, acl=["a@acme.com"])
+        self.assertTrue(all(r["acl"] == ["a@acme.com"] for r in stubs.configured[connector_id]))
+        with bounded_sleep(), self.assertRaises(AssertionError):
+            hydra.connect("notion", "db", "docs", {"token": "x"})
+
+    def test_connect_stops_on_every_state_that_cannot_recover(self):
+        for lifecycle, status in (("ingesting", "failed"), ("paused", "paused"),
+                                  ("ingesting", "capped"), ("reconnect", "degraded")):
+            with self.subTest(lifecycle=lifecycle, status=status):
+                hydra, stubs = self.load_setup()
+                stubs.connector_status = (lifecycle, status)
+                gave_up = mock.patch("time.sleep", side_effect=AssertionError("connect kept polling"))
+                with gave_up, self.assertRaisesRegex(RuntimeError, "connector is"):
+                    hydra.connect("slack", "db", "docs", {"access_token": "x"})
+
+    def test_connect_gives_up_after_its_timeout(self):
+        hydra, stubs = self.load_setup()
+        stubs.connector_status = ("ingesting", "checking")  # An account with nothing to sync never goes active.
+        with bounded_sleep(), mock.patch("time.time", side_effect=[0, 0, 10, 10_000, 10_000]), \
+                self.assertRaisesRegex(TimeoutError, "synced nothing"):
+            hydra.connect("slack", "db", "docs", {"access_token": "x"}, timeout=60)
 
     def load_setup(self):
         """Import hydra.py with stubbed SDK methods, outside any cookbook."""

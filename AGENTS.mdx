@@ -9,7 +9,7 @@ This is the complete, maintained agent guide. Continue with the sections below; 
 
 1. **`POST /databases`** (`client.databases.create()`): Create an isolated database. Creation is asynchronous.
 2. **`GET /databases/status`** (`client.databases.status()`): Poll until `infra.ready_for_ingestion` is true before you ingest or query.
-3. **`POST /context/ingest`** (`client.context.ingest()`): Ingest files, app sources, or memories with `type="knowledge"` or `type="memory"`. Indexing is asynchronous.
+3. **`POST /context/ingest`** (`client.context.ingest()`): Ingest files or memories with `type="knowledge"` or `type="memory"`. Indexing is asynchronous.
 4. **`GET /context/status`** (`client.context.status()`): Poll by `ids` until `indexing_status` is `completed` before you query. `graph_creation` means the source is becoming searchable while its graph builds, but a query sent the moment it appears can still miss the source. `errored` means indexing failed: read `error_code` and `error_message`. Details in [7. Context status and lifecycle](#7-context-status-and-lifecycle).
 5. **`POST /query`** (`client.query()`): Retrieve chunks with `type: "knowledge"`, `"memory"`, or `"all"`.
 6. **`POST /feedback`** (`client.feedback.submit()`): Tell us when a query did not give you what you needed, and once the task is done, how the context held up. See [Sending feedback](#sending-feedback).
@@ -60,7 +60,7 @@ Raw HTTP responses are wrapped:
 
 - `metadata`: schema-aligned fields, declared at database creation; the fast filter path. Filter on them with top-level `metadata_filters` keys.
 - `additional_metadata`: free-form fields; anything not in the `metadata` schema. Filter on them with `metadata_filters.additional_metadata`.
-- Set both per source on `/context/ingest`: on each `document_metadata[]` item (file uploads), each `app_knowledge[]` item, or each memory item. There is no top-level `metadata` or `additional_metadata` form field.
+- Set both per source on `/context/ingest`: on each `document_metadata[]` item (file uploads) or each memory item. There is no top-level `metadata` or `additional_metadata` form field.
 
 Schema fields, placement, and filter operators are in [10. Metadata guide](#10-metadata-guide).
 
@@ -197,7 +197,7 @@ Scoping rules are in [Do not mix scopes accidentally](#do-not-mix-scopes-acciden
 
 ### Knowledge
 
-Knowledge is the documents, app sources, and facts your AI reasons over: PDFs, Markdown, CSVs, Slack threads, Notion pages, Gmail threads, tickets, webpages, and so on. Ingest and query it with `type: "knowledge"`.
+Knowledge is the documents and facts your AI reasons over: PDFs, Markdown, and CSVs you upload, plus Slack threads, Notion pages, Gmail threads, tickets, and other content that [connectors](#connectors) sync from your apps. Ingest and query it with `type: "knowledge"`.
 
 - It can be private: restrict sources with `acl` (see [Access control](#access-control)).
 - Mutability is explicit: re-ingest with the same ID and `upsert: true`, edit metadata in place with `PATCH /context/{id}/metadata`, or delete.
@@ -234,14 +234,14 @@ Forceful relations are links you declare between sources at ingest:
 ```
 
 - Use `ids`.
-- Declare `relations` on `document_metadata[]` and `app_knowledge[]` items. They link knowledge sources; memory items do not take `relations`.
+- Declare `relations` on `document_metadata[]` items. They link knowledge sources; memory items do not take `relations`.
 - A query pulls the related chunks into `additional_context` only in `mode: "thinking"` with `query_forceful_relations: true` (the default).
 
 ### Access control
 
 A source's `acl` lists who may retrieve it; a query's `acl` says who is asking. The query-side rule is in [Send `acl` on user queries](#send-acl-on-user-queries).
 
-- Set `acl` on `app_knowledge[]` items at ingest, or on any existing source with `PATCH /context/{id}/metadata`, where it replaces the stored list.
+- Set `acl` on any existing source with `PATCH /context/{id}/metadata`, where it replaces the stored list.
 - Connectors copy permissions from Slack, Google Drive, GitHub, Confluence, Jira, and other providers on every sync.
 - Principals: an email (`grace@acme.com`), `domain:acme.com`, `group:<provider>:<id>`, or `__public__`.
 - On a query, the caller's email also matches its `domain:` principal and `__public__` automatically. Group membership is never derived from an email; send `group:` principals yourself.
@@ -251,7 +251,7 @@ Example: a source with `"acl": ["grace@acme.com"]` comes back for a query with `
 
 ### Connectors
 
-Connectors sync context from 70 apps, including Slack, Gmail, Google Drive, Notion, Jira, Confluence, GitHub, Linear, HubSpot, and Zendesk, into a database on a schedule, with no ingestion code. Prefer a connector over hand-written `app_knowledge` ingestion when the app is in the catalog; `GET /connectors/providers` lists it.
+Connectors sync context from 70 apps, including Slack, Gmail, Google Drive, Notion, Jira, Confluence, GitHub, Linear, HubSpot, and Zendesk, into a database on a schedule, with no ingestion code. App content reaches HydraDB through connectors: `GET /connectors/providers` lists the catalog.
 
 Setup is four calls, made once:
 
@@ -352,7 +352,7 @@ SDK naming:
 
 - Python methods and fields are snake_case: `databases.get_metadata_schema()`, `page_size`, `query_by`.
 - TypeScript methods and fields are camelCase: `databases.getMetadataSchema()`, `pageSize`, `queryBy`.
-- Values passed as JSON strings (`memories`, `app_knowledge`, `document_metadata`) keep snake_case keys inside the stringified payload in both SDKs, because that is raw wire data.
+- Values passed as JSON strings (`memories`, `document_metadata`) keep snake_case keys inside the stringified payload in both SDKs, because that is raw wire data.
 
 ---
 
@@ -554,7 +554,6 @@ The collections, stats, and delete routes also take `database` as a query parame
 | `upsert` | default `true`; replaces existing sources with the same ID |
 | `documents` | binary file uploads for knowledge |
 | `document_metadata` | JSON-stringified array, one item per uploaded file; see [Knowledge from files](#knowledge-from-files) |
-| `app_knowledge` | JSON-stringified object/array of pre-extracted app sources |
 | `memories` | JSON-stringified array of memory items |
 
 ### Knowledge from files
@@ -571,7 +570,7 @@ Use for files HydraDB should parse. Supported extensions:
 | Plain text | `.txt` `.md` `.markdown` `.json` |
 
 - Any other extension, including source code (`.py`, `.ts`, `.go`), `.html`, and `.zip`, is rejected. The request still returns `202`; the rejected file comes back in `data.results` with `status: "failed"` and `error_code: "E1002"`, and has no status record to poll. Check every result item before polling.
-- To ingest source code, upload it with `.txt` added to the filename (`auth.py.txt`) and keep the real path in `additional_metadata`, or send its text as an app source.
+- To ingest source code, upload it with `.txt` added to the filename (`auth.py.txt`) and keep the real path in `additional_metadata`.
 - The `Content-Type` of the part is used only when the filename has no extension.
 
 ```python
@@ -600,62 +599,6 @@ with open("policy.pdf", "rb") as f:
 | `metadata` | schema-aligned fields for this file (max 16 KiB compact JSON) |
 | `additional_metadata` | free-form fields for this file (max 1 KiB compact JSON) |
 | `relations` | relations you declare to other sources, e.g. `{ "ids": [...] }` |
-
-### Knowledge from app sources
-
-Use `app_knowledge` when you already extracted the text from Slack, Gmail, Jira, Linear, Zendesk, Notion, Confluence, Salesforce, webpages, and so on.
-
-```ts
-await client.context.ingest({
-  type: "knowledge",
-  database: "acme_corp",
-  appKnowledge: JSON.stringify([
-    {
-      id: "slack_C123_1715012345_000100",
-      title: "Pricing discussion - Slack #product",
-      kind: "message",
-      provider: "slack",
-      external_id: "1715012345.000100",
-      url: "https://slack.com/archives/C123/p1715012345000100",
-      timestamp: "2025-01-15T12:30:00Z",
-      fields: {
-        kind: "message",
-        body: "We agreed on three tiers: Starter, Pro, and Enterprise.",
-        author: "alice",
-        thread_id: "1715012345.000100",
-        created_at: "2025-01-15T12:30:00Z",
-      },
-      metadata: {
-        channel: "product",
-        workspace: "acme",
-      },
-      additional_metadata: {
-        slack_ts: "1715012345.000100",
-      },
-      relations: {
-        ids: ["slack_thread_root_001"],
-      },
-    }
-  ]),
-});
-```
-
-Recommended app-source fields:
-
-| Field | Why send it |
-|---|---|
-| `id` | stable HydraDB ID and upsert key |
-| `title` | readable result/citation title |
-| `kind` | what the record is: `email`, `message`, `ticket`, `knowledge_base`, `comment`, `meeting`, or `custom` |
-| `provider`, `external_id` | the app it came from and its ID there |
-| `fields` | the record's content and structure for that kind, such as `body`, `author`, and `thread_id`; `fields.kind` must equal `kind` |
-| `metadata` | fast filters such as channel, project, region, workspace |
-| `additional_metadata` | provider IDs, status, assignee, timestamps |
-| `url` | citation / navigation link |
-| `timestamp` | freshness and chronology |
-| `relations.ids` | thread, parent/child, linked issue, related source expansion |
-
-Kinds in OpenAPI are `email`, `message`, `ticket`, `knowledge_base`, `comment`, `meeting`, and `custom`. An older shape with `type` and `content.text` in place of `kind` and `fields` is still accepted; do not use it in new code. See [Context](https://docs.hydradb.com/essentials/v2/context.md) for the keys each kind takes in `fields`. At minimum provide a stable `id`, `kind`, `fields`, and the `metadata` you filter on.
 
 ### Memories
 
@@ -816,7 +759,7 @@ Rules:
 | `query_forceful_relations` | boolean | only effective in `thinking` mode |
 | `additional_context` | string | short factual hint; not a hard filter |
 | `metadata_filters` | object | deterministic filters before/around ranking |
-| `query_apps` | boolean | app-aware retrieval lane for app sources; still searches the full selected knowledge scope; defaults to `true` on `/query`, send `false` to disable |
+| `query_apps` | boolean | app-aware retrieval lane for content synced by connectors; still searches the full selected knowledge scope; defaults to `true` on `/query`, send `false` to disable |
 
 `type: "all"` reads both stores from the same scope. When shared knowledge lives in its own collection, send `collections: ["<shared>", "<user>"]`.
 
@@ -830,7 +773,7 @@ Rules:
 | User preferences only | `type: "memory"`, include `collection`, `query_by: "hybrid"` |
 | Exact keyword / phrase | `type: "knowledge"`, `query_by: "text"`, `operator: "phrase"` |
 | Recent operational updates | `query_by: "hybrid"`, `recency_bias: 0.6-0.8`, metadata filter to doc type/status |
-| App search | `type: "knowledge"`, `query_by: "hybrid"`, `mode: "thinking"`, `query_apps: true`; still searches non-app knowledge too |
+| App search | `type: "knowledge"`, `query_by: "hybrid"`, `mode: "thinking"`, `query_apps: true`; still searches uploaded files too |
 
 ### Query examples
 
@@ -1227,7 +1170,7 @@ try {
 Most integrations follow the same architecture:
 
 1. Create a database with a metadata schema for hot filters.
-2. Ingest shared knowledge and app sources with stable IDs.
+2. Upload shared knowledge with stable IDs, and connect apps with connectors.
 3. Ingest user and session memories with `collection`.
 4. Poll status or use webhooks.
 5. Query with `type: "knowledge"`, `"memory"`, or `"all"`.
@@ -1252,7 +1195,7 @@ Section 1, critical rules:
 Sections 2 to 7, ingestion and lifecycle:
 
 - [ ] Uploading a file with an unsupported extension, such as source code, and polling an ID that was rejected with `E1002`.
-- [ ] Hand-writing `app_knowledge` ingestion for an app a connector already syncs.
+- [ ] Writing your own ingestion for an app instead of using a connector.
 - [ ] Editing an existing connector resource with `POST /connectors/{id}/resources`, which returns `409` and changes nothing.
 - [ ] Querying right after database creation without polling readiness.
 - [ ] Querying right after ingestion without polling `context.status` or using webhooks.
@@ -1290,7 +1233,7 @@ Every method is on the client: `client.<method>` in both SDKs. Return shapes are
 | Databases | `databases.collections()` | `databases.collections()` | `GET /databases/collections` | List active collections |
 | Databases | `databases.delete_collection()` | `databases.deleteCollection()` | `DELETE /databases/collections` | Delete a collection |
 | Databases | `databases.delete()` | `databases.delete()` | `DELETE /databases` | Delete a database and all its data |
-| Context | `context.ingest()` | `context.ingest()` | `POST /context/ingest` | Ingest files, app sources, or memories |
+| Context | `context.ingest()` | `context.ingest()` | `POST /context/ingest` | Ingest files or memories |
 | Context | `context.status()` | `context.status()` | `GET /context/status` | Check indexing status |
 | Context | `context.list()` | `context.list()` | `POST /context/list` | Browse knowledge or memories |
 | Context | `context.inspect()` | `context.inspect()` | `GET /context/inspect` | Original content or a presigned URL |
@@ -1373,64 +1316,6 @@ curl -s -X POST 'https://api.hydradb.com/query' \
   -H "Content-Type: application/json" \
   -d "{\"database\":\"${DATABASE}\",\"collection\":\"${COLLECTION}\",\"query\":\"How should I answer Alex?\",\"type\":\"memory\",\"query_by\":\"hybrid\",\"mode\":\"thinking\"}" \
   | jq '.data.chunks'
-```
-
-### 15.2 Raw HTTP: ingest app-source knowledge
-
-The raw HTTP form of [Knowledge from app sources](#knowledge-from-app-sources). `app_knowledge` must be a JSON string in multipart form data.
-
-```bash
-curl -s -X POST 'https://api.hydradb.com/context/ingest' \
-  -H "Authorization: Bearer $HYDRADB_API_KEY" \
-  -H "API-Version: 2" \
-  -F "type=knowledge" \
-  -F "database=acme_corp" \
-  -F 'app_knowledge=[
-    {
-      "id": "slack_C123_1715012345_000100",
-      "title": "Pricing discussion - Slack #product",
-      "kind": "message",
-      "provider": "slack",
-      "external_id": "1715012345.000100",
-      "url": "https://slack.com/archives/C123/p1715012345000100",
-      "timestamp": "2025-01-15T12:30:00Z",
-      "fields": {
-        "kind": "message",
-        "body": "We agreed on three tiers: Starter at $29, Pro at $79, Enterprise at $199.",
-        "author": "alice",
-        "thread_id": "1715012345.000100",
-        "created_at": "2025-01-15T12:30:00Z"
-      },
-      "metadata": {
-        "channel": "product",
-        "workspace": "acme"
-      },
-      "additional_metadata": {
-        "slack_ts": "1715012345.000100"
-      },
-      "relations": {
-        "ids": ["slack_thread_root_001"]
-      }
-    }
-  ]'
-```
-
-Query it with app-aware retrieval:
-
-```bash
-curl -s -X POST 'https://api.hydradb.com/query' \
-  -H "Authorization: Bearer $HYDRADB_API_KEY" \
-  -H "API-Version: 2" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "database": "acme_corp",
-    "query": "What pricing tiers did product agree on?",
-    "type": "knowledge",
-    "query_by": "hybrid",
-    "mode": "thinking",
-    "query_apps": true,
-    "graph_context": true
-  }' | jq '.data.chunks'
 ```
 
 ---

@@ -96,7 +96,6 @@ SHARED_FACTS = {
     },
 }
 INDEXING_STATUSES = ["queued", "processing", "graph_creation", "completed", "errored"]
-APP_SOURCE_KINDS = ["email", "message", "ticket", "knowledge_base", "comment", "meeting", "custom"]
 
 
 class SharedFactsTest(unittest.TestCase):
@@ -126,14 +125,20 @@ class SharedFactsTest(unittest.TestCase):
         self.assertTrue(used)
         self.assertLessEqual(used, set(INDEXING_STATUSES))
 
-    def test_app_source_kinds_are_the_same_everywhere(self):
-        listed = ", ".join(f"`{kind}`" for kind in APP_SOURCE_KINDS[:-1]) + f", or `{APP_SOURCE_KINDS[-1]}`"
-        for relative in ("essentials/v2/context.mdx", "api-reference/v2/endpoint/ingest-context.mdx"):
-            self.assertIn(listed, self.read(relative), relative)
-        table = re.findall(r"^\| `(\w+)` \| [^|]+ \| `", self.read("essentials/v2/context.mdx"), re.M)
-        self.assertEqual(APP_SOURCE_KINDS, table)
-        guide = re.search(r"Kinds in OpenAPI[^.]*\.", self.read("AGENTS.mdx")).group(0)
-        self.assertEqual(set(APP_SOURCE_KINDS), set(re.findall(r"`(\w+)`", guide)))
+    def test_app_sources_are_documented_only_under_connectors(self):
+        """App content reaches HydraDB through connectors, so no other page teaches app_knowledge."""
+        pattern = re.compile(r"app[_ ]knowledge|appKnowledge|app_relations|app[ -]sources?", re.I)
+        offenders = []
+        pages = [p for p in live_files("*.mdx") if "/v2/" in str(p) or p.name == "AGENTS.mdx"]
+        pages += sorted((ROOT / "snippets").glob("*.mdx"))
+        for path in pages:
+            relative = str(path.relative_to(ROOT))
+            if relative == "essentials/v2/connectors.mdx" or "connector" in path.name:
+                continue
+            for number, line in enumerate(path.read_text(encoding="utf-8").split("\n"), 1):
+                if pattern.search(line):
+                    offenders.append(f"{relative}:{number}")
+        self.assertEqual([], offenders)
 
     def test_supported_file_formats_match_the_api_reference(self):
         def extensions(relative, start, end):
