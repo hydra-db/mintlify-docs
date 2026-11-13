@@ -512,7 +512,7 @@ class EndpointPages(unittest.TestCase):
                 # for this operation's request body.
                 leaf = name.split(".")[-1].split("[")[0]
                 self.assertIn(f'"{leaf}"', FULL_TEXT.get(template, SPEC_TEXT), f"{page.name}: {name}")
-        self.assertGreaterEqual(checked, 40)
+        self.assertGreaterEqual(checked, 55)
 
 
 class JsonAndCurlExamples(unittest.TestCase):

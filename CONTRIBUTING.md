@@ -175,8 +175,8 @@ Use one term per concept. Literal field names, SDK identifiers, and error codes 
 | collection | sub-tenant, namespace | |
 | context | data | Everything stored: knowledge and memories. |
 | source | item, object, doc | One stored unit with an `id`. "Document" and "file" are for uploaded files only. |
-| app source | app knowledge, app record | The request field is `app_knowledge`. |
-| kind | class | The type of an app source, set in `kind`. |
+| app source | app knowledge, app record | A record a connector synced from an app. Use it only on connector pages; other pages say "content synced by connectors". |
+| kind | class | The type of an app source, such as `message` or `ticket`. |
 | chunk | passage, snippet | Gloss once per page if needed: "chunks (passages of a source)". |
 | query | recall, search request | The operation behind `POST /query`. "Search" is fine as a plain verb. |
 | ingest | add, push, load | "Upload" for files only. "Sync" for connectors only. |
