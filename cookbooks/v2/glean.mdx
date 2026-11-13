@@ -6,7 +6,7 @@ description: "Company search across Slack, Jira, and Notion that respects each p
 
 import Setup from "/snippets/cookbook-setup.mdx";
 
-Company search answers a question from everything the company has written, and shows each person only what they are allowed to see. This cookbook builds it with three ideas: one collection for all company knowledge, an ACL on each source, and the asker's identity on every query.
+Company search answers a question from everything the company has written, and shows each person only what they are allowed to see. This cookbook builds it with three ideas: one collection for all company knowledge, connectors that sync each app along with its permissions, and the asker's identity on every query.
 
 | Benchmark | Result | What it shows here |
 | --- | --- | --- |
@@ -21,78 +21,37 @@ Put everything in one collection so a single query searches all of it. Separate 
 
 ```python glean.py
 import json
+import os
 
-from hydra import answer, client, create_database, source_ids, wait_indexed
+from hydra import answer, client, connect, create_database
 
 DATABASE, COLLECTION = "acme_corp", "company"
 
 create_database(DATABASE)
 ```
 
-## 2. Ingest sources from each app
+## 2. Connect each app
 
-Send records your code already holds as [app sources](/essentials/v2/context#send-app-sources). `kind` tells HydraDB what the record is, `fields` carries its content, and `acl` lists who may see it. The samples include an outdated wiki page and the Slack message that replaced it, and a ticket only the finance lead can see.
+A [connector](/essentials/v2/connectors) syncs one app account into the collection and keeps it in sync on a schedule. For providers that support it, such as Slack, it also copies the app's permissions into each source's ACL, so a private Slack channel stays private in search. [Connectors](/essentials/v2/connectors#what-each-provider-captures) lists what each provider captures. `connect` from `hydra.py` makes the four connector calls: create, discover, configure, and status.
 
 ```python glean.py
-sources = [
-    {
-        "id": "notion_pricing_2025",
-        "title": "Pricing (2025)",
-        "kind": "knowledge_base",
-        "provider": "notion",
-        "external_id": "page_pricing_2025",
-        "url": "https://notion.so/acme/pricing-2025",
-        "timestamp": "2025-03-01T09:00:00Z",
-        "fields": {
-            "kind": "knowledge_base",
-            "title": "Pricing (2025)",
-            "body": "Pro is $79 per seat per month. Enterprise is $199.",
-            "updated_at": "2025-03-01T09:00:00Z",
-        },
-        "acl": ["domain:acme.com"],
-    },
-    {
-        "id": "slack_C01_1788000000_000100",
-        "title": "Pricing change - Slack #product",
-        "kind": "message",
-        "provider": "slack",
-        "external_id": "1788000000.000100",
-        "timestamp": "2026-09-01T10:00:00Z",
-        "fields": {
-            "kind": "message",
-            "body": "Decision: from October 1, 2026, Pro moves from $79 to $89 per seat.",
-            "author": "alice@acme.com",
-            "thread_id": "1788000000.000100",
-            "created_at": "2026-09-01T10:00:00Z",
-        },
-        "acl": ["domain:acme.com"],
-    },
-    {
-        "id": "jira_FIN_42",
-        "title": "FIN-42: Enterprise discount floor",
-        "kind": "ticket",
-        "provider": "jira",
-        "external_id": "FIN-42",
-        "timestamp": "2026-09-03T15:00:00Z",
-        "fields": {
-            "kind": "ticket",
-            "title": "Enterprise discount floor",
-            "description": "Do not discount Enterprise below $150 per seat without CFO approval.",
-            "status": "open",
-            "assignee": "grace@acme.com",
-        },
-        "acl": ["grace@acme.com"],
-    },
-]
-
-result = client.context.ingest(
-    type="knowledge",
-    database=DATABASE,
-    collection=COLLECTION,
-    app_knowledge=json.dumps(sources),
+connect(
+    "slack",
+    DATABASE,
+    COLLECTION,
+    credentials={"access_token": os.environ["SLACK_TOKEN"]},
+    account_scope=os.environ["SLACK_WORKSPACE_ID"],
 )
-wait_indexed(DATABASE, COLLECTION, source_ids(result))
+
+# Add one call per app, all pointing at the same collection. Each provider has
+# its own credentials: client.list_providers(id="notion") returns the shape.
+for provider in ("notion", "jira"):
+    variable = f"{provider.upper()}_CREDENTIALS"
+    if variable in os.environ:
+        connect(provider, DATABASE, COLLECTION, credentials=json.loads(os.environ[variable]))
 ```
+
+`connect` syncs every channel, page, or project the credentials can reach. To sync only some, pass a shorter `resources` list to [`configure`](/api-reference/v2/endpoint/configure-connector).
 
 ## 3. Query as the person asking
 
@@ -125,42 +84,19 @@ def ask(question, user_email):
         print(f"  - {title} ({source_id})")
 
 
-ask("What does Pro cost per seat?", "bob@acme.com")
-ask("How far can we discount Enterprise?", "bob@acme.com")
-ask("How far can we discount Enterprise?", "grace@acme.com")
+ask("What did we decide about pricing?", "bob@acme.com")
+ask("What did we decide about pricing?", "grace@acme.com")
 ```
 
 ## Run it
+
+Set `SLACK_TOKEN` and `SLACK_WORKSPACE_ID`, replace the two emails with people in your workspace, and run:
 
 ```bash
 python glean.py
 ```
 
-The first answer should give $89 and cite the Slack decision alongside the older page. The second should say it does not know, because the ticket is restricted to Grace. The third should give the $150 floor and cite FIN-42.
-
-## Use real data
-
-Replace step 2 with [connectors](/essentials/v2/connectors): HydraDB then syncs each app on a schedule and copies its permissions into each source's ACL. Create one connector per app, all pointing at the same collection.
-
-```python connect.py
-from hydra import client
-
-connector = client.connectors.create(
-    provider="slack",
-    database="acme_corp",
-    collection="company",
-    provider_account_scope="T12345ACME",
-    credentials={"access_token": "xoxp-..."},
-)
-found = client.connectors.discover(connector.connector_id)
-client.connectors.configure(
-    connector.connector_id,
-    resources=[
-        {"resource_id": r.id, "resource_type": r.resource_type, "name": r.name}
-        for r in found.resources
-    ],
-)
-```
+The first run waits for the first sync, which takes a few minutes. Each answer cites the Slack messages and pages it came from. If the decision was made in a private channel, only the person who is a member of that channel gets it; the other is told the context does not say.
 
 Keep sending `acl` on every query, and leave [`enforce_acl`](/essentials/v2/connectors#enforce-acl) off for this application. With `enforce_acl` on, HydraDB ignores the request's `acl` and uses the identity of whoever created the API key, so every user of your application would see what the key's creator can see. Enforcement fits a caller who authenticates as themselves, such as a user signed in through MCP OAuth.
 

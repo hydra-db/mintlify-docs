@@ -6,7 +6,7 @@ description: "An assistant that tracks decisions and commitments across meetings
 
 import Setup from "/snippets/cookbook-setup.mdx";
 
-A chief of staff remembers what was decided, who committed to what, and what has changed since. This cookbook builds one from two types of context: meetings and email as knowledge, and the decisions drawn from them as memories that HydraDB keeps current.
+A chief of staff remembers what was decided, who committed to what, and what has changed since. This cookbook builds one from two types of context: email and chat as knowledge, and the decisions drawn from them as memories that HydraDB keeps current.
 
 | Benchmark | Result | What it shows here |
 | --- | --- | --- |
@@ -22,8 +22,9 @@ Work records go in one collection. The executive's own decisions and commitments
 
 ```python chief_of_staff.py
 import json
+import os
 
-from hydra import answer, client, create_database, source_ids, wait_indexed
+from hydra import answer, client, connect, create_database, source_ids, wait_indexed
 
 DATABASE = "acme_corp"
 RECORDS, EXECUTIVE = "work_records", "exec_dana"
@@ -31,55 +32,21 @@ RECORDS, EXECUTIVE = "work_records", "exec_dana"
 create_database(DATABASE)
 ```
 
-## 2. Ingest meetings and email as knowledge
+## 2. Connect email and chat as knowledge
 
-Meetings and email are [app sources](/essentials/v2/context#send-app-sources). The `meeting` and `email` kinds keep participants, senders, and dates, which is what lets a query answer "what did Priya agree to on the September call".
+Where the work happened is already written down in email and chat. A [connector](/essentials/v2/connectors) syncs each app into the records collection and keeps senders, participants, threads, and dates, which is what lets a query answer "what did Priya agree to in September".
 
 ```python chief_of_staff.py
-records = [
-    {
-        "id": "gong_call_0912",
-        "title": "Q4 planning call",
-        "kind": "meeting",
-        "provider": "gong",
-        "external_id": "call_0912",
-        "timestamp": "2026-09-12T16:00:00Z",
-        "fields": {
-            "kind": "meeting",
-            "title": "Q4 planning call",
-            "body": "Dana: we launch the EU region on November 3. Priya: I will "
-            "have the data residency review done by October 15.",
-            "host": "Dana Okafor",
-            "participants": [{"name": "Priya Shah", "email": "priya@acme.com"}],
-            "started_at": "2026-09-12T16:00:00Z",
-        },
-    },
-    {
-        "id": "gmail_msg_1002",
-        "title": "EU launch date",
-        "kind": "email",
-        "provider": "gmail",
-        "external_id": "msg_1002",
-        "timestamp": "2026-10-02T09:30:00Z",
-        "fields": {
-            "kind": "email",
-            "subject": "EU launch date",
-            "body": "Legal needs two more weeks. Moving the EU launch to November 17.",
-            "from": "dana@acme.com",
-            "to": ["leadership@acme.com"],
-            "thread_id": "thread_eu_launch",
-            "created_at": "2026-10-02T09:30:00Z",
-        },
-    },
-]
-
-result = client.context.ingest(
-    type="knowledge",
-    database=DATABASE,
-    collection=RECORDS,
-    app_knowledge=json.dumps(records),
+# Each provider has its own credentials: client.list_providers(id="gmail")
+# returns the shape. Gmail needs no account scope.
+connect("gmail", DATABASE, RECORDS, credentials=json.loads(os.environ["GMAIL_CREDENTIALS"]))
+connect(
+    "slack",
+    DATABASE,
+    RECORDS,
+    credentials={"access_token": os.environ["SLACK_TOKEN"]},
+    account_scope=os.environ["SLACK_WORKSPACE_ID"],
 )
-wait_indexed(DATABASE, RECORDS, source_ids(result))
 ```
 
 ## 3. Save decisions as memories
@@ -104,7 +71,7 @@ remember("2026-10-02: Moved the EU launch to November 17 because legal needs two
 
 ## 4. Ask what is current
 
-Query both collections at once with `type: "all"`. `recency_bias` favors newer context, and `thinking` mode reranks, so the current launch date ranks above the one it replaced.
+Query both collections at once with `type: "all"`, as the executive: a connector copies the app's permissions where the provider supports it, and `acl` keeps the brief to what this person may see. `recency_bias` favors newer context, and `thinking` mode reranks, so the current launch date ranks above the one it replaced.
 
 ```python chief_of_staff.py
 def brief(question):
@@ -115,6 +82,7 @@ def brief(question):
         type="all",
         mode="thinking",
         recency_bias=0.6,
+        acl=[os.environ["EXECUTIVE_EMAIL"]],
     )
     return answer(question, result, "When facts conflict, the most recent one is current. "
                                     "Name the owner and due date of each commitment.")
@@ -125,15 +93,15 @@ print(brief("When is the EU launch, and what is still open before it?"))
 
 ## Run it
 
+Set `GMAIL_CREDENTIALS`, `SLACK_TOKEN`, `SLACK_WORKSPACE_ID`, and `EXECUTIVE_EMAIL`, replace the two sample decisions and the question with your own, and run:
+
 ```bash
 python chief_of_staff.py
 ```
 
-The answer should give November 17, note that the date moved from November 3, and list Priya's data residency review as the open commitment.
+With the sample decisions, the answer gives November 17, notes that the date moved from November 3, and lists Priya's data residency review as the open commitment. It adds whatever your email and chat say on the subject.
 
-## Use real data
-
-Connect the calendar, meeting, and email apps with [connectors](/essentials/v2/connectors) in place of step 2. Keep step 3 in your application: decide what counts as a decision, and save it when the meeting ends.
+Keep step 3 in your application: decide what counts as a decision, and save it when the meeting or thread ends.
 
 ## Common mistakes
 

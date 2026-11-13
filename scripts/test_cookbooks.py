@@ -26,33 +26,18 @@ ROOT = Path(__file__).resolve().parents[1]
 COOKBOOKS = sorted(p for p in (ROOT / "cookbooks/v2").glob("*.mdx") if p.name != "index.mdx")
 SETUP = ROOT / "snippets/cookbook-setup.mdx"
 
-APP_SOURCE_KEYS = {
-    "id", "database", "collection", "title", "kind", "provider", "external_id", "url",
-    "timestamp", "fields", "metadata", "additional_metadata", "relations",
-    "app_relations", "acl", "attachments", "comments",
-}
-KINDS = {"email", "message", "ticket", "knowledge_base", "comment", "meeting", "custom"}
 DOCUMENT_METADATA_KEYS = {"id", "metadata", "additional_metadata", "relations"}
 MEMORY_KEYS = {
     "id", "title", "text", "user_assistant_pairs", "is_markdown", "infer",
     "custom_instructions", "user_name", "metadata", "additional_metadata",
 }
 OPERATORS = {"equals", "contains", "contains_any"}
-# fields.* per kind, from the field reference in essentials/v2/context.mdx.
-KIND_FIELDS = {
-    "email": {"subject", "body", "from", "to", "cc", "bcc", "thread_id", "reply_to_id",
-              "forwarded_from_id", "created_at", "url"},
-    "message": {"body", "author", "thread_id", "parent_id", "mentions", "created_at",
-                "edited_at", "url"},
-    "ticket": {"title", "description", "status", "priority", "assignee", "reporter",
-               "parent_id", "linked_issue_ids", "created_at", "updated_at", "url"},
-    "knowledge_base": {"title", "body", "parent_id", "created_by", "updated_by",
-                       "created_at", "updated_at", "url"},
-    "comment": {"body", "author", "parent_id", "thread_id", "created_at", "updated_at",
-                "url", "properties"},
-    "meeting": {"title", "body", "host", "host_email", "participants", "started_at",
-                "updated_at", "labels", "url"},
-    "custom": {"body", "parent_id", "thread_id", "data"},
+# Cookbooks that bring app content in through connectors, and the variables they read.
+CONNECTOR_COOKBOOKS = {"glean", "chief-of-staff", "personal-assistant"}
+APP_CREDENTIALS = {
+    "SLACK_TOKEN": "xoxp-test", "SLACK_WORKSPACE_ID": "T12345ACME",
+    "GMAIL_CREDENTIALS": '{"refresh_token": "test"}',
+    "EXECUTIVE_EMAIL": "dana@acme.com", "USER_EMAIL": "maya@example.com",
 }
 # Plain-text and document extensions POST /context/ingest accepts
 # (api-reference/v2/endpoint/ingest-context.mdx#supported-file-formats).
@@ -93,7 +78,9 @@ class Stubs:
         self.test = test
         self.declared = set()
         self.collections = set()
-        self.restricted = set()  # Collections holding a source that carries an acl.
+        self.restricted = set()  # Collections a connector syncs into: their sources carry ACLs.
+        self.connectors = []
+        self.connector_status = ("active", "healthy")
         self.status = "completed"
         self.calls = []
         for owner, name, handler in [
@@ -105,6 +92,8 @@ class Stubs:
             (client.connectors, "create", self.connector_create),
             (client.connectors, "discover", self.connector_discover),
             (client.connectors, "configure", self.connector_configure),
+            (client.connectors, "status", self.connector_status_call),
+            (client.connectors, "list", self.connector_list),
         ]:
             label = name if owner is client else f"{type(owner).__name__}.{name}"
             setattr(owner, name, self.checked(label, getattr(owner, name), handler))
@@ -135,11 +124,28 @@ class Stubs:
             )
         )
 
-    def connector_create(self, **kwargs):
-        self.test.assertNotIn("enforce_acl", kwargs)  # Needs a dashboard session.
-        return sdk.HandlerConnectorCreateResponse(connector_id="conn_1")
+    def connector_create(self, provider, database, collection, credentials, provider_account_scope=None):
+        self.test.assertTrue(credentials and all(credentials.values()), "credentials must not be empty")
+        connector_id = f"conn_{len(self.connectors) + 1}"
+        self.connectors.append(sdk.HandlerConnectorApiView(
+            connector_id=connector_id, provider=provider, database=database, collection=collection,
+        ))
+        self.collections.add(collection)
+        self.restricted.add(collection)
+        return sdk.HandlerConnectorCreateResponse(connector_id=connector_id)
+
+    def connector_list(self, provider=None):
+        return sdk.HandlerConnectorListResponse(
+            connectors=[c for c in self.connectors if provider in (None, c.provider)]
+        )
+
+    def connector_status_call(self, id):
+        self.test.assertIn(id, [c.connector_id for c in self.connectors])
+        lifecycle, status = self.connector_status
+        return sdk.HandlerConnectorStatusResponse(connector_id=id, lifecycle=lifecycle, status=status)
 
     def connector_discover(self, id):
+        self.test.assertIn(id, [c.connector_id for c in self.connectors])
         return sdk.HandlerDiscoverResponseBody(resources=[
             sdk.HandlerDiscoveredResourceDto(id="C1", resource_type="channel", name="general")
         ])
@@ -151,12 +157,11 @@ class Stubs:
         return sdk.HandlerConfigureResponse()
 
     def ingest(self, type, database, collection, documents=None, document_metadata=None,
-               app_knowledge=None, memories=None):
+               memories=None):  # No app_knowledge: app content comes through connectors.
         test = self.test
         self.collections.add(collection)
         ids = []
         if type == "memory":
-            test.assertIsNone(app_knowledge)
             for item in json.loads(memories):
                 test.assertLessEqual(set(item), MEMORY_KEYS)
                 test.assertEqual(1, ("text" in item) + ("user_assistant_pairs" in item))
@@ -171,20 +176,10 @@ class Stubs:
                 test.assertEqual(len(documents), len(items))
                 for (filename, handle, content_type), item in zip(documents, items):
                     test.assertLessEqual(set(item), DOCUMENT_METADATA_KEYS)
+                    test.assertLessEqual(set(item.get("metadata", {})), self.declared)
                     test.assertIn(Path(filename).suffix, UPLOAD_EXTENSIONS, filename)
                     test.assertTrue(handle.read(), f"{filename} is empty")
                     ids.append(item["id"])
-            for item in json.loads(app_knowledge or "[]"):
-                test.assertLessEqual(set(item), APP_SOURCE_KEYS)
-                test.assertIn(item["kind"], KINDS)
-                test.assertEqual(item["kind"], item["fields"]["kind"])
-                test.assertLessEqual(
-                    set(item["fields"]) - {"kind"}, KIND_FIELDS[item["kind"]], item["id"]
-                )
-                test.assertLessEqual(set(item.get("metadata", {})), self.declared)
-                if item.get("acl"):
-                    self.restricted.add(collection)
-                ids.append(item["id"])
         test.assertTrue(ids)
         test.assertTrue(all(re.fullmatch(r"[^,\s]+", i) for i in ids), ids)
         return sdk.HandlerEnvelopeIngestionV2IngestResponse(
@@ -220,7 +215,7 @@ class Stubs:
             test.assertEqual(1, len(value))
             test.assertLessEqual(set(value), OPERATORS)
         if self.restricted & set(scopes):
-            test.assertIn("acl", kwargs, "a query over restricted sources must send the caller's acl")
+            test.assertIn("acl", kwargs, "a query over connector-synced sources must send the caller's acl")
         if "acl" in kwargs:
             test.assertTrue(kwargs["acl"] and all(isinstance(p, str) for p in kwargs["acl"]))
         # Public fields only: `sources` and other internal fields stay unset,
@@ -277,7 +272,7 @@ class CookbookTest(unittest.TestCase):
         files = python_blocks(path)
         self.assertTrue(files, f"{path.name} has no labelled Python blocks")
         with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
-            os.environ, {"HYDRADB_API_KEY": "test", "OPENAI_API_KEY": "test"}
+            os.environ, {"HYDRADB_API_KEY": "test", "OPENAI_API_KEY": "test", **APP_CREDENTIALS}
         ), mock.patch.dict(sys.modules, {"openai": fake_openai()}), mock.patch("time.sleep"), \
                 mock.patch("builtins.print"):
             previous = os.getcwd()
@@ -301,9 +296,35 @@ class CookbookTest(unittest.TestCase):
         for path in COOKBOOKS:
             with self.subTest(cookbook=path.name):
                 stubs = self.run_cookbook(path)
-                for step in ("DatabasesClient.create", "DatabasesClient.status",
-                             "ContextClient.ingest", "ContextClient.status", "query"):
+                steps = ["DatabasesClient.create", "DatabasesClient.status", "query"]
+                if path.stem in CONNECTOR_COOKBOOKS:
+                    steps += ["ConnectorsClient.list", "ConnectorsClient.create", "ConnectorsClient.discover",
+                              "ConnectorsClient.configure", "ConnectorsClient.status"]
+                else:
+                    steps += ["ContextClient.ingest", "ContextClient.status"]
+                    self.assertNotIn("ConnectorsClient.create", stubs.calls)
+                for step in steps:
                     self.assertIn(step, stubs.calls)
+
+    def test_connect_reuses_an_existing_connector(self):
+        hydra, stubs = self.load_setup()
+        with mock.patch("time.sleep"):
+            first = hydra.connect("slack", "db", "docs", {"access_token": "x"}, account_scope="T1")
+            second = hydra.connect("slack", "db", "docs", {"access_token": "x"}, account_scope="T1")
+            other = hydra.connect("slack", "db", "other", {"access_token": "x"}, account_scope="T1")
+        self.assertEqual(first, second)
+        self.assertNotEqual(first, other)
+        self.assertEqual(2, stubs.calls.count("ConnectorsClient.create"))
+
+    def test_connect_waits_for_the_first_sync_and_raises_on_failure(self):
+        hydra, stubs = self.load_setup()
+        stubs.connector_status = ("ingesting", "checking")
+        with mock.patch("time.sleep", side_effect=TimeoutError), self.assertRaises(TimeoutError):
+            hydra.connect("slack", "db", "docs", {"access_token": "x"})
+        stubs.connector_status = ("ingesting", "failed")
+        gave_up = mock.patch("time.sleep", side_effect=AssertionError("connect kept polling a failed connector"))
+        with gave_up, self.assertRaisesRegex(RuntimeError, "slack connector failed"):
+            hydra.connect("slack", "db", "docs", {"access_token": "x"})
 
     def load_setup(self):
         """Import hydra.py with stubbed SDK methods, outside any cookbook."""

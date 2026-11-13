@@ -21,9 +21,11 @@ A personal assistant has two jobs: remember what a person tells it, across sessi
 Each user's context lives in their own collection, named by their user ID. Nothing one user saves can appear in another user's query.
 
 ```python assistant.py
+import io
 import json
+import os
 
-from hydra import answer, client, create_database, source_ids, wait_indexed
+from hydra import answer, client, connect, create_database, source_ids, wait_indexed
 
 DATABASE = "assistant"
 USER = "user_maya"
@@ -62,52 +64,40 @@ remember_session([
 
 ## 3. Add the person's email and photos
 
-Email and media are knowledge, saved in the same collection. Send an email as an `email` app source. Send a photo or video as a `custom` app source: put the caption and any text read from the image in `fields.body`, and the date and place in `fields.data`. This mirrors the ATM-Bench setup, where every item is text plus its timestamp, location, and tags.
+Email and media are knowledge, saved in the same collection. A [connector](/essentials/v2/connectors) syncs the person's mailbox. Photos and videos have no text to search, so caption each one with a vision model in your application, then upload the caption, any text read from the image, and the date and place as a small file. This mirrors the ATM-Bench setup, where every item is text plus its timestamp, location, and tags.
 
 ```python assistant.py
-items = [
-    {
-        "id": "gmail_msg_771",
-        "title": "Your booking at The Lighthouse, Whitstable",
-        "kind": "email",
-        "provider": "gmail",
-        "external_id": "msg_771",
-        "timestamp": "2026-06-14T08:12:00Z",
-        "fields": {
-            "kind": "email",
-            "subject": "Your booking at The Lighthouse, Whitstable",
-            "body": "Two nights, June 20 to 22. Total paid: 312 GBP.",
-            "from": "bookings@thelighthouse.example",
-            "created_at": "2026-06-14T08:12:00Z",
-        },
-    },
-    {
-        "id": "photo_2026_06_21_0934",
-        "title": "Photo: oyster stall, Whitstable harbour",
-        "kind": "custom",
-        "provider": "photos",
-        "external_id": "IMG_0934",
-        "timestamp": "2026-06-21T12:40:00Z",
-        "fields": {
-            "kind": "custom",
-            "body": "A blue oyster stall on the harbour wall. Sign reads 'Wheelers'.",
-            "data": {"taken_at": "2026-06-21", "place": "Whitstable", "tags": "harbour, food, sea"},
-        },
-    },
-]
+# Each provider has its own credentials: client.list_providers(id="gmail")
+# returns the shape. Use this user's own credentials and collection.
+connect("gmail", DATABASE, USER, credentials=json.loads(os.environ["GMAIL_CREDENTIALS"]))
 
-result = client.context.ingest(
-    type="knowledge",
-    database=DATABASE,
-    collection=USER,
-    app_knowledge=json.dumps(items),
+
+def add_photo(photo_id, caption, taken_at, place):
+    text = f"# Photo taken {taken_at} in {place}\n\n{caption}\n"
+    result = client.context.ingest(
+        type="knowledge",
+        database=DATABASE,
+        collection=USER,
+        documents=[(f"{photo_id}.md", io.BytesIO(text.encode()), "text/markdown")],
+        document_metadata=json.dumps([{
+            "id": photo_id,
+            "additional_metadata": {"taken_at": taken_at, "place": place},
+        }]),
+    )
+    wait_indexed(DATABASE, USER, source_ids(result))
+
+
+add_photo(
+    "photo_2026_06_21_0934",
+    "A blue oyster stall on the harbour wall. Sign reads 'Wheelers'.",
+    "2026-06-21",
+    "Whitstable",
 )
-wait_indexed(DATABASE, USER, source_ids(result))
 ```
 
 ## 4. Answer from memories and items together
 
-`type: "all"` searches the user's memories and knowledge in one call.
+`type: "all"` searches the user's memories and knowledge in one call. `acl` is the user's own email, so the query returns only what this person may see.
 
 ```python assistant.py
 def ask(question):
@@ -117,32 +107,31 @@ def ask(question):
         query=question,
         type="all",
         mode="thinking",
+        acl=[os.environ["USER_EMAIL"]],
     )
     return answer(question, result, "When facts conflict, the most recent one is current.")
 
 
 print(ask("Suggest somewhere for a team dinner near my office."))
-print(ask("How much did I pay for the place in Whitstable?"))
+print(ask("What bookings or trips do I have coming up?"))
 print(ask("What was the name on that oyster stall?"))
 ```
 
 ## Run it
 
+Set `GMAIL_CREDENTIALS` and `USER_EMAIL`, and run:
+
 ```bash
 python assistant.py
 ```
 
-The first answer should suggest vegetarian options near King's Cross, not Shoreditch. The second should give 312 GBP from the booking email. The third should give "Wheelers" from the photo.
-
-## Use real data
-
-Connect Gmail and Google Drive with [connectors](/essentials/v2/connectors) to keep email and files in sync, with each user's connector pointing at that user's collection. For photos and video, caption them with a vision model in your application, then ingest them as in step 3.
+The first answer suggests vegetarian options near King's Cross, not Shoreditch. The second comes from the person's own email. The third gives "Wheelers" from the photo caption.
 
 ## Common mistakes
 
 - **Saving a transcript with `infer: false`:** that stores the dialogue word for word, and the preference inside it is harder to find. Use `infer: true` for raw conversation.
 - **Forgetting `collection` on the query:** a query without it reads the default collection, which holds nothing for this user.
-- **Ingesting images without text:** queries match text. Put a caption, any text in the image, and the date and place into the app source.
+- **Ingesting images without text:** queries match text. Put a caption, any text in the image, and the date and place into the file you upload.
 
 ## Next steps
 

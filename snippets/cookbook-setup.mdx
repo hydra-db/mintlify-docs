@@ -4,7 +4,7 @@
 - An OpenAI API key, set as `OPENAI_API_KEY`. HydraDB returns context, not answers, so any model works; swap the `answer` function below for your own.
 - Python 3.10 or later, with the SDKs: `pip install "hydradb-sdk>=2.1.7,<3" openai`.
 
-Save this as `hydra.py`. Every cookbook imports it. It holds what every HydraDB application does around its own logic: wait for the database, check what an ingest accepted, wait for indexing, and pass query results to a model.
+Save this as `hydra.py`. Every cookbook imports it. It holds what every HydraDB application does around its own logic: wait for the database, connect an app, check what an ingest accepted, wait for indexing, and pass query results to a model.
 
 ```python hydra.py
 import os
@@ -30,6 +30,40 @@ def create_database(database, schema=None):
         pass  # The database already exists.
     while not client.databases.status(database=database).data.infra.ready_for_ingestion:
         time.sleep(5)
+
+
+def connect(provider, database, collection, credentials, account_scope=None):
+    """Connect one app account, sync what its credentials can reach, and wait for the first sync."""
+    existing = [
+        c for c in client.connectors.list(provider=provider).connectors or []
+        if c.database == database and c.collection == collection
+    ]
+    if existing:  # Already connected on an earlier run.
+        connector_id = existing[0].connector_id
+    else:
+        scope = {"provider_account_scope": account_scope} if account_scope else {}
+        connector_id = client.connectors.create(
+            provider=provider,
+            database=database,
+            collection=collection,
+            credentials=credentials,
+            **scope,
+        ).connector_id
+        found = client.connectors.discover(connector_id)
+        client.connectors.configure(
+            connector_id,
+            resources=[
+                {"resource_id": r.id, "resource_type": r.resource_type, "name": r.name}
+                for r in found.resources
+            ],
+        )
+    while True:
+        status = client.connectors.status(connector_id)
+        if status.lifecycle == "active":
+            return connector_id
+        if status.status == "failed":
+            raise RuntimeError(f"{provider} connector failed: {status.error}")
+        time.sleep(10)
 
 
 def source_ids(result):
