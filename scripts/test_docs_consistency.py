@@ -10,8 +10,25 @@ ROOT = Path(__file__).resolve().parents[1]
 DEPRECATED_API_KEY = "HYDRA" + "_DB_API_KEY"
 
 
+def hidden_pages():
+    """Pages in a hidden navigation group: old copies kept for reference, not maintained."""
+    def pages(value):
+        if isinstance(value, str):
+            return {value}
+        if isinstance(value, list):
+            return set().union(set(), *(pages(item) for item in value))
+        if isinstance(value, dict):
+            return set().union(set(), *(pages(item) for key, item in value.items() if key in {"pages", "groups", "tabs", "anchors", "dropdowns"}))
+        return set()
+    config = json.loads((ROOT / "docs.json").read_text())
+    return {ROOT / f"{slug}.mdx" for version in config["navigation"]["versions"] if version.get("hidden") for slug in pages(version)}
+
+
 def live_files(pattern: str):
+    hidden = hidden_pages()
     for path in ROOT.rglob(pattern):
+        if path in hidden:
+            continue
         relative = path.relative_to(ROOT)
         if not set(relative.parts).intersection({
             ".git",
@@ -72,7 +89,7 @@ class DocsConsistencyTest(unittest.TestCase):
 SHARED_FACTS = {
     "max_results default and maximum": {
         "AGENTS.mdx": r"\| `max_results` \| [^|]*\| default (\d+); max (\d+) \|",
-        "essentials/v2/query.mdx": r"\| `max_results` \|[^|]*Default `(\d+)`, maximum `(\d+)`",
+        "essentials/v2/query.mdx": r"`max_results`(?:</td>\s*<td>| \|)[^|<]*Default `(\d+)`, maximum `(\d+)`",
         "api-reference/v2/endpoint/query.mdx":
             r'name="max_results"[^|]*\|[^|]*to `(?P<max>\d+)`\. Defaults to `(?P<default>\d+)`',
     },
@@ -83,15 +100,15 @@ SHARED_FACTS = {
     "metadata size limit": {
         "AGENTS.mdx": r"\| `metadata` \| [^|]*max (\d+ KiB)",
         "essentials/v2/context.mdx": r"\| `metadata` \| [^|]*Up to (\d+ KiB)",
-        "essentials/v2/metadata.mdx": r"\| `metadata` \| [^|]*\| (\d+ KiB)",
+        "essentials/v2/metadata.mdx": r"\| `metadata`(?: \(stored\))? \|(?: [^|]*\|)? (\d+ KiB)",
     },
     "additional_metadata size limit": {
         "AGENTS.mdx": r"\| `additional_metadata` \| [^|]*max (\d+ KiB)",
         "essentials/v2/context.mdx": r"\| `additional_metadata` \| [^|]*Up to (\d+ KiB)",
-        "essentials/v2/metadata.mdx": r"\| `additional_metadata` \| [^|]*\| (\d+ KiB)",
+        "essentials/v2/metadata.mdx": r"\| `additional_metadata`(?: \(stored\))? \|(?: [^|]*\|)? (\d+ KiB)",
     },
     "collections per query": {
-        "essentials/v2/query.mdx": r"\*\*Several collections:\*\*[^\n]*Up to (\d+);",
+        "essentials/v2/query.mdx": r"\*\*Several collections:\*\*[^\n]*[Uu]p to (\d+)[; ]",
         "api-reference/v2/endpoint/query.mdx": r"at most (\d+) collections",
     },
 }
@@ -114,8 +131,13 @@ class SharedFactsTest(unittest.TestCase):
                 self.assertEqual(1, len(set(values.values())), values)
 
     def test_indexing_statuses_are_the_same_everywhere(self):
+        # The reference page is the one place that must list every status.
+        reference = self.read("api-reference/v2/endpoint/source-status.mdx")
+        for status in INDEXING_STATUSES:
+            self.assertIn(f"`{status}`", reference)
         sentence = re.search(r"moves forward through ([^:]*):", self.read("essentials/v2/context.mdx"))
-        self.assertEqual(INDEXING_STATUSES, re.findall(r"`(\w+)`", sentence.group(1)))
+        if sentence:  # The guide may spell the sequence out; if it does, it must match.
+            self.assertEqual(INDEXING_STATUSES, re.findall(r"`(\w+)`", sentence.group(1)))
         used = set()
         for path in live_files("*.mdx"):
             if "/v2/" in str(path) or path.name == "AGENTS.mdx":

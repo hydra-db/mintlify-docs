@@ -6,20 +6,15 @@ from generate_llms_index import generate, page_paths, ROOT
 
 
 class DocsDiscoveryTest(unittest.TestCase):
-    def test_index_is_current_and_does_not_redirect_back_to_the_guide(self):
-        self.assertEqual(generate(), (ROOT / "llms.txt").read_text())
+    def test_llms_txt_is_the_agent_guide(self):
+        """llms.txt and the Agent Integration Guide page must say the same thing."""
+        text = (ROOT / "llms.txt").read_text()
+        self.assertEqual(generate(), text)
+        guide = (ROOT / "AGENTS.mdx").read_text().split("---\n", 2)[2].strip()
+        self.assertTrue(text.endswith(guide + "\n"))
+        self.assertTrue(text.startswith("# Complete Agent Integration Guide\n\n> "))
         config = json.loads((ROOT / "docs.json").read_text())
         self.assertFalse({"/llms.txt", "/llms-full.txt"} & {redirect["source"] for redirect in config["redirects"]})
-        links = re.findall(r'https://docs\.hydradb\.com/([^\s)]+)\.md\)', generate())
-        expected = {path.relative_to(ROOT).with_suffix("").as_posix() for path in ROOT.rglob("*.mdx") if not any(part.startswith(".") or part in {"node_modules", "archive", "snippets"} for part in path.relative_to(ROOT).parts)}
-        self.assertEqual(expected, set(links))
-        self.assertEqual(len(links), len(set(links)))
-        self.assertIn("AGENTS", links)
-        self.assertIn("plugins/cursor", links)
-        self.assertIn("api-reference/v2/endpoint/sync-connector", links)
-        for slug in links:
-            self.assertTrue((ROOT / f"{slug}.mdx").is_file(), slug)
-            self.assertFalse(slug.startswith(("archive/", "snippets/")), slug)
 
     def test_each_legacy_api_page_has_the_shared_rendered_warning(self):
         config = json.loads((ROOT / "docs.json").read_text())

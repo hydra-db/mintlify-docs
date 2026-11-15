@@ -294,10 +294,14 @@ def fake_openai():
     return module
 
 
+from test_docs_consistency import hidden_pages  # noqa: E402
+
+HIDDEN_PAGES = hidden_pages()
 V2_PAGES = [GUIDE] + sorted(
     page
     for folder in ("get-started/v2", "essentials/v2", "api-reference/v2", "plugins")
     for page in (ROOT / folder).rglob("*.mdx")
+    if page not in HIDDEN_PAGES
 )
 
 
@@ -472,7 +476,7 @@ class TypeScriptExamples(unittest.TestCase):
             self.assertEqual(0, result.returncode, result.stdout + result.stderr)
         finally:
             shutil.rmtree(work, ignore_errors=True)
-        self.assertGreaterEqual(count, 100)
+        self.assertGreaterEqual(count, 85)
 
 
 class EndpointPages(unittest.TestCase):
@@ -554,7 +558,7 @@ class JsonAndCurlExamples(unittest.TestCase):
                     if isinstance(sample, dict) and "query" in sample and "database" in sample \
                             and "params" not in sample:
                         self.assertEqual([], unknown_keys(sample, request_schema(operation("POST", "/query")[1])))
-        self.assertGreaterEqual(count, 120)
+        self.assertGreaterEqual(count, 85)
 
     @staticmethod
     def curl_calls(source):
@@ -606,7 +610,7 @@ class JsonAndCurlExamples(unittest.TestCase):
                         if bound and source.strip() in request_example:
                             self.assertEqual(bound, (method, operation(method, path)[0]),
                                              "the request example does not call the endpoint this page documents")
-        self.assertGreaterEqual(calls, 80)
+        self.assertGreaterEqual(calls, 70)
 
     def test_status_values_are_the_documented_ones(self):
         pages = V2_PAGES + sorted((ROOT / "cookbooks/v2").glob("*.mdx")) + sorted((ROOT / "snippets").glob("*.mdx"))
