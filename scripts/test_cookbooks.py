@@ -95,6 +95,7 @@ class Stubs:
         self.discovered = [["C1", "C2"], ["C3"]]  # Two pages, so pagination is exercised.
         self.connector_status = ("active", "healthy")
         self.failing = set()  # Resource IDs whose last sync failed.
+        self.credentials = {}  # connector_id -> the credentials last sent.
         self.status = "completed"
         self.calls = []
         for owner, name, handler in [
@@ -109,6 +110,7 @@ class Stubs:
             (client.connectors, "status", self.connector_status_call),
             (client.connectors, "list", self.connector_list),
             (client.connectors, "list_resources", self.connector_resources),
+            (client.connectors, "update", self.connector_update),
             (client.connectors, "update_resource_acl", self.connector_update_resource),
         ]:
             label = name if owner is client else f"{type(owner).__name__}.{name}"
@@ -160,6 +162,7 @@ class Stubs:
             lifecycle="pending_setup",
         ))
         self.configured[connector_id] = None
+        self.credentials[connector_id] = credentials
         self.collections.add(collection)
         self.restricted.add(collection)
         return sdk.HandlerConnectorCreateResponse(connector_id=connector_id)
@@ -189,6 +192,12 @@ class Stubs:
                     message="permission denied" if r["resource_id"] in self.failing else None)
                 for r in self.configured[id]
             ])
+
+    def connector_update(self, id, credentials):
+        self.connector(id)
+        self.test.assertTrue(credentials and all(credentials.values()), "credentials must not be empty")
+        self.credentials[id] = credentials
+        return sdk.HandlerConnectorUpdateResponse(connector_id=id, credentials_updated=True)
 
     def connector_resources(self, id):
         self.connector(id)
@@ -408,6 +417,14 @@ class CookbookTest(unittest.TestCase):
         self.assertEqual(3, stubs.calls.count("ConnectorsClient.create"))
         self.assertEqual(3, stubs.calls.count("ConnectorsClient.configure"))
         self.assertEqual({"T1", "T2"}, {c.provider_account_scope for c in stubs.connectors})
+
+    def test_connect_sends_new_credentials_to_a_connector_it_reuses(self):
+        hydra, stubs = self.load_setup()
+        with bounded_sleep():
+            connector_id = hydra.connect("slack", "T1", "db", "docs", {"access_token": "old"})
+            hydra.connect("slack", "T1", "db", "docs", {"access_token": "rotated"})
+        self.assertEqual({"access_token": "rotated"}, stubs.credentials[connector_id])
+        self.assertEqual(1, stubs.calls.count("ConnectorsClient.create"))
 
     def test_connect_gives_each_mailbox_its_own_connector(self):
         hydra, stubs = self.load_setup()
