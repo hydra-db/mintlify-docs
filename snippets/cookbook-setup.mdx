@@ -45,9 +45,15 @@ def connect(provider, account, database, collection, credentials,
     a mailbox address, a Jira site. Each account gets its own connector.
     Pass acl for a provider that does not capture permissions, such as Gmail or
     Notion. Without it, everything that provider syncs is readable by every caller.
-    An empty list lets nobody read it. The credentials are used when the connector
+    connect refuses such a provider when acl is left out, and stops if a provider's
+    permissions could not be read. An empty list lets nobody read the content.
+    The credentials are used when the connector
     is created; to rotate them later, call client.connectors.update.
     """
+    if acl is None:  # Then only the provider's own permissions restrict this content.
+        catalog = client.list_providers().providers or []
+        if not any(p.provider == provider and getattr(p, "acl_supported", False) for p in catalog):
+            raise ValueError(f"{provider} captures no permissions: pass acl to say who may read it")
     name = f"cookbook-{provider}-{collection}-{account}"
     connectors = client.connectors.list(provider=provider).connectors or []
     existing = [c for c in connectors if c.name == name and c.database == database]
@@ -99,6 +105,17 @@ def connect(provider, account, database, collection, credentials,
         if any(r.retryable is False for r in failed):  # Waiting will not fix these.
             raise RuntimeError(f"The {provider} connector cannot sync {detail}")
         if status.lifecycle == "active":
+            unread = [
+                r.display_name or r.resource_id
+                for r in status.resources or []
+                if r.acl_warning or r.page_acl_warning
+            ]
+            if acl is None and unread:  # Synced without permissions: readable by everyone.
+                raise RuntimeError(
+                    f"The {provider} connector could not read the permissions of "
+                    + ", ".join(unread)
+                    + ". Pass acl to restrict them."
+                )
             if status.status == "healthy":
                 return connector_id
             raise RuntimeError(

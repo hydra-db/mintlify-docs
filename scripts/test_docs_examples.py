@@ -80,6 +80,12 @@ def resolve(schema):
     return schema
 
 
+# Documented fields the generated spec does not declare yet. The spec is synced
+# from the application and is never edited by hand, so a field whose release is
+# pending is listed here until the sync brings it in. Remove the entry then.
+PENDING_SPEC_FIELDS = {".acl_inherit"}  # PATCH /context/{id}/metadata
+
+
 def unknown_keys(value, schema, path=""):
     """List keys in value that the schema does not declare, recursively."""
     schema = resolve(schema)
@@ -94,7 +100,8 @@ def unknown_keys(value, schema, path=""):
     unknown = []
     for key, child in value.items():
         if key not in properties:
-            unknown.append(f"{path}.{key}")
+            if f"{path}.{key}" not in PENDING_SPEC_FIELDS:
+                unknown.append(f"{path}.{key}")
         else:
             unknown += unknown_keys(child, properties[key], f"{path}.{key}")
     return unknown
@@ -517,6 +524,11 @@ class EndpointPages(unittest.TestCase):
 
 class JsonAndCurlExamples(unittest.TestCase):
     REFERENCE = [page for page in V2_PAGES if "plugins" not in page.parts]
+
+    def test_pending_fields_are_still_missing_from_the_spec(self):
+        """An entry must leave PENDING_SPEC_FIELDS as soon as the spec declares it."""
+        declared = {f".{name}" for schema in SCHEMAS.values() for name in schema.get("properties", {})}
+        self.assertEqual(set(), PENDING_SPEC_FIELDS & declared)
 
     def test_json_blocks_parse_and_use_public_fields(self):
         count = 0

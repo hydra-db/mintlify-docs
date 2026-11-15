@@ -97,6 +97,8 @@ class Stubs:
         self.failing = set()  # Resource IDs whose last sync failed.
         self.retryable = True  # Whether waiting can fix those failures.
         self.quiet = "ok"  # Status of the resources that did not fail.
+        self.acl_warnings = {}  # resource_id -> why its permissions could not be read.
+        self.page_acl_warnings = {}
         self.status = "completed"
         self.calls = []
         for owner, name, handler in [
@@ -110,6 +112,7 @@ class Stubs:
             (client.connectors, "configure", self.connector_configure),
             (client.connectors, "status", self.connector_status_call),
             (client.connectors, "list", self.connector_list),
+            (client, "list_providers", self.provider_catalog),
             (client.connectors, "list_resources", self.connector_resources),
             (client.connectors, "update_resource_acl", self.connector_update_resource),
         ]:
@@ -166,6 +169,14 @@ class Stubs:
         self.restricted.add(collection)
         return sdk.HandlerConnectorCreateResponse(connector_id=connector_id)
 
+    def provider_catalog(self, id=None):
+        self.test.assertIsNone(id, "the catalog, not one provider, reports acl_supported")
+        return sdk.HandlerProviderListResponse(providers=[
+            sdk.HandlerCatalogConnector.model_validate(
+                {"provider": p, "acl_supported": p in self.CAPTURES_ACL})
+            for p in sorted(self.CAPTURES_ACL | {"gmail", "notion"})
+        ])
+
     def connector_list(self, provider=None):
         return sdk.HandlerConnectorListResponse(
             connectors=[c for c in self.connectors if provider in (None, c.provider)]
@@ -189,7 +200,9 @@ class Stubs:
                     resource_id=r["resource_id"], display_name=r["name"],
                     status="failed" if r["resource_id"] in self.failing else self.quiet,
                     message="permission denied" if r["resource_id"] in self.failing else None,
-                    retryable=self.retryable if r["resource_id"] in self.failing else None)
+                    retryable=self.retryable if r["resource_id"] in self.failing else None,
+                    acl_warning=self.acl_warnings.get(r["resource_id"]),
+                    page_acl_warning=self.page_acl_warnings.get(r["resource_id"]))
                 for r in self.configured[id]
             ])
 
@@ -448,8 +461,26 @@ class CookbookTest(unittest.TestCase):
             connector_id = hydra.connect("gmail", "a@acme.com", "db", "docs", {"refresh_token": "x"},
                                          acl=["a@acme.com"])
         self.assertTrue(all(r["acl"] == ["a@acme.com"] for r in stubs.configured[connector_id]))
-        with bounded_sleep(), self.assertRaises(AssertionError):
+        with bounded_sleep(), self.assertRaisesRegex(ValueError, "notion captures no permissions"):
             hydra.connect("notion", "ws1", "db", "docs", {"token": "x"})
+        self.assertNotIn("ConnectorsClient.create", stubs.calls[stubs.calls.index("list_providers"):])
+
+    def test_connect_stops_when_permissions_could_not_be_read(self):
+        for field in ("acl_warnings", "page_acl_warnings"):
+            with self.subTest(field=field):
+                hydra, stubs = self.load_setup()
+                setattr(stubs, field, {"C2": "provider returned 403"})
+                gave_up = mock.patch("time.sleep", side_effect=AssertionError("connect kept polling"))
+                with gave_up, self.assertRaisesRegex(RuntimeError, "could not read the permissions of c2. Pass"):
+                    hydra.connect("slack", "T1", "db", "docs", {"access_token": "x"})
+
+    def test_connect_accepts_unread_permissions_when_an_acl_is_set(self):
+        hydra, stubs = self.load_setup()
+        stubs.acl_warnings = {"C2": "provider returned 403"}
+        with bounded_sleep():
+            connector_id = hydra.connect("slack", "T1", "db", "docs", {"access_token": "x"},
+                                         acl=["domain:acme.com"])
+        self.assertTrue(all(r["acl"] == ["domain:acme.com"] for r in stubs.configured[connector_id]))
 
     def test_connect_replaces_the_acl_of_a_connector_it_reuses(self):
         hydra, stubs = self.load_setup()
@@ -460,9 +491,15 @@ class CookbookTest(unittest.TestCase):
         self.assertTrue(all(r["acl"] == ["a@acme.com"] for r in stubs.configured[connector_id]))
         self.assertEqual(3, stubs.calls.count("ConnectorsClient.update_resource_acl"))
         self.assertEqual(1, stubs.calls.count("ConnectorsClient.configure"))
-        with bounded_sleep():  # No acl: the rule already stored is left alone.
+
+    def test_connect_leaves_a_stored_acl_alone_when_none_is_passed(self):
+        hydra, stubs = self.load_setup()
+        args = ("slack", "T1", "db", "docs", {"access_token": "x"})
+        with bounded_sleep():
+            connector_id = hydra.connect(*args, acl=["domain:acme.com"])
             hydra.connect(*args)
-        self.assertEqual(3, stubs.calls.count("ConnectorsClient.update_resource_acl"))
+        self.assertTrue(all(r["acl"] == ["domain:acme.com"] for r in stubs.configured[connector_id]))
+        self.assertNotIn("ConnectorsClient.update_resource_acl", stubs.calls)
 
     def test_connect_treats_an_empty_acl_as_nobody_not_as_unset(self):
         hydra, stubs = self.load_setup()
