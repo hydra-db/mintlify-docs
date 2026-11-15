@@ -1,5 +1,5 @@
 ---
-title: "HydraDB Agent Integration Guide"
+title: "Complete Agent Integration Guide"
 description: "The one page an AI coding agent reads before writing a HydraDB v2 integration: rules, API contracts, and runnable examples."
 ---
 
@@ -76,6 +76,8 @@ Schema fields, placement, and filter operators are in [10. Metadata guide](#10-m
 - A query with no `acl`, `[]`, or `["*"]` is not filtered: it returns everything in scope, including sources restricted to other people.
 - Derive `acl` from your authenticated session, never from client input. See [Access control](#access-control).
 - Do not turn on a connector's `enforce_acl` for an application that serves many users through one API key. With `enforce_acl` on, HydraDB ignores the request's `acl` for that connector's content and uses the email of whoever created the API key, so every user sees what the key's creator may see. Leave it off and send `acl` yourself.
+- Under `enforce_acl`, the identity comes from authentication: an API key or pasted-key MCP uses the key creator's email, and MCP OAuth and the dashboard use the signed-in user. A request `acl` still scopes content from non-enforced connectors.
+- If you send `acl` and an enforced connector ignores it, a successful response includes one `meta.warnings` entry with code `acl_ignored_by_connector_enforcement`. Treat it as a signal that your `acl` did not apply to that content.
 
 ### Sending feedback
 
@@ -220,9 +222,9 @@ HydraDB builds a graph of entity/relation triplets from ingested content. When `
 
 Graph context augments the result; it does not replace `chunks`.
 
-### Forceful relations
+### Explicit relations
 
-Forceful relations are links you declare between sources at ingest:
+Explicit relations are links you declare between sources at ingest:
 
 ```json
 {
@@ -235,7 +237,7 @@ Forceful relations are links you declare between sources at ingest:
 
 - Use `ids`.
 - Declare `relations` on `document_metadata[]` and `app_knowledge[]` items. They link knowledge sources; memory items do not take `relations`.
-- A query pulls the related chunks into `additional_context` only in `mode: "thinking"` with `query_forceful_relations: true` (the default).
+- A query pulls the related chunks into `data.additional_context` only in `mode: "thinking"` with `query_explicit_relations: true` (the default).
 
 ### Access control
 
@@ -251,7 +253,7 @@ Example: a source with `"acl": ["grace@acme.com"]` comes back for a query with `
 
 ### Connectors
 
-Connectors sync context from 70 apps, including Slack, Gmail, Google Drive, Notion, Jira, Confluence, GitHub, Linear, HubSpot, and Zendesk, into a database on a schedule, with no ingestion code. Prefer a connector over hand-written `app_knowledge` ingestion when the app is in the catalog; `GET /connectors/providers` lists it.
+Connectors sync context from 70+ apps, including Slack, Gmail, Google Drive, Notion, Jira, Confluence, GitHub, Linear, HubSpot, and Zendesk, into a database on a schedule, with no ingestion code. Indexing is permission-aware: for providers with `acl_supported: true`, each synced source carries the provider's own access rules. Prefer a connector over hand-written `app_knowledge` ingestion when the app is in the catalog; `GET /connectors/providers` lists it.
 
 Setup is four calls, made once:
 
@@ -307,6 +309,26 @@ Rules:
 - To change one resource, use `PATCH /connectors/{id}/resources/{resource_id}`. `POST /connectors/{id}/resources` adds new resources only: on an existing resource it returns `409` and changes nothing.
 - Every synced source carries `connector_id` and `provider` in `metadata`, and `connector_id` and `resource_id` in `additional_metadata`; filter on them to scope a query.
 - `custom_instructions` on the connector or one resource tells HydraDB how to read its documents, from the next sync on.
+
+### Bring Your Own Graph (BYOG)
+
+To build and query your own graph in Cypher, for example when migrating from Neo4j or another Cypher-compatible store, use the `/byog` endpoints instead of `/context/ingest`:
+
+| Endpoint | Purpose |
+| --- | --- |
+| `POST /byog/databases` | Create a database; ready immediately. Returns `409` if the name exists |
+| `POST /byog/query` | Run Cypher against one `collection`, with user data in `params` |
+| `GET /byog/collections` | List a database's graph collections |
+| `DELETE /byog/collections` | Drop one collection |
+| `DELETE /byog/databases` | Drop a database |
+
+- Each collection is an isolated graph, created on first write. Reading one that does not exist yet returns zero rows.
+- Pass user data through `params`, never by building it into the query string.
+- Procedure calls (`CALL db.*`, `CALL apoc.*`) and `LOAD CSV` are not supported.
+- Limits: 256 KiB request body (`413`), 8 s for reads and 30 s for writes (`400` on timeout). Rows beyond the result-set cap are silently dropped, so paginate large reads.
+- Agents can run the same Cypher through the HydraDB MCP graph tools: `hydradb_graph_query`, `hydradb_graph_collections`, and `hydradb_graph_admin`.
+
+Full guide: `https://docs.hydradb.com/essentials/v2/bring-your-own-graph`.
 
 ---
 
@@ -768,7 +790,7 @@ Headers: `X-HydraDB-Delivery-ID`, `X-HydraDB-Event`, and `X-HydraDB-Signature` w
 
 Signature scheme:
 
-```
+```text
 X-HydraDB-Signature: sha256=<lowercase hex digest>
 
 digest = HMAC-SHA256(key = signing_secret, message = raw request body bytes)
@@ -802,19 +824,19 @@ Rules:
 |---|---|---|
 | `database` | string | required |
 | `collection` | string/null | the collection the context was saved in; default collection if omitted |
-| `collections` | list of collection IDs | query several collections at once; every listed collection must exist |
+| `collections` | list of collection IDs, or an object of weights | query up to 100 collections at once; every listed collection must exist. Send weights, such as `{"user_alex": 2, "company_docs": 1}`, to rank one collection over another |
 | `query` | string | required |
 | `type` | `knowledge`, `memory`, `all` | store selector for knowledge, memories, or both |
 | `acl` | list of principals | who is asking; see [Send `acl` on user queries](#send-acl-on-user-queries) |
 | `query_by` | `hybrid`, `text` | default `hybrid` (semantic + BM25); `text` is BM25 keyword/phrase search |
 | `operator` | `or`, `and`, `phrase` | only for `query_by: "text"` |
-| `mode` | `fast`, `thinking`, `auto` | applies to hybrid; omitted means `auto`, which picks fast or thinking per query (thinking when unsure). `fast` is low latency. `thinking` adds query expansion, reranking, richer graph traversal, and forceful-relation expansion; it improves quality but adds latency |
+| `mode` | `fast`, `thinking`, `auto` | applies to hybrid; omitted means `auto`, which picks fast or thinking per query (thinking when unsure). `fast` is low latency. `thinking` adds query expansion, reranking, richer graph traversal, and explicit-relation expansion; it improves quality but adds latency |
 | `max_results` | integer/null | default 10; max 250 |
 | `alpha` | `0.0` to `1.0`, or `auto` | hybrid weight; `1.0` semantic, `0.0` BM25 |
 | `recency_bias` | `0.0` to `1.0` | boost newer content; omitted means `0.4`, send `0` to disable |
 | `graph_context` | boolean | default true; include graph slice; `false` only takes effect in fast mode, thinking always includes it |
-| `query_forceful_relations` | boolean | only effective in `thinking` mode |
-| `additional_context` | string | short factual hint; not a hard filter |
+| `query_explicit_relations` | boolean | default true; returns explicitly related chunks in `data.additional_context`; only effective in `thinking` mode |
+| `additional_graph_context` | string | short factual hint that sharpens retrieval; not a hard filter |
 | `metadata_filters` | object | deterministic filters before/around ranking |
 | `query_apps` | boolean | app-aware retrieval lane for app sources; still searches the full selected knowledge scope; defaults to `true` on `/query`, send `false` to disable |
 
@@ -917,11 +939,14 @@ The successful `data` object / SDK return is a `RetrievalResult`:
     "chunk_relations": [],
     "chunk_id_to_group_ids": {}
   },
-  "additional_context": {}
+  "additional_context": {},
+  "llm_prompt": "..."
 }
 ```
 
 Each chunk's `id` is the ID of the source it came from, and `source_title` is that source's title: cite with these. The public result has no `sources` array.
+
+`llm_prompt` is the result rendered as Markdown for a model, with the ranked results numbered `[1]`, `[2]`, and so on.
 
 Use `chunks` as the primary LLM context. Preserve server order, which is the ranking; do not re-sort unless you have a deliberate reranking step.
 
@@ -929,11 +954,11 @@ Use `chunks` as the primary LLM context. Preserve server order, which is the ran
 
 ## 9. Turning query results into LLM prompts
 
-- Do not pass raw result JSON to the LLM if token budget matters. Use the SDK formatting helper to produce a compact context string: `build_string(result)` from `hydra_db.helpers` (Python) or `buildString(result)` from `@hydradb/sdk/helpers` (TypeScript).
+- Do not pass raw result JSON to the LLM if token budget matters. Use the SDK formatting helper to produce a compact context string: `build_string(result)` from `hydra_db.helpers` (Python) or `buildString(result)` from `@hydradb/sdk/helpers` (TypeScript). Both return `data.llm_prompt`, which numbers the ranked results `[1]`, `[2]`, and so on; ask the model to cite by those numbers.
 - Include a grounding instruction: answer only from the provided context, and say when the context is insufficient.
 - Start with `max_results: 10`; reduce it for tight context windows.
 - Use graph context only when it helps the question.
-- Use `additional_context` to attach forcefully related chunks by `chunk_uuid` / `extra_context_ids`.
+- Use `data.additional_context` to attach explicitly related chunks by `chunk_uuid` / `extra_context_ids`.
 - For personalized answers, `type: "all"` is simplest: one result set already merges knowledge and memories.
 
 Python:
@@ -1037,7 +1062,14 @@ Field options:
 | `data_type` | friendly names like `string`, `integer`, `float`, `boolean`, or backend types like `VARCHAR`, `INT*`, `JSON` |
 | `enable_dense_embedding` | semantically embed `VARCHAR` field |
 | `enable_sparse_embedding` | BM25 index `VARCHAR` field |
-| `max_length` | max string length |
+| `max_length` | max string length; default `1024`, maximum `65535`, and it cannot be raised after the field is created |
+
+Schema limits:
+
+- Up to 32 fields and 6 embedding flags per database. Embedding flags are valid only on `VARCHAR` fields.
+- Field names are unique, case-insensitively.
+- `ARRAY` is not a supported `data_type` and is rejected with `400`. For a multi-value field, store the values as one comma-joined `VARCHAR` and filter for a member with `contains`.
+- Values must match their declared type, and undeclared `metadata` keys are rejected on ingest.
 
 ### Where metadata belongs
 
@@ -1052,6 +1084,7 @@ Rules:
 
 - Plan hot filter fields before the first ingest. `PATCH /databases/{database}/metadata-schema` can add fields later, but cannot rename, retype, or reflag existing ones, and rejects `enable_dense_embedding` / `enable_sparse_embedding` (declare those at database creation). Changing an existing field definition requires a new database and re-ingestion.
 - Top-level `metadata_filters` keys must be declared in the metadata schema. They support `equals`, `contains`, and `contains_any`. Range and fuzzy matching belong in the query or a downstream reranker.
+- Inside `metadata_filters.additional_metadata`, use bare values or arrays, not operators. An operator there, or a misspelled operator anywhere, does not error: it returns `200` with no results.
 - To change metadata on an indexed source, call `PATCH /context/{id}/metadata` (merges keys), or re-ingest with the same `id` and `upsert: true`.
 - Do not rename metadata keys without re-ingesting the affected sources.
 
@@ -1266,7 +1299,8 @@ Sections 8 to 10, query and metadata:
 
 - [ ] Using undeclared `metadata` keys in `metadata_filters`.
 - [ ] Using `operator` without `query_by: "text"`.
-- [ ] Expecting `query_forceful_relations` to work in `mode: "fast"`.
+- [ ] Expecting `query_explicit_relations` to work in `mode: "fast"`.
+- [ ] Putting operators inside `metadata_filters.additional_metadata`, or misspelling an operator, which silently returns no results.
 - [ ] Setting `graph_context: false` and expecting graph fields.
 - [ ] Reading `data.sources`, which the public result does not return; cite from each chunk's `id` and `source_title`.
 - [ ] Re-sorting chunks before prompting without a deliberate reranker.
