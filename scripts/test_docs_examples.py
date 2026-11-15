@@ -83,7 +83,7 @@ def resolve(schema):
 # Documented fields the generated spec does not declare yet. The spec is synced
 # from the application and is never edited by hand, so a field whose release is
 # pending is listed here until the sync brings it in. Remove the entry then.
-PENDING_SPEC_FIELDS = {".acl_inherit"}  # PATCH /context/{id}/metadata
+PENDING_SPEC_FIELDS = set()
 
 
 def unknown_keys(value, schema, path=""):
@@ -179,6 +179,8 @@ class FakeHydraDB:
         if key == ("GET", "/databases/status"):
             return 200, envelope({"database": query["database"][0],
                                   "infra": {"ready_for_ingestion": True}})
+        if key == ("GET", "/databases/{database}/metadata-schema"):
+            return 200, envelope({"database": "acme_corp", "fields": []})
         if key == ("POST", "/context/ingest"):
             items = json.loads(body.get("memories")
                                or body.get("document_metadata") or "[{}]")
@@ -202,10 +204,19 @@ class FakeHydraDB:
             return 200, envelope({"feedback_id": "fb_1"})
         if key == ("POST", "/connectors"):
             return 201, {"connector_id": "conn_1", "provider": body.get("provider"), "status": "active"}
+        if key == ("GET", "/connectors/providers"):
+            if query.get("id"):
+                return 200, {"provider": query["id"][0], "connector_type": query["id"][0],
+                             "indexed_object_types": [], "searchable_fields": [], "filterable_fields": []}
+            return 200, {"providers": []}
         if key == ("GET", "/connectors/{id}/discover"):
-            return 200, {"resources": [{"id": "C1", "resource_type": "channel", "name": "general"}]}
+            return 200, {"provider": "slack", "resources": [{"id": "C1", "resource_type": "channel", "name": "general"}]}
         if key == ("POST", "/connectors/{id}/configure"):
-            return 200, {}
+            return 200, {"connector_id": "conn_1"}
+        if key == ("PATCH", "/connectors/{id}"):
+            return 200, {"connector_id": "conn_1"}
+        if key == ("PATCH", "/connectors/{id}/resources/{resource_id}"):
+            return 200, {"connector_id": "conn_1", "resource_id": "C1", **body}
         if key == ("GET", "/connectors/{id}/status"):
             return 200, {"connector_id": "conn_1", "status": "active"}
         if key == ("GET", "/context/inspect"):

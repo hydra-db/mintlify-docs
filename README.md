@@ -46,10 +46,13 @@ python .github/verify_v2_public_contract.py
 python -m unittest discover -s .github -p 'test_v2_schema_types.py'
 python scripts/verify_agents_endpoints.py
 python scripts/generate_llms_index.py --check
+python scripts/generate_connector_pages.py --check
 pnpm mintlify validate
 ```
 
 When adding or removing a documentation page, regenerate the complete agent index with `python scripts/generate_llms_index.py`. Mintlify serves the root `llms.txt`; `llms-full.txt` remains Mintlify-generated. These local contract tests don't prove live indexing or authenticated vendor workflows.
+
+Connector capability pages are generated with `python scripts/generate_connector_pages.py` from `scripts/connector_capabilities.json`. The snapshot records the application and dashboard source commits, the export checksum, and the proven provider aliases. Refresh it from the public provider descriptions and source-backed dashboard setup guidance, not marketing labels or guessed object types. Keep empty object-type lists when the descriptor does not enumerate them, then register any new pages in `docs.json`.
 
 ## Content Structure
 

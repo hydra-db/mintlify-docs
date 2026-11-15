@@ -141,6 +141,7 @@ class Stubs:
     def database_status(self, database):
         return sdk.HandlerEnvelopeTenantsInfraStatusResponseV2(
             data=sdk.TenantsInfraStatusResponseV2(
+                database=database,
                 infra=sdk.TenantsInfraV2(ready_for_ingestion=True)
             )
         )
@@ -222,11 +223,12 @@ class Stubs:
         return {"connector_id": id, "resource_id": resource_id, **request}
 
     def connector_discover(self, id, cursor=None, limit=None):
-        self.connector(id)
+        connector = self.connector(id)
         self.test.assertLessEqual(limit or 100, 100)
         pages = self.discovered
         index = 0 if cursor is None else int(cursor)
         return sdk.HandlerDiscoverResponseBody(
+            provider=connector.provider,
             resources=[sdk.HandlerDiscoveredResourceDto(id=r, resource_type="channel", name=r.lower())
                        for r in pages[index]],
             has_more=index + 1 < len(pages),
@@ -246,7 +248,7 @@ class Stubs:
                 test.assertIsNotNone(resource.get("acl"),
                                 f"{connector.provider} captures no permissions: set acl on its resources")
         self.configured[id] = resources
-        return sdk.HandlerConfigureResponse()
+        return sdk.HandlerConfigureResponse(connector_id=id)
 
     def ingest(self, type, database, collection, documents=None, document_metadata=None,
                memories=None):  # No app_knowledge: app content comes through connectors.
@@ -356,10 +358,19 @@ class CookbookTest(unittest.TestCase):
                 "additional_metadata": {"path": "src/auth.py"}, "path": "src/auth.py",
             }],
             "graph_context": {"query_paths": [{"combined_context": "Router calls validate_token."}]},
-            "additional_context": {"policy": {
+            "additional_graph_context": {"policy": {
                 "id": "policy", "chunk_content": "Service tokens require the admin scope.",
             }},
         }, context)
+
+        canonical = {"canonical_policy": {"id": "canonical_policy", "chunk_content": "Use MFA."}}
+        result = NS(data=NS(json=lambda **kwargs: json.dumps({
+            "chunks": [], "graph_context": {},
+            "additional_graph_context": canonical,
+            "additional_context": {"legacy_policy": {"id": "legacy_policy"}},
+        })))
+        context = json.loads(scope["search_code"]("How is authentication enforced?"))
+        self.assertEqual(canonical, context["additional_graph_context"])
 
     @staticmethod
     def optional_credentials(source):

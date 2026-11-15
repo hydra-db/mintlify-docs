@@ -114,6 +114,130 @@ SHARED_FACTS = {
 INDEXING_STATUSES = ["queued", "processing", "graph_creation", "completed", "errored"]
 
 
+class UnifiedNarrativeTest(unittest.TestCase):
+    def read(self, relative):
+        return (ROOT / relative).read_text(encoding="utf-8")
+
+    def test_memory_scope_is_derived_from_the_signed_in_session(self):
+        text = self.read("essentials/v2/context.mdx")
+        memory = text.split("## Ingesting memory", 1)[1].split("## Wait for indexing", 1)[0]
+        self.assertIn("signed-in session", memory)
+        self.assertIn("does not authenticate", memory)
+        self.assertIn("every ingest, status check, and query", memory)
+        self.assertIn("`infer: true` (default)", memory)
+        self.assertIn("`infer: false`", memory)
+
+    def test_legacy_memory_instructions_are_not_public_guidance(self):
+        for relative in (
+            "essentials/v2/context.mdx",
+            "api-reference/v2/endpoint/ingest-context.mdx",
+            "cookbooks/v2/personal-assistant.mdx",
+        ):
+            self.assertNotIn("custom_instructions", self.read(relative), relative)
+        guide = self.read("AGENTS.mdx")
+        memories = guide.split("### Memories")[-1].split("## 7.", 1)[0]
+        self.assertNotIn("custom_instructions", memories)
+        self.assertIn("`custom_instructions` on the connector", guide)
+        self.assertIn("custom_instructions", self.read("essentials/v2/connectors.mdx"))
+
+    def test_query_names_and_defaults_match_the_canonical_contract(self):
+        for relative in (
+            "AGENTS.mdx",
+            "essentials/v2/query.mdx",
+            "api-reference/v2/endpoint/query.mdx",
+        ):
+            text = self.read(relative)
+            with self.subTest(relative=relative):
+                self.assertIn("query_explicit_relations", text)
+                self.assertIn("additional_graph_context", text)
+                self.assertIn("data.additional_graph_context", text)
+                self.assertNotRegex(text, r'(?:Default|default|omitted means)[^\n|]*`0\.4`')
+        reference = self.read("api-reference/v2/endpoint/query.mdx")
+        self.assertRegex(reference, r'name="type"[^\n]*default=`"all"`')
+        self.assertRegex(reference, r'name="recency_bias"[^\n]*default=`0\.6`')
+        self.assertIn('name="query_explicit_relations"', reference)
+        self.assertIn('name="additional_graph_context"', reference)
+        self.assertIn("request-time hint", reference)
+        self.assertIn("response map", reference)
+        context = self.read("essentials/v2/context.mdx")
+        self.assertIn("`relations.ids`", context)
+        self.assertNotIn("`explicit_relations`", context)
+
+    def test_cli_authentication_does_not_require_a_database_or_key_in_argv(self):
+        text = self.read("plugins/cli.mdx")
+        self.assertIn("hydradb login\n", text)
+        self.assertNotIn("hydradb login --", text)
+        self.assertNotIn("--api-key", text)
+        self.assertIn("masked prompt", text)
+        self.assertIn("`0600`", text)
+        self.assertIn("hydradb database list", text)
+        self.assertIn("hydradb config set database my-db", text)
+        self.assertIn("hydradb database create my-db", text)
+        self.assertIn("### Deprecated aliases", text)
+        self.assertIn("### Persistent configuration", text)
+        self.assertIn("`--kind`", text)
+        self.assertIn("knowledge text", text.split("| `--markdown`", 1)[1].split("\n", 1)[0])
+        self.assertIn("| `--additional-graph-context`", text)
+        self.assertIn("`--additional_graph_context` is also accepted", text)
+        self.assertIn("`response_warnings`", text)
+        self.assertIn("effective `scope`", text)
+
+    def test_client_auto_selection_is_not_documented_as_a_backend_wire_type(self):
+        context = self.read("essentials/v2/context.mdx")
+        self.assertIn("client-side selection", context)
+        self.assertIn("defaults to `type=knowledge`", context)
+        self.assertIn("`auto` is not an API wire value", context)
+        self.assertNotIn("`type=traces`", context)
+        self.assertIn("default is `\"knowledge\"`", self.read("AGENTS.mdx"))
+        self.assertIn('default=`"knowledge"`', self.read("api-reference/v2/endpoint/ingest-context.mdx"))
+
+    def test_mcp_api_key_connection_can_choose_its_scope_after_authentication(self):
+        text = self.read("plugins/mcp.mdx")
+        quickstart = text.split("## Configuration", 1)[0]
+        self.assertNotIn('"X-HydraDB-Database"', quickstart)
+        self.assertNotIn('"HYDRADB_DATABASE"', quickstart)
+        self.assertIn("hydradb_databases", text)
+        self.assertIn("hydradb_database_create", text)
+        self.assertNotIn("names no database is refused", text)
+        self.assertIn("`scope_notice`", text)
+        self.assertIn("`warnings_omitted`", text)
+        self.assertIn("rejected before an API call", text)
+
+    def test_repaired_local_links_have_stable_targets(self):
+        links = {
+            "essentials/v2/context.mdx": ("link-sources-deterministically", "## Link sources deterministically"),
+            "essentials/v2/connectors.mdx": ("6-connect-several-accounts-from-one-provider", "## 6. Connect several accounts from one provider"),
+            "essentials/v2/metadata-2.mdx": ("metadata-and-additional-metadata", "## Metadata and additional metadata"),
+            "plugins/cli.mdx": ("persistent-configuration", "### Persistent configuration"),
+            "plugins/mcp.mdx": ("api-key-headers", "### API key headers"),
+        }
+        for relative, (anchor, target) in links.items():
+            text = self.read(relative)
+            with self.subTest(relative=relative):
+                self.assertIn(f"](#{anchor})", text)
+                self.assertIn(target, text)
+
+    def test_byog_endpoints_have_navigable_reference_pages(self):
+        routes = {
+            "byog-query-managed": "POST /byog",
+            "byog-query": "POST /byog/query",
+            "byog-create-database": "POST /byog/databases",
+            "byog-delete-database": "DELETE /byog/databases",
+            "byog-list-collections": "GET /byog/collections",
+            "byog-delete-collection": "DELETE /byog/collections",
+        }
+        config = self.read("docs.json")
+        for page, operation in routes.items():
+            relative = f"api-reference/v2/endpoint/{page}"
+            text = self.read(f"{relative}.mdx")
+            with self.subTest(operation=operation):
+                self.assertIn(f'"{relative}"', config)
+                self.assertIn(f'openapi: "api-reference/v2/openapi.json {operation}"', text)
+                self.assertIn("<RequestExample>", text)
+                self.assertIn("$HYDRADB_API_KEY", text)
+                self.assertIn("## Related resources", text)
+
+
 class SharedFactsTest(unittest.TestCase):
     def read(self, relative):
         return (ROOT / relative).read_text(encoding="utf-8")
