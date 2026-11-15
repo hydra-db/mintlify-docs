@@ -66,10 +66,9 @@ class DocsConsistencyTest(unittest.TestCase):
             )
             matches.extend([str(path.relative_to(ROOT))] * count)
 
-        self.assertCountEqual(
-            ["plugins/claude-code.mdx", "plugins/cli.mdx", "plugins/mcp.mdx"],
-            matches,
-        )
+        # The CLI and MCP pages name only the current variable. The Claude Code
+        # page keeps one note for people upgrading from the old name.
+        self.assertCountEqual(["plugins/claude-code.mdx"], matches)
 
 
 
