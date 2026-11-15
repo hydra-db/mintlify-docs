@@ -45,13 +45,14 @@ def connect(provider, account, database, collection, credentials,
     a mailbox address, a Jira site. Each account gets its own connector.
     Pass acl for a provider that does not capture permissions, such as Gmail or
     Notion. Without it, everything that provider syncs is readable by every caller.
+    An empty list lets nobody read it. The credentials are used when the connector
+    is created; to rotate them later, call client.connectors.update.
     """
     name = f"cookbook-{provider}-{collection}-{account}"
     connectors = client.connectors.list(provider=provider).connectors or []
     existing = [c for c in connectors if c.name == name and c.database == database]
-    if existing:  # This account was connected on an earlier run: keep its credentials current.
+    if existing:  # This account was connected on an earlier run.
         connector_id = existing[0].connector_id
-        client.connectors.update(connector_id, credentials=credentials)
     else:
         scope = {"provider_account_scope": account} if provider in SCOPED else {}
         connector_id = client.connectors.create(
@@ -73,7 +74,7 @@ def connect(provider, account, database, collection, credentials,
             cursor = page.next_cursor
         if not resources:
             raise RuntimeError(f"The {provider} credentials can reach nothing to sync")
-        rule = {"acl": acl} if acl else {}
+        rule = {} if acl is None else {"acl": acl}
         client.connectors.configure(
             connector_id,
             lookback_days=lookback_days,
@@ -82,32 +83,33 @@ def connect(provider, account, database, collection, credentials,
                 for r in resources
             ],
         )
-    elif acl:  # Already configured: make its resources match the rule asked for now.
+    elif acl is not None:  # Already configured: set the rule asked for now on every resource.
         for resource in client.connectors.list_resources(connector_id).resources or []:
-            if sorted(resource.acl or []) != sorted(acl):
-                client.connectors.update_resource_acl(
-                    connector_id, resource.resource_id, request={"acl": acl}
-                )
+            client.connectors.update_resource_acl(
+                connector_id, resource.resource_id, request={"acl": acl}
+            )
 
     deadline = time.time() + timeout
     while time.time() < deadline:
         status = client.connectors.status(connector_id)
         if status.status in ("failed", "paused", "capped") or status.lifecycle == "reconnect":
             raise RuntimeError(f"The {provider} connector is {status.status}: {status.error}")
+        failed = [r for r in status.resources or [] if r.status == "failed"]
+        detail = "; ".join(f"{r.display_name or r.resource_id}: {r.message}" for r in failed)
+        if any(r.retryable is False for r in failed):  # Waiting will not fix these.
+            raise RuntimeError(f"The {provider} connector cannot sync {detail}")
         if status.lifecycle == "active":
             if status.status == "healthy":
                 return connector_id
-            failing = [
-                f"{r.display_name or r.resource_id}: {r.message}"
-                for r in status.resources or []
-                if r.status != "ok"
-            ]
             raise RuntimeError(
                 f"The {provider} connector is {status.status}, so its content is incomplete: "
-                + ("; ".join(failing) or str(status.error))
+                + (detail or str(status.error))
             )
         time.sleep(10)
-    raise TimeoutError(f"The {provider} connector synced nothing within {timeout} seconds")
+    raise TimeoutError(
+        f"The {provider} connector synced nothing within {timeout} seconds"
+        + (f" ({detail})" if detail else "")
+    )
 
 
 def source_ids(result):
