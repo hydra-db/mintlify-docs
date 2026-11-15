@@ -34,7 +34,7 @@ import hydra_db
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_cookbooks import (  # noqa: E402
-    APP_SOURCE_KEYS, DOCUMENT_METADATA_KEYS, KIND_FIELDS, KINDS, MEMORY_KEYS,
+    DOCUMENT_METADATA_KEYS, MEMORY_KEYS,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -80,6 +80,12 @@ def resolve(schema):
     return schema
 
 
+# Documented fields the generated spec does not declare yet. The spec is synced
+# from the application and is never edited by hand, so a field whose release is
+# pending is listed here until the sync brings it in. Remove the entry then.
+PENDING_SPEC_FIELDS = {".acl_inherit"}  # PATCH /context/{id}/metadata
+
+
 def unknown_keys(value, schema, path=""):
     """List keys in value that the schema does not declare, recursively."""
     schema = resolve(schema)
@@ -94,7 +100,8 @@ def unknown_keys(value, schema, path=""):
     unknown = []
     for key, child in value.items():
         if key not in properties:
-            unknown.append(f"{path}.{key}")
+            if f"{path}.{key}" not in PENDING_SPEC_FIELDS:
+                unknown.append(f"{path}.{key}")
         else:
             unknown += unknown_keys(child, properties[key], f"{path}.{key}")
     return unknown
@@ -173,7 +180,7 @@ class FakeHydraDB:
             return 200, envelope({"database": query["database"][0],
                                   "infra": {"ready_for_ingestion": True}})
         if key == ("POST", "/context/ingest"):
-            items = json.loads(body.get("memories") or body.get("app_knowledge")
+            items = json.loads(body.get("memories")
                                or body.get("document_metadata") or "[{}]")
             return 202, envelope({"success": True, "results": [
                 {"id": item.get("id", f"source_{n}"), "status": "queued"}
@@ -222,13 +229,8 @@ class FakeHydraDB:
             test.assertEqual(1, ("text" in item) + ("user_assistant_pairs" in item), where)
         for item in json.loads(body.get("document_metadata") or "[]"):
             test.assertLessEqual(set(item), DOCUMENT_METADATA_KEYS, where)
-        for item in json.loads(body.get("app_knowledge") or "[]"):
-            test.assertEqual("knowledge", body["type"], where)
-            test.assertLessEqual(set(item), APP_SOURCE_KEYS, where)
-            test.assertIn(item.get("kind"), KINDS, where)
-            fields = item.get("fields", {})
-            test.assertEqual(item["kind"], fields.get("kind"), where)
-            test.assertLessEqual(set(fields) - {"kind"}, KIND_FIELDS[item["kind"]], f"{where}: {item.get('id')}")
+        # App content comes through connectors; examples must not hand-write it.
+        test.assertNotIn("app_knowledge", body, where)
 
     def handle(self, request):
         try:
@@ -517,11 +519,16 @@ class EndpointPages(unittest.TestCase):
                 # for this operation's request body.
                 leaf = name.split(".")[-1].split("[")[0]
                 self.assertIn(f'"{leaf}"', FULL_TEXT.get(template, SPEC_TEXT), f"{page.name}: {name}")
-        self.assertGreaterEqual(checked, 60)
+        self.assertGreaterEqual(checked, 55)
 
 
 class JsonAndCurlExamples(unittest.TestCase):
     REFERENCE = [page for page in V2_PAGES if "plugins" not in page.parts]
+
+    def test_pending_fields_are_still_missing_from_the_spec(self):
+        """An entry must leave PENDING_SPEC_FIELDS as soon as the spec declares it."""
+        declared = {f".{name}" for schema in SCHEMAS.values() for name in schema.get("properties", {})}
+        self.assertEqual(set(), PENDING_SPEC_FIELDS & declared)
 
     def test_json_blocks_parse_and_use_public_fields(self):
         count = 0
