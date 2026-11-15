@@ -94,6 +94,7 @@ class Stubs:
         self.configured = {}  # connector_id -> resources, or None before configure.
         self.discovered = [["C1", "C2"], ["C3"]]  # Two pages, so pagination is exercised.
         self.connector_status = ("active", "healthy")
+        self.failing = set()  # Resource IDs whose last sync failed.
         self.status = "completed"
         self.calls = []
         for owner, name, handler in [
@@ -107,6 +108,8 @@ class Stubs:
             (client.connectors, "configure", self.connector_configure),
             (client.connectors, "status", self.connector_status_call),
             (client.connectors, "list", self.connector_list),
+            (client.connectors, "list_resources", self.connector_resources),
+            (client.connectors, "update_resource_acl", self.connector_update_resource),
         ]:
             label = name if owner is client else f"{type(owner).__name__}.{name}"
             setattr(owner, name, self.checked(label, getattr(owner, name), handler))
@@ -144,6 +147,12 @@ class Stubs:
     def connector_create(self, provider, name, database, collection, credentials,
                          provider_account_scope=None):
         self.test.assertTrue(credentials and all(credentials.values()), "credentials must not be empty")
+        if provider in {"slack", "github", "linear", "notion"}:
+            self.test.assertTrue(provider_account_scope, f"{provider} needs provider_account_scope")
+        else:
+            self.test.assertIsNone(provider_account_scope, f"{provider} has no account scope")
+        self.test.assertNotIn(name, [c.name for c in self.connectors if c.database == database],
+                              "one connector per account")
         connector_id = f"conn_{len(self.connectors) + 1}"
         self.connectors.append(sdk.HandlerConnectorApiView(
             connector_id=connector_id, provider=provider, name=name, database=database,
@@ -171,7 +180,29 @@ class Stubs:
             return sdk.HandlerConnectorStatusResponse(
                 connector_id=id, lifecycle="pending_setup", status="degraded")
         lifecycle, status = self.connector_status
-        return sdk.HandlerConnectorStatusResponse(connector_id=id, lifecycle=lifecycle, status=status)
+        return sdk.HandlerConnectorStatusResponse(
+            connector_id=id, lifecycle=lifecycle, status=status,
+            resources=[
+                sdk.HandlerConnectorResourceStatus(
+                    resource_id=r["resource_id"], display_name=r["name"],
+                    status="failed" if r["resource_id"] in self.failing else "ok",
+                    message="permission denied" if r["resource_id"] in self.failing else None)
+                for r in self.configured[id]
+            ])
+
+    def connector_resources(self, id):
+        self.connector(id)
+        return sdk.HandlerConnectorResourcesResponse(resources=[
+            sdk.ConnectorsResource(connector_id=id, resource_id=r["resource_id"], acl=r.get("acl"))
+            for r in self.configured[id] or []
+        ])
+
+    def connector_update_resource(self, id, resource_id, request):
+        self.test.assertLessEqual(set(request), {"acl", "custom_instructions"})
+        found = [r for r in self.configured[id] if r["resource_id"] == resource_id]
+        self.test.assertTrue(found, f"unknown resource {resource_id}")
+        found[0].update(request)
+        return {"connector_id": id, "resource_id": resource_id, **request}
 
     def connector_discover(self, id, cursor=None, limit=None):
         self.connector(id)
@@ -318,7 +349,11 @@ class CookbookTest(unittest.TestCase):
         """Environment variables for providers a cookbook connects only when they are set."""
         names = re.findall(r'for provider in \(([^)]*)\)', source)
         providers = re.findall(r'"(\w+)"', " ".join(names))
-        return {f"{p.upper()}_CREDENTIALS": '{"api_token": "test"}' for p in providers}
+        variables = {}
+        for p in providers:
+            variables[f"{p.upper()}_CREDENTIALS"] = '{"api_token": "test"}'
+            variables[f"{p.upper()}_SITE"] = f"acme-{p}.example.com"
+        return variables
 
     def run_cookbook(self, path):
         setup = python_blocks(SETUP)["hydra.py"]
@@ -364,19 +399,31 @@ class CookbookTest(unittest.TestCase):
         hydra, stubs = self.load_setup()
         token = {"access_token": "x"}
         with bounded_sleep():
-            first = hydra.connect("slack", "db", "docs", token, account_scope="T1")
-            again = hydra.connect("slack", "db", "docs", token, account_scope="T1")
-            workspace = hydra.connect("slack", "db", "docs", token, account_scope="T2")
-            collection = hydra.connect("slack", "db", "other", token, account_scope="T1")
+            first = hydra.connect("slack", "T1", "db", "docs", token)
+            again = hydra.connect("slack", "T1", "db", "docs", token)
+            workspace = hydra.connect("slack", "T2", "db", "docs", token)
+            collection = hydra.connect("slack", "T1", "db", "other", token)
         self.assertEqual(first, again)
         self.assertEqual(3, len({first, workspace, collection}))
         self.assertEqual(3, stubs.calls.count("ConnectorsClient.create"))
         self.assertEqual(3, stubs.calls.count("ConnectorsClient.configure"))
+        self.assertEqual({"T1", "T2"}, {c.provider_account_scope for c in stubs.connectors})
+
+    def test_connect_gives_each_mailbox_its_own_connector(self):
+        hydra, stubs = self.load_setup()
+        with bounded_sleep():
+            work = hydra.connect("gmail", "maya@acme.com", "db", "docs", {"refresh_token": "a"},
+                                 acl=["maya@acme.com"])
+            home = hydra.connect("gmail", "maya@home.org", "db", "docs", {"refresh_token": "b"},
+                                 acl=["maya@acme.com"])
+        self.assertNotEqual(work, home)
+        self.assertEqual(2, stubs.calls.count("ConnectorsClient.create"))
+        self.assertEqual(2, stubs.calls.count("ConnectorsClient.configure"))
 
     def test_connect_configures_every_page_of_resources(self):
         hydra, stubs = self.load_setup()
         with bounded_sleep():
-            connector_id = hydra.connect("slack", "db", "docs", {"access_token": "x"}, lookback_days=90)
+            connector_id = hydra.connect("slack", "T1", "db", "docs", {"access_token": "x"}, lookback_days=90)
         self.assertEqual(["C1", "C2", "C3"], [r["resource_id"] for r in stubs.configured[connector_id]])
         self.assertEqual(2, stubs.calls.count("ConnectorsClient.discover"))
 
@@ -384,37 +431,59 @@ class CookbookTest(unittest.TestCase):
         hydra, stubs = self.load_setup()
         stubs.discovered = [[]]  # The first run finds nothing and stops before configure.
         with bounded_sleep(), self.assertRaisesRegex(RuntimeError, "can reach nothing to sync"):
-            hydra.connect("slack", "db", "docs", {"access_token": "x"})
+            hydra.connect("slack", "T1", "db", "docs", {"access_token": "x"})
         stubs.discovered = [["C1"]]
         with bounded_sleep():
-            connector_id = hydra.connect("slack", "db", "docs", {"access_token": "x"})
+            connector_id = hydra.connect("slack", "T1", "db", "docs", {"access_token": "x"})
         self.assertEqual(1, stubs.calls.count("ConnectorsClient.create"))
         self.assertEqual(["C1"], [r["resource_id"] for r in stubs.configured[connector_id]])
 
     def test_connect_sets_acl_for_a_provider_that_captures_none(self):
         hydra, stubs = self.load_setup()
         with bounded_sleep():
-            connector_id = hydra.connect("gmail", "db", "docs", {"refresh_token": "x"}, acl=["a@acme.com"])
+            connector_id = hydra.connect("gmail", "a@acme.com", "db", "docs", {"refresh_token": "x"},
+                                         acl=["a@acme.com"])
         self.assertTrue(all(r["acl"] == ["a@acme.com"] for r in stubs.configured[connector_id]))
         with bounded_sleep(), self.assertRaises(AssertionError):
-            hydra.connect("notion", "db", "docs", {"token": "x"})
+            hydra.connect("notion", "ws1", "db", "docs", {"token": "x"})
+
+    def test_connect_replaces_the_acl_of_a_connector_it_reuses(self):
+        hydra, stubs = self.load_setup()
+        args = ("gmail", "a@acme.com", "db", "docs", {"refresh_token": "x"})
+        with bounded_sleep():
+            connector_id = hydra.connect(*args, acl=["domain:acme.com"])
+            self.assertEqual(connector_id, hydra.connect(*args, acl=["a@acme.com"]))
+        self.assertTrue(all(r["acl"] == ["a@acme.com"] for r in stubs.configured[connector_id]))
+        self.assertEqual(3, stubs.calls.count("ConnectorsClient.update_resource_acl"))
+        with bounded_sleep():  # Nothing left to change on a third run.
+            hydra.connect(*args, acl=["a@acme.com"])
+        self.assertEqual(3, stubs.calls.count("ConnectorsClient.update_resource_acl"))
+        self.assertEqual(1, stubs.calls.count("ConnectorsClient.configure"))
+
+    def test_connect_reports_a_connector_that_synced_only_part(self):
+        hydra, stubs = self.load_setup()
+        stubs.connector_status = ("active", "degraded")
+        stubs.failing = {"C2"}
+        gave_up = mock.patch("time.sleep", side_effect=AssertionError("connect kept polling"))
+        with gave_up, self.assertRaisesRegex(RuntimeError, "incomplete: c2: permission denied"):
+            hydra.connect("slack", "T1", "db", "docs", {"access_token": "x"})
 
     def test_connect_stops_on_every_state_that_cannot_recover(self):
-        for lifecycle, status in (("ingesting", "failed"), ("paused", "paused"),
+        for lifecycle, status in (("ingesting", "failed"), ("paused", "paused"), ("active", "failed"),
                                   ("ingesting", "capped"), ("reconnect", "degraded")):
             with self.subTest(lifecycle=lifecycle, status=status):
                 hydra, stubs = self.load_setup()
                 stubs.connector_status = (lifecycle, status)
                 gave_up = mock.patch("time.sleep", side_effect=AssertionError("connect kept polling"))
                 with gave_up, self.assertRaisesRegex(RuntimeError, "connector is"):
-                    hydra.connect("slack", "db", "docs", {"access_token": "x"})
+                    hydra.connect("slack", "T1", "db", "docs", {"access_token": "x"})
 
     def test_connect_gives_up_after_its_timeout(self):
         hydra, stubs = self.load_setup()
         stubs.connector_status = ("ingesting", "checking")  # An account with nothing to sync never goes active.
         with bounded_sleep(), mock.patch("time.time", side_effect=[0, 0, 10, 10_000, 10_000]), \
                 self.assertRaisesRegex(TimeoutError, "synced nothing"):
-            hydra.connect("slack", "db", "docs", {"access_token": "x"}, timeout=60)
+            hydra.connect("slack", "T1", "db", "docs", {"access_token": "x"}, timeout=60)
 
     def load_setup(self):
         """Import hydra.py with stubbed SDK methods, outside any cookbook."""
