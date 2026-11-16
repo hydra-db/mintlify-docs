@@ -118,6 +118,15 @@ class UnifiedNarrativeTest(unittest.TestCase):
     def read(self, relative):
         return (ROOT / relative).read_text(encoding="utf-8")
 
+    def test_inference_opt_out_does_not_promise_no_graph_processing(self):
+        for relative in ("essentials/v2/context.mdx", "api-reference/v2/endpoint/ingest-context.mdx"):
+            text = self.read(relative)
+            with self.subTest(page=relative):
+                self.assertIn("additional memory enrichment", text)
+                self.assertIn("entity/graph extraction may still run", text)
+                self.assertNotIn("Explicit `false` stores the text verbatim", text)
+                self.assertNotIn("without preprocessing", text)
+
     def test_query_method_and_alpha_defaults_do_not_confuse_auto_mode(self):
         text = self.read("essentials/v2/query.mdx")
         method = re.search(r"<td>`query_by`</td>\s*<td>(.*?)</td>", text, re.S)

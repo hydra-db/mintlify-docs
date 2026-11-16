@@ -8,7 +8,11 @@ Save this as `hydra.py`. Every cookbook imports it. It holds what every HydraDB 
 
 If `connect` raises because provider permissions could not be read, it aborts only the cookbook. It does not pause or delete the remote connector: content without a valid ACL may already be readable by every caller, and scheduled syncs may continue. Inspect the persistent `acl_warning` / `page_acl_warning` in connector status, then repair provider permissions or rerun `connect` with an explicit resource `acl` to restrict that content. Existing valid private ACLs and revocations remain enforced.
 
+`connect` hashes the complete `(provider, database, collection, account)` tuple for its lookup name and checks returned connector metadata before reuse. `account` is your application's stable account label, not a validated native account identity. Resolve it from trusted server configuration and authorize the caller separately; a connector name is not authentication. An incomplete, mismatched, or ambiguous same-name identity raises before resource or ACL changes. The `timeout` bounds first-sync polling after setup; zero or an already-expired deadline raises `TimeoutError` with a diagnostic instead of polling.
+
 ```python hydra.py
+import hashlib
+import json
 import os
 import time
 
@@ -60,11 +64,23 @@ def connect(provider, account, database, collection, credentials,
         catalog = client.list_providers().providers or []
         if not any(p.provider == provider and getattr(p, "acl_supported", False) for p in catalog):
             raise ValueError(f"{provider} captures no permissions: pass acl to say who may read it")
-    name = f"cookbook-{provider}-{collection}-{account}"
-    connectors = client.connectors.list(provider=provider).connectors or []
-    existing = [c for c in connectors if c.name == name and c.database == database]
+    identity = json.dumps([provider, database, collection, account], separators=(",", ":"))
+    name = "cookbook-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    connectors = client.connectors.list().connectors or []
+    existing = [c for c in connectors if c.name == name]
     if existing:  # This account was connected on an earlier run.
-        connector_id = existing[0].connector_id
+        if len(existing) != 1:
+            raise RuntimeError(f"Cannot verify connector identity: multiple connectors named {name}")
+        connector = existing[0]
+        scope_matches = (
+            connector.provider_account_scope == account if provider in SCOPED
+            else connector.provider_account_scope in (None, "")
+        )
+        if (not connector.connector_id
+                or (connector.provider, connector.database, connector.collection) != (provider, database, collection)
+                or not scope_matches):
+            raise RuntimeError(f"Cannot verify connector identity for {name}; no resources or ACLs were changed")
+        connector_id = connector.connector_id
     else:
         scope = {"provider_account_scope": account} if provider in SCOPED else {}
         connector_id = client.connectors.create(
@@ -101,6 +117,7 @@ def connect(provider, account, database, collection, credentials,
                 connector_id, resource.resource_id, request={"acl": acl}
             )
 
+    detail = f"first-sync polling did not run for {connector_id}"
     deadline = time.time() + timeout
     while time.time() < deadline:
         status = client.connectors.status(connector_id)

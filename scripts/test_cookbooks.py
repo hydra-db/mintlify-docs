@@ -8,6 +8,7 @@ only. A cookbook that reads a field the public API does not return fails here.
 """
 
 import ast
+import copy
 import inspect
 import json
 import os
@@ -448,6 +449,100 @@ class CookbookTest(unittest.TestCase):
         self.assertEqual(2, stubs.calls.count("ConnectorsClient.create"))
         self.assertEqual(2, stubs.calls.count("ConnectorsClient.configure"))
 
+    def test_connect_keeps_ambiguous_collection_account_pairs_separate(self):
+        for provider, credential in (("gmail", "refresh_token"), ("slack", "access_token")):
+            with self.subTest(provider=provider):
+                hydra, stubs = self.load_setup()
+                first_args = (provider, "carol@example.com", "db", "alice-bob", {credential: "first"})
+                second_args = (provider, "bob-carol@example.com", "db", "alice", {credential: "second"})
+                with bounded_sleep():
+                    first = hydra.connect(*first_args, acl=["carol@example.com"])
+                    original = copy.deepcopy(stubs.configured[first])
+                    second = hydra.connect(*second_args, acl=["bob-carol@example.com"])
+                    self.assertEqual(original, stubs.configured[first], "the second account changed the first account's resources or ACLs")
+                    self.assertNotEqual(first, second)
+                    self.assertEqual(first, hydra.connect(*first_args, acl=["carol@example.com"]))
+                    self.assertEqual(second, hydra.connect(*second_args, acl=["bob-carol@example.com"]))
+                self.assertEqual(2, stubs.calls.count("ConnectorsClient.create"))
+                self.assertEqual(2, stubs.calls.count("ConnectorsClient.configure"))
+                self.assertNotEqual(stubs.connector(first).name, stubs.connector(second).name)
+                if provider == "gmail":
+                    stubs.connectors = [connector.model_copy(update={"provider_account_scope": ""})
+                                        for connector in stubs.connectors]
+                    with bounded_sleep():
+                        self.assertEqual(first, hydra.connect(*first_args, acl=["carol@example.com"]))
+                        self.assertEqual(second, hydra.connect(*second_args, acl=["bob-carol@example.com"]))
+                    self.assertEqual(2, stubs.calls.count("ConnectorsClient.create"))
+                for connector_id, args, acl in ((first, first_args, ["carol@example.com"]),
+                                                (second, second_args, ["bob-carol@example.com"])):
+                    connector = stubs.connector(connector_id)
+                    self.assertEqual((args[0], args[2], args[3]),
+                                     (connector.provider, connector.database, connector.collection))
+                    self.assertEqual(args[1] if provider == "slack" else "", connector.provider_account_scope)
+                    self.assertTrue(all(resource["acl"] == acl for resource in stubs.configured[connector_id]))
+
+    def test_connect_name_includes_the_database_identity(self):
+        hydra, stubs = self.load_setup()
+        with bounded_sleep():
+            first = hydra.connect("slack", "caller-chosen-account", "db-a", "docs", {"access_token": "x"})
+            second = hydra.connect("slack", "caller-chosen-account", "db-b", "docs", {"access_token": "x"})
+        self.assertNotEqual(first, second)
+        self.assertNotEqual(stubs.connector(first).name, stubs.connector(second).name)
+        self.assertEqual({"db-a", "db-b"}, {connector.database for connector in stubs.connectors})
+
+    def test_connect_rejects_same_name_with_missing_or_mismatched_identity_before_writes(self):
+        cases = [("slack", field, value) for field, value in (
+            ("provider", "github"), ("database", "other-db"), ("collection", "other-collection"),
+            ("provider_account_scope", "other-caller-chosen-account"),
+            ("provider_account_scope", ""),
+            ("provider", None), ("database", None), ("collection", None),
+            ("provider_account_scope", None), ("connector_id", None),
+        )] + [("gmail", "provider_account_scope", "unexpected-account-scope")]
+        for configured in (False, True):
+            for provider, field, value in cases:
+                with self.subTest(configured=configured, provider=provider, field=field, value=value):
+                    hydra, stubs = self.load_setup()
+                    credential = "refresh_token" if provider == "gmail" else "access_token"
+                    args = (provider, "caller-chosen-account", "db", "docs", {credential: "x"})
+                    with bounded_sleep():
+                        connector_id = hydra.connect(*args, acl=["first@example.com"])
+                    stubs.connectors[0] = stubs.connectors[0].model_copy(update={field: value})
+                    if not configured:
+                        stubs.configured[connector_id] = None
+                    before = copy.deepcopy(stubs.configured)
+                    start = len(stubs.calls)
+                    with bounded_sleep(), self.assertRaisesRegex(RuntimeError, "identity"):
+                        hydra.connect(*args, acl=["second@example.com"])
+                    self.assertEqual(before, stubs.configured)
+                    self.assertEqual(["ConnectorsClient.list"], stubs.calls[start:])
+
+    def test_connect_does_not_reuse_legacy_ambiguous_names(self):
+        hydra, stubs = self.load_setup()
+        args = ("gmail", "carol@example.com", "db", "alice-bob", {"refresh_token": "x"})
+        with bounded_sleep():
+            first = hydra.connect(*args, acl=["first@example.com"])
+            original = copy.deepcopy(stubs.configured[first])
+            old_name = "cookbook-gmail-alice-bob-carol@example.com"
+            stubs.connectors[0] = stubs.connectors[0].model_copy(update={"name": old_name})
+            second = hydra.connect(*args, acl=["second@example.com"])
+        self.assertNotEqual(first, second)
+        self.assertEqual(original, stubs.configured[first])
+        self.assertNotEqual(old_name, stubs.connector(second).name)
+
+    def test_connect_rejects_multiple_same_name_connectors_before_acl_writes(self):
+        hydra, stubs = self.load_setup()
+        args = ("slack", "caller-chosen-account", "db", "docs", {"access_token": "x"})
+        with bounded_sleep():
+            first = hydra.connect(*args, acl=["first@example.com"])
+            hydra.connect("slack", "another-account", "other-db", "docs", {"access_token": "x"}, acl=["other@example.com"])
+        stubs.connectors[1] = stubs.connectors[1].model_copy(update={"name": stubs.connector(first).name})
+        before = copy.deepcopy(stubs.configured)
+        start = len(stubs.calls)
+        with bounded_sleep(), self.assertRaisesRegex(RuntimeError, "identity"):
+            hydra.connect(*args, acl=["second@example.com"])
+        self.assertEqual(before, stubs.configured)
+        self.assertEqual(["ConnectorsClient.list"], stubs.calls[start:])
+
     def test_connect_configures_every_page_of_resources(self):
         hydra, stubs = self.load_setup()
         with bounded_sleep():
@@ -565,6 +660,19 @@ class CookbookTest(unittest.TestCase):
         with bounded_sleep(), mock.patch("time.time", side_effect=[0, 0, 10, 10_000, 10_000]), \
                 self.assertRaisesRegex(TimeoutError, "synced nothing"):
             hydra.connect("slack", "T1", "db", "docs", {"access_token": "x"}, timeout=60)
+
+    def test_connect_reports_zero_and_immediate_timeouts_without_polling(self):
+        for timeout, times in ((0, [0, 0]), (60, [0, 100])):
+            with self.subTest(timeout=timeout):
+                hydra, stubs = self.load_setup()
+                with bounded_sleep(), mock.patch("time.time", side_effect=times), \
+                        self.assertRaises(TimeoutError) as raised:
+                    hydra.connect("slack", "caller-chosen-account", "db", "docs", {"access_token": "x"}, timeout=timeout)
+                message = str(raised.exception)
+                self.assertIn(f"synced nothing within {timeout} seconds", message)
+                self.assertIn("first-sync polling did not run for conn_1", message)
+                self.assertEqual(1, stubs.calls.count("ConnectorsClient.status"))
+                self.assertEqual(["C1", "C2", "C3"], [r["resource_id"] for r in stubs.configured["conn_1"]])
 
     def load_setup(self):
         """Import hydra.py with stubbed SDK methods, outside any cookbook."""
