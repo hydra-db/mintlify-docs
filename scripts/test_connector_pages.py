@@ -2,7 +2,7 @@ import json
 import re
 import unittest
 
-from generate_connector_pages import COPY, DIRECTORY, LOGOS as LOGO_DIRECTORY, PLACEHOLDER_MARK, PURPOSES, ROOT, SNAPSHOT, SCOPED_PROVIDER_EXAMPLES, artwork, load_copy, logo, pages, placeholder_logos, prose
+from generate_connector_pages import COPY, DIRECTORY, LOGOS as LOGO_DIRECTORY, PLACEHOLDER_MARK, ROOT, SNAPSHOT, SCOPED_PROVIDER_EXAMPLES, artwork, load_copy, logo, pages, placeholder_logos, prose
 from generate_llms_index import page_paths
 
 
@@ -14,7 +14,15 @@ TITLE_LOGOS = ROOT / "connector-logos.css"
 DASHBOARD_NAMES = json.loads((ROOT / "scripts/dashboard_provider_names.json").read_text())
 FILTER_KEYS = json.loads((ROOT / "scripts/production_filter_keys.json").read_text())["filter_keys"]
 PILOT = ("slack", "bigquery", "github", "notion", "stripe", "hubspot")
-COPY_SECTIONS = ["Before you connect", "What gets synced", "How it fits into the graph", "Permissions", "Keeping in sync", "Not synced", "Questions this lets you answer", "Good to know"]
+COPY_SECTIONS = ["Permissions", "Before you connect", "Keeping in sync", "What gets synced", "How it fits into the graph", "Not synced"]
+# The badge vocabulary a customer reads on every attribute. The overview defines each one; provider pages do not repeat it.
+BADGES = ("Searchable text", "Query filter", "Result date", "Graph connection", "Graph identity", "Access rule", "Stored only")
+GRAPH_CLASSES = ("Email", "Message", "Ticket", "Page", "Contact", "Comment", "Meeting", "Record", "Container", "Iteration")
+# Wording that describes HydraDB's machinery or hedges instead of stating the outcome. Checked on pages rendered from copy files and the overview.
+COPY_PAGE_TERMS = (
+    "declared", "declares", "shared model", "second pass", "walks", "walked", "acl_supported", "entities", "backfill",
+    "depending on your deployment", "matched to messages through",
+)
 # How a connector is built is not a customer's concern. No connector page or the overview may name it.
 INTERNAL_TERMS = (
     "moveit", "classic", "native", "golang", "go-native", "python", "tap", "taps", "singer", "lance", "lancedb",
@@ -53,6 +61,10 @@ def body(text):
     return text.split("\n---\n", 1)[1]
 
 
+def section(text, title):
+    return text.split(f"\n## {title}\n", 1)[1].split("\n## ", 1)[0]
+
+
 def title_logos(slug):
     css = TITLE_LOGOS.read_text() if TITLE_LOGOS.is_file() else ""
     rules = re.findall(rf'^(html(?:\.dark)?)\[data-current-path\$="/essentials/v2/connectors/{slug}"\] #page-title::before \{{[^}}]*url\("/images/connectors/([^"]+)"\)', css, re.M)
@@ -82,7 +94,7 @@ class ConnectorPagesTest(unittest.TestCase):
                 self.assertIn("`provider_account_scope`", text)
                 for value in pair:
                     self.assertIn(f"`{value}`", text)
-                self.assertIn("caller-provided example identifiers", text)
+                self.assertIn("labels you choose" if load_copy(provider) else "caller-provided example identifiers", text)
                 self.assertIn("own account ids", text)
 
     def test_all_provider_pages_keep_one_account_per_connector_and_human_enforcement(self):
@@ -91,8 +103,12 @@ class ConnectorPagesTest(unittest.TestCase):
         for path in paths:
             text = path.read_text()
             with self.subTest(provider=path.stem):
-                self.assertIn("one connector per account", text)
-                self.assertIn("collection names do not authorize access", text)
+                if load_copy(path.stem.replace("-", "_")):
+                    self.assertRegex(text, r"\nOne (connector|token) (reads|covers) ")
+                    self.assertNotIn("collection names do not authorize access", text)
+                else:
+                    self.assertIn("one connector per account", text)
+                    self.assertIn("collection names do not authorize access", text)
                 self.assertIn("API-key requests must omit `enforce_acl`", text)
                 self.assertIn("including `false`", text)
                 self.assertNotRegex(text, r"(?i)(?:multiple|several|two) accounts per connector")
@@ -336,11 +352,11 @@ class ConnectorCopyPagesTest(unittest.TestCase):
     def test_a_copy_file_missing_a_section_or_label_is_rejected(self):
         broken = json.loads((COPY / "slack.json").read_text())
         del broken["not_synced"]
-        broken["documents"][0]["attributes"][0]["purposes"] = ["Indexed"]
+        broken["documents"][0]["attributes"][0]["uses"] = ["Indexed"]
         path = COPY / "zz_broken_copy_probe.json"
         path.write_text(json.dumps(broken))
         try:
-            with self.assertRaisesRegex(ValueError, r"missing not_synced.*purposes \['Indexed'\]"):
+            with self.assertRaisesRegex(ValueError, r"missing not_synced.*uses \['Indexed'\]"):
                 load_copy("zz_broken_copy_probe")
         finally:
             path.unlink()
@@ -375,30 +391,38 @@ class ConnectorCopyPagesTest(unittest.TestCase):
     def test_every_filter_key_on_a_copy_page_is_published_by_production(self):
         for provider, text in copy_pages().items():
             published = set(FILTER_KEYS[provider])
-            filters = re.findall(r'<ResponseField name="([^"]+)" type="Filter', text)
+            filters = re.findall(r'<ResponseField name="([^"]+)" type="[^"]*Query filter', text)
             keys = set(re.findall(r"\badditional_metadata\.\w+", text))
             with self.subTest(provider=provider):
                 self.assertTrue(filters)
                 self.assertLessEqual(set(filters), published)
                 self.assertLessEqual(keys, published)
 
-    def test_attribute_labels_are_the_plain_purpose_labels(self):
+    def test_every_attribute_shows_each_use_as_a_customer_badge(self):
         for provider, text in copy_pages().items():
-            section = text.split("## What gets synced\n", 1)[1].split("\n## ", 1)[0]
+            fields = re.findall(r'<ResponseField name="([^"]+)" type="([^"]*)">\n(.*?)\n</ResponseField>', section(text, "What gets synced"), re.S)
             with self.subTest(provider=provider):
-                for kind in re.findall(r'<ResponseField name="[^"]+" type="([^"]+)"', section):
-                    self.assertLessEqual(set(kind.split(", ")), set(PURPOSES), kind)
+                self.assertTrue(fields)
+                for name, kind, description in fields:
+                    uses = kind.split(", ")
+                    self.assertTrue(kind, name)
+                    self.assertLessEqual(set(uses), set(BADGES), name)
+                    self.assertEqual([badge for badge in BADGES if badge in uses], uses, f"{name}: badges in legend order")
+                    if "Stored only" in uses:
+                        self.assertEqual(["Stored only"], uses, name)
+                    elif "Searchable text" not in uses:
+                        self.assertIn("not searchable", description.lower(), f"{name} has no search use, so it must say so")
 
     def test_permissions_section_matches_production(self):
         acl = {row["provider"]: row["acl_supported"] for row in PRODUCTION}
         for provider, text in copy_pages().items():
-            section = text.split("## Permissions\n", 1)[1].split("\n## ", 1)[0]
+            permissions = section(text, "Permissions")
             with self.subTest(provider=provider):
-                carries = "This connector can carry" in section
+                carries = permissions.lstrip().startswith("Turn on **Enforce ACL** for this connector")
                 self.assertEqual(acl[provider], carries)
                 if not acl[provider]:
-                    self.assertIn("Every synced item is visible to everyone who can query the collection", section)
-                    self.assertIn("/essentials/v2/connectors#set-your-own-rule-on-a-resource", section)
+                    self.assertIn("Every synced item is visible to everyone who can query the collection", permissions)
+                    self.assertIn("/essentials/v2/connectors#set-your-own-rule-on-a-resource", permissions)
 
     def test_copy_pages_keep_nothing_from_the_old_template(self):
         for provider, text in copy_pages().items():
@@ -411,6 +435,106 @@ class ConnectorCopyPagesTest(unittest.TestCase):
         self.assertIn("## How to read a connector page", index)
         self.assertLess(index.index("## How to read a connector page"), index.index("<Columns"))
         self.assertIn("](/essentials/v2/connectors)", index.split("<Columns", 1)[0])
+
+
+class RevisedPageDesignTest(unittest.TestCase):
+    def test_permissions_come_first_and_setup_has_real_subheadings(self):
+        for provider, text in copy_pages().items():
+            connect = section(text, "Before you connect")
+            with self.subTest(provider=provider):
+                self.assertEqual(COPY_SECTIONS, re.findall(r"^## (.+)$", text, re.M))
+                self.assertEqual(["Credentials", "Set it up"], re.findall(r"^### (.+)$", connect, re.M))
+
+    def test_provider_pages_leave_the_label_legend_to_the_overview(self):
+        legend = ("part of the text a query matches", "What the labels mean", "kept on the item and shown when you inspect it")
+        for provider, text in copy_pages().items():
+            with self.subTest(provider=provider):
+                for phrase in legend:
+                    self.assertNotIn(phrase, text)
+
+    def test_no_good_to_know_and_at_most_three_example_searches(self):
+        for provider, text in copy_pages().items():
+            with self.subTest(provider=provider):
+                self.assertNotIn("## Good to know", text)
+                self.assertNotIn("## Questions this lets you answer", text)
+                if "**Example searches**" in text:
+                    examples = text.split("**Example searches**\n\n", 1)[1].split("\n\n", 1)[0]
+                    self.assertLessEqual(len(examples.splitlines()), 3)
+
+    def test_not_synced_stays_visible_and_accordions_hold_only_stored_or_optional_detail(self):
+        for provider, text in copy_pages().items():
+            with self.subTest(provider=provider):
+                self.assertNotIn("<Accordion", section(text, "Not synced"))
+                self.assertTrue(re.findall(r"^- ", section(text, "Not synced"), re.M))
+                for title, content in re.findall(r'<Accordion title="([^"]+)">(.*?)</Accordion>', text, re.S):
+                    self.assertNotIn("not kept", title.lower())
+                    kinds = set(re.findall(r'<ResponseField name="[^"]+" type="([^"]+)"', content))
+                    if title.startswith("Stored only"):
+                        self.assertEqual({"Stored only"}, kinds, title)
+                    else:
+                        self.assertFalse(kinds & set(BADGES), f"{title} folds attributes that are not stored-only")
+
+    def test_json_examples_are_multi_line_and_never_wider_than_80_columns(self):
+        for provider, text in copy_pages().items():
+            with self.subTest(provider=provider):
+                for block in re.findall(r"^```json[^\n]*\n(.*?)^```$", text, re.S | re.M):
+                    self.assertGreater(len(block.splitlines()), 1)
+                    self.assertLessEqual(max(len(line) for line in block.splitlines()), 80, block)
+
+    def test_copy_pages_and_overview_describe_outcomes_not_machinery(self):
+        pages_to_check = {provider: body(text) for provider, text in copy_pages().items()}
+        pages_to_check["connector-providers"] = body(INDEX.read_text())
+        for page, text in pages_to_check.items():
+            with self.subTest(page=page):
+                found = [term for term in COPY_PAGE_TERMS if re.search(rf"(?i)(?<![\w-]){re.escape(term)}(?![\w-])", text)]
+                self.assertEqual([], found)
+
+    def test_permissions_state_the_cloud_outcome_with_enforce_acl_first(self):
+        acl = {row["provider"]: row["acl_supported"] for row in PRODUCTION}
+        for provider, text in copy_pages().items():
+            permissions = section(text, "Permissions").strip()
+            with self.subTest(provider=provider):
+                if acl[provider]:
+                    self.assertTrue(permissions.startswith("Turn on **Enforce ACL**"))
+                    self.assertIn("On HydraDB Cloud, with Enforce ACL on, such an item follows the access rule you set on its resource. With no rule, it is hidden from search.", permissions)
+                    self.assertIn("Self-hosted deployments can be configured differently.", permissions)
+                else:
+                    self.assertTrue(permissions.startswith("<Warning>"))
+                    self.assertIn("**Enforce ACL** is unavailable for this connector", permissions.split("</Warning>", 1)[0])
+
+    def test_graph_section_names_each_item_class_without_generic_promises(self):
+        for provider, text in copy_pages().items():
+            graph = section(text, "How it fits into the graph")
+            documents = re.findall(r"^### (.+)$", section(text, "What gets synced"), re.M)
+            with self.subTest(provider=provider):
+                for document in documents:
+                    if document.startswith("On every "):
+                        continue
+                    self.assertRegex(graph, rf"(?m)^- {re.escape(document)} use the ({'|'.join(GRAPH_CLASSES)}) class\.$")
+                self.assertNotIn("kept with its author and its thread", graph)
+                self.assertNotIn("There is no per-connector setup", graph)
+
+    def test_overview_defines_the_labels_and_graph_classes_above_the_grid(self):
+        index = INDEX.read_text()
+        top = index.split("<Columns", 1)[0]
+        self.assertIn("### Attribute labels", top)
+        self.assertIn("### Graph classes", top)
+        for badge in BADGES:
+            self.assertIn(f"- **{badge}:** ", top)
+        for title in GRAPH_CLASSES:
+            self.assertIn(f"- **{title}:** ", top)
+
+    def test_an_attribute_must_say_when_it_is_not_searchable(self):
+        broken = json.loads((COPY / "slack.json").read_text())
+        broken["documents"][0]["attributes"].append({"name": "probe", "uses": ["Query filter"], "text": "A filter."})
+        broken["documents"][0]["attributes"].append({"name": "mixed", "uses": ["Stored only", "Query filter"], "text": "Not searchable."})
+        path = COPY / "zz_unsaid_probe.json"
+        path.write_text(json.dumps(broken))
+        try:
+            with self.assertRaisesRegex(ValueError, r"probe: an attribute with no search use must say it is not searchable.*mixed: Stored only cannot be combined"):
+                load_copy("zz_unsaid_probe")
+        finally:
+            path.unlink()
 
 
 if __name__ == "__main__":
