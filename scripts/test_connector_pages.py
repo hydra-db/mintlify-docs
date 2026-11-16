@@ -10,6 +10,18 @@ PRODUCTION = json.loads((ROOT / "scripts/production_providers.json").read_text()
 PRODUCTION_SLUGS = {provider["provider"].replace("_", "-") for provider in PRODUCTION}
 LOGOS = ROOT / "images/connectors"
 INDEX = ROOT / "essentials/v2/connector-providers.mdx"
+TITLE_LOGOS = ROOT / "connector-logos.css"
+DASHBOARD_NAMES = json.loads((ROOT / "scripts/dashboard_provider_names.json").read_text())
+
+
+def body(text):
+    return text.split("\n---\n", 1)[1]
+
+
+def title_logos(slug):
+    css = TITLE_LOGOS.read_text() if TITLE_LOGOS.is_file() else ""
+    rules = re.findall(rf'^(html(?:\.dark)?)\[data-current-path\$="/essentials/v2/connectors/{slug}"\] #page-title::before \{{[^}}]*url\("/images/connectors/([^"]+)"\)', css, re.M)
+    return dict(rules)
 
 
 def page_icon(text):
@@ -61,7 +73,7 @@ class ConnectorPagesTest(unittest.TestCase):
         for path, content in generated.items():
             with self.subTest(page=str(path.relative_to(ROOT))):
                 self.assertEqual(content, path.read_text())
-        self.assertEqual(set(DIRECTORY.glob("*.mdx")), set(generated) - {ROOT / "essentials/v2/connector-providers.mdx", ROOT / "docs.json"})
+        self.assertEqual(set(DIRECTORY.glob("*.mdx")), set(generated) - {INDEX, ROOT / "docs.json", TITLE_LOGOS})
 
     def test_every_provider_page_is_registered_and_linked_from_the_catalog(self):
         config = json.loads((ROOT / "docs.json").read_text())
@@ -119,17 +131,55 @@ class ConnectorPagesTest(unittest.TestCase):
             card = re.search(rf'<Card title="[^"]+"(.*?) href="/essentials/v2/connectors/{slug}" horizontal />', index)
             with self.subTest(provider=slug):
                 self.assertIsNotNone(card)
-                page_images = sorted(re.findall(r'<img src="/images/connectors/([^"]+)"', page.split("\n---\n", 1)[1].split("## What syncs", 1)[0]))
                 card_images = sorted(re.findall(r'/images/connectors/([^"]+)"', card.group(1)))
-                self.assertEqual(expected, page_images)
                 self.assertEqual(expected, card_images)
                 self.assertEqual(f"/images/connectors/{slug}-light.svg" if len(expected) == 2 else expected and f"/images/connectors/{expected[0]}" or None, page_icon(page))
+                logos = title_logos(slug)
                 if len(expected) == 2:
-                    self.assertIn(f'{slug}-light.svg" alt="{re.search(r"^title: \"([^\"]+)\"", page, re.M).group(1)} logo" className="connector-page-logo block dark:hidden"', page)
-                    self.assertIn(f'{slug}-dark.svg" alt="', page)
-                    self.assertRegex(page, rf'{slug}-dark.svg" alt="[^"]*" className="connector-page-logo hidden dark:block"')
+                    self.assertEqual({"html": f"{slug}-light.svg", "html.dark": f"{slug}-dark.svg"}, logos)
+                else:
+                    self.assertEqual({"html": expected[0]} if expected else {}, logos)
                 shown.update(expected)
         self.assertEqual(files, shown)
+
+    def test_no_page_body_shows_a_standalone_logo(self):
+        for slug in PRODUCTION_SLUGS:
+            with self.subTest(provider=slug):
+                self.assertNotIn("<img", body((DIRECTORY / f"{slug}.mdx").read_text()))
+
+    def test_title_logo_rules_touch_only_connector_page_titles(self):
+        css = TITLE_LOGOS.read_text()
+        selectors = re.findall(r"^([^\s/{}][^{\n]*?)\s*\{", css, re.M)
+        self.assertTrue(selectors)
+        for selector in selectors:
+            with self.subTest(selector=selector):
+                self.assertRegex(selector, r'^html(\.dark)?\[data-current-path(\$|\*)="/essentials/v2/connectors/[a-z0-9-]*"\] #page-title::before$')
+
+    def test_every_page_names_its_production_provider_slug(self):
+        production = {provider["provider"] for provider in PRODUCTION}
+        for slug in PRODUCTION_SLUGS:
+            text = (DIRECTORY / f"{slug}.mdx").read_text()
+            with self.subTest(provider=slug):
+                named = re.findall(r"Use provider `([^`]+)`", text)
+                self.assertLessEqual(len(named), 1)
+                for value in named:
+                    self.assertIn(value, production)
+                    self.assertEqual(slug, value.replace("_", "-"))
+        self.assertIn("Use provider `zoho_crm`", (DIRECTORY / "zoho-crm.mdx").read_text())
+
+    def test_display_names_match_the_dashboard(self):
+        names = DASHBOARD_NAMES["names"]
+        overrides = DASHBOARD_NAMES["docs_overrides"]
+        self.assertEqual({provider["provider"] for provider in PRODUCTION}, set(names))
+        self.assertEqual({"coda": "Coda"}, overrides)
+        index = INDEX.read_text()
+        for provider, dashboard_name in names.items():
+            name = overrides.get(provider, dashboard_name)
+            slug = provider.replace("_", "-")
+            with self.subTest(provider=provider):
+                self.assertIn(f'title: "{name}"\n', (DIRECTORY / f"{slug}.mdx").read_text())
+                self.assertIn(f'<Card title="{name}"', index)
+                self.assertRegex(index, rf'<Card title="{re.escape(name)}"[^\n]* href="/essentials/v2/connectors/{slug}" horizontal />')
 
     def test_monochrome_marks_change_only_their_ink_between_themes(self):
         pairs = sorted(path.name[: -len("-light.svg")] for path in LOGOS.glob("*-light.svg"))
