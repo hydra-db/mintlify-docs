@@ -1,4 +1,9 @@
+"""Generate one page per connector enabled in production, plus the providers overview.
+
+scripts/production_providers.json is refreshed from GET /connectors/providers on production.
+"""
 import argparse
+from collections import namedtuple
 import html
 import json
 from pathlib import Path
@@ -7,6 +12,8 @@ import re
 
 ROOT = Path(__file__).resolve().parents[1]
 SNAPSHOT = ROOT / "scripts/connector_capabilities.json"
+PRODUCTION = ROOT / "scripts/production_providers.json"
+LOGOS = ROOT / "images/connectors"
 DIRECTORY = ROOT / "essentials/v2/connectors"
 INDEX = ROOT / "essentials/v2/connector-providers.mdx"
 SCOPED_PROVIDER_EXAMPLES = {
@@ -15,6 +22,25 @@ SCOPED_PROVIDER_EXAMPLES = {
     "linear": ("linear-account-a", "linear-account-b"),
     "notion": ("notion-account-a", "notion-account-b"),
 }
+NAVIGATION = ROOT / "docs.json"
+NAVIGATION_GROUP = "Connector providers"
+GROUPS = {
+    "CRM & support": {"crm", "sales", "support"},
+    "Docs & files": {"docs", "knowledge", "storage", "cms", "design"},
+    "Engineering": {"dev_tools", "monitoring", "security"},
+    "HR & finance": {"hr", "finance"},
+    "Marketing & analytics": {"marketing", "analytics", "forms"},
+    "Meetings & calendar": {"communications", "calendar", "scheduling"},
+    "Messaging & email": {"messaging", "email", "social"},
+    "Project management": {"project_management"},
+}
+PROVIDER_GROUPS = {
+    "airtable": "Docs & files",
+    "microsoft_teams": "Messaging & email",
+    "outlook": "Messaging & email",
+    "twilio": "Messaging & email",
+}
+Logo = namedtuple("Logo", "light dark")
 
 
 def prose(value):
@@ -24,17 +50,81 @@ def prose(value):
     return re.sub(r"&lt;([A-Za-z_][\w-]*)&gt;", r"`<\1>`", escaped)
 
 
+def slug(identifier):
+    return identifier.replace("_", "-")
+
+
+def group(row):
+    if row["provider"] in PROVIDER_GROUPS:
+        return PROVIDER_GROUPS[row["provider"]]
+    return next(title for title, categories in GROUPS.items() if row["category"] in categories)
+
+
+def logo(identifier):
+    """Monochrome marks ship a light-mode and a dark-mode file; multi-colour marks ship one file for both."""
+    url = lambda path: f"/{path.relative_to(ROOT)}"
+    single, light, dark = (LOGOS / f"{slug(identifier)}{suffix}.svg" for suffix in ("", "-light", "-dark"))
+    if light.is_file() and dark.is_file():
+        return Logo(url(light), url(dark))
+    return Logo(url(single), None) if single.is_file() else None
+
+
+def images(found, alt, class_name):
+    if found.dark is None:
+        return [f'<img src="{found.light}" alt="{alt}" className="{class_name}" noZoom />']
+    return [
+        f'<img src="{found.light}" alt="{alt}" className="{class_name} block dark:hidden" noZoom />',
+        f'<img src="{found.dark}" alt="{alt}" className="{class_name} hidden dark:block" noZoom />',
+    ]
+
+
+def card(provider, found):
+    href = f"/essentials/v2/connectors/{slug(provider['provider'])}"
+    if found is None:
+        icon = ""
+    elif found.dark is None:
+        icon = f' icon="{found.light}"'
+    else:
+        icon = f" icon={{<>{''.join(images(found, '', 'connector-card-logo'))}</>}}"
+    return f'  <Card title="{provider["name"]}"{icon} href="{href}" horizontal />'
+
+
+def navigation(by_group):
+    """Rewrites only the connector providers group of docs.json, so hand-kept groups keep their layout."""
+    text = NAVIGATION.read_text()
+    marker = text.index(f'"group": "{NAVIGATION_GROUP}"')
+    start = text.rindex("{", 0, marker)
+    depth = 0
+    for end in range(start, len(text)):
+        depth += {"{": 1, "}": -1}.get(text[end], 0)
+        if depth == 0:
+            break
+    indent = text[text.rindex("\n", 0, start) + 1:start]
+    entry = {
+        "group": NAVIGATION_GROUP, "public": True,
+        "pages": [str(INDEX.relative_to(ROOT).with_suffix(""))] + [
+            {"group": title, "pages": [f"essentials/v2/connectors/{slug(provider['provider'])}" for provider in members]}
+            for title, members in by_group.items()
+        ],
+    }
+    block = json.dumps(entry, indent=2).replace("\n", "\n" + indent)
+    return text[:start] + block + text[end + 1:]
+
+
 def pages():
+    enabled = {slug(row["provider"]): group(row) for row in json.loads(PRODUCTION.read_text())["providers"]}
     snapshot = json.loads(SNAPSHOT.read_text())
-    providers = sorted(snapshot["providers"], key=lambda item: item["name"].casefold())
+    providers = sorted((item for item in snapshot["providers"] if slug(item["provider"]) in enabled), key=lambda item: item["name"].casefold())
     output = {}
     for provider in providers:
         identifier = provider["provider"]
         name = provider["name"]
+        found = logo(identifier)
         lines = [
             "---", f"title: {json.dumps(name)}",
             f"description: {json.dumps(f'What HydraDB syncs from {name}, and how to connect it.')}",
-            "---", "", f"Use the {prose(name)} connector to bring the following content into HydraDB.",
+            *([f"icon: {json.dumps(found.light)}"] if found else []),
+            "---", "", *([*images(found, f"{name} logo", "connector-page-logo"), ""] if found else []), f"Use the {prose(name)} connector to bring the following content into HydraDB.",
             "", "## What syncs", "",
         ]
         if provider.get("summary"):
@@ -74,24 +164,18 @@ def pages():
             "- [Connectors](/essentials/v2/connectors): setup, sync, and access control",
             "- [Get Connector Status](/api-reference/v2/endpoint/get-connector-status): progress and warnings", "",
         ])
-        output[DIRECTORY / f"{identifier.replace('_', '-')}.mdx"] = "\n".join(lines)
+        output[DIRECTORY / f"{slug(identifier)}.mdx"] = "\n".join(lines)
     lines = [
-        "---", 'title: "Connector providers"',
+        "---", 'title: "Connector providers"', 'sidebarTitle: "All connectors"',
         'description: "See what each connector indexes before you connect an account."', "---", "",
         "Choose a provider to see the indexed object types and any provider-specific setup steps. These pages describe content capabilities; availability and credentials come from your deployment's [provider catalog](/api-reference/v2/endpoint/list-connector-providers).", "",
-        "| Provider | Indexed object types (examples) |", "| --- | --- |",
     ]
-    for provider in providers:
-        slug = provider["provider"].replace("_", "-")
-        types = provider["indexed_object_types"]
-        summary = ", ".join(f"`{kind}`" for kind in types[:3])
-        if len(types) > 3:
-            summary += ", and more"
-        if not summary:
-            summary = "See provider page"
-        lines.append(f"| [{provider['name']}](/essentials/v2/connectors/{slug}) | {summary} |")
-    lines.extend(["", "## Related", "", "- [Connectors](/essentials/v2/connectors): shared setup and sync workflow", ""])
+    by_group = {title: [provider for provider in providers if enabled[slug(provider["provider"])] == title] for title in GROUPS}
+    for title, members in by_group.items():
+        lines.extend([f"## {title}", "", "<Columns cols={3}>", *(card(provider, logo(provider["provider"])) for provider in members), "</Columns>", ""])
+    lines.extend(["## Related", "", "- [Connectors](/essentials/v2/connectors): shared setup and sync workflow", ""])
     output[INDEX] = "\n".join(lines)
+    output[NAVIGATION] = navigation(by_group)
     return output
 
 
@@ -106,8 +190,10 @@ if __name__ == "__main__":
         extra = set(DIRECTORY.glob("*.mdx")) - generated.keys()
         if stale or extra:
             raise SystemExit(f"Connector pages are stale: {stale + sorted(str(path.relative_to(ROOT)) for path in extra)}")
-        print(f"{len(generated) - 1} connector pages match the capability snapshot")
+        print(f"{len(generated) - 2} connector pages, the overview and the navigation group match the snapshot")
     else:
         DIRECTORY.mkdir(parents=True, exist_ok=True)
+        for path in set(DIRECTORY.glob("*.mdx")) - generated.keys():
+            path.unlink()
         for path, content in generated.items():
             path.write_text(content)
