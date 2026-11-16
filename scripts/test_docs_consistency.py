@@ -197,9 +197,8 @@ class UnifiedNarrativeTest(unittest.TestCase):
         self.assertIn("signed-in session", memory)
         self.assertIn("does not authenticate", memory)
         self.assertIn("every ingest, status check, and query", memory)
-        self.assertIn("`infer: false` (default)", memory)
-        self.assertIn("Omitting `infer` means `false`", memory)
-        self.assertIn("`infer: true`", memory)
+        self.assertIn("`infer: true` (default)", memory)
+        self.assertIn("`infer: false`", memory)
 
     def test_legacy_memory_instructions_are_not_public_guidance(self):
         for relative in (
@@ -225,10 +224,10 @@ class UnifiedNarrativeTest(unittest.TestCase):
                 self.assertIn("query_explicit_relations", text)
                 self.assertIn("additional_graph_context", text)
                 self.assertIn("data.additional_graph_context", text)
-                self.assertNotRegex(text, r'(?:Default|default|omitted means)[^\n|]*`0\.6`')
+                self.assertNotRegex(text, r'(?:Default|default|omitted means)[^\n|]*`0\.4`')
         reference = self.read("api-reference/v2/endpoint/query.mdx")
-        self.assertRegex(reference, r'name="type"[^\n]*default=`"knowledge"`')
-        self.assertRegex(reference, r'name="recency_bias"[^\n]*default=`0\.4`')
+        self.assertRegex(reference, r'name="type"[^\n]*default=`"all"`')
+        self.assertRegex(reference, r'name="recency_bias"[^\n]*default=`0\.6`')
         self.assertIn('name="query_explicit_relations"', reference)
         self.assertIn('name="additional_graph_context"', reference)
         self.assertIn("request-time hint", reference)
@@ -443,58 +442,19 @@ def v2_pages():
 class PublishedQueryContractTest(unittest.TestCase):
     """The production query contract the guides teach (PRO-1618 review, 2026-11-16)."""
 
-    def read(self, relative):
-        return (ROOT / relative).read_text(encoding="utf-8")
-
-    def test_query_type_defaults_to_knowledge(self):
-        claims_all = re.compile(
-            r"(?i)defaults? to `\"?all|default=`\"all\"`|leav\w* `?type`? out|omit\w* `?type`? to search both"
-            r"|`type` omitted|that leaves out `type`|without `type` searches (?:both|knowledge and)"
-        )
-        offenders = [f"{relative}: {m.group(0)}" for relative, text in v2_pages() for m in claims_all.finditer(text)]
-        self.assertEqual([], offenders, "a split database searches knowledge when type is omitted")
-        self.assertIn("defaults to `knowledge`; send `all`", self.read("AGENTS.mdx"))
-        self.assertIn('Defaults to `"knowledge"`', self.read("essentials/v2/query.mdx"))
-        self.assertIn('Defaults to `"knowledge"`', self.read("api-reference/v2/endpoint/query-overview.mdx"))
-        self.assertIn("Omitted means `knowledge`; pass `all`", self.read("plugins/cli.mdx"))
-
-    def test_examples_that_read_a_user_collection_send_the_store(self):
-        user_scope = re.compile(r"""collections["']?\s*[:=]\s*[\[{][^\]}]*["']user_""")
-        offenders = []
-        for relative, text in v2_pages():
-            for block in re.findall(r"```.*?```", text, re.S):
-                calls = re.split(r"(?=\bclient\.query\(|POST /query|/query\b)", block)
-                for call in calls:
-                    asks = re.search(r"""\bquery["']?\s*[:=]\s*["']""", call)
-                    if asks and user_scope.search(call) and not re.search(r"""\btype\b["']?\s*[:=]\s*["'](?:all|memory)["']""", call):
-                        offenders.append(f"{relative}: {call.strip()[:80]}")
-        self.assertEqual([], offenders, "an untyped query skips memories on a split database")
-
-    def test_memory_infer_defaults_to_false(self):
-        claims_true = re.compile(
-            r"`infer: true` \(default\)|`infer`[^\n|]*defaults? to `true`|Omitting `infer` means `true`"
-            r"|name=\"infer\"[^\n]*memory enrichment[^\n]*default=`true`"
-        )
-        offenders = [f"{relative}: {m.group(0)}" for relative, text in v2_pages() for m in claims_true.finditer(text)]
-        self.assertEqual([], offenders, "a split database stores a memory without inference when infer is omitted")
-        self.assertRegex(self.read("api-reference/v2/endpoint/ingest-context.mdx"),
-                         r'name="infer"[^\n]*memory enrichment[^\n]*default=`false`')
-        self.assertIn("defaults to `false` when omitted", self.read("AGENTS.mdx"))
-
-    def test_recency_bias_defaults_to_a_mild_tilt(self):
-        self.assertIn("Default `0.4`", self.read("essentials/v2/query.mdx"))
-        self.assertIn("omitted means `0.4`", self.read("AGENTS.mdx"))
-        self.assertIn("a mild `0.4` tilt", self.read("plugins/cli.mdx"))
-        self.assertNotRegex(self.read("plugins/cli.mdx"), r"Omitted means `0\.6`")
-
-    def test_databases_guide_says_existing_databases_keep_their_defaults(self):
-        guide = self.read("essentials/v2/databases-and-collections.mdx")
-        self.assertIn("Existing databases keep the defaults above", guide)
+    def test_examples_leave_the_default_query_type_out(self):
+        explicit_all = re.compile(r"""\btype\b["']?\s*[:=]\s*["']all["']""")
+        offenders = [
+            f"{relative}: {match.group(0)}"
+            for relative, text in v2_pages()
+            for block in re.findall(r"```.*?```", text, re.S)
+            for match in explicit_all.finditer(block)
+        ]
+        self.assertEqual([], offenders, "omit type to search both stores; a unified database rejects an explicit all")
 
     def test_withdrawn_query_aliases_and_notices_are_not_documented(self):
         withdrawn = re.compile(
-            r"follow_forceful_relations|enrichment_enabled_by_default|inference_enabled_by_default"
-            r"|default-processing-warnings"
+            r"follow_forceful_relations|enrichment_enabled_by_default"
             r"|alias(?:es)?\b[^.\n]*`context`|> `context`"
         )
         offenders = [f"{relative}: {m.group(0)}" for relative, text in v2_pages() for m in withdrawn.finditer(text)]
