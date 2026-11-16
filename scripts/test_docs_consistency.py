@@ -118,6 +118,56 @@ class UnifiedNarrativeTest(unittest.TestCase):
     def read(self, relative):
         return (ROOT / relative).read_text(encoding="utf-8")
 
+    def test_query_method_and_alpha_defaults_do_not_confuse_auto_mode(self):
+        text = self.read("essentials/v2/query.mdx")
+        method = re.search(r"<td>`query_by`</td>\s*<td>(.*?)</td>", text, re.S)
+        self.assertIsNotNone(method)
+        values = set(re.findall(r'`"([^"]+)"`', method.group(1)))
+        spec = json.loads(self.read("api-reference/v2/openapi.json"))
+        self.assertEqual({"hybrid", "text"}, values)
+        self.assertEqual(set(spec["components"]["schemas"]["search.QueryBy"]["enum"]), values)
+        self.assertIn('`"hybrid"` (the default)', method.group(1))
+        self.assertRegex(self.read("api-reference/v2/endpoint/query.mdx"), r'name="query_by"[^\n]*default=`"hybrid"`')
+        self.assertNotIn("auto", method.group(1))
+        alpha = next(line for line in text.splitlines() if line.startswith("- `alpha`"))
+        self.assertIn("Default `0.8`", alpha)
+        self.assertIn('`"auto"` also resolves to `0.8`', alpha)
+        self.assertNotIn('which `"auto"`', alpha)
+        self.assertIn('`"auto"` (the default)', text.split('<td>`mode`</td>', 1)[1].split('</td>', 1)[0])
+        self.assertIn("auto selector", self.read("plugins/cli.mdx"))
+
+    def test_connector_enforcement_requires_a_human_session_even_for_false(self):
+        text = self.read("essentials/v2/connectors.mdx")
+        section = text.split("## 5. ACL", 1)[1].split("### Examples", 1)[0]
+        for phrase in ("signed-in human", "owner or writer", "API-key clients must omit", "even `false`", "dashboard", "Enforce ACL", "`acl_supported: true`", "`false`", "persistent", "warning"):
+            self.assertIn(phrase, section)
+        self.assertIn("valid private ACLs", section)
+        self.assertNotRegex(section, r"API.key[^.\n]*send[^.\n]*false")
+
+    def test_memory_authorization_covers_mutations_and_adjacent_examples(self):
+        text = self.read("essentials/v2/context.mdx")
+        memory = text.split("## Ingesting memory", 1)[1].split("## Wait for indexing", 1)[0]
+        self.assertIn("updates and deletes", memory)
+        self.assertIn("authorize", memory)
+        self.assertIn("source ID", memory)
+        self.assertIn("verified session", memory)
+        self.assertIn('collection=verified_session["memory_collection"]', memory)
+        self.assertIn("collection: verifiedSession.memoryCollection", memory)
+        self.assertIn('"collection=$SESSION_MEMORY_COLLECTION"', memory)
+
+    def test_cli_shell_examples_do_not_recommend_api_keys_in_argv(self):
+        text = self.read("plugins/cli.mdx")
+        shell_blocks = re.findall(r"```(?:bash|sh|shell)[^\n]*\n(.*?)```", text, re.S)
+        self.assertTrue(shell_blocks)
+        for source in shell_blocks:
+            commands = "\n".join(line for line in source.splitlines() if not line.lstrip().startswith("#"))
+            commands = commands.replace("\\\n", " ")
+            self.assertNotRegex(commands, r"\bhydradb\b[^\n]*--api-key(?:[=\s]|$)")
+            self.assertNotRegex(commands, r"\bhydradb\s+config\s+set\s+api_key\b")
+        self.assertIn("masked prompt", text)
+        self.assertIn("`0600`", text)
+        self.assertIn("inject `HYDRADB_API_KEY` through your environment or secret manager", text)
+
     def test_memory_scope_is_derived_from_the_signed_in_session(self):
         text = self.read("essentials/v2/context.mdx")
         memory = text.split("## Ingesting memory", 1)[1].split("## Wait for indexing", 1)[0]

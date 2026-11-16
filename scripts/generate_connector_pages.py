@@ -9,9 +9,16 @@ ROOT = Path(__file__).resolve().parents[1]
 SNAPSHOT = ROOT / "scripts/connector_capabilities.json"
 DIRECTORY = ROOT / "essentials/v2/connectors"
 INDEX = ROOT / "essentials/v2/connector-providers.mdx"
+SCOPED_PROVIDER_EXAMPLES = {
+    "slack": ("slack-account-a", "slack-account-b"),
+    "github": ("github-account-a", "github-account-b"),
+    "linear": ("linear-account-a", "linear-account-b"),
+    "notion": ("notion-account-a", "notion-account-b"),
+}
 
 
 def prose(value):
+    value = value.replace("With acl_supported on for the provider, permission-aware search", "With Enforce ACL enabled for a provider reporting acl_supported: true, permission-aware search")
     escaped = html.escape(re.sub(r"\s*\u2014\s*", "; ", value), quote=False).replace("{", "&#123;").replace("}", "&#125;")
     escaped = re.sub(r"https?://[^\s]*&lt;[^\s]*", lambda match: f"`{html.unescape(match.group())}`", escaped)
     return re.sub(r"&lt;([A-Za-z_][\w-]*)&gt;", r"`<\1>`", escaped)
@@ -40,6 +47,16 @@ def pages():
         elif not provider.get("summary"):
             lines.append("The provider description does not enumerate fixed indexed object types. Use the setup notes below when available; the resource picker shows what your connection can select.")
         lines.extend(["", "## Connect", ""])
+        lines.extend([
+            "Create one connector per account, using that account's credentials where required. Use a separate connector for a different account; see [account scopes](/essentials/v2/connectors#6-connect-several-accounts-from-one-provider). Shared destinations are allowed, but collection names do not authorize access.",
+            "",
+        ])
+        if identifier in SCOPED_PROVIDER_EXAMPLES:
+            first, second = SCOPED_PROVIDER_EXAMPLES[identifier]
+            lines.extend([
+                f"Set a stable, distinct `provider_account_scope` for each connected account yourself, for example `{first}` and `{second}`. These are caller-provided example identifiers, not validated native account-ID formats. The API stores the supplied value; it does not derive or validate the provider's account identity. Reusing a scope can make sources with matching external IDs overwrite each other in the same destination.",
+                "",
+            ])
         if provider.get("setup_guide"):
             lines.extend(f"{number}. {prose(step)}" for number, step in enumerate(provider["setup_guide"], 1))
             lines.append("")
@@ -51,6 +68,7 @@ def pages():
             "", "## Common mistakes", "",
             "- A provider page describes indexed content, not the access granted to your credentials. Select resources the connected account can read.",
             "- Synced content is not automatically private to each person. Review [ACL enforcement](/essentials/v2/connectors#enforce-acl) and set resource access rules where needed.",
+            "- API-key requests must omit `enforce_acl`, including `false`. Only a signed-in human workspace owner or writer can change **Enforce ACL** in dashboard connector settings, and enabling it requires `acl_supported: true`.",
             "", "## Related", "",
             "- [Connector providers](/essentials/v2/connector-providers)",
             "- [Connectors](/essentials/v2/connectors): setup, sync, and access control",

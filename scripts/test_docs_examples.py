@@ -490,6 +490,55 @@ class TypeScriptExamples(unittest.TestCase):
         self.assertGreaterEqual(count, 85)
 
 
+class CookbookPermissionDiagnostics(unittest.TestCase):
+    def test_permission_warning_distinguishes_local_abort_from_remote_sync(self):
+        import test_cookbooks
+
+        for field, response_field in (("acl_warnings", "acl_warning"), ("page_acl_warnings", "page_acl_warning")):
+            with self.subTest(field=field):
+                hydra, stubs = test_cookbooks.CookbookTest.load_setup(self)
+                getattr(stubs, field)["C2"] = "provider returned 403"
+                with mock.patch.object(hydra.client.connectors, "pause") as pause, \
+                        mock.patch.object(hydra.client.connectors, "delete") as delete, \
+                        mock.patch("time.sleep", side_effect=AssertionError("connect kept polling")), \
+                        self.assertRaises(RuntimeError) as raised:
+                    hydra.connect("slack", "T1", "db", "docs", {"access_token": "x"})
+                message = str(raised.exception)
+                for phrase in ("only the cookbook", "does not pause", "may already be readable by every caller", "scheduled syncs may continue", "Pass acl"):
+                    self.assertIn(phrase, message)
+                pause.assert_not_called()
+                delete.assert_not_called()
+                self.assertEqual(1, stubs.calls.count("ConnectorsClient.configure"))
+                self.assertNotIn("ConnectorsClient.update_resource_acl", stubs.calls)
+                self.assertTrue(all("acl" not in resource for resource in stubs.configured["conn_1"]))
+                status = hydra.client.connectors.status("conn_1")
+                self.assertEqual("active", status.lifecycle)
+                resource = next(resource for resource in status.resources if resource.resource_id == "C2")
+                self.assertEqual("provider returned 403", getattr(resource, response_field))
+
+    def test_explicit_resource_acl_recovers_without_erasing_provider_warning(self):
+        import test_cookbooks
+
+        for field, response_field in (("acl_warnings", "acl_warning"), ("page_acl_warnings", "page_acl_warning")):
+            with self.subTest(field=field):
+                hydra, stubs = test_cookbooks.CookbookTest.load_setup(self)
+                getattr(stubs, field)["C2"] = "provider returned 403"
+                with test_cookbooks.bounded_sleep(), self.assertRaises(RuntimeError):
+                    hydra.connect("slack", "T1", "db", "docs", {"access_token": "x"})
+                with test_cookbooks.bounded_sleep(), \
+                        mock.patch.object(hydra.client.connectors, "pause") as pause, \
+                        mock.patch.object(hydra.client.connectors, "delete") as delete:
+                    connector_id = hydra.connect("slack", "T1", "db", "docs", {"access_token": "x"}, acl=["domain:acme.com"])
+                self.assertEqual("conn_1", connector_id)
+                self.assertTrue(all(resource["acl"] == ["domain:acme.com"] for resource in stubs.configured[connector_id]))
+                self.assertEqual(3, stubs.calls.count("ConnectorsClient.update_resource_acl"))
+                pause.assert_not_called()
+                delete.assert_not_called()
+                status = hydra.client.connectors.status(connector_id)
+                resource = next(resource for resource in status.resources if resource.resource_id == "C2")
+                self.assertEqual("provider returned 403", getattr(resource, response_field))
+
+
 class EndpointPages(unittest.TestCase):
     """Checks on the pages bound to one operation with `openapi:` front matter."""
 
