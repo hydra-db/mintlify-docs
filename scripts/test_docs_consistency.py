@@ -118,6 +118,20 @@ class UnifiedNarrativeTest(unittest.TestCase):
     def read(self, relative):
         return (ROOT / relative).read_text(encoding="utf-8")
 
+    def test_cookbook_migration_requires_verified_identity(self):
+        intro = self.read("snippets/cookbook-setup.mdx").split("```python hydra.py", 1)[0]
+        self.assertIn("**Existing deployments:**", intro)
+        migration = intro.split("**Existing deployments:**", 1)[1]
+        for phrase in (
+            "does not adopt legacy connectors", "remote syncs can continue",
+            "Before switching", "client.connectors.list()", "`connector_id`",
+            "`(provider, database, collection, account)`", "ownership",
+            "trusted server configuration and credentials", "`provider_account_scope` where applicable",
+            "connector names are not proof of ownership", "only under that verified identity",
+            "without legacy-name adoption, automatic ACL reassignment, or blanket pause/delete",
+        ):
+            self.assertIn(phrase, migration)
+
     def test_inference_opt_out_does_not_promise_no_graph_processing(self):
         for relative in ("essentials/v2/context.mdx", "api-reference/v2/endpoint/ingest-context.mdx"):
             text = self.read(relative)
