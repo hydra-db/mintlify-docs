@@ -1,32 +1,292 @@
 ---
 title: "PostHog"
-description: "What HydraDB syncs from PostHog, and how to connect it."
+description: "Sync people, cohorts, feature flags and annotations from the PostHog projects you select. Events are not synced."
 icon: "/images/connectors/posthog.svg"
 ---
 
-## What syncs
+Sync people, cohorts, feature flags and annotations from the PostHog projects you select. Each person is one contact document built from their PostHog properties. Cohorts, feature flags and annotations are one document each, naming their creator.
 
-**Indexed object types**
+PostHog permissions are not imported, so every synced item is visible to everyone who can query the collection unless you set an access rule. Events, such as pageviews and custom events, are not synced. People deleted in PostHog stay in HydraDB, and feature flags and annotations that PostHog marks deleted stay searchable.
 
-- `persons`
-- `cohorts`
-- `feature_flags`
-- `annotations`
+<Note>
+PostHog is in beta.
+</Note>
 
-## Connect
+## Permissions
 
-Create one connector per account, using that account's credentials where required. Use a separate connector for a different account; see [account scopes](/essentials/v2/connectors#6-connect-several-accounts-from-one-provider). Shared destinations are allowed, but collection names do not authorize access.
+<Warning>
+PostHog permissions are not imported, so **Enforce ACL** is unavailable for this connector. Every synced item is visible to everyone who can query the collection, unless you [set an access rule on the resource](/essentials/v2/connectors#set-your-own-rule-on-a-resource).
+</Warning>
 
-Use provider `posthog` with [Create Connector](/api-reference/v2/endpoint/create-connector), then [discover resources](/api-reference/v2/endpoint/discover-connector-resources) and [configure the resources](/api-reference/v2/endpoint/configure-connector) you want to sync. The [provider description](/api-reference/v2/endpoint/list-connector-providers) supplies the credential fields for your deployment.
+API-key requests must omit `enforce_acl`, including `false`. See [ACL on synced content](/essentials/v2/connectors#5-acl-native-rbac-awareness).
 
-## Common mistakes
+## Before you connect
 
-- A provider page describes indexed content, not the access granted to your credentials. Select resources the connected account can read.
-- Synced content is not automatically private to each person. Review [ACL enforcement](/essentials/v2/connectors#enforce-acl) and set resource access rules where needed.
-- API-key requests must omit `enforce_acl`, including `false`. Only a signed-in human workspace owner or writer can change **Enforce ACL** in dashboard connector settings, and enabling it requires `acl_supported: true`.
+### Credentials
 
-## Related
+PostHog uses a personal API key.
 
-- [Connector providers](/essentials/v2/connector-providers)
-- [Connectors](/essentials/v2/connectors): setup, sync, and access control
-- [Get Connector Status](/api-reference/v2/endpoint/get-connector-status): progress and warnings
+<ResponseField name="api_key" type="secret string" required>
+A PostHog personal API key.
+</ResponseField>
+
+<ResponseField name="project_id" type="string" required>
+A PostHog project id. It is used when you select no projects. The projects you select take its place.
+</ResponseField>
+
+### Set it up
+
+<Steps>
+  <Step title="Create a personal API key">
+    In PostHog, create a personal API key.
+  </Step>
+  <Step title="Create the connector">
+    Paste the key as `api_key` and a project id as `project_id`.
+  </Step>
+  <Step title="Select projects">
+    HydraDB lists the projects of the organization the key belongs to, from `https://app.posthog.com`. The connection form has no setting for another PostHog address. Select the projects to sync. Each one syncs separately.
+  </Step>
+  <Step title="Give each project its own collection">
+    If you select more than one project, send each to its own collection. Records of the same type with the same id in two projects can replace each other when they land in the same collection.
+  </Step>
+</Steps>
+
+One connector reads projects from one PostHog organization, the one the API key belongs to.
+
+<Accordion title="Connect through the API">
+
+Use provider `posthog` with [Create Connector](/api-reference/v2/endpoint/create-connector). Then call [Discover Connector Resources](/api-reference/v2/endpoint/discover-connector-resources) to list the resources the connector can sync, and [Configure Connector](/api-reference/v2/endpoint/configure-connector) to choose what to sync.
+
+</Accordion>
+
+## Keeping in sync
+
+- **First sync:** People are read in full, whatever the window. Cohorts, feature flags and annotations reach back the window set by `lookback_days`, 30 days by default.
+- **New and changed items:** Every sync reads all people in each selected project again, which is slow for projects with many people. A cohort is picked up again when PostHog recalculates it. Feature flags and annotations are picked up again when they are updated.
+- **Edits:** An edited item replaces its document.
+- **Deletions:** Deleted people are not removed. A person deleted in PostHog stays searchable in HydraDB. Feature flags and annotations that PostHog marks deleted are still synced and searchable.
+
+After the first sync, HydraDB syncs every hour by default. Set `sync_interval_seconds` on the connector to change it.
+
+## What gets synced
+
+### On every PostHog item
+
+<ResponseField name="additional_metadata.posthog_stream" type="Query filter">
+The record type: `persons`, `cohorts`, `feature_flags` or `annotations`. Limits a query to one type, for example only people. Not searchable.
+</ResponseField>
+
+<ResponseField name="connector_id" type="Query filter">
+Limits a query to this connector's items. Not searchable.
+</ResponseField>
+
+<ResponseField name="provider" type="Query filter">
+Always `posthog`. Not searchable.
+</ResponseField>
+
+<Accordion title="Stored only, not searchable (1)">
+
+<ResponseField name="stream_type" type="Stored only">
+The record type, shown when you inspect the item. To limit a query by type, use `additional_metadata.posthog_stream`.
+</ResponseField>
+
+</Accordion>
+
+### People
+
+- **One document:** One person in a selected project.
+- **Title:** `PostHog persons: <name>`, using the person's name, else their first and last name, else their email. `PostHog persons` when there is none.
+- **Text:** Contact details taken from the person's properties, described below. Then notes with a `Name` line, a `Distinct IDs` line, and every person property that has a single value, in alphabetical order as `property: value`. The title is searchable too.
+- **Date:** When the person was created.
+- **Link back:** None.
+- **Files:** None.
+
+<ResponseField name="display_name, first_name, last_name, email, emails" type="Searchable text, Graph identity">
+The person's name and email, from their properties. The email comes from `email` or `$email`. They identify the person in the graph.
+</ResponseField>
+
+<ResponseField name="provider_user_id" type="Searchable text, Graph identity">
+The person's first distinct id. It is part of the contact details and identifies the person in the graph.
+</ResponseField>
+
+<ResponseField name="linkedin_url, x_handle" type="Searchable text, Graph identity">
+Social handles, from `linkedin_url` or `linkedin`, and from `x_handle`, `twitter_handle` or `username`. The first one available identifies the person in the graph.
+</ResponseField>
+
+<ResponseField name="entity_type" type="Searchable text, Graph identity">
+Always `person`. It makes the contact a person in the graph.
+</ResponseField>
+
+<ResponseField name="owner, owner_email" type="Searchable text, Graph identity">
+The contact owner's name and email, from the person's properties. The graph records the owner as a separate person.
+</ResponseField>
+
+<ResponseField name="distinct_ids" type="Searchable text">
+All of the person's distinct ids, written as the `Distinct IDs` line. Only the first one identifies the person in the graph.
+</ResponseField>
+
+<ResponseField name="job_title, organization_name, organization_id, lifecycle_stage" type="Searchable text">
+Job, company and lifecycle stage, from matching properties or from `title`, `company`, `company_id` and `stage`.
+</ResponseField>
+
+<ResponseField name="phones" type="Searchable text">
+Phone numbers from the `phones`, `phone` and `phone_number` properties. They do not identify the person in the graph.
+</ResponseField>
+
+<ResponseField name="labels, tags, url" type="Searchable text">
+Labels, tags and a URL from the person's properties or record. The URL is part of the contact details and is not a link back.
+</ResponseField>
+
+<ResponseField name="created_at" type="Searchable text, Result date">
+When the person was created. It is part of the contact details and sets the result date.
+</ResponseField>
+
+<ResponseField name="updated_at" type="Searchable text">
+When the person was last updated, when PostHog provides it. It does not set the result date.
+</ResponseField>
+
+<Accordion title="Stored only, not searchable (1)">
+
+<ResponseField name="Other person fields" type="Stored only">
+Every other field of the person record, kept for inspection only.
+</ResponseField>
+
+</Accordion>
+
+### Cohorts
+
+- **One document:** One saved cohort.
+- **Title:** `PostHog cohorts: <name>`.
+- **Text:** `Name`, `Description` and `Count` lines, with the creator as the author. The title is searchable too.
+- **Date:** When the cohort was created.
+- **Link back:** None.
+- **Files:** None. The list of members is not synced.
+
+<ResponseField name="created_by" type="Searchable text, Graph identity">
+The creator's name, or their email when there is no name. It is written as the author, and the graph records the creator as the author.
+</ResponseField>
+
+<ResponseField name="created_by_email" type="Graph identity">
+The creator's email, attached to the author in the graph. Not searchable.
+</ResponseField>
+
+<ResponseField name="created_at" type="Result date">
+When the cohort was created. Not searchable.
+</ResponseField>
+
+<Accordion title="Stored only, not searchable (2)">
+
+<ResponseField name="last_calculation" type="Stored only">
+When PostHog last recalculated the cohort. A recalculation is what makes a sync pick the cohort up again.
+</ResponseField>
+
+<ResponseField name="Other cohort fields" type="Stored only">
+Every other field of the cohort record, kept for inspection only.
+</ResponseField>
+
+</Accordion>
+
+### Feature flags
+
+- **One document:** One flag, active or archived.
+- **Title:** `PostHog feature_flags` followed by the feature flag name. When a feature flag has no name, its key is not used in its place.
+- **Text:** `Name`, `Key`, `Active` and `Rollout percentage` lines, when present, with the creator as the author and the update time. The rollout percentage is the flag's top-level one. The title is searchable too.
+- **Date:** When the flag was created.
+- **Link back:** None.
+- **Files:** None.
+
+<ResponseField name="created_by" type="Searchable text, Graph identity">
+The creator's name, or their email when there is no name. It is written as the author, and the graph records the creator as the author.
+</ResponseField>
+
+<ResponseField name="created_by_email" type="Graph identity">
+The creator's email, attached to the author in the graph. Not searchable.
+</ResponseField>
+
+<ResponseField name="updated_at" type="Searchable text">
+When the flag was last updated, when PostHog provides it. It does not set the result date.
+</ResponseField>
+
+<ResponseField name="created_at" type="Result date">
+When the flag was created. Not searchable.
+</ResponseField>
+
+<Accordion title="Stored only, not searchable (1)">
+
+<ResponseField name="Other flag fields" type="Stored only">
+Other fields of the flag, including its targeting rules under `filters` and PostHog's `deleted` marker. Kept for inspection only, so targeting rules are not searchable.
+</ResponseField>
+
+</Accordion>
+
+### Annotations
+
+- **One document:** One annotation.
+- **Title:** `PostHog annotations` followed by the first 80 characters of the content, with an ellipsis when it is longer. Just `PostHog annotations` when the content is empty.
+- **Text:** The annotation content, then `Insight`, `Scope` and `Date marker` lines, when present, with the creator as the author and the update time. The title is searchable too.
+- **Date:** When the annotation was last updated, or when it was created if PostHog gives no update time.
+- **Link back:** None.
+- **Files:** None.
+
+<ResponseField name="created_by" type="Searchable text, Graph identity">
+The creator's name, or their email when there is no name. It is written as the author, and the graph records the creator as the author.
+</ResponseField>
+
+<ResponseField name="created_by_email" type="Graph identity">
+The creator's email, attached to the author in the graph. Not searchable.
+</ResponseField>
+
+<ResponseField name="updated_at" type="Searchable text, Result date">
+When the annotation was last updated. It is part of the text and sets the result date.
+</ResponseField>
+
+<ResponseField name="created_at" type="Result date">
+When the annotation was created. Sets the result date only when there is no update time. Not searchable.
+</ResponseField>
+
+<Accordion title="Stored only, not searchable (1)">
+
+<ResponseField name="Other annotation fields" type="Stored only">
+Every other field of the annotation record, kept for inspection only.
+</ResponseField>
+
+</Accordion>
+
+**Example searches**
+
+- Which company and lifecycle stage does PostHog record for jane@acme.com?
+- What are the key, active status and rollout percentage of the new-checkout flag?
+- Which annotations were added around the March release?
+
+## How it fits into the graph
+
+- People use the Contact class.
+- Cohorts use the Page class.
+- Feature flags use the Page class.
+- Annotations use the Page class.
+
+[Graph classes](/essentials/v2/connector-providers#graph-classes) explains each class.
+
+**Connections PostHog creates**
+
+- None. People, cohorts, feature flags and annotations are not linked to each other.
+- No links to other tools.
+
+**People and groups**
+
+- Each person, identified by their name, email, social handle and first distinct id.
+- A person's owner, as a separate person.
+- The creator of cohorts, feature flags and annotations, as their author.
+
+**Found in the text**
+
+The text of people, cohorts, feature flags and annotations. HydraDB identifies people, organizations, projects and other named things in this text. To steer what it looks for, use [custom instructions](/essentials/v2/connectors#4-custom-ingestion-instructions).
+
+## Not synced
+
+- Events, including pageviews, autocapture and custom events.
+- Insights, dashboards, session recordings, experiments and surveys.
+- Projects you did not select.
+- Cohort members. A cohort carries its member count only.
+- Targeting rules of feature flags, in the searchable text.
+- Deletions: people deleted in PostHog stay in HydraDB.

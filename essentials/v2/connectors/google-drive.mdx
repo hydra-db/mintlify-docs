@@ -1,29 +1,211 @@
 ---
 title: "Google Drive"
-description: "What HydraDB syncs from Google Drive, and how to connect it."
+description: "Sync files and folders from the Google Drive folders and shared drives you choose, one document per file or folder. With Enforce ACL on, each file's Drive sharing decides who can find it."
 icon: "/images/connectors/google-drive.svg"
 ---
 
-## What syncs
+Sync the files inside the Google Drive folders and shared drives you select, including My Drive and every folder below a selected one. Each file and each folder is one document, and each links to its parent folder. Files are downloaded and their text is read: Google Docs and Slides come across as text, and Sheets as comma-separated values. A file whose text cannot be read is still findable by its name, type, owner and location.
 
-**Indexed object types**
+Each file's own Drive sharing becomes its access list, and search follows it when Enforce ACL is on. The first sync reaches only files modified in the last 30 days unless you raise `lookback_days`. Files removed in Drive are not deleted from HydraDB. Comments, suggestions and revision history are not synced.
 
-- `files`
+## Permissions
 
-## Connect
+Turn on **Enforce ACL** for this connector to make search follow Google Drive permissions. With Enforce ACL off, HydraDB does not enforce them. Only a workspace owner or writer signed in to HydraDB can turn it on. API-key requests must omit `enforce_acl`, including `false`. See [Enforce ACL](/essentials/v2/connectors#enforce-acl).
 
-Create one connector per account, using that account's credentials where required. Use a separate connector for a different account; see [account scopes](/essentials/v2/connectors#6-connect-several-accounts-from-one-provider). Shared destinations are allowed, but collection names do not authorize access.
+- **Who can read an item:** Each file has its own access list, read from its Drive sharing. A person it is shared with can read it, and so can members of a Google Group it is shared with. A domain share grants that Google Workspace domain. A file shared with anyone becomes readable by everyone who can query the collection only when it is discoverable. An unshared file can be read by its owner.
+- **How a person is identified:** A person's email address. A Google Group share is turned into its members' email addresses when the Directory scope below is granted.
+- **When permissions cannot be read:** If HydraDB cannot read a file's sharing, or cannot turn a Google Group into its members, the connector reports a permission warning and the file carries `additional_metadata.acl_warning`. On HydraDB Cloud, with Enforce ACL on, such an item follows the access rule you set on its resource. With no rule, it is hidden from search. Self-hosted deployments can be configured differently. Permission warnings appear in [Get Connector Status](/api-reference/v2/endpoint/get-connector-status).
+- A share with anyone who has the link does not make a file readable by everyone.
+- Without the Directory scope, Google Group shares are not turned into members, so a person identified only by email does not match a file shared only with a group.
+- If a Google Group cannot be turned into its members, the group share is kept as it is. Access is not opened up.
+- Sharing changes that do not edit the file are picked up on each sync.
 
-Use provider `google_drive` with [Create Connector](/api-reference/v2/endpoint/create-connector), then [discover resources](/api-reference/v2/endpoint/discover-connector-resources) and [configure the resources](/api-reference/v2/endpoint/configure-connector) you want to sync. The [provider description](/api-reference/v2/endpoint/list-connector-providers) supplies the credential fields for your deployment.
+You can also [set your own rule on a resource](/essentials/v2/connectors#set-your-own-rule-on-a-resource).
 
-## Common mistakes
+## Before you connect
 
-- A provider page describes indexed content, not the access granted to your credentials. Select resources the connected account can read.
-- Synced content is not automatically private to each person. Review [ACL enforcement](/essentials/v2/connectors#enforce-acl) and set resource access rules where needed.
-- API-key requests must omit `enforce_acl`, including `false`. Only a signed-in human workspace owner or writer can change **Enforce ACL** in dashboard connector settings, and enabling it requires `acl_supported: true`.
+### Credentials
 
-## Related
+Google Drive uses an OAuth client from your Google Cloud project and a refresh token for the Google account that connects. HydraDB sees what that account can see.
 
-- [Connector providers](/essentials/v2/connector-providers)
-- [Connectors](/essentials/v2/connectors): setup, sync, and access control
-- [Get Connector Status](/api-reference/v2/endpoint/get-connector-status): progress and warnings
+<ResponseField name="client_id" type="secret string" required>
+The OAuth client id of your Google Cloud app.
+</ResponseField>
+
+<ResponseField name="client_secret" type="secret string" required>
+The OAuth client secret of the same app.
+</ResponseField>
+
+<ResponseField name="refresh_token" type="secret string" required>
+A refresh token for the connecting Google account, issued with the `drive.readonly` scope.
+</ResponseField>
+
+**Scopes to grant**
+
+- `https://www.googleapis.com/auth/drive.readonly`: required. Lists My Drive, files shared with the account and shared drives, and reads file details and sharing.
+- `https://www.googleapis.com/auth/admin.directory.group.member.readonly`: optional, needs Google Workspace admin consent. Turns Google Group shares into member email addresses, for search that follows Drive permissions.
+- `https://www.googleapis.com/auth/drive`: optional. Full Drive access, not needed to sync.
+
+### Set it up
+
+<Steps>
+  <Step title="Create an OAuth client">
+    In Google Cloud, create an OAuth client and note its client id and client secret.
+  </Step>
+  <Step title="Authorize the account">
+    Sign in with a Google account that can see the folders and shared drives you want synced, grant `drive.readonly`, and keep the refresh token.
+  </Step>
+  <Step title="Grant group access, if you use groups">
+    If files are shared with Google Groups and search must follow Drive permissions, have a Google Workspace admin consent to `admin.directory.group.member.readonly`.
+  </Step>
+  <Step title="Create the connector">
+    Paste the three values as `client_id`, `client_secret` and `refresh_token`.
+  </Step>
+  <Step title="Select folders and shared drives">
+    HydraDB lists My Drive, your shared drives and folders. Select at least one. Nothing syncs until you do. To reach files older than 30 days, raise `lookback_days` when you select them.
+  </Step>
+</Steps>
+
+One connector reads what one Google account can see.
+
+<Accordion title="Connect through the API">
+
+Use provider `google_drive` with [Create Connector](/api-reference/v2/endpoint/create-connector). Then call [Discover Connector Resources](/api-reference/v2/endpoint/discover-connector-resources) to list the resources the connector can sync, and [Configure Connector](/api-reference/v2/endpoint/configure-connector) to choose what to sync.
+
+</Accordion>
+
+## Keeping in sync
+
+- **First sync:** Each selected folder or shared drive reads back the window set by `lookback_days`, 30 days by default. Files last modified before that window are not synced.
+- **New and changed items:** Each sync reads files modified since the last sync. Sharing changes are read on every sync, even when the file itself did not change.
+- **Edits:** An edited file is read again, and its text replaces the old text.
+- **Deletions:** Files removed in Drive are not deleted from HydraDB. When Drive reports a file as removed, HydraDB makes it private. It is then hidden only when Enforce ACL is on. With Enforce ACL off, it stays searchable.
+- A file in two selected folders is kept once.
+- A shortcut is synced as the file it points to when that file can be read. Otherwise only the shortcut's details are kept. Shortcuts to folders are not followed.
+
+After the first sync, HydraDB syncs every hour by default. Set `sync_interval_seconds` on the connector to change it.
+
+## What gets synced
+
+### Files and folders
+
+- **One document:** One Drive file or one folder.
+- **Title:** The shared drive name, the first parent folder name and the file name, joined with slashes, for example `Research/Q3 Findings.pdf`. A name that is missing is left out, and a shared drive's name may be missing. A file with no name is titled `Drive file` and its id.
+- **Text:** For a file whose text could be read, that text. For a folder, or a file whose text could not be read, the title followed by `Type`, `Owner`, `Link` and `Modified` lines, leaving out empty ones. The title is searchable too.
+- **Date:** When the file was last modified in Drive.
+- **Link back:** Opens the file in Drive. A folder without its own link gets a Drive folder link.
+- **Files:** Each file is downloaded and its text is read. Google Docs and Slides are exported as text, and Sheets as comma-separated values. Files over 50 MiB, and Google file types other than Docs, Sheets and Slides, keep only their details.
+
+<ResponseField name="mime_type" type="Searchable text">
+The Drive file type, written as the `Type` line. Searchable on folders and on files whose text could not be read. On other files it is kept but not searchable.
+</ResponseField>
+
+<ResponseField name="author" type="Searchable text">
+The display name, or else the email, of the file's first owner, written as the `Owner` line. Searchable on folders and on files whose text could not be read. On other files it is kept but not searchable. The owner is not attached to the file as a person in the graph.
+</ResponseField>
+
+<ResponseField name="url" type="Searchable text">
+The Drive link, written as the `Link` line on folders and on files whose text could not be read. On other files it is the link back only. A Drive folder link that HydraDB builds is not added to the text.
+</ResponseField>
+
+<ResponseField name="updated_at" type="Searchable text, Result date">
+When the file was last modified in Drive. Sets the result date and decides which files each sync reads. Written as the `Modified` line, so it is searchable only on folders and on files whose text could not be read.
+</ResponseField>
+
+<ResponseField name="additional_metadata.container_id" type="Query filter">
+The shared drive id for a file in a shared drive, otherwise its parent folder id. Limits a query to one shared drive, or to one folder in My Drive. Not searchable.
+</ResponseField>
+
+<ResponseField name="additional_metadata.container_name" type="Query filter">
+The shared drive name, or the parent folder name. Limits a query by drive or folder name. Not searchable.
+</ResponseField>
+
+<ResponseField name="additional_metadata.container_type" type="Query filter">
+`drive` or `folder`. Says which kind of container the two keys above refer to. Not searchable.
+</ResponseField>
+
+<ResponseField name="additional_metadata.folder_id" type="Query filter">
+The first parent folder id, even inside a shared drive. Limits a query to one folder. Not searchable.
+</ResponseField>
+
+<ResponseField name="additional_metadata.folder_name" type="Query filter">
+The first parent folder name. Limits a query by folder name. Not searchable.
+</ResponseField>
+
+<ResponseField name="additional_metadata.acl_warning" type="Query filter">
+Set when the file's sharing could not be read or a Google Group could not be turned into its members. Finds the files that need attention. It does not grant access. Not searchable.
+</ResponseField>
+
+<ResponseField name="connector_id" type="Query filter">
+Limits a query to this connector's files. Not searchable.
+</ResponseField>
+
+<ResponseField name="provider" type="Query filter">
+Always `google_drive`. Not searchable.
+</ResponseField>
+
+<ResponseField name="parent_id" type="Graph connection">
+The file's first parent folder. Links the file or folder to that folder's document, so a folder and its files are connected. Not searchable.
+</ResponseField>
+
+<ResponseField name="Drive sharing" type="Access rule">
+The file's people, group, domain and public shares. Decides who can read it when Enforce ACL is on. Not searchable.
+</ResponseField>
+
+<Accordion title="Stored only, not searchable (5)">
+
+<ResponseField name="size" type="Stored only">
+The size in bytes. Empty for Google Docs, Sheets and Slides.
+</ResponseField>
+
+<ResponseField name="md5_checksum" type="Stored only">
+Drive's content checksum, for comparing file versions. Empty for Google Docs, Sheets and Slides.
+</ResponseField>
+
+<ResponseField name="created_at" type="Stored only">
+When the file was created in Drive. The result date uses the modified time instead.
+</ResponseField>
+
+<ResponseField name="content_type" type="Stored only">
+`folder` on folders.
+</ResponseField>
+
+<ResponseField name="is_container" type="Stored only">
+True on folders.
+</ResponseField>
+
+</Accordion>
+
+**Example searches**
+
+- What does the Q3 findings deck say about onboarding?
+- Which files in the Finance folder mention the 2026 budget?
+- Which pricing files were changed most recently?
+
+## How it fits into the graph
+
+- Files and folders use the Record class.
+
+[Graph classes](/essentials/v2/connector-providers#graph-classes) explains each class.
+
+**Connections Google Drive creates**
+
+- A file or folder to its first parent folder.
+- No links to items in other tools.
+
+**People and groups**
+
+- No people are attached to files in the graph. The owner is part of the text only on folders and on files whose text could not be read.
+
+**Found in the text**
+
+The file's text, or for a folder or unread file, its title and detail lines. HydraDB identifies people, organizations, projects and other named things in this text. To steer what it looks for, use [custom instructions](/essentials/v2/connectors#4-custom-ingestion-instructions).
+
+## Not synced
+
+- Folders and shared drives you did not select.
+- Files last modified before the `lookback_days` window on the first sync.
+- Comments, suggestions and revision history.
+- Text of files over 50 MiB.
+- Text of Google file types other than Docs, Sheets and Slides.
+- Deletions: removed files stay in HydraDB.

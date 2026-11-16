@@ -1,39 +1,322 @@
 ---
 title: "Okta"
-description: "What HydraDB syncs from Okta, and how to connect it."
+description: "Sync every user, group and application in your Okta org, plus System Log events. Okta permissions are not carried over."
 icon: "/images/connectors/okta.svg"
 ---
 
-## What syncs
+Sync every user, group and application in your Okta org, plus System Log events. Each user, group, application and log event is one document. A group lists its members, an application its assigned users, and a user the active MFA factors HydraDB found.
 
-**Indexed object types**
+Okta permissions are not imported, so every synced item is visible to everyone who can query the collection unless you set an access rule. These records do not prove who has access today or that MFA is off: a missing factor can mean a factor read failed. Users, groups and applications deleted in Okta can stay in HydraDB.
 
-- `users`
-- `groups`
-- `applications`
-- `system_logs`
+## Permissions
 
-## Connect
+<Warning>
+Okta permissions are not imported, so **Enforce ACL** is unavailable for this connector. Every synced item is visible to everyone who can query the collection, unless you [set an access rule on the resource](/essentials/v2/connectors#set-your-own-rule-on-a-resource).
+</Warning>
 
-Create one connector per account, using that account's credentials where required. Use a separate connector for a different account; see [account scopes](/essentials/v2/connectors#6-connect-several-accounts-from-one-provider). Shared destinations are allowed, but collection names do not authorize access.
+- Okta reads are governed by the admin role on the token, not by anything on a user, group, application or event, so there is nothing per item to import.
+- Application assignments and self-service settings are not treated as read permissions.
 
-1. Create an API token: Okta admin console → Security → API → Tokens → Create Token. There is no scope picker and no role selector on that dialog; the token silently inherits the role of whoever creates it.
-2. That inheritance is the thing to get right. To get a least-privilege token you must be signed in AS a Read-only Administrator when you mint it; minting as a Super Admin gives you a Super Admin token with nothing in the UI saying so. Check the Role column in the token list afterwards to confirm what you actually created.
-3. The create form has a required dropdown, "API calls made with this token must originate from". Leaving it unset fails with only "We found some errors" and no indication of which field. Choose Any IP unless you have defined an Okta network zone covering HydraDB's egress addresses.
-4. Set the org URL to your own org host, keeping the /api/v1/ path and the trailing slash: `https://<org>.okta.com/api/v1/` . The -admin host answers the API too, so either hostname works; the path and trailing slash are the part that matters.
-5. Two expiry traps. The token is bound to its creating user, so deactivating that person breaks the sync with 403s. And Okta expires a token after 30 days of no use, while the admin session itself is short-lived; so mint it and paste it in one sitting.
-6. Nothing is picked after connecting: Okta syncs the whole org. Users, groups, applications and system log events are indexed, with group membership, app assignments and MFA enrolment folded into the user, group and application records.
+API-key requests must omit `enforce_acl`, including `false`. See [ACL on synced content](/essentials/v2/connectors#5-acl-native-rbac-awareness).
 
-Use provider `okta` with [Create Connector](/api-reference/v2/endpoint/create-connector), then [discover resources](/api-reference/v2/endpoint/discover-connector-resources) and [configure the resources](/api-reference/v2/endpoint/configure-connector) you want to sync. The [provider description](/api-reference/v2/endpoint/list-connector-providers) supplies the credential fields for your deployment.
+## Before you connect
 
-## Common mistakes
+### Credentials
 
-- A provider page describes indexed content, not the access granted to your credentials. Select resources the connected account can read.
-- Synced content is not automatically private to each person. Review [ACL enforcement](/essentials/v2/connectors#enforce-acl) and set resource access rules where needed.
-- API-key requests must omit `enforce_acl`, including `false`. Only a signed-in human workspace owner or writer can change **Enforce ACL** in dashboard connector settings, and enabling it requires `acl_supported: true`.
+Okta uses an API token. The token gets the admin role of the person who creates it, so create it while signed in as a Read-only Administrator.
 
-## Related
+<ResponseField name="api_key" type="secret string" required>
+An Okta API token, from Security, API, Tokens, Create Token.
+</ResponseField>
 
-- [Connector providers](/essentials/v2/connector-providers)
-- [Connectors](/essentials/v2/connectors): setup, sync, and access control
-- [Get Connector Status](/api-reference/v2/endpoint/get-connector-status): progress and warnings
+<ResponseField name="service_url" type="string" required>
+Your org's API address with the `/api/v1/` path and the trailing slash: `https://<org>.okta.com/api/v1/`.
+</ResponseField>
+
+The token stops working if the account that created it is deactivated, and Okta expires a token after 30 days without use.
+
+**What the token's admin role needs**
+
+- `Read-only Administrator`: the role of the person who creates the token.
+- `View users and their details`
+- `View groups and their details`
+- `View applications and their details`
+- `View System Log`: without it, the sync fails with an error instead of skipping log events.
+
+### Set it up
+
+<Steps>
+  <Step title="Sign in as a Read-only Administrator">
+    Sign in to the Okta admin console as a Read-only Administrator, so the token gets that role. Use a long-lived admin account.
+  </Step>
+  <Step title="Create a token">
+    Open Security, API, Tokens and create a token. Set where API calls made with this token must come from: Any IP, unless you have a network zone for HydraDB's addresses. Without this setting, creating the token fails with an unclear error.
+  </Step>
+  <Step title="Check the role">
+    In the token list, check the Role column to confirm the role the token got.
+  </Step>
+  <Step title="Create the connector">
+    Paste the token as `api_key` and your org's API address as `service_url`, with `/api/v1/` and the trailing slash.
+  </Step>
+  <Step title="Nothing to select">
+    Okta has no resources to choose. The connector reads the whole org.
+  </Step>
+</Steps>
+
+One connector reads one Okta org.
+
+<Accordion title="Connect through the API">
+
+Use provider `okta` with [Create Connector](/api-reference/v2/endpoint/create-connector). Then call [Discover Connector Resources](/api-reference/v2/endpoint/discover-connector-resources) to list the resources the connector can sync, and [Configure Connector](/api-reference/v2/endpoint/configure-connector) to choose what to sync.
+
+</Accordion>
+
+## Keeping in sync
+
+- **First sync:** Users, groups, applications, group members, application assignments and MFA factors are read in full. System Log events reach back the window set by `lookback_days`, 30 days by default.
+- **New and changed items:** Each sync reads the whole directory again, and System Log events newer than the last sync. Users, groups and applications that did not change are skipped.
+- **Edits:** A change to a user, group or application updates its document. A change only to a group's members, an application's assignments or a user's MFA factors may not show until the group, application or user itself changes.
+- **Deletions:** Users, groups and applications deleted in Okta can stay searchable in HydraDB. A removed MFA factor can stay listed on the user.
+- MFA factors are read one user at a time, with a one-second pause per user. If one user's factors cannot be read, that user's factors are skipped and the sync goes on. If Okta rejects the token, the sync fails.
+
+After the first sync, HydraDB syncs every hour by default. Set `sync_interval_seconds` on the connector to change it.
+
+## What gets synced
+
+### On every Okta item
+
+<ResponseField name="connector_id" type="Query filter">
+Limits a query to this connector's items. Not searchable.
+</ResponseField>
+
+<ResponseField name="provider" type="Query filter">
+Always `okta`. Not searchable.
+</ResponseField>
+
+### Users
+
+- **One document:** One Okta user.
+- **Title:** The first and last name, else the login, else `Okta user` with the user's id.
+- **Text:** The name, then `Login`, `Email`, `Title`, `Department`, `Manager`, `Organization`, `Location`, `Second Email`, `Mobile Phone`, `Status`, `MFA`, `Created` and `Last Login` lines. Profile attributes outside this list are not synced. The title is searchable too.
+- **Date:** When the user was last updated in Okta, else when it was created.
+- **Link back:** None.
+
+<ResponseField name="email" type="Searchable text, Graph identity">
+The primary email, written as the `Email` line. Identifies the user as a person in the graph. The name does not.
+</ResponseField>
+
+<ResponseField name="first_name, last_name" type="Searchable text">
+The user's name, used for the title and the first line.
+</ResponseField>
+
+<ResponseField name="login" type="Searchable text">
+The username, written as the `Login` line. It is the title when the user has no name.
+</ResponseField>
+
+<ResponseField name="job_title, department, organization" type="Searchable text">
+Written as the `Title`, `Department` and `Organization` lines.
+</ResponseField>
+
+<ResponseField name="manager" type="Searchable text">
+The manager's name from the profile, written as the `Manager` line. It does not create the manager link.
+</ResponseField>
+
+<ResponseField name="managerId" type="Graph connection">
+Links the user to their manager's user record when it matches exactly one user by id, employee number or login, ignoring case. Not kept as a field. Not searchable.
+</ResponseField>
+
+<ResponseField name="status" type="Searchable text">
+The account state, written as the `Status` line.
+</ResponseField>
+
+<ResponseField name="mfa_factors" type="Searchable text">
+The active factor types and providers HydraDB found, written as the `MFA` line. A missing factor does not prove MFA is off: a user's factor read can fail and be skipped, and a removed factor can stay listed.
+</ResponseField>
+
+<ResponseField name="created" type="Searchable text, Result date">
+When the user was created, written as the `Created` line. The result date when the user has no last-updated time.
+</ResponseField>
+
+<ResponseField name="last_login" type="Searchable text">
+The last recorded login, written as the `Last Login` line. Not used as the result date.
+</ResponseField>
+
+<ResponseField name="last_updated" type="Result date">
+When the user was last updated in Okta. Not searchable.
+</ResponseField>
+
+<ResponseField name="additional_metadata.okta_user_id" type="Query filter">
+The Okta user id. Picks out one user. Not searchable.
+</ResponseField>
+
+<Accordion title="Stored only, not searchable (1)">
+
+<ResponseField name="activated" type="Stored only">
+When the account was activated.
+</ResponseField>
+
+</Accordion>
+
+### Groups
+
+- **One document:** One Okta group, with its members.
+- **Title:** The group name, else `Okta group` with the group's id.
+- **Text:** The name, then `Description`, `Type`, `Members` and `Created` lines. The title is searchable too.
+- **Date:** When the group was last updated in Okta, else when it was created.
+- **Link back:** None.
+
+<ResponseField name="description" type="Searchable text">
+The group description.
+</ResponseField>
+
+<ResponseField name="group_type" type="Searchable text">
+Whether the group is managed in Okta, comes from an application, or is built in.
+</ResponseField>
+
+<ResponseField name="members" type="Searchable text, Graph connection">
+Up to 200 distinct member names, with a count of the rest and of members without a name. Each member is linked to their user record.
+</ResponseField>
+
+<ResponseField name="Source application" type="Graph connection">
+A group that comes from an application is linked to that application's record. Not searchable.
+</ResponseField>
+
+<ResponseField name="created" type="Searchable text, Result date">
+When the group was created, written as the `Created` line. The result date when the group has no last-updated time.
+</ResponseField>
+
+<ResponseField name="last_updated" type="Result date">
+When the group was last updated in Okta. Not searchable.
+</ResponseField>
+
+<ResponseField name="additional_metadata.okta_group_id" type="Query filter">
+The Okta group id. Picks out one group. Not searchable.
+</ResponseField>
+
+<Accordion title="Stored only, not searchable (1)">
+
+<ResponseField name="member_count" type="Stored only">
+How many members the group has, including any beyond the 200 names in the text.
+</ResponseField>
+
+</Accordion>
+
+### Applications
+
+- **One document:** One Okta application, with its assignments.
+- **Title:** The application label, else its internal name, else `Okta application` with its id.
+- **Text:** The label, then `App`, `Status`, `Sign-On Mode`, `Assigned Users` and `Created` lines. Assigned groups are not written into the text. The title is searchable too.
+- **Date:** When the application was last updated in Okta, else when it was created.
+- **Link back:** None.
+
+<ResponseField name="name" type="Searchable text">
+The internal app name, written as the `App` line. It is the title when the application has no label.
+</ResponseField>
+
+<ResponseField name="status, sign_on_mode" type="Searchable text">
+The application state and its sign-on mode, such as `SAML_2_0`.
+</ResponseField>
+
+<ResponseField name="assigned_users" type="Searchable text, Graph connection">
+Up to 200 distinct assigned user names, with a count of the rest. Each assigned user is linked to the application.
+</ResponseField>
+
+<ResponseField name="Assigned groups" type="Graph connection">
+Each group assigned to the application is linked to it. Not searchable.
+</ResponseField>
+
+<ResponseField name="created" type="Searchable text, Result date">
+When the application was created, written as the `Created` line. The result date when the application has no last-updated time.
+</ResponseField>
+
+<ResponseField name="last_updated" type="Result date">
+When the application was last updated in Okta. Not searchable.
+</ResponseField>
+
+<ResponseField name="additional_metadata.okta_application_id" type="Query filter">
+The Okta application id. Picks out one application. Not searchable.
+</ResponseField>
+
+<Accordion title="Stored only, not searchable (1)">
+
+<ResponseField name="assigned_user_count, assigned_group_count" type="Stored only">
+How many users and groups are assigned to the application.
+</ResponseField>
+
+</Accordion>
+
+### System Log events
+
+- **One document:** One System Log event.
+- **Title:** The event's display message, else its event type, else `Okta event` with its id.
+- **Text:** The message, then `Event Type`, `Outcome`, `Actor`, `Severity` and `Published` lines. The title is searchable too.
+- **Date:** When the event was published.
+- **Link back:** None.
+
+<ResponseField name="event_type" type="Searchable text">
+The event type, written as the `Event Type` line. It is the title when the event has no display message.
+</ResponseField>
+
+<ResponseField name="outcome, severity" type="Searchable text">
+The result with its reason, and the severity.
+</ResponseField>
+
+<ResponseField name="actor" type="Searchable text, Graph connection">
+Who performed the action, by display name, else alternate id, else id, written as the `Actor` line. The event is linked to that person's user record.
+</ResponseField>
+
+<ResponseField name="Targets" type="Graph connection">
+The users, applications and groups the event acted on. The event is linked to each of their records. Not searchable.
+</ResponseField>
+
+<ResponseField name="published" type="Searchable text, Result date">
+When the event happened, written as the `Published` line.
+</ResponseField>
+
+<ResponseField name="additional_metadata.okta_log_uuid" type="Query filter">
+The event's Okta id. Picks out one event. Not searchable.
+</ResponseField>
+
+**Example searches**
+
+- Which members are listed for the Engineering-Admins group?
+- Which recorded sign-in events failed yesterday?
+- Who is linked as this user's manager?
+
+## How it fits into the graph
+
+- Users use the Record class.
+- Groups use the Record class.
+- Applications use the Record class.
+- System Log events use the Record class.
+
+[Graph classes](/essentials/v2/connector-providers#graph-classes) explains each class.
+
+**Connections Okta creates**
+
+- A user to their manager.
+- A group to each of its members.
+- A group that comes from an application to that application.
+- An application to each assigned user and group.
+- A System Log event to the user who performed it, and to each user, application or group it acted on.
+- A link is made only when its target was synced by this connector. Each item has at most 200 links.
+- No links to items in other tools.
+
+**People and groups**
+
+- Each user, identified by primary email.
+- Groups and applications are linked records, not people.
+- Managers, members, assignees and event actors are linked to user records, not added as separate people.
+
+**Found in the text**
+
+The text of users, groups, applications and events, including department, organization and location. HydraDB identifies people, organizations, projects and other named things in this text. To steer what it looks for, use [custom instructions](/essentials/v2/connectors#4-custom-ingestion-instructions).
+
+## Not synced
+
+- Policies, authorization servers, network zones and admin role assignments.
+- Custom profile attributes outside the fields listed above.
+- System Log events older than the sync window.
+- Member and assignee names beyond 200 per group or application, and links beyond 200 per item.
+- Group memberships and application assignments as their own documents. They are shown on the group or application.
+- Deletions: users, groups, applications and MFA factors deleted in Okta can stay in HydraDB.

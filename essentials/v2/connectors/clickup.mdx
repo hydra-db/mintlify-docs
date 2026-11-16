@@ -1,36 +1,324 @@
 ---
 title: "ClickUp"
-description: "What HydraDB syncs from ClickUp, and how to connect it."
+description: "Sync every task, subtask and task comment from the ClickUp Workspaces you choose, plus one overview page per Workspace. ClickUp permissions are not imported."
 icon: "/images/connectors/clickup.svg"
 ---
 
-## What syncs
+Sync every task and subtask, including closed and archived ones, from the ClickUp Workspaces you select. Each task is one document with its description, status, people, checklists, custom fields, and its list, folder and space names. Each comment is its own document, linked to its task. Each Workspace is one short overview page listing its members.
 
-**Indexed object types**
+ClickUp permissions are not imported, so every synced item is visible to everyone who can query the collection unless you set an access rule. Task dependencies and linked tasks do not become links. Items deleted in ClickUp can stay in HydraDB.
 
-- `team`
-- `task`
-- `task_comment`
+## Permissions
 
-## Connect
+<Warning>
+ClickUp permissions are not imported, so **Enforce ACL** is unavailable for this connector. Every synced item is visible to everyone who can query the collection, unless you [set an access rule on the resource](/essentials/v2/connectors#set-your-own-rule-on-a-resource).
+</Warning>
 
-Create one connector per account, using that account's credentials where required. Use a separate connector for a different account; see [account scopes](/essentials/v2/connectors#6-connect-several-accounts-from-one-provider). Shared destinations are allowed, but collection names do not authorize access.
+- ClickUp guest access and private Spaces, Lists and Tasks are not reproduced. Set an access rule on each Workspace that should be restricted.
+- Every synced item carries a fixed note saying ClickUp visibility is not captured, in `additional_metadata.rbac_warning`. The note itself restricts nothing.
 
-1. Create a personal API token under avatar → Settings → Apps → API Token. ClickUp personal tokens have no scope picker and inherit the user; use a dedicated account that can open every Workspace you intend to select.
-2. ClickUp personal tokens have no refresh flow. Rotate by generating a replacement, updating the connector, verifying discovery and sync, and then revoking the old token; an OAuth installation must use ClickUp's refresh-token lifecycle instead.
-3. Pick Workspaces after connecting. Tasks and subtasks are indexed with descriptions, status, assignees, priority, tags and list/folder context. Task comments are indexed as first-class comment documents with human author and parent-task context. ClickUp limits personal and OAuth tokens per Workspace plan, starting at 100 requests/minute on Free, Unlimited and Business.
-4. HydraDB does not currently reproduce ClickUp guest or private Space/List/Task visibility. Synced tasks and comments are tenant-wide under the current fail-open policy, carry a persistent rbac_warning, and can be restricted with a HydraDB resource ACL for the selected Workspace.
+API-key requests must omit `enforce_acl`, including `false`. See [ACL on synced content](/essentials/v2/connectors#5-acl-native-rbac-awareness).
 
-Use provider `clickup` with [Create Connector](/api-reference/v2/endpoint/create-connector), then [discover resources](/api-reference/v2/endpoint/discover-connector-resources) and [configure the resources](/api-reference/v2/endpoint/configure-connector) you want to sync. The [provider description](/api-reference/v2/endpoint/list-connector-providers) supplies the credential fields for your deployment.
+## Before you connect
 
-## Common mistakes
+### Credentials
 
-- A provider page describes indexed content, not the access granted to your credentials. Select resources the connected account can read.
-- Synced content is not automatically private to each person. Review [ACL enforcement](/essentials/v2/connectors#enforce-acl) and set resource access rules where needed.
-- API-key requests must omit `enforce_acl`, including `false`. Only a signed-in human workspace owner or writer can change **Enforce ACL** in dashboard connector settings, and enabling it requires `acl_supported: true`.
+ClickUp uses a personal API token. It has no scopes to choose: it sees what its user sees.
 
-## Related
+<ResponseField name="api_token" type="secret string" required>
+A ClickUp personal API token, which starts with `pk_`.
+</ResponseField>
 
-- [Connector providers](/essentials/v2/connector-providers)
-- [Connectors](/essentials/v2/connectors): setup, sync, and access control
-- [Get Connector Status](/api-reference/v2/endpoint/get-connector-status): progress and warnings
+ClickUp limits requests per token by Workspace plan, starting at 100 a minute on Free, Unlimited and Business. To rotate the token, generate a new one, update the connector, check that HydraDB still lists your Workspaces and a sync succeeds, then revoke the old one.
+
+### Set it up
+
+<Steps>
+  <Step title="Create a token">
+    In ClickUp, open your avatar, Settings, Apps, API Token, and generate a token. Use a dedicated account that can open every Workspace you plan to select.
+  </Step>
+  <Step title="Create the connector">
+    Paste the token as `api_token`.
+  </Step>
+  <Step title="Select Workspaces">
+    HydraDB lists every Workspace the token can see. Select the Workspaces to sync. Each selected Workspace syncs its tasks and subtasks, whether open, closed or archived.
+  </Step>
+</Steps>
+
+One connector reads what one token's ClickUp user can see.
+
+<Accordion title="Connect through the API">
+
+Use provider `clickup` with [Create Connector](/api-reference/v2/endpoint/create-connector). Then call [Discover Connector Resources](/api-reference/v2/endpoint/discover-connector-resources) to list the resources the connector can sync, and [Configure Connector](/api-reference/v2/endpoint/configure-connector) to choose what to sync.
+
+</Accordion>
+
+## Keeping in sync
+
+- **First sync:** A newly selected Workspace reads back the window set by `lookback_days`, 30 days by default, measured on when tasks were last updated. The comments on those tasks are read in full, however old they are. Workspace overviews are read in full.
+- **New and changed items:** Each sync reads the tasks updated since the last sync, whether open, closed or archived, and reads all comments on each of those tasks again.
+- **Edits:** An edited task is picked up through its last-updated time and updates its document. A comment is read again only when its task is picked up.
+- **Deletions:** Tasks and comments deleted in ClickUp can stay searchable in HydraDB.
+
+After the first sync, HydraDB syncs every hour by default. Set `sync_interval_seconds` on the connector to change it.
+
+## What gets synced
+
+### On every ClickUp item
+
+<ResponseField name="connector_id" type="Query filter">
+Limits a query to this connector's items. Not searchable.
+</ResponseField>
+
+<ResponseField name="provider" type="Query filter">
+Always `clickup`. Not searchable.
+</ResponseField>
+
+<ResponseField name="additional_metadata.rbac_warning" type="Query filter">
+A fixed note that ClickUp visibility is not captured and the item is open to everyone who can query the collection. It does not restrict access. Not searchable.
+</ResponseField>
+
+### Tasks
+
+- **One document:** One ClickUp task or subtask. Its comments are separate documents.
+- **Title:** The task name, or `ClickUp task` and its id when the name is empty.
+- **Text:** The task name, then the description as plain text when it differs from the name. Then `Status`, `Assignees`, `Priority`, `Tags`, `List`, `Folder` and `Space` lines, each checklist with its items marked `[ ]` or `[x]`, each custom field with a value as `name: value`, and one `Attachment` line per file name. The creator, the first assignee, the creation and closure dates, the task id and the parent are written into the task details too. The title is searchable too.
+- **Date:** When the task was last updated, or when it was created if there is no update time.
+- **Link back:** The task's page in ClickUp.
+- **Files:** Files attached to the task are downloaded with the connector's token and read, and their text becomes searchable with the task. A file with no id or download address is skipped. A file that fails to download or is not a supported type keeps only its details.
+
+<ResponseField name="Task id" type="Searchable text">
+The ClickUp task id. It keeps later syncs on the same document.
+</ResponseField>
+
+<ResponseField name="status" type="Searchable text">
+The status label, written as the `Status` line.
+</ResponseField>
+
+<ResponseField name="priority" type="Searchable text">
+The priority label, written as the `Priority` line.
+</ResponseField>
+
+<ResponseField name="tags" type="Searchable text">
+Tag names, written as the `Tags` line.
+</ResponseField>
+
+<ResponseField name="assignees" type="Searchable text">
+Every assignee's username, or email, written as the `Assignees` line.
+</ResponseField>
+
+<ResponseField name="assignee" type="Searchable text, Graph identity">
+The first assignee's username, or email. The graph records that person as the assignee. Other assignees are only in the text.
+</ResponseField>
+
+<ResponseField name="assignee_email" type="Graph identity">
+The first assignee's email, when available. Identifies the assignee in the graph. Not searchable.
+</ResponseField>
+
+<ResponseField name="reporter" type="Searchable text, Graph identity">
+The creator's display name, or email. The graph records that person as the reporter.
+</ResponseField>
+
+<ResponseField name="reporter_email" type="Graph identity">
+The creator's email, when available. Identifies the reporter in the graph. Not searchable.
+</ResponseField>
+
+<ResponseField name="list_name, folder_name, space_name" type="Searchable text">
+The names of the task's list, folder and space, written as `List`, `Folder` and `Space` lines. They are not filters, and they do not become items in the graph.
+</ResponseField>
+
+<ResponseField name="checklists" type="Searchable text">
+Each checklist name and its items, marked done or not done.
+</ResponseField>
+
+<ResponseField name="clickup_custom_fields" type="Searchable text">
+Each custom field that has a value, written as `name: value`.
+</ResponseField>
+
+<ResponseField name="Attached files" type="Searchable text">
+The text read from each attached file, searchable with the task. Each file name is also written as an `Attachment` line.
+</ResponseField>
+
+<ResponseField name="created_at" type="Searchable text, Result date">
+When the task was created, written into the task details. Sets the result date only when there is no update time.
+</ResponseField>
+
+<ResponseField name="resolved_at" type="Searchable text">
+When the task was closed, written into the task details.
+</ResponseField>
+
+<ResponseField name="updated_at" type="Result date">
+When the task was last updated. Sets the result date and decides when a sync picks the task up. Not searchable.
+</ResponseField>
+
+<ResponseField name="date_created, date_updated, date_closed" type="Result date">
+The original times in milliseconds, as ClickUp sends them. They become `created_at`, `updated_at` and `resolved_at`. Not searchable.
+</ResponseField>
+
+<ResponseField name="parent_id" type="Searchable text, Graph connection">
+For a subtask, its parent task's id. Links the subtask to its parent.
+</ResponseField>
+
+<ResponseField name="additional_metadata.clickup_task_id" type="Query filter">
+The ClickUp task id. Picks out one task. Not searchable.
+</ResponseField>
+
+<Accordion title="Stored only, not searchable (8)">
+
+<ResponseField name="creator, creator_id" type="Stored only">
+The creator's username, or email, and ClickUp id, as ClickUp sends them. The same person is searchable through `reporter`.
+</ResponseField>
+
+<ResponseField name="assignee_ids" type="Stored only">
+The ClickUp ids of all assignees.
+</ResponseField>
+
+<ResponseField name="parent" type="Stored only">
+The parent task id as ClickUp sends it. `parent_id` carries the searchable parent and the link.
+</ResponseField>
+
+<ResponseField name="due_date" type="Stored only">
+The due date. It is not written into the text.
+</ResponseField>
+
+<ResponseField name="clickup_due_date" type="Stored only">
+The due date in milliseconds, as ClickUp sends it.
+</ResponseField>
+
+<ResponseField name="dependencies, linked_tasks" type="Stored only">
+Dependency and linked-task references. They are not written into the text and do not become links.
+</ResponseField>
+
+<ResponseField name="team_id" type="Stored only">
+The Workspace id.
+</ResponseField>
+
+<ResponseField name="list_id, folder_id, space_id" type="Stored only">
+The ids of the task's list, folder and space.
+</ResponseField>
+
+</Accordion>
+
+### Comments
+
+- **One document:** One comment on a task.
+- **Title:** `Comment by <author> on <task name>`, or `Comment on <task name>` without an author.
+- **Text:** A `Task` line with the task name and id, then the comment text. The author, the comment time and the task id are written with it.
+- **Date:** When the comment was posted.
+- **Link back:** The task's page in ClickUp. Comments have no link of their own.
+
+<ResponseField name="author" type="Searchable text, Graph identity">
+The commenter's username, or email. The graph records the comment as written by that person.
+</ResponseField>
+
+<ResponseField name="author_email" type="Graph identity">
+The commenter's email, when ClickUp returns it. Identifies the commenter in the graph. Not searchable.
+</ResponseField>
+
+<ResponseField name="task_name" type="Searchable text">
+The name of the task, in the `Task` line, so a comment matches queries about its task.
+</ResponseField>
+
+<ResponseField name="parent_id" type="Searchable text, Graph connection">
+The id of the task the comment is on. Links the comment to that task.
+</ResponseField>
+
+<ResponseField name="created_at" type="Searchable text, Result date">
+When the comment was posted, written as the `Created` line.
+</ResponseField>
+
+<ResponseField name="date" type="Result date">
+The comment time in milliseconds, as ClickUp sends it. It becomes `created_at`. Not searchable.
+</ResponseField>
+
+<ResponseField name="additional_metadata.clickup_comment_id" type="Query filter">
+The ClickUp comment id. Picks out one comment. Not searchable.
+</ResponseField>
+
+<ResponseField name="additional_metadata.clickup_task_id" type="Query filter">
+The id of the task. Returns every comment on one task. Not searchable.
+</ResponseField>
+
+<Accordion title="Stored only, not searchable (3)">
+
+<ResponseField name="author_id" type="Stored only">
+The commenter's ClickUp id.
+</ResponseField>
+
+<ResponseField name="resolved" type="Stored only">
+Whether the action assigned in the comment is resolved.
+</ResponseField>
+
+<ResponseField name="team_id" type="Stored only">
+The Workspace id.
+</ResponseField>
+
+</Accordion>
+
+### Workspace overviews
+
+- **One document:** One selected ClickUp Workspace.
+- **Title:** The Workspace name, or `ClickUp workspace` and its id when the name is empty.
+- **Text:** `ClickUp workspace:` and the name, then a `Members` line with member usernames or emails. The title is searchable too.
+- **Date:** None.
+- **Link back:** None.
+
+<ResponseField name="member_names" type="Searchable text">
+Member display names, written as the `Members` line. Members are not added to the graph as people.
+</ResponseField>
+
+<Accordion title="Stored only, not searchable (3)">
+
+<ResponseField name="members" type="Stored only">
+The member details ClickUp returned.
+</ResponseField>
+
+<ResponseField name="color" type="Stored only">
+The Workspace color.
+</ResponseField>
+
+<ResponseField name="avatar" type="Stored only">
+The link to the Workspace avatar image.
+</ResponseField>
+
+</Accordion>
+
+**Example searches**
+
+- What is open and high priority in the Mobile list?
+- Which checklist items are still open on the launch task?
+- What did people say in the comments on the checkout redesign task?
+
+## How it fits into the graph
+
+- Tasks use the Ticket class.
+- Comments use the Comment class.
+- Workspace overviews use the Page class.
+
+[Graph classes](/essentials/v2/connector-providers#graph-classes) explains each class.
+
+**Connections ClickUp creates**
+
+- A subtask to its parent task.
+- A comment to its task.
+- Task dependencies and linked tasks do not become links.
+- No links to items in other tools.
+
+**People and groups**
+
+- The creator and the first assignee of each task.
+- The author of each comment.
+- Other assignees and Workspace members appear only in the text.
+
+**Found in the text**
+
+Task descriptions, checklist items, custom field values and comment text. HydraDB identifies people, organizations, projects and other named things in this text. To steer what it looks for, use [custom instructions](/essentials/v2/connectors#4-custom-ingestion-instructions).
+
+## Not synced
+
+- Workspaces you did not select.
+- Spaces, folders and lists as items of their own. Their names appear on tasks.
+- Goals, time entries, tags as items of their own, custom field definitions and task templates.
+- ClickUp visibility: guests, and private Spaces, Lists and Tasks.
+- Comments marked deleted.
+- Attached files with no usable id or download address.

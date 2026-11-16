@@ -1,36 +1,712 @@
 ---
 title: "Pipedrive"
-description: "What HydraDB syncs from Pipedrive, and how to connect it."
+description: "Sync deals, leads, projects, tasks, persons, organizations, activities and notes from one Pipedrive account. Pipedrive visibility settings are not enforced."
 icon: "/images/connectors/pipedrive-light.svg"
 ---
 
-## What syncs
+Sync a whole Pipedrive account: deals, leads, projects and project tasks, persons, organizations, activities such as calls and meetings, and notes. Each record is one document. Stage, pipeline, organization, person, activity type, product and lead label ids are turned into names. A note or activity links to every deal, person, organization and lead it is attached to.
 
-**Indexed object types**
+Pipedrive's visibility setting is kept as a filter but does not restrict who can read an item, so every synced item is visible to everyone who can query the collection unless you set an access rule. Records deleted in Pipedrive stay in HydraDB. Pipedrive mail, files and call logs are not synced.
 
-- `deals`
-- `persons`
-- `organizations`
-- `notes`
-- `activities`
-- `leads`
-- `projects`
-- `tasks`
+<Note>
+Pipedrive is in beta.
+</Note>
 
-## Connect
+## Permissions
 
-Create one connector per account, using that account's credentials where required. Use a separate connector for a different account; see [account scopes](/essentials/v2/connectors#6-connect-several-accounts-from-one-provider). Shared destinations are allowed, but collection names do not authorize access.
+<Warning>
+Pipedrive permissions are not imported, so **Enforce ACL** is unavailable for this connector. Every synced item is visible to everyone who can query the collection, unless you [set an access rule on the resource](/essentials/v2/connectors#set-your-own-rule-on-a-resource).
+</Warning>
 
-Use provider `pipedrive` with [Create Connector](/api-reference/v2/endpoint/create-connector), then [discover resources](/api-reference/v2/endpoint/discover-connector-resources) and [configure the resources](/api-reference/v2/endpoint/configure-connector) you want to sync. The [provider description](/api-reference/v2/endpoint/list-connector-providers) supplies the credential fields for your deployment.
+- Pipedrive's `visible_to` setting is stored as `additional_metadata.visible_to`. You can filter on it, but it does not decide who can read an item.
 
-## Common mistakes
+API-key requests must omit `enforce_acl`, including `false`. See [ACL on synced content](/essentials/v2/connectors#5-acl-native-rbac-awareness).
 
-- A provider page describes indexed content, not the access granted to your credentials. Select resources the connected account can read.
-- Synced content is not automatically private to each person. Review [ACL enforcement](/essentials/v2/connectors#enforce-acl) and set resource access rules where needed.
-- API-key requests must omit `enforce_acl`, including `false`. Only a signed-in human workspace owner or writer can change **Enforce ACL** in dashboard connector settings, and enabling it requires `acl_supported: true`.
+## Before you connect
 
-## Related
+### Credentials
 
-- [Connector providers](/essentials/v2/connector-providers)
-- [Connectors](/essentials/v2/connectors): setup, sync, and access control
-- [Get Connector Status](/api-reference/v2/endpoint/get-connector-status): progress and warnings
+Pipedrive uses a personal API token.
+
+<ResponseField name="api_token" type="secret string" required>
+A Pipedrive personal API token. The connector reads every record this token can see.
+</ResponseField>
+
+### Set it up
+
+<Steps>
+  <Step title="Copy an API token">
+    In Pipedrive, copy the personal API token of a user who can see the records you want in HydraDB.
+  </Step>
+  <Step title="Create the connector">
+    Paste the token as `api_token`.
+  </Step>
+  <Step title="Configure the connector">
+    Pipelines are offered for selection, but selecting them does not narrow the sync. The connector syncs every record the token can read in the account.
+  </Step>
+</Steps>
+
+One connector reads one Pipedrive account.
+
+<Accordion title="Connect through the API">
+
+Use provider `pipedrive` with [Create Connector](/api-reference/v2/endpoint/create-connector). Then call [Discover Connector Resources](/api-reference/v2/endpoint/discover-connector-resources) to list the resources the connector can sync, and [Configure Connector](/api-reference/v2/endpoint/configure-connector) to choose what to sync.
+
+</Accordion>
+
+## Keeping in sync
+
+- **First sync:** Reaches back the window set by `lookback_days`, 30 days by default.
+- **New and changed items:** Each sync reads records whose update time moved past the last sync. A deal's line items are read again whenever the deal changes.
+- **Edits:** An edited record is read again and updates its document.
+- **Deletions:** Deleted records are not removed. They stay searchable in HydraDB. A record Pipedrive marks as deleted is flagged, so you can leave it out with `additional_metadata.is_deleted`, or `additional_metadata.active_flag` for notes.
+
+After the first sync, HydraDB syncs every hour by default. Set `sync_interval_seconds` on the connector to change it.
+
+## What gets synced
+
+### On every Pipedrive item
+
+<ResponseField name="additional_metadata.pipedrive_id" type="Query filter">
+The Pipedrive record id. Ids can repeat across record types, so combine it with `additional_metadata.pipedrive_object` to target one record. Not searchable.
+</ResponseField>
+
+<ResponseField name="additional_metadata.pipedrive_object" type="Query filter">
+The record type, such as `deals`, `persons` or `notes`. Limits a query to one type. Not searchable.
+</ResponseField>
+
+<ResponseField name="connector_id" type="Query filter">
+Limits a query to this connector's items. Not searchable.
+</ResponseField>
+
+<ResponseField name="provider" type="Query filter">
+Always `pipedrive`. Not searchable.
+</ResponseField>
+
+### Deals
+
+- **One document:** One deal.
+- **Title:** The deal title.
+- **Text:** The deal title, then `Value` with its currency, `Status`, `Lost reason`, `Stage`, `Pipeline`, `Organization`, `Contact`, `Expected close` and `Owner` lines. Then a `Products` block listing each line item with its quantity, price, currency and comments. The deal's key and creation time are part of the text too.
+- **Date:** When the deal was last modified, else when it was created.
+- **Link back:** None.
+
+<ResponseField name="value" type="Searchable text">
+The deal amount, written as the `Value` line with `currency`.
+</ResponseField>
+
+<ResponseField name="currency" type="Searchable text">
+The deal currency, written with the value.
+</ResponseField>
+
+<ResponseField name="status" type="Searchable text">
+The deal outcome, written as the `Status` line.
+</ResponseField>
+
+<ResponseField name="lost_reason" type="Searchable text">
+Why a lost deal was lost, written as the `Lost reason` line.
+</ResponseField>
+
+<ResponseField name="stage" type="Searchable text">
+The stage name, written as the `Stage` line. When the name cannot be found, the stage id is written instead.
+</ResponseField>
+
+<ResponseField name="pipeline" type="Searchable text">
+The pipeline name, written as the `Pipeline` line. When the name cannot be found, the pipeline id is written instead.
+</ResponseField>
+
+<ResponseField name="organization" type="Searchable text">
+The organization name, written as the `Organization` line.
+</ResponseField>
+
+<ResponseField name="person" type="Searchable text">
+The contact person's name, written as the `Contact` line.
+</ResponseField>
+
+<ResponseField name="org_id" type="Searchable text, Graph connection">
+Links the deal to its organization. Written into the text only when the organization's name cannot be found.
+</ResponseField>
+
+<ResponseField name="person_id" type="Searchable text, Graph connection">
+Links the deal to its contact person. Written into the text only when the person's name cannot be found.
+</ResponseField>
+
+<ResponseField name="products" type="Searchable text">
+The product names of the deal's line items, written in the `Products` block, so a query can find the deals that include a product.
+</ResponseField>
+
+<ResponseField name="owner" type="Searchable text">
+The owner's name or email, written as the `Owner` line, where HydraDB can identify the person.
+</ResponseField>
+
+<ResponseField name="additional_metadata.expected_close_date" type="Searchable text, Query filter">
+The expected closing date, written as the `Expected close` line. Limits a query to a range of closing dates.
+</ResponseField>
+
+<ResponseField name="additional_metadata.is_deleted" type="Query filter">
+Set when Pipedrive marks the deal as deleted. Leaves deleted deals out of a query. Not searchable.
+</ResponseField>
+
+<ResponseField name="additional_metadata.is_archived" type="Query filter">
+Set when the deal is archived. Leaves archived deals out of a query. Not searchable.
+</ResponseField>
+
+<ResponseField name="additional_metadata.visible_to" type="Query filter">
+Pipedrive's visibility level for the deal. Filters on that value. It does not decide who can read the deal. Not searchable.
+</ResponseField>
+
+<ResponseField name="external_id" type="Searchable text">
+The record type and Pipedrive id together, written into the text as the deal's key. Keeps later syncs on the same document.
+</ResponseField>
+
+<ResponseField name="created_at" type="Searchable text, Result date">
+When the deal was created, written as a `Created` line. Used as the result date only when the modification time is missing.
+</ResponseField>
+
+<ResponseField name="updated_at" type="Result date">
+When the deal was last modified. Not searchable.
+</ResponseField>
+
+<Accordion title="Stored only, not searchable (8)">
+
+<ResponseField name="won_time" type="Stored only">
+When the deal was won.
+</ResponseField>
+
+<ResponseField name="lost_time" type="Stored only">
+When the deal was lost.
+</ResponseField>
+
+<ResponseField name="probability" type="Stored only">
+The win probability.
+</ResponseField>
+
+<ResponseField name="mrr" type="Stored only">
+Monthly recurring revenue.
+</ResponseField>
+
+<ResponseField name="arr" type="Stored only">
+Annual recurring revenue.
+</ResponseField>
+
+<ResponseField name="acv" type="Stored only">
+Annual contract value.
+</ResponseField>
+
+<ResponseField name="label_ids" type="Stored only">
+The deal's label ids. They are not turned into names.
+</ResponseField>
+
+<ResponseField name="object_type" type="Stored only">
+The record type. Filter on it with `additional_metadata.pipedrive_object`.
+</ResponseField>
+
+</Accordion>
+
+### Leads
+
+- **One document:** One lead.
+- **Title:** The lead title.
+- **Text:** The lead title, then `Value`, `Labels`, `Source`, `Organization`, `Contact`, `Expected close` and `Owner` lines. The lead's key and creation time are part of the text too. When none of a lead's label names can be found, the lead's other filled-in fields are written into the text as a list instead.
+- **Date:** When the lead was last modified, else when it was created.
+- **Link back:** None.
+
+<ResponseField name="value" type="Searchable text">
+The lead amount, written as the `Value` line with `currency`.
+</ResponseField>
+
+<ResponseField name="currency" type="Searchable text">
+The lead currency, written with the value.
+</ResponseField>
+
+<ResponseField name="labels" type="Searchable text">
+The lead's label names, written as the `Labels` line.
+</ResponseField>
+
+<ResponseField name="source_name" type="Searchable text">
+Where the lead came from, written as the `Source` line.
+</ResponseField>
+
+<ResponseField name="organization" type="Searchable text">
+The organization name, written as the `Organization` line.
+</ResponseField>
+
+<ResponseField name="person" type="Searchable text">
+The contact person's name, written as the `Contact` line.
+</ResponseField>
+
+<ResponseField name="org_id" type="Searchable text, Graph connection">
+Links the lead to its organization. Written into the text only when the organization's name is missing or the lead is written as a list.
+</ResponseField>
+
+<ResponseField name="person_id" type="Searchable text, Graph connection">
+Links the lead to its contact person. Written into the text only when the person's name is missing or the lead is written as a list.
+</ResponseField>
+
+<ResponseField name="label_ids" type="Searchable text">
+The lead's label ids. Written into the text only when the lead is written as a list.
+</ResponseField>
+
+<ResponseField name="owner" type="Searchable text">
+The owner's name or email, written as the `Owner` line, where HydraDB can identify the person.
+</ResponseField>
+
+<ResponseField name="additional_metadata.expected_close_date" type="Searchable text, Query filter">
+The expected closing date, written as the `Expected close` line. Limits a query to a range of closing dates.
+</ResponseField>
+
+<ResponseField name="additional_metadata.is_archived" type="Query filter">
+Set when the lead is archived. Leaves archived leads out of a query. Not searchable.
+</ResponseField>
+
+<ResponseField name="additional_metadata.visible_to" type="Query filter">
+Pipedrive's visibility level for the lead. Filters on that value. It does not decide who can read the lead. Not searchable.
+</ResponseField>
+
+<ResponseField name="external_id" type="Searchable text">
+The record type and Pipedrive id together, written into the text as the lead's key. Keeps later syncs on the same document.
+</ResponseField>
+
+<ResponseField name="created_at" type="Searchable text, Result date">
+When the lead was created, written as a `Created` line. Used as the result date only when the modification time is missing.
+</ResponseField>
+
+<ResponseField name="updated_at" type="Searchable text, Result date">
+When the lead was last modified. Written into the text only when the lead is written as a list.
+</ResponseField>
+
+<ResponseField name="object_type" type="Searchable text">
+The record type. Written into the text only when the lead is written as a list. Filter on it with `additional_metadata.pipedrive_object`.
+</ResponseField>
+
+### Projects
+
+- **One document:** One project.
+- **Title:** The project title.
+- **Text:** The project description. The title, the project's key and its creation time are searchable too. The status, health, dates and owner are not part of the text. Filter on status and health, or follow the project's links, instead.
+- **Date:** When the project was last modified, else when it was created.
+- **Link back:** None.
+
+<ResponseField name="description" type="Searchable text">
+The project description.
+</ResponseField>
+
+<ResponseField name="deal_ids" type="Graph connection">
+Links the project to each linked deal. Not searchable.
+</ResponseField>
+
+<ResponseField name="org_ids" type="Graph connection">
+Links the project to each linked organization. Not searchable.
+</ResponseField>
+
+<ResponseField name="person_ids" type="Graph connection">
+Links the project to each linked person. Not searchable.
+</ResponseField>
+
+<ResponseField name="additional_metadata.project_status" type="Query filter">
+The project status. Limits a query to open, completed, canceled or deleted projects. Not searchable.
+</ResponseField>
+
+<ResponseField name="additional_metadata.health_status" type="Query filter">
+The project health. Limits a query to projects that are at risk or off track. Not searchable.
+</ResponseField>
+
+<ResponseField name="external_id" type="Searchable text">
+The record type and Pipedrive id together, written into the text as the project's key. Keeps later syncs on the same document.
+</ResponseField>
+
+<ResponseField name="created_at" type="Searchable text, Result date">
+When the project was created, written as a `Created` line. Used as the result date only when the modification time is missing.
+</ResponseField>
+
+<ResponseField name="updated_at" type="Result date">
+When the project was last modified. Not searchable.
+</ResponseField>
+
+<Accordion title="Stored only, not searchable (6)">
+
+<ResponseField name="body" type="Stored only">
+A summary with the project's status, health, start, end and owner. It is not part of the searchable text.
+</ResponseField>
+
+<ResponseField name="start_date" type="Stored only">
+When the project starts.
+</ResponseField>
+
+<ResponseField name="end_date" type="Stored only">
+When the project ends.
+</ResponseField>
+
+<ResponseField name="owner" type="Stored only">
+The owner's name or email.
+</ResponseField>
+
+<ResponseField name="label_ids" type="Stored only">
+The project's label ids.
+</ResponseField>
+
+<ResponseField name="object_type" type="Stored only">
+The record type. Filter on it with `additional_metadata.pipedrive_object`.
+</ResponseField>
+
+</Accordion>
+
+### Tasks
+
+- **One document:** One project task.
+- **Title:** The task title.
+- **Text:** The task description. The title, the task's key and its creation time are searchable too. The project name, assignees and dates are not part of the text. Filter on completion, milestone and priority, or follow the task's links, instead.
+- **Date:** When the task was last modified, else when it was created.
+- **Link back:** None.
+
+<ResponseField name="description" type="Searchable text">
+The task description.
+</ResponseField>
+
+<ResponseField name="project_id" type="Graph connection">
+Links the task to its project. Not searchable.
+</ResponseField>
+
+<ResponseField name="parent_task_id" type="Graph connection">
+Links the task to its parent task. Not searchable.
+</ResponseField>
+
+<ResponseField name="additional_metadata.is_done" type="Query filter">
+Whether the task is done. Limits a query to unfinished tasks. Not searchable.
+</ResponseField>
+
+<ResponseField name="additional_metadata.is_milestone" type="Query filter">
+Whether the task is a milestone. Limits a query to project milestones. Not searchable.
+</ResponseField>
+
+<ResponseField name="additional_metadata.priority" type="Query filter">
+The task priority. Limits a query to one priority. Not searchable.
+</ResponseField>
+
+<ResponseField name="external_id" type="Searchable text">
+The record type and Pipedrive id together, written into the text as the task's key. Keeps later syncs on the same document.
+</ResponseField>
+
+<ResponseField name="created_at" type="Searchable text, Result date">
+When the task was created, written as a `Created` line. Used as the result date only when the modification time is missing.
+</ResponseField>
+
+<ResponseField name="updated_at" type="Result date">
+When the task was last modified. Not searchable.
+</ResponseField>
+
+<Accordion title="Stored only, not searchable (7)">
+
+<ResponseField name="body" type="Stored only">
+A summary with the task's project, assignees, start, due and completion dates. It is not part of the searchable text.
+</ResponseField>
+
+<ResponseField name="project" type="Stored only">
+The project's title.
+</ResponseField>
+
+<ResponseField name="assignees" type="Stored only">
+The names of the assigned users. They are not linked to the task as people.
+</ResponseField>
+
+<ResponseField name="start_date" type="Stored only">
+When the task starts.
+</ResponseField>
+
+<ResponseField name="due_date" type="Stored only">
+When the task is due.
+</ResponseField>
+
+<ResponseField name="marked_as_done_time" type="Stored only">
+When the task was completed.
+</ResponseField>
+
+<ResponseField name="object_type" type="Stored only">
+The record type. Filter on it with `additional_metadata.pipedrive_object`.
+</ResponseField>
+
+</Accordion>
+
+### Persons
+
+- **One document:** One person.
+- **Title:** The person's name.
+- **Text:** `Name`, `Emails`, `Phones`, `Organization` and `Owner` lines.
+- **Date:** When the person was last modified, else when they were created.
+- **Link back:** None.
+
+<ResponseField name="emails" type="Searchable text">
+The person's email addresses, written as the `Emails` line.
+</ResponseField>
+
+<ResponseField name="phones" type="Searchable text">
+The person's phone numbers, written as the `Phones` line.
+</ResponseField>
+
+<ResponseField name="organization" type="Searchable text">
+The organization name, written as the `Organization` line.
+</ResponseField>
+
+<ResponseField name="org_id" type="Searchable text, Graph connection">
+Links the person to their organization. Written into the text only when the organization's name cannot be found.
+</ResponseField>
+
+<ResponseField name="owner" type="Searchable text">
+The owner's name or email, written as the `Owner` line, where HydraDB can identify the person.
+</ResponseField>
+
+<ResponseField name="additional_metadata.is_deleted" type="Query filter">
+Set when Pipedrive marks the person as deleted. Leaves deleted persons out of a query. Not searchable.
+</ResponseField>
+
+<ResponseField name="additional_metadata.visible_to" type="Query filter">
+Pipedrive's visibility level for the person. Filters on that value. It does not decide who can read the person. Not searchable.
+</ResponseField>
+
+<ResponseField name="updated_at" type="Result date">
+When the person was last modified. Not searchable.
+</ResponseField>
+
+<ResponseField name="created_at" type="Result date">
+When the person was created. Used as the result date only when the modification time is missing. Not searchable.
+</ResponseField>
+
+<Accordion title="Stored only, not searchable (2)">
+
+<ResponseField name="label_ids" type="Stored only">
+The person's label ids.
+</ResponseField>
+
+<ResponseField name="object_type" type="Stored only">
+The record type. Filter on it with `additional_metadata.pipedrive_object`.
+</ResponseField>
+
+</Accordion>
+
+### Organizations
+
+- **One document:** One organization.
+- **Title:** The organization's name.
+- **Text:** `Name`, `Address` and `Owner` lines.
+- **Date:** When the organization was last modified, else when it was created.
+- **Link back:** None.
+
+<ResponseField name="address" type="Searchable text">
+The formatted address, written as the `Address` line.
+</ResponseField>
+
+<ResponseField name="owner" type="Searchable text">
+The owner's name or email, written as the `Owner` line, where HydraDB can identify the person.
+</ResponseField>
+
+<ResponseField name="additional_metadata.is_deleted" type="Query filter">
+Set when Pipedrive marks the organization as deleted. Leaves deleted organizations out of a query. Not searchable.
+</ResponseField>
+
+<ResponseField name="additional_metadata.visible_to" type="Query filter">
+Pipedrive's visibility level for the organization. Filters on that value. It does not decide who can read the organization. Not searchable.
+</ResponseField>
+
+<ResponseField name="updated_at" type="Result date">
+When the organization was last modified. Not searchable.
+</ResponseField>
+
+<ResponseField name="created_at" type="Result date">
+When the organization was created. Used as the result date only when the modification time is missing. Not searchable.
+</ResponseField>
+
+<Accordion title="Stored only, not searchable (2)">
+
+<ResponseField name="label_ids" type="Stored only">
+The organization's label ids.
+</ResponseField>
+
+<ResponseField name="object_type" type="Stored only">
+The record type. Filter on it with `additional_metadata.pipedrive_object`.
+</ResponseField>
+
+</Accordion>
+
+### Activities
+
+- **One document:** One activity, such as a call, meeting, task or logged email.
+- **Title:** The activity subject.
+- **Text:** The subject, then `Type`, `Due`, `Duration`, `Location` and `Owner` lines, then the activity note converted from HTML to text, and its public description.
+- **Date:** When the activity was last modified, else when it was created.
+- **Link back:** None.
+
+<ResponseField name="activity_type" type="Searchable text">
+The activity type's name, written as the `Type` line. When the name cannot be found, the type key is written instead.
+</ResponseField>
+
+<ResponseField name="note" type="Searchable text">
+The activity note, converted from HTML to text.
+</ResponseField>
+
+<ResponseField name="public_description" type="Searchable text">
+The activity's public description.
+</ResponseField>
+
+<ResponseField name="due_date" type="Searchable text">
+The due date, written in the `Due` line.
+</ResponseField>
+
+<ResponseField name="due_time" type="Searchable text">
+The due time, written in the `Due` line.
+</ResponseField>
+
+<ResponseField name="duration" type="Searchable text">
+The scheduled duration, written as the `Duration` line.
+</ResponseField>
+
+<ResponseField name="location" type="Searchable text">
+Where the activity takes place, written as the `Location` line.
+</ResponseField>
+
+<ResponseField name="owner" type="Searchable text">
+The owner's name or email, written as the `Owner` line, where HydraDB can identify the person.
+</ResponseField>
+
+<ResponseField name="deal_id" type="Graph connection">
+Links the activity to its deal. Not searchable.
+</ResponseField>
+
+<ResponseField name="lead_id" type="Graph connection">
+Links the activity to its lead. Not searchable.
+</ResponseField>
+
+<ResponseField name="person_id" type="Graph connection">
+Links the activity to its contact person. Not searchable.
+</ResponseField>
+
+<ResponseField name="org_id" type="Graph connection">
+Links the activity to its organization. Not searchable.
+</ResponseField>
+
+<ResponseField name="participants" type="Graph connection">
+Links the activity to each person who took part. Not searchable.
+</ResponseField>
+
+<ResponseField name="additional_metadata.is_deleted" type="Query filter">
+Set when Pipedrive marks the activity as deleted. Leaves deleted activities out of a query. Not searchable.
+</ResponseField>
+
+<ResponseField name="updated_at" type="Result date">
+When the activity was last modified. Not searchable.
+</ResponseField>
+
+<ResponseField name="created_at" type="Result date">
+When the activity was created. Used as the result date only when the modification time is missing. Not searchable.
+</ResponseField>
+
+<Accordion title="Stored only, not searchable (3)">
+
+<ResponseField name="type" type="Stored only">
+The activity type key. Its name is in `activity_type`.
+</ResponseField>
+
+<ResponseField name="done" type="Stored only">
+Whether the activity is marked as done.
+</ResponseField>
+
+<ResponseField name="marked_as_done_time" type="Stored only">
+When the activity was marked as done.
+</ResponseField>
+
+</Accordion>
+
+### Notes
+
+- **One document:** One note that has content. Empty notes are skipped.
+- **Title:** `Comment by` and the author's name. Without an author, the first 80 characters of the text.
+- **Text:** The note content converted from HTML to text, with the author, the first record it is attached to, and its created and updated times.
+- **Date:** When the note was last modified, else when it was created.
+- **Link back:** None.
+
+<ResponseField name="author" type="Searchable text, Graph identity">
+The note's author. The graph records the note as written by that person.
+</ResponseField>
+
+<ResponseField name="parent_id" type="Searchable text, Graph connection">
+The first deal, person or organization the note is attached to, written as a `Parent` line. Links the note to that record.
+</ResponseField>
+
+<ResponseField name="lead_id" type="Graph connection">
+Links the note to the lead it is attached to. Not searchable.
+</ResponseField>
+
+<ResponseField name="additional_metadata.pipedrive_parent_id" type="Query filter">
+The id of the first deal, person or organization the note is attached to. Finds the notes on that record. It does not cover a note's other records, or notes attached only to a lead. Not searchable.
+</ResponseField>
+
+<ResponseField name="additional_metadata.active_flag" type="Query filter">
+False when Pipedrive marks the note as deleted. Leaves deleted notes out of a query. Not searchable.
+</ResponseField>
+
+<ResponseField name="updated_at" type="Searchable text, Result date">
+When the note was last modified, written as an `Updated` line.
+</ResponseField>
+
+<ResponseField name="created_at" type="Searchable text, Result date">
+When the note was created, written as a `Created` line. Used as the result date only when the modification time is missing.
+</ResponseField>
+
+<Accordion title="Stored only, not searchable (2)">
+
+<ResponseField name="parent_type" type="Stored only">
+The type of the first record the note is attached to.
+</ResponseField>
+
+<ResponseField name="parent_title" type="Stored only">
+The title of the first record the note is attached to.
+</ResponseField>
+
+</Accordion>
+
+**Example searches**
+
+- Which deals for Acme are open and at what stage?
+- What was discussed in the last call with this person?
+- Which deals include the Enterprise plan product?
+
+## How it fits into the graph
+
+- Deals use the Ticket class.
+- Leads use the Ticket class.
+- Projects use the Ticket class.
+- Tasks use the Ticket class.
+- Persons use the Record class.
+- Organizations use the Record class.
+- Activities use the Record class.
+- Notes use the Comment class.
+
+[Graph classes](/essentials/v2/connector-providers#graph-classes) explains each class.
+
+**Connections Pipedrive creates**
+
+- A note or activity to every deal, person, organization and lead it is attached to.
+- An activity to each person who took part.
+- A deal or lead to its organization and contact person.
+- A person to their organization.
+- A project to every linked deal, organization and person.
+- A task to its project and its parent task.
+- No links to other tools.
+
+**People and groups**
+
+- The author of each note.
+- Owners of deals, leads, persons, organizations and activities appear in the text, where HydraDB can identify them.
+- Project owners and task assignees are kept with the item but not attached to it as people.
+
+**Found in the text**
+
+Notes, activity notes, deal titles, and project and task descriptions, along with the rest of each record's text. HydraDB identifies people, organizations, projects and other named things in this text. To steer what it looks for, use [custom instructions](/essentials/v2/connectors#4-custom-ingestion-instructions).
+
+## Not synced
+
+- Pipedrive mail messages and mail threads.
+- Files, call logs and deal stage-change history.
+- Deal participants and followers.
+- Custom field values.
+- Project boards and phases, task audit users and lead marketing attribution.
+- Records removed from Pipedrive entirely: they stay in HydraDB.

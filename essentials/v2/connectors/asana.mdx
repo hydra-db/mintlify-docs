@@ -1,38 +1,278 @@
 ---
 title: "Asana"
-description: "What HydraDB syncs from Asana, and how to connect it."
+description: "Sync tasks, subtasks, comments and project overviews from the Asana projects you choose. Asana permissions are not imported."
 icon: "/images/connectors/asana.svg"
 ---
 
-## What syncs
+Sync tasks, subtasks, comments and project overviews from the Asana projects you select. Each task and subtask is one document. Each comment on a task is its own document, linked to the task. Each project is one overview page. Tasks link to their parent task, their projects and the tasks they block or are blocked by.
 
-**Indexed object types**
+Asana permissions are not imported, so every synced item is visible to everyone who can query the collection unless you set an access rule. A task in two selected projects is stored once per project. Attachments, task activity other than comments, tags and custom fields are not synced. Items deleted in Asana can stay in HydraDB.
 
-- `tasks`
-- `subtasks`
-- `stories`
-- `projects`
+## Permissions
 
-## Connect
+<Warning>
+Asana permissions are not imported, so **Enforce ACL** is unavailable for this connector. Every synced item is visible to everyone who can query the collection, unless you [set an access rule on the resource](/essentials/v2/connectors#set-your-own-rule-on-a-resource).
+</Warning>
 
-Create one connector per account, using that account's credentials where required. Use a separate connector for a different account; see [account scopes](/essentials/v2/connectors#6-connect-several-accounts-from-one-provider). Shared destinations are allowed, but collection names do not authorize access.
+- Asana project privacy, project membership and per-task visibility are not reproduced. Set an access rule on each project that should be restricted.
+- A task in two selected projects is stored as one copy per project, and each copy follows its own project's rule.
 
-1. Create a personal access token in Asana's Developer Console under My apps → Personal access tokens. PATs inherit the creating user's visibility and have no scope picker, so use a dedicated integration user with access to every project you intend to select.
-2. Asana PATs do not refresh automatically. Rotate by creating a replacement token, updating the connector, verifying a sync, and only then revoking the old token; removing the integration user immediately invalidates its token.
-3. Pick the projects to sync after connecting. Tasks, subtasks, projects and comment stories become searchable; system-generated activity stories are skipped. The connector only reads Asana.
-4. HydraDB uses Asana's privacy_setting to capture each selected project's read audience: public_to_workspace includes active, non-guest workspace members plus explicit project memberships; private includes explicit project memberships; deprecated private_to_team includes the project team's users plus explicit project memberships. Memberships can grant admins, editors, commenters, viewers or teams. If project attribution is missing, Asana omits or returns an unknown privacy setting, hides a member email, or a permission read is incomplete, HydraDB refuses a partial ACL and shows a resource-level warning under the current fail-open policy; the content remains workspace-readable unless a customer resource rule governs it. Use a dedicated integration user's personal access token that can read the selected project, its memberships, and member email addresses.
-5. Asana quotas are per token (150 requests/minute on free domains and 1,500 on paid domains). Large comment/subtask histories fan out per task, so a dedicated token also keeps this connector from sharing quota with unrelated automations.
+API-key requests must omit `enforce_acl`, including `false`. See [ACL on synced content](/essentials/v2/connectors#5-acl-native-rbac-awareness).
 
-Use provider `asana` with [Create Connector](/api-reference/v2/endpoint/create-connector), then [discover resources](/api-reference/v2/endpoint/discover-connector-resources) and [configure the resources](/api-reference/v2/endpoint/configure-connector) you want to sync. The [provider description](/api-reference/v2/endpoint/list-connector-providers) supplies the credential fields for your deployment.
+## Before you connect
 
-## Common mistakes
+### Credentials
 
-- A provider page describes indexed content, not the access granted to your credentials. Select resources the connected account can read.
-- Synced content is not automatically private to each person. Review [ACL enforcement](/essentials/v2/connectors#enforce-acl) and set resource access rules where needed.
-- API-key requests must omit `enforce_acl`, including `false`. Only a signed-in human workspace owner or writer can change **Enforce ACL** in dashboard connector settings, and enabling it requires `acl_supported: true`.
+Asana uses a personal access token. It has no scopes to choose: it sees what its user sees.
 
-## Related
+<ResponseField name="personal_access_token" type="secret string" required>
+An Asana personal access token.
+</ResponseField>
 
-- [Connector providers](/essentials/v2/connector-providers)
-- [Connectors](/essentials/v2/connectors): setup, sync, and access control
-- [Get Connector Status](/api-reference/v2/endpoint/get-connector-status): progress and warnings
+Asana limits requests per token: 150 a minute on free domains and 1,500 on paid ones. A dedicated token keeps this connector from sharing that limit with other automations. To rotate it, create a new token, update the connector, check that a sync succeeds, then revoke the old token. Removing the token's user invalidates the token.
+
+### Set it up
+
+<Steps>
+  <Step title="Create a token">
+    In Asana's Developer Console, under My apps, Personal access tokens, create a token. A dedicated integration user works best. Add that user to every project you plan to select.
+  </Step>
+  <Step title="Create the connector">
+    Paste the token as `personal_access_token`.
+  </Step>
+  <Step title="Select projects">
+    HydraDB lists every non-archived project in every workspace the token can see. Select the projects to sync.
+  </Step>
+</Steps>
+
+One connector reads what one token's Asana user can see, across that user's workspaces.
+
+<Accordion title="Connect through the API">
+
+Use provider `asana` with [Create Connector](/api-reference/v2/endpoint/create-connector). Then call [Discover Connector Resources](/api-reference/v2/endpoint/discover-connector-resources) to list the resources the connector can sync, and [Configure Connector](/api-reference/v2/endpoint/configure-connector) to choose what to sync.
+
+</Accordion>
+
+## Keeping in sync
+
+- **First sync:** A newly selected project reads back the window set by `lookback_days`, 30 days by default, measured on when tasks and projects were last modified.
+- **New and changed items:** Each sync reads the tasks, subtasks and projects modified since the last sync. Comments are read again on every sync, without a time window.
+- **Edits:** An edited task or project is picked up through its modified time and updates its document. An edited comment is picked up because comments are read again on every sync.
+- **Deletions:** Tasks, comments and projects deleted in Asana can stay searchable in HydraDB.
+- A project that refuses access on the first request is skipped and reported, and its unread window is kept for a later sync.
+
+After the first sync, HydraDB syncs every hour by default. Set `sync_interval_seconds` on the connector to change it.
+
+## What gets synced
+
+### Tasks and subtasks
+
+- **One document:** One task or subtask, as it appears in one selected project. Its comments are separate documents.
+- **Title:** The task name, or `Asana task` and its id when the name is empty.
+- **Text:** The task notes as plain text. A task with no notes gets a short summary instead: name, assignee, due date, status (`Open` or `Completed`) and projects. A subtask ends with a `Parent task` line that names its parent. The assignee, creation date, task key and parent are written as lines too. The title is searchable too.
+- **Date:** When the task was last modified, or when it was created if there is no modification time.
+- **Link back:** The task's Asana permalink.
+- **Files:** Task attachments and their contents are not synced.
+
+<ResponseField name="Task key" type="Searchable text">
+The selected project's id and the task's id. It keeps each project's copy of the task on its own document.
+</ResponseField>
+
+<ResponseField name="assignee" type="Searchable text, Graph identity">
+The assigned user's display name, written as the `Assignee` line. The graph records that person as the assignee.
+</ResponseField>
+
+<ResponseField name="completed" type="Searchable text">
+Whether the task is done. Searchable as `Open` or `Completed` only in the summary of a task with no notes. It is not a filter.
+</ResponseField>
+
+<ResponseField name="due_at" type="Searchable text">
+The due time, or the due date. Searchable only in the summary of a task with no notes. It is not a filter.
+</ResponseField>
+
+<ResponseField name="created_at" type="Searchable text, Result date">
+When the task was created, written into the task details. Sets the result date only when there is no modification time.
+</ResponseField>
+
+<ResponseField name="updated_at" type="Result date">
+When the task was last modified. Sets the result date and decides when a sync picks the task up. Not searchable.
+</ResponseField>
+
+<ResponseField name="parent_id" type="Searchable text, Graph connection">
+For a subtask, its parent task, written as the `Parent` line. Links the subtask to its parent.
+</ResponseField>
+
+<ResponseField name="mentions" type="Graph identity">
+Display names of people @mentioned in the task notes. The graph records each as mentioned by the task. The field itself is not searchable, but the notes are.
+</ResponseField>
+
+<ResponseField name="additional_metadata.asana_gid" type="Query filter">
+The task's Asana id. Picks out one task, in every project it was synced from. Not searchable.
+</ResponseField>
+
+<ResponseField name="additional_metadata.assignee_gid" type="Query filter">
+The assigned user's Asana id. Limits a query to tasks assigned to one person. Not searchable.
+</ResponseField>
+
+<ResponseField name="connector_id" type="Query filter">
+Limits a query to this connector's items. Not searchable.
+</ResponseField>
+
+<ResponseField name="provider" type="Query filter">
+Always `asana`. Not searchable.
+</ResponseField>
+
+<Accordion title="Stored only, not searchable (1)">
+
+<ResponseField name="completed_at" type="Stored only">
+When the task was completed.
+</ResponseField>
+
+</Accordion>
+
+### Comments
+
+- **One document:** One comment on a task. A task in two selected projects has a copy of each comment per project.
+- **Title:** `Comment by <author> on <task name>`, leaving out whichever part is missing.
+- **Text:** The comment as plain text, then a `Parent task` line that names the task. The author, the posting time and the task's key are written with it.
+- **Date:** When the comment was posted.
+- **Link back:** None.
+
+<ResponseField name="author" type="Searchable text, Graph identity">
+The commenter's display name. The graph records the comment as written by that person.
+</ResponseField>
+
+<ResponseField name="created_at" type="Searchable text, Result date">
+When the comment was posted, written as the `Created` line.
+</ResponseField>
+
+<ResponseField name="parent_id" type="Searchable text, Graph connection">
+The key of the task the comment is on. Links the comment to that task.
+</ResponseField>
+
+<ResponseField name="mentions" type="Graph identity">
+Display names of people @mentioned in the comment. The graph records each as mentioned. The field itself is not searchable, but the comment text is.
+</ResponseField>
+
+<ResponseField name="additional_metadata.asana_gid" type="Query filter">
+The comment's Asana id. Picks out one comment. Not searchable.
+</ResponseField>
+
+<ResponseField name="additional_metadata.asana_task_gid" type="Query filter">
+The Asana id of the task. Returns every comment on one task. Not searchable.
+</ResponseField>
+
+<ResponseField name="additional_metadata.author_gid" type="Query filter">
+The commenter's Asana id. Limits a query to one person's comments. Not searchable.
+</ResponseField>
+
+<ResponseField name="connector_id" type="Query filter">
+Limits a query to this connector's items. Not searchable.
+</ResponseField>
+
+<ResponseField name="provider" type="Query filter">
+Always `asana`. Not searchable.
+</ResponseField>
+
+### Projects
+
+- **One document:** One selected Asana project, as an overview page.
+- **Title:** The project name, or `Asana project` and its id when the name is empty.
+- **Text:** The project notes as plain text, then the title of the latest status update when Asana supplies one. A project with neither is written as `Project: <name>`. The modification time is written as the `Updated` line. The title is searchable too.
+- **Date:** When the project was last modified, or when it was created if there is no modification time.
+- **Link back:** The project's Asana permalink.
+
+<ResponseField name="updated_at" type="Searchable text, Result date">
+When the project was last modified, written as the `Updated` line. Sets the result date.
+</ResponseField>
+
+<ResponseField name="created_at" type="Result date">
+When the project was created. Sets the result date only when there is no modification time. Not searchable.
+</ResponseField>
+
+<ResponseField name="additional_metadata.asana_gid" type="Query filter">
+The project's Asana id. Picks out one project. Not searchable.
+</ResponseField>
+
+<ResponseField name="additional_metadata.asana_kind" type="Query filter">
+Always `project`. Keeps or leaves out project overview pages. Not searchable.
+</ResponseField>
+
+<ResponseField name="additional_metadata.owner_gid" type="Query filter">
+The project owner's Asana id. Limits a query to projects owned by one person. Not searchable.
+</ResponseField>
+
+<ResponseField name="connector_id" type="Query filter">
+Limits a query to this connector's items. Not searchable.
+</ResponseField>
+
+<ResponseField name="provider" type="Query filter">
+Always `asana`. Not searchable.
+</ResponseField>
+
+<Accordion title="Stored only, not searchable (5)">
+
+<ResponseField name="owner" type="Stored only">
+The project owner's display name. The owner is not added to the graph as a person.
+</ResponseField>
+
+<ResponseField name="completed" type="Stored only">
+Whether the project is completed.
+</ResponseField>
+
+<ResponseField name="completed_at" type="Stored only">
+When the project was completed.
+</ResponseField>
+
+<ResponseField name="due_at" type="Stored only">
+The project due date.
+</ResponseField>
+
+<ResponseField name="type" type="Stored only">
+Always `project`. Filter on it with `additional_metadata.asana_kind`.
+</ResponseField>
+
+</Accordion>
+
+**Example searches**
+
+- What tasks are assigned to Priya in the Q3 Launch project?
+- Which tasks are blocking the API migration task?
+- What does the Q3 Launch project brief say?
+
+## How it fits into the graph
+
+- Tasks and subtasks use the Ticket class.
+- Comments use the Comment class.
+- Projects use the Page class.
+
+[Graph classes](/essentials/v2/connector-providers#graph-classes) explains each class.
+
+**Connections Asana creates**
+
+- A subtask to its parent task.
+- A task to each project it belongs to.
+- A task to each task it depends on, and to each task that depends on it.
+- A comment to its task.
+- No links to items in other tools.
+
+**People and groups**
+
+- The assignee of each task.
+- The author of each comment.
+- People @mentioned in task notes and comments.
+- A project's owner is kept on the project but not added to the graph.
+
+**Found in the text**
+
+Task notes, comment text and project notes. HydraDB identifies people, organizations, projects and other named things in this text. To steer what it looks for, use [custom instructions](/essentials/v2/connectors#4-custom-ingestion-instructions).
+
+## Not synced
+
+- Projects you did not select. Archived projects are not listed for selection.
+- Task activity other than comments, such as assignments and field changes.
+- Task attachments and their contents.
+- Sections, tags, custom fields and portfolios, including tag and custom-field values on tasks.
+- Comment likes, task followers and start dates.
+- Project status contents, apart from the latest status update's title.
+- Comments on a nested subtask that does not appear in its project's task list.

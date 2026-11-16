@@ -1,36 +1,248 @@
 ---
 title: "Discord"
-description: "What HydraDB syncs from Discord, and how to connect it."
+description: "Sync the messages a Discord bot can read in the servers you choose, one document per message. Discord channel and role permissions are not carried over."
 icon: "/images/connectors/discord.svg"
 ---
 
-## What syncs
+Sync messages from the Discord servers you select: channel histories, including the text chat of voice and stage channels, and active and archived threads, including forum and media threads. Each message is one document. A reply is its own document and links to the message it answers. Text from PDF and DOCX attachments is searchable with the message when it can be read.
 
-**Indexed object types**
+Discord permissions are not imported, so private and role-restricted channels are visible to everyone who can query the collection unless you set an access rule on the server. Each sync reads the server's lookback window again, so edits inside it are picked up. Messages deleted in Discord stay in HydraDB.
 
-- `messages`
+## Permissions
 
-## Connect
+<Warning>
+Discord permissions are not imported, so **Enforce ACL** is unavailable for this connector. Every synced item is visible to everyone who can query the collection, unless you [set an access rule on the resource](/essentials/v2/connectors#set-your-own-rule-on-a-resource).
+</Warning>
 
-Create one connector per account, using that account's credentials where required. Use a separate connector for a different account; see [account scopes](/essentials/v2/connectors#6-connect-several-accounts-from-one-provider). Shared destinations are allowed, but collection names do not authorize access.
+- Discord does not expose member email addresses, so roles and channel permissions cannot be matched to the people who query HydraDB.
+- Private channels and role-restricted channels are not restricted in HydraDB. Set an access rule on the server if they must stay private.
 
-1. Create a Discord application and bot in the Developer Portal, reset/copy the bot token, and invite it to each server with OAuth2 scope bot. Grant View Channels and Read Message History on every selected channel; the connector is read-only and never sends messages.
-2. Enable Message Content Intent under Developer Portal → Bot → Privileged Gateway Intents. The connector verifies the application flag and refuses to sync when it is absent instead of silently indexing empty content fields.
-3. Pick the Discord servers to sync. Every readable message in their text and announcement channels, active threads, public archived threads, and joined private archived threads becomes a message source. User, role and channel mentions are rewritten to human display names; attachments contribute filenames but their bytes are not downloaded.
-4. Discord bot tokens have no granular API scope picker and do not expire automatically. Rotate a leaked token in the Developer Portal. Discord enforces rate-limit buckets and the connector honors Retry-After before retrying.
-5. Discord exposes no guild-member email addresses, so provider roles and channel overwrites cannot be mapped safely to HydraDB login emails. Under the current fail-open RBAC policy Discord sources are tenant-public with a persistent warning unless a customer HydraDB resource ACL is configured.
-6. The REST history API exposes existing messages and edits but not deletion events. A deleted Discord message can remain indexed until the connector is rebuilt from a fresh snapshot; real-time deletion capture requires the Discord Gateway and is intentionally not claimed by this pull connector.
+API-key requests must omit `enforce_acl`, including `false`. See [ACL on synced content](/essentials/v2/connectors#5-acl-native-rbac-awareness).
 
-Use provider `discord` with [Create Connector](/api-reference/v2/endpoint/create-connector), then [discover resources](/api-reference/v2/endpoint/discover-connector-resources) and [configure the resources](/api-reference/v2/endpoint/configure-connector) you want to sync. The [provider description](/api-reference/v2/endpoint/list-connector-providers) supplies the credential fields for your deployment.
+## Before you connect
 
-## Common mistakes
+### Credentials
 
-- A provider page describes indexed content, not the access granted to your credentials. Select resources the connected account can read.
-- Synced content is not automatically private to each person. Review [ACL enforcement](/essentials/v2/connectors#enforce-acl) and set resource access rules where needed.
-- API-key requests must omit `enforce_acl`, including `false`. Only a signed-in human workspace owner or writer can change **Enforce ACL** in dashboard connector settings, and enabling it requires `acl_supported: true`.
+Discord uses the token of a bot in your Discord application. What the bot can read comes from the permissions it is granted when you invite it.
 
-## Related
+<ResponseField name="bot_token" type="secret string" required>
+The token of a bot in your Discord application.
+</ResponseField>
 
-- [Connector providers](/essentials/v2/connector-providers)
-- [Connectors](/essentials/v2/connectors): setup, sync, and access control
-- [Get Connector Status](/api-reference/v2/endpoint/get-connector-status): progress and warnings
+**What the bot needs**
+
+- `bot`: OAuth2 scope, used when you invite the bot.
+- `View Channels`: on each channel to sync.
+- `Read Message History`: on each channel to sync.
+- `Message Content Intent`: turned on under Bot, Privileged Gateway Intents.
+
+Without Message Content Intent, every sync fails rather than indexing empty messages.
+
+### Set it up
+
+<Steps>
+  <Step title="Create a bot">
+    In the Discord Developer Portal, create an application and a bot, and copy the bot token.
+  </Step>
+  <Step title="Turn on Message Content Intent">
+    Under Bot, Privileged Gateway Intents, turn on Message Content Intent. HydraDB checks it and refuses to sync without it.
+  </Step>
+  <Step title="Invite the bot">
+    Invite the bot to each server with the OAuth2 scope `bot`. Grant View Channels and Read Message History on every channel to sync.
+  </Step>
+  <Step title="Create the connector">
+    Paste the token as `bot_token`.
+  </Step>
+  <Step title="Select servers">
+    HydraDB lists every server the bot is a member of. Select the servers to sync. With no server selected, nothing is synced.
+  </Step>
+</Steps>
+
+One connector reads the servers one Discord bot has joined.
+
+<Accordion title="Connect through the API">
+
+Use provider `discord` with [Create Connector](/api-reference/v2/endpoint/create-connector). Then call [Discover Connector Resources](/api-reference/v2/endpoint/discover-connector-resources) to list the resources the connector can sync, and [Configure Connector](/api-reference/v2/endpoint/configure-connector) to choose what to sync.
+
+</Accordion>
+
+## Keeping in sync
+
+- **First sync:** Each server reaches back the window set by `lookback_days`, 30 days by default.
+- **New and changed items:** Each sync reads the server's lookback window again and updates messages by id.
+- **Edits:** An edit is picked up while the message is still inside the server's lookback window. Edits to older messages are not.
+- **Deletions:** Deleted messages are not removed. A message deleted in Discord stays searchable in HydraDB.
+- A private archived thread is read only when the bot can see it or has joined it. Histories the bot cannot read are skipped with a warning.
+
+After the first sync, HydraDB syncs every hour by default. Set `sync_interval_seconds` on the connector to change it.
+
+## What gets synced
+
+### On every Discord item
+
+<ResponseField name="author" type="Searchable text, Graph identity">
+The author's server nickname, else global display name, else username. On a message it is the From line, and the graph records the message as sent by that person. On a reply it is the Author line, and the graph records the reply as written by that person.
+</ResponseField>
+
+<ResponseField name="created_at" type="Searchable text">
+When the message was sent, written as the Sent line on a message and the Created line on a reply.
+</ResponseField>
+
+<ResponseField name="updated_at" type="Searchable text, Result date">
+When the message was last edited, else when it was sent. Searchable on replies, as the Updated line. Not searchable on other messages.
+</ResponseField>
+
+<ResponseField name="mentions" type="Searchable text, Graph identity">
+Display names of the users mentioned. Known mentions are written into the text as names. The graph records each as mentioned. A mention that cannot be resolved keeps its raw Discord syntax.
+</ResponseField>
+
+<ResponseField name="attachments" type="Searchable text">
+Attachment file names, written after `Attachments:`. A message whose only content is a file of an unsupported type is still found by its file name.
+</ResponseField>
+
+<ResponseField name="Attachment text" type="Searchable text">
+Text read from PDF and DOCX attachments, searchable with the message.
+</ResponseField>
+
+<ResponseField name="stickers" type="Searchable text">
+Sticker names, written after `Stickers:`.
+</ResponseField>
+
+<ResponseField name="Reply or forward reference" type="Graph connection">
+The message this one replies to or forwards. Joins a reply to the message it answers, and a forward to its original. Not searchable as a link, though a reply's text ends with the parent message id.
+</ResponseField>
+
+<ResponseField name="Loom links" type="Graph connection">
+Loom share or embed links in the text or in embeds, up to 50 per message. Links the message to that Loom video. Not searchable as a link, though the link stays in the text.
+</ResponseField>
+
+<ResponseField name="additional_metadata.discord_message_id" type="Query filter">
+The message id. Picks out one message. Not searchable.
+</ResponseField>
+
+<ResponseField name="additional_metadata.discord_server_id" type="Query filter">
+The server id. Limits a query to one server. Not searchable.
+</ResponseField>
+
+<ResponseField name="additional_metadata.discord_channel_id" type="Query filter">
+The channel or thread id. Limits a query to one channel or thread. Not searchable.
+</ResponseField>
+
+<ResponseField name="additional_metadata.discord_author_id" type="Query filter">
+The author's user or bot id. Limits a query to one author, even after a display name change. Not searchable.
+</ResponseField>
+
+<ResponseField name="additional_metadata.discord_message_type" type="Query filter">
+Discord's numeric message type. Includes or excludes message types. Not searchable.
+</ResponseField>
+
+<ResponseField name="additional_metadata.pinned" type="Query filter">
+Whether the message was pinned when it was synced. Not searchable.
+</ResponseField>
+
+<ResponseField name="additional_metadata.tts" type="Query filter">
+Whether the message was sent as text-to-speech. Not searchable.
+</ResponseField>
+
+<ResponseField name="additional_metadata.has_attachments" type="Query filter">
+Whether the message has at least one named attachment, even when the file text could not be read. Not searchable.
+</ResponseField>
+
+<ResponseField name="additional_metadata.rbac_warning" type="Query filter">
+A fixed note on every message that Discord permissions are not imported. An access rule you set on the server still applies. Not searchable.
+</ResponseField>
+
+<ResponseField name="connector_id" type="Query filter">
+Limits a query to this connector's messages. Not searchable.
+</ResponseField>
+
+<ResponseField name="provider" type="Query filter">
+Always `discord`. Not searchable.
+</ResponseField>
+
+<Accordion title="Stored only, not searchable (4)">
+
+<ResponseField name="channel" type="Stored only">
+The channel or thread name, so you can see where a result came from. To limit a query to a channel, use `additional_metadata.discord_channel_id`.
+</ResponseField>
+
+<ResponseField name="server" type="Stored only">
+The server name. To limit a query to a server, use `additional_metadata.discord_server_id`.
+</ResponseField>
+
+<ResponseField name="is_edited" type="Stored only">
+Whether Discord reports the message as edited.
+</ResponseField>
+
+<ResponseField name="edited_at" type="Stored only">
+When Discord reports the message was last edited, empty if never.
+</ResponseField>
+
+</Accordion>
+
+### Messages
+
+- **One document:** One Discord message that is not a reply. A forwarded message is a message too.
+- **Title:** `#channel` and the author's display name. Search matches the message text, not this title, so a channel name in a query does not limit results to that channel.
+- **Text:** The message text, with user, role and channel mentions turned into names and custom emoji shown as `:name:`. Then embed titles, descriptions and fields, the poll question and answers, interactive component text and forwarded message text. Then `Attachments:` with file names and `Stickers:` with sticker names. The author is written as a From line and the time as a Sent line. A message with none of these is skipped.
+- **Date:** When the message was last edited, else when it was sent.
+- **Link back:** A discord.com link to the message, when the server and channel ids are known.
+- **Files:** PDF and DOCX attachments up to 20 MiB are downloaded and read, and their text is searchable with the message. If reading fails, the message is still kept. Other files contribute only their names.
+
+<ResponseField name="Server" type="Access rule">
+The selected server. An access rule you set on it governs its messages. Not searchable.
+</ResponseField>
+
+### Replies
+
+- **One document:** One message that replies to another message.
+- **Title:** `#channel` and the author's display name. Search matches the reply text, not this title.
+- **Text:** Built like a message's text, ending with `Reply to message:` and the parent message id. The author is written as an Author line, with Created and Updated lines.
+- **Date:** When the reply was last edited, else when it was sent.
+- **Link back:** A discord.com link to the reply, when the server and channel ids are known.
+- **Files:** As for messages: PDF and DOCX attachments up to 20 MiB are read, and other files contribute only their names.
+
+<ResponseField name="Server" type="Access rule">
+The selected server. An access rule you set on it governs its replies. Not searchable.
+</ResponseField>
+
+**Example searches**
+
+- What did the community say about the release, limited to the announcements channel's id?
+- Who replied to the bug report, and what did they suggest?
+- What does the setup guide PDF posted in Discord say about configuring the bot?
+
+## How it fits into the graph
+
+- Messages use the Message class.
+- Replies use the Comment class.
+
+[Graph classes](/essentials/v2/connector-providers#graph-classes) explains each class.
+
+**Connections Discord creates**
+
+- A reply to the message it answers.
+- A forwarded message to its original.
+- A message to any Loom video it links to, which resolves when that video is synced into the same collection.
+- Channels and servers are kept as labels, not linked.
+- No other links to other tools.
+
+**People and groups**
+
+- The author of each message or reply.
+- Users mentioned in a message, by display name.
+- The author's id is a query filter, not a person in the graph.
+
+**Found in the text**
+
+The message text, embed text and text read from attachments. HydraDB identifies people, organizations, projects and other named things in this text. To steer what it looks for, use [custom instructions](/essentials/v2/connectors#4-custom-ingestion-instructions).
+
+## Not synced
+
+- Servers you did not select, and channels and private threads the bot cannot read.
+- Voice and stage audio and video.
+- Forum and media parent objects, apart from the messages in their threads.
+- Attachment contents other than PDF and DOCX, files over 20 MiB, and files that cannot be read.
+- Reactions and poll vote counts.
+- Deletions: deleted messages stay in HydraDB.
+- Member email addresses and Discord permissions. Role names are used only to turn mentions into names.
