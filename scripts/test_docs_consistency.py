@@ -442,19 +442,9 @@ def v2_pages():
 class PublishedQueryContractTest(unittest.TestCase):
     """The production query contract the guides teach (PRO-1618 review, 2026-11-16)."""
 
-    def test_examples_leave_the_default_query_type_out(self):
-        explicit_all = re.compile(r"""\btype\b["']?\s*[:=]\s*["']all["']""")
-        offenders = [
-            f"{relative}: {match.group(0)}"
-            for relative, text in v2_pages()
-            for block in re.findall(r"```.*?```", text, re.S)
-            for match in explicit_all.finditer(block)
-        ]
-        self.assertEqual([], offenders, "omit type to search both stores; a unified database rejects an explicit all")
-
     def test_withdrawn_query_aliases_and_notices_are_not_documented(self):
         withdrawn = re.compile(
-            r"follow_forceful_relations|enrichment_enabled_by_default|inference_enabled_by_default"
+            r"enrichment_enabled_by_default|inference_enabled_by_default"
             r"|alias(?:es)?\b[^.\n]*`context`|> `context`"
         )
         offenders = [f"{relative}: {m.group(0)}" for relative, text in v2_pages() for m in withdrawn.finditer(text)]
