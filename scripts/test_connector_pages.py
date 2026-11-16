@@ -2,7 +2,7 @@ import json
 import re
 import unittest
 
-from generate_connector_pages import COPY, DIRECTORY, LOGOS as LOGO_DIRECTORY, PLACEHOLDER_MARK, ROOT, SNAPSHOT, SCOPED_PROVIDER_EXAMPLES, artwork, load_copy, logo, pages, placeholder_logos, prose
+from generate_connector_pages import COPY, DIRECTORY, LOGOS as LOGO_DIRECTORY, PLACEHOLDER_MARK, ROOT, SNAPSHOT, SCOPED_PROVIDER_EXAMPLES, artwork, load_copy, logo, mdx, pages, placeholder_logos
 from generate_llms_index import page_paths
 
 
@@ -13,7 +13,6 @@ INDEX = ROOT / "essentials/v2/connector-providers.mdx"
 TITLE_LOGOS = ROOT / "connector-logos.css"
 DASHBOARD_NAMES = json.loads((ROOT / "scripts/dashboard_provider_names.json").read_text())
 FILTER_KEYS = json.loads((ROOT / "scripts/production_filter_keys.json").read_text())["filter_keys"]
-PILOT = ("slack", "bigquery", "github", "notion", "stripe", "hubspot")
 COPY_SECTIONS = ["Permissions", "Before you connect", "Keeping in sync", "What gets synced", "How it fits into the graph", "Not synced"]
 # The badge vocabulary a customer reads on every attribute. The overview defines each one; provider pages do not repeat it.
 BADGES = ("Searchable text", "Query filter", "Result date", "Graph connection", "Graph identity", "Access rule", "Stored only")
@@ -21,7 +20,7 @@ GRAPH_CLASSES = ("Email", "Message", "Ticket", "Page", "Contact", "Comment", "Me
 # Wording that describes HydraDB's machinery or hedges instead of stating the outcome. Checked on pages rendered from copy files and the overview.
 COPY_PAGE_TERMS = (
     "declared", "declares", "shared model", "second pass", "walks", "walked", "acl_supported", "entities", "backfill",
-    "depending on your deployment", "matched to messages through",
+    "depending on your deployment", "matched to messages through", "fails open", "fail-open",
 )
 # How a connector is built is not a customer's concern. No connector page or the overview may name it.
 INTERNAL_TERMS = (
@@ -40,8 +39,16 @@ INTERNAL_PATTERNS = (
 # Words the provider itself shows the customer, each confirmed in that provider's reviewed fact file.
 PROVIDER_VOCABULARY = {
     "airtable": {"LAST_MODIFIED_TIME"},  # Airtable's own formula function, named in the setup step the customer follows.
+    "copper": {"pipeline", "pipelines"},  # Copper's opportunity pipelines, which the customer sets up in Copper.
+    "datadog": {"declared"},  # Datadog's "declared incident" and its declaration time, shown on every incident.
     "github": {"classic"},  # GitHub's "classic" personal access tokens, which the customer creates.
+    "gitlab": {"pipelines"},  # GitLab's CI/CD pipelines, named in Not synced so customers know they are left out.
     "hubspot": {"pipeline", "pipelines"},  # HubSpot's deal pipeline, a field the customer sees on every deal.
+    "launchdarkly": {"feature flag"},  # LaunchDarkly's own name for the flags it syncs.
+    "mailchimp": {"classic"},  # Mailchimp's "classic automations", told apart from Customer Journeys.
+    "okta": {"SAML_2_0"},  # An Okta sign-on mode value, shown as Okta returns it.
+    "pipedrive": {"pipeline", "pipelines"},  # Pipedrive's deal pipelines, a field the customer sees on every deal.
+    "posthog": {"feature flag"},  # PostHog's product name for the flags it syncs.
     "supabase": {"webhook", "webhooks"},  # Supabase's Database Webhooks integration, which the customer installs.
 }
 OLD_TEMPLATE = (
@@ -94,7 +101,7 @@ class ConnectorPagesTest(unittest.TestCase):
                 self.assertIn("`provider_account_scope`", text)
                 for value in pair:
                     self.assertIn(f"`{value}`", text)
-                self.assertIn("labels you choose" if load_copy(provider) else "caller-provided example identifiers", text)
+                self.assertIn("labels you choose", text)
                 self.assertIn("own account ids", text)
 
     def test_all_provider_pages_keep_one_account_per_connector_and_human_enforcement(self):
@@ -103,21 +110,15 @@ class ConnectorPagesTest(unittest.TestCase):
         for path in paths:
             text = path.read_text()
             with self.subTest(provider=path.stem):
-                if load_copy(path.stem.replace("-", "_")):
-                    self.assertRegex(text, r"\nOne (connector|token) (reads|covers) ")
-                    self.assertNotIn("collection names do not authorize access", text)
-                else:
-                    self.assertIn("one connector per account", text)
-                    self.assertIn("collection names do not authorize access", text)
+                self.assertRegex(text, r"\nOne (connector|token) (reads|covers) ")
                 self.assertIn("API-key requests must omit `enforce_acl`", text)
                 self.assertIn("including `false`", text)
                 self.assertNotRegex(text, r"(?i)(?:multiple|several|two) accounts per connector")
                 self.assertNotIn("With acl_supported on for the provider", text)
 
-    def test_setup_placeholders_and_json_are_safe_mdx(self):
-        self.assertEqual("Use `<client_id>`", prose("Use <client_id>"))
-        self.assertEqual("`https://<org>.okta.com/api/v1/`", prose("https://<org>.okta.com/api/v1/"))
-        self.assertEqual('&#123;"table": "a.b"&#125;', prose('{"table": "a.b"}'))
+    def test_copy_text_is_safe_mdx_outside_inline_code(self):
+        self.assertEqual("Use &lt;client_id&gt; or `<client_id>`", mdx("Use <client_id> or `<client_id>`"))
+        self.assertEqual('&#123;"table": "a.b"&#125; and `{"table": "a.b"}`', mdx('{"table": "a.b"} and `{"table": "a.b"}`'))
 
     def test_provider_pages_match_the_source_snapshot(self):
         generated = pages()
@@ -152,18 +153,17 @@ class ConnectorPagesTest(unittest.TestCase):
         self.assertEqual("Google Analytics", providers["ga4"]["name"])
         self.assertIn("no history backfill", providers["supabase"]["summary"].lower())
 
-    def test_provider_pages_list_only_the_exact_indexed_object_types(self):
-        snapshot = json.loads(SNAPSHOT.read_text())
-        for provider in snapshot["providers"]:
-            slug = provider["provider"].replace("_", "-")
-            if slug not in PRODUCTION_SLUGS or load_copy(provider["provider"]):
-                continue
-            text = (DIRECTORY / f"{slug}.mdx").read_text()
-            section = text.split("## What syncs\n", 1)[1].split("## Connect", 1)[0]
-            with self.subTest(provider=provider["provider"]):
-                self.assertEqual(provider["indexed_object_types"], re.findall(r"^- `([^`]+)`$", section, re.M))
-        monday = (DIRECTORY / "monday.mdx").read_text()
-        self.assertIn("fails open with a persistent warning", monday)
+    def test_every_production_provider_renders_from_its_copy_file(self):
+        for row in PRODUCTION:
+            with self.subTest(provider=row["provider"]):
+                copy = load_copy(row["provider"])
+                text = (DIRECTORY / f"{row['provider'].replace('_', '-')}.mdx").read_text()
+                self.assertIn(f"description: {json.dumps(copy['description'])}\n", text)
+        self.assertEqual({row["provider"] for row in PRODUCTION}, {path.stem for path in COPY.glob("*.json")})
+
+    def test_a_provider_without_a_copy_file_stops_the_run(self):
+        with self.assertRaisesRegex(ValueError, r"zz_missing_probe\.json: every production provider needs a copy file"):
+            load_copy("zz_missing_probe")
 
     def test_pages_exist_exactly_for_the_production_providers(self):
         self.assertEqual(70, len(PRODUCTION_SLUGS))
@@ -223,7 +223,9 @@ class ConnectorPagesTest(unittest.TestCase):
         self.assertNotIn("docs_overrides", DASHBOARD_NAMES)
         self.assertEqual({"coda": "Coda"}, DASHBOARD_NAMES["formerly"])
         self.assertEqual("Superhuman", names["coda"])
-        self.assertIn('description: "What HydraDB syncs from Superhuman (formerly Coda), and how to connect it."', (DIRECTORY / "coda.mdx").read_text())
+        coda = (DIRECTORY / "coda.mdx").read_text()
+        self.assertIn('title: "Superhuman"\n', coda)
+        self.assertIn("formerly Coda", body(coda))
         self.assertEqual({provider["provider"] for provider in PRODUCTION}, set(names))
         index = INDEX.read_text()
         for provider, name in names.items():
@@ -276,15 +278,12 @@ class ConnectorPagesTest(unittest.TestCase):
 
 class PageOpeningAndOrderTest(unittest.TestCase):
     def test_no_page_opens_with_filler(self):
-        setup_steps = {step for provider in json.loads(SNAPSHOT.read_text())["providers"] for step in provider.get("setup_guide", [])}
         for path in sorted(DIRECTORY.glob("*.mdx")):
             text = body(path.read_text())
             with self.subTest(page=path.stem):
                 for phrase in ("connector to bring", "the following content", "provider description lists"):
                     self.assertNotIn(phrase, text)
-                for line in text.splitlines():
-                    if "Use the" in line:
-                        self.assertIn(re.sub(r"^\d+\. ", "", line), {prose(step) for step in setup_steps}, "only a production setup step may say 'Use the'")
+                self.assertNotRegex(text, r"Use the [^.\n]* connector to")
                 self.assertRegex(text, r"^\n*\S", "no blank gap under the title block")
                 self.assertNotRegex(text, r"(?im)^(this section|the following|below are)")
 
@@ -337,33 +336,29 @@ class PlaceholderLogoTest(unittest.TestCase):
 
 
 class ConnectorCopyPagesTest(unittest.TestCase):
-    def test_every_pilot_provider_has_a_valid_copy_file(self):
-        for provider in PILOT:
-            with self.subTest(provider=provider):
-                copy = load_copy(provider)
-                self.assertIsNotNone(copy, f"scripts/connector_pages/{provider}.json is missing")
-                for document in copy["documents"]:
+    def test_every_provider_has_a_valid_copy_file(self):
+        for row in PRODUCTION:
+            with self.subTest(provider=row["provider"]):
+                for document in load_copy(row["provider"])["documents"]:
                     self.assertTrue(document["attributes"], document["name"])
-        for path in COPY.glob("*.json"):
-            with self.subTest(copy=path.name):
-                self.assertIn(path.stem, {row["provider"] for row in PRODUCTION})
-                self.assertIsNotNone(load_copy(path.stem))
 
     def test_a_copy_file_missing_a_section_or_label_is_rejected(self):
         broken = json.loads((COPY / "slack.json").read_text())
         del broken["not_synced"]
         broken["documents"][0]["attributes"][0]["uses"] = ["Indexed"]
+        broken["connect"]["credentials"][0]["type"] = "integer"
+        broken["sync"]["scheduled"] = "no"
         path = COPY / "zz_broken_copy_probe.json"
         path.write_text(json.dumps(broken))
         try:
-            with self.assertRaisesRegex(ValueError, r"missing not_synced.*uses \['Indexed'\]"):
+            with self.assertRaisesRegex(ValueError, r"missing not_synced.*: type integer.*sync.scheduled must be true or false.*uses \['Indexed'\]"):
                 load_copy("zz_broken_copy_probe")
         finally:
             path.unlink()
 
     def test_copy_pages_have_every_section_in_order(self):
         pages_by_provider = copy_pages()
-        self.assertLessEqual(set(PILOT), set(pages_by_provider))
+        self.assertEqual({row["provider"] for row in PRODUCTION}, set(pages_by_provider))
         for provider, text in pages_by_provider.items():
             with self.subTest(provider=provider):
                 self.assertEqual(COPY_SECTIONS, re.findall(r"^## (.+)$", text, re.M))
@@ -394,7 +389,7 @@ class ConnectorCopyPagesTest(unittest.TestCase):
             filters = re.findall(r'<ResponseField name="([^"]+)" type="[^"]*Query filter', text)
             keys = set(re.findall(r"\badditional_metadata\.\w+", text))
             with self.subTest(provider=provider):
-                self.assertTrue(filters)
+                self.assertEqual(bool(published), bool(filters), "a page shows filters exactly when production publishes some")
                 self.assertLessEqual(set(filters), published)
                 self.assertLessEqual(keys, published)
 
@@ -485,8 +480,9 @@ class RevisedPageDesignTest(unittest.TestCase):
         pages_to_check = {provider: body(text) for provider, text in copy_pages().items()}
         pages_to_check["connector-providers"] = body(INDEX.read_text())
         for page, text in pages_to_check.items():
+            allowed = PROVIDER_VOCABULARY.get(page, set())
             with self.subTest(page=page):
-                found = [term for term in COPY_PAGE_TERMS if re.search(rf"(?i)(?<![\w-]){re.escape(term)}(?![\w-])", text)]
+                found = [term for term in COPY_PAGE_TERMS if term not in allowed and re.search(rf"(?i)(?<![\w-]){re.escape(term)}(?![\w-])", text)]
                 self.assertEqual([], found)
 
     def test_permissions_state_the_cloud_outcome_with_enforce_acl_first(self):
@@ -496,11 +492,28 @@ class RevisedPageDesignTest(unittest.TestCase):
             with self.subTest(provider=provider):
                 if acl[provider]:
                     self.assertTrue(permissions.startswith("Turn on **Enforce ACL**"))
-                    self.assertIn("On HydraDB Cloud, with Enforce ACL on, such an item follows the access rule you set on its resource. With no rule, it is hidden from search.", permissions)
-                    self.assertIn("Self-hosted deployments can be configured differently.", permissions)
+                    cloud = "On HydraDB Cloud, with Enforce ACL on, such an item follows the access rule you set on its resource. With no rule, it is hidden from search."
+                    if load_copy(provider)["permissions"].get("cloud_outcome", True):
+                        self.assertIn(cloud, permissions)
+                        self.assertIn("Self-hosted deployments can be configured differently.", permissions)
+                    else:
+                        self.assertNotIn(cloud, permissions)
                 else:
                     self.assertTrue(permissions.startswith("<Warning>"))
                     self.assertIn("**Enforce ACL** is unavailable for this connector", permissions.split("</Warning>", 1)[0])
+
+    def test_the_hourly_schedule_shows_only_for_scheduled_connectors(self):
+        hourly = "HydraDB syncs every hour by default"
+        for provider, text in copy_pages().items():
+            with self.subTest(provider=provider):
+                self.assertEqual(load_copy(provider)["sync"].get("scheduled", True), hourly in section(text, "Keeping in sync"))
+        self.assertNotIn(hourly, (DIRECTORY / "supabase.mdx").read_text())
+
+    def test_numeric_settings_use_the_number_type(self):
+        for provider, text in copy_pages().items():
+            with self.subTest(provider=provider):
+                self.assertNotIn("A whole number", text)
+        self.assertIn('<ResponseField name="max_backfill_days" type="number">', (DIRECTORY / "twitter.mdx").read_text())
 
     def test_graph_section_names_each_item_class_without_generic_promises(self):
         for provider, text in copy_pages().items():

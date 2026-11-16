@@ -1,7 +1,7 @@
 """Generate one page per connector enabled in production, plus the providers overview.
 
 scripts/production_providers.json is refreshed from GET /connectors/providers on production.
-A provider with a copy file in scripts/connector_pages/ gets its page body rendered from that file.
+Every provider's page body is rendered from its copy file in scripts/connector_pages/. A provider without one stops the run.
 """
 import argparse
 from collections import namedtuple
@@ -47,19 +47,6 @@ PROVIDER_GROUPS = {
     "twilio": "Messaging & email",
 }
 Logo = namedtuple("Logo", "light dark")
-# Production setup steps that explain HydraDB's internals. Each rewrite keeps the effect a customer acts on and drops the reason.
-SETUP_STEP_REWRITES = {
-    "datadog": {8: "That mirroring takes effect only once HydraDB turns on access-scoped search for this connector. Until then, a private incident is searchable by everyone in your HydraDB tenant. Ask us to turn it on, or leave out the incident_read scope if that is not acceptable: everything else syncs without it."},
-    "launchdarkly": {7: "Two things are never indexed. An environment's SDK key and mobile key are dropped before indexing, because they are live credentials for your own environment. So are a member's MFA state and whether they have a password."},
-    "sharepoint": {5: "SharePoint item and site permissions are not yet reproduced. Content is readable by everyone in your HydraDB tenant, and every item carries rbac_warning; set a resource access rule for sites that must be restricted."},
-}
-
-
-def prose(value):
-    value = value.replace("With acl_supported on for the provider, permission-aware search", "With Enforce ACL enabled for a provider reporting acl_supported: true, permission-aware search")
-    escaped = html.escape(re.sub(r"\s*\u2014\s*", "; ", value), quote=False).replace("{", "&#123;").replace("}", "&#125;")
-    escaped = re.sub(r"https?://[^\s]*&lt;[^\s]*", lambda match: f"`{html.unescape(match.group())}`", escaped)
-    return re.sub(r"&lt;([A-Za-z_][\w-]*)&gt;", r"`<\1>`", escaped)
 
 
 def slug(identifier):
@@ -177,7 +164,7 @@ def navigation(by_group):
 USES = {
     "Searchable text": "part of the text a query matches.",
     "Query filter": "a key you can filter a query on, typed exactly as shown.",
-    "Result date": "the date HydraDB uses when it ranks results by date.",
+    "Result date": "the date shown for the result. HydraDB uses it, among other signals, when it ranks results by date.",
     "Graph connection": "links the item to another item in the knowledge graph.",
     "Graph identity": "names a person or group, and the graph attaches the item to them.",
     "Access rule": "decides who can read the item.",
@@ -200,6 +187,9 @@ CLASSES = {
 COPY_KEYS = {"description", "opening", "permissions", "connect", "sync", "documents", "graph", "not_synced"}
 OPTIONAL_COPY_KEYS = {"callouts", "shared_attributes", "example_searches"}
 CONNECT_KEYS = {"auth", "credentials", "steps", "account"}
+FIELD_TYPES = {"secret string", "string", "string list", "boolean", "number"}
+SYNC_KEYS = {"first_sync", "changes", "edits", "deletes"}
+OPTIONAL_SYNC_KEYS = {"notes", "scheduled"}
 OPTIONAL_CONNECT_KEYS = {"alternatives", "credentials_note", "settings", "advanced_settings", "permissions_label", "permissions", "permissions_note", "examples", "scope_unit"}
 CALLOUT_SECTIONS = {"opening", "permissions", "connect", "sync", "synced", "graph"}
 MAX_EXAMPLE_SEARCHES = 3
@@ -217,17 +207,30 @@ def attribute_problems(item):
     return []
 
 
+def connect_fields(connect):
+    return [*connect.get("credentials", []), *connect.get("settings", []), *connect.get("advanced_settings", []),
+            *(item for option in connect.get("alternatives", []) for item in option["credentials"])]
+
+
 def load_copy(identifier):
-    """Returns the provider's checked-in page copy, or None. Raises ValueError on a copy file that cannot render."""
+    """Returns the provider's checked-in page copy. Raises ValueError on a copy file that is missing or cannot render."""
     path = COPY / f"{identifier}.json"
     if not path.is_file():
-        return None
+        raise ValueError(f"{path.relative_to(ROOT)}: every production provider needs a copy file")
     copy = json.loads(path.read_text())
     problems = [f"missing {key}" for key in sorted(COPY_KEYS - copy.keys())]
     problems += [f"unknown {key}" for key in sorted(copy.keys() - COPY_KEYS - OPTIONAL_COPY_KEYS)]
     connect = copy.get("connect", {})
     problems += [f"connect missing {key}" for key in sorted(CONNECT_KEYS - connect.keys())]
     problems += [f"connect unknown {key}" for key in sorted(connect.keys() - CONNECT_KEYS - OPTIONAL_CONNECT_KEYS)]
+    problems += [f"{item.get('name')}: type {item.get('type')}" for item in connect_fields(connect) if item.get("type") not in FIELD_TYPES]
+    sync = copy.get("sync", {})
+    problems += [f"sync missing {key}" for key in sorted(SYNC_KEYS - sync.keys())]
+    problems += [f"sync unknown {key}" for key in sorted(sync.keys() - SYNC_KEYS - OPTIONAL_SYNC_KEYS)]
+    if not isinstance(sync.get("scheduled", True), bool):
+        problems.append("sync.scheduled must be true or false")
+    if not isinstance(copy.get("permissions", {}).get("cloud_outcome", True), bool):
+        problems.append("permissions.cloud_outcome must be true or false")
     if identifier in SCOPED_PROVIDER_EXAMPLES and not connect.get("scope_unit"):
         problems.append("connect.scope_unit names what one provider_account_scope covers")
     for section in copy.get("callouts", {}):
@@ -316,13 +319,13 @@ def permissions_section(provider, copy, acl_supported):
         raise ValueError(f"{provider['production_id']}: permissions.carried is {permissions['carried']} but production reports acl_supported {acl_supported}")
     lines = ["## Permissions", ""]
     if permissions["carried"]:
+        cloud = " On HydraDB Cloud, with Enforce ACL on, such an item follows the access rule you set on its resource. With no rule, it is hidden from search. Self-hosted deployments can be configured differently. Permission warnings appear in [Get Connector Status](/api-reference/v2/endpoint/get-connector-status)."
         lines += [
             f"Turn on **Enforce ACL** for this connector to make search follow {name} permissions. With Enforce ACL off, HydraDB does not enforce them. Only a workspace owner or writer signed in to HydraDB can turn it on. API-key requests must omit `enforce_acl`, including `false`. See [Enforce ACL]({GUIDE}#enforce-acl).",
             "", *callout(copy, "permissions"),
             labelled("Who can read an item", permissions["who_can_read"]),
             labelled("How a person is identified", permissions["identity"]),
-            labelled("When permissions cannot be read", permissions["when_unreadable"])
-            + " On HydraDB Cloud, with Enforce ACL on, such an item follows the access rule you set on its resource. With no rule, it is hidden from search. Self-hosted deployments can be configured differently. Permission warnings appear in [Get Connector Status](/api-reference/v2/endpoint/get-connector-status).",
+            labelled("When permissions cannot be read", permissions["when_unreadable"]) + (cloud if permissions.get("cloud_outcome", True) else ""),
             *bullets(permissions.get("notes", [])), "",
             f"You can also [set your own rule on a resource]({GUIDE}#set-your-own-rule-on-a-resource).", "",
         ]
@@ -373,7 +376,7 @@ def connect_section(provider, copy):
             "",
         ]
     lines += accordion("Connect through the API", [
-        f"Use provider `{provider['production_id']}` with [Create Connector](/api-reference/v2/endpoint/create-connector). Then call [Discover Connector Resources](/api-reference/v2/endpoint/discover-connector-resources) to list what the credentials can reach, and [Configure Connector](/api-reference/v2/endpoint/configure-connector) to choose what to sync.",
+        f"Use provider `{provider['production_id']}` with [Create Connector](/api-reference/v2/endpoint/create-connector). Then call [Discover Connector Resources](/api-reference/v2/endpoint/discover-connector-resources) to list the resources the connector can sync, and [Configure Connector](/api-reference/v2/endpoint/configure-connector) to choose what to sync.",
         "",
     ])
     return lines
@@ -381,13 +384,15 @@ def connect_section(provider, copy):
 
 def sync_section(copy):
     sync = copy["sync"]
-    return [
+    lines = [
         "## Keeping in sync", "", *callout(copy, "sync"),
         labelled("First sync", sync["first_sync"]), labelled("New and changed items", sync["changes"]),
         labelled("Edits", sync["edits"]), labelled("Deletions", sync["deletes"]),
-        *bullets(sync.get("notes", [])),
-        "", "After the first sync, HydraDB syncs every hour by default. Set `sync_interval_seconds` on the connector to change it.", "",
+        *bullets(sync.get("notes", [])), "",
     ]
+    if sync.get("scheduled", True):
+        lines += ["After the first sync, HydraDB syncs every hour by default. Set `sync_interval_seconds` on the connector to change it.", ""]
+    return lines
 
 
 def synced_section(provider, copy):
@@ -434,50 +439,6 @@ def copy_body(provider, copy, beta, acl_supported):
     ]
 
 
-def legacy_body(provider):
-    identifier = provider["provider"]
-    name = provider["display_name"]
-    lines = ["## What syncs", ""]
-    if provider.get("summary"):
-        lines.extend([prose(provider["summary"]), ""])
-    types = provider["indexed_object_types"]
-    if types:
-        lines.extend(["**Indexed object types**", ""])
-        lines.extend(f"- `{kind}`" for kind in types)
-    elif not provider.get("summary"):
-        lines.append("No fixed object types: what syncs is the set of resources you select when you configure the connector.")
-    lines.extend(["", "## Connect", ""])
-    lines.extend([
-        "Create one connector per account, using that account's credentials where required. Use a separate connector for a different account; see [account scopes](/essentials/v2/connectors#6-connect-several-accounts-from-one-provider). Shared destinations are allowed, but collection names do not authorize access.",
-        "",
-    ])
-    if identifier in SCOPED_PROVIDER_EXAMPLES:
-        first, second = SCOPED_PROVIDER_EXAMPLES[identifier]
-        lines.extend([
-            f"Set a stable, distinct `provider_account_scope` for each connected account yourself, for example `{first}` and `{second}`. These are caller-provided example identifiers. The API stores the supplied value as given; it does not check it against the provider's own account ids. Reusing a scope can make sources with matching external IDs overwrite each other in the same destination.",
-            "",
-        ])
-    if provider.get("setup_guide"):
-        rewrites = SETUP_STEP_REWRITES.get(identifier, {})
-        lines.extend(f"{number}. {prose(rewrites.get(number, step))}" for number, step in enumerate(provider["setup_guide"], 1))
-        lines.append("")
-    if identifier == "supabase":
-        lines.append("Follow the Supabase connection flow in the dashboard. Changes arrive as they happen, through the database webhooks you set up in Supabase.")
-    else:
-        lines.append(f"Use provider `{provider['production_id']}` with [Create Connector](/api-reference/v2/endpoint/create-connector), then [discover resources](/api-reference/v2/endpoint/discover-connector-resources) and [configure the resources](/api-reference/v2/endpoint/configure-connector) you want to sync. The [provider description](/api-reference/v2/endpoint/list-connector-providers) supplies the credential fields for your deployment.")
-    lines.extend([
-        "", "## Common mistakes", "",
-        "- A provider page describes indexed content, not the access granted to your credentials. Select resources the connected account can read.",
-        "- Synced content is not automatically private to each person. Review [ACL enforcement](/essentials/v2/connectors#enforce-acl) and set resource access rules where needed.",
-        "- API-key requests must omit `enforce_acl`, including `false`. Only a signed-in human workspace owner or writer can change **Enforce ACL** in dashboard connector settings, and enabling it requires `acl_supported: true`.",
-        "", "## Related", "",
-        "- [Connector providers](/essentials/v2/connector-providers)",
-        "- [Connectors](/essentials/v2/connectors): setup, sync, and access control",
-        "- [Get Connector Status](/api-reference/v2/endpoint/get-connector-status): progress and warnings", "",
-    ])
-    return lines
-
-
 def pages():
     production = {slug(row["provider"]): row for row in json.loads(PRODUCTION.read_text())["providers"]}
     enabled = {key: group(row) for key, row in production.items()}
@@ -490,27 +451,19 @@ def pages():
             providers.append({**item, "production_id": production_id, "display_name": names["names"][production_id]})
     providers.sort(key=lambda item: item["display_name"].casefold())
     output = {}
-    rewritten = []
     for provider in providers:
         identifier = provider["provider"]
         name = provider["display_name"]
         row = production[slug(identifier)]
         found = logo(identifier)
         copy = load_copy(provider["production_id"])
-        formerly = names["formerly"].get(provider["production_id"])
-        called = f"{name} (formerly {formerly})" if formerly else name
-        description = copy["description"] if copy else f"What HydraDB syncs from {called}, and how to connect it."
         lines = [
             "---", f"title: {json.dumps(name)}",
-            f"description: {json.dumps(description)}",
+            f"description: {json.dumps(copy['description'])}",
             f"icon: {json.dumps(found.light)}",
             "---", "",
+            *copy_body(provider, copy, row["is_beta"], row["acl_supported"]),
         ]
-        if copy:
-            lines += copy_body(provider, copy, row["is_beta"], row["acl_supported"])
-            rewritten.append(provider)
-        else:
-            lines += legacy_body(provider)
         output[DIRECTORY / f"{slug(identifier)}.mdx"] = "\n".join(lines)
     lines = [
         "---", 'title: "Connector providers"', 'sidebarTitle: "All connectors"',
@@ -533,9 +486,6 @@ def pages():
         *(f"- **{title}:** {meaning}" for title, meaning in CLASSES.values()), "",
         f"HydraDB also identifies people, organizations, projects and other named things in the searchable text of every item, whichever tool it came from. To steer what it looks for, use [custom instructions]({GUIDE}#4-custom-ingestion-instructions).", "",
     ]
-    if len(rewritten) < len(providers):
-        links = ", ".join(f"[{provider['display_name']}](/essentials/v2/connectors/{slug(provider['provider'])})" for provider in rewritten)
-        lines += [f"These pages follow that layout: {links}. The others list the indexed object types and setup notes while they move to it.", ""]
     by_group = {title: [provider for provider in providers if enabled[slug(provider["provider"])] == title] for title in GROUPS}
     for title, members in by_group.items():
         lines.extend([f"## {title}", "", "<Columns cols={3}>", *(card(provider, logo(provider["provider"])) for provider in members), "</Columns>", ""])
