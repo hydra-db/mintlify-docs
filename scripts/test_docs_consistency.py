@@ -454,7 +454,7 @@ class PublishedQueryContractTest(unittest.TestCase):
 
     def test_withdrawn_query_aliases_and_notices_are_not_documented(self):
         withdrawn = re.compile(
-            r"follow_forceful_relations|enrichment_enabled_by_default"
+            r"follow_forceful_relations|enrichment_enabled_by_default|inference_enabled_by_default"
             r"|alias(?:es)?\b[^.\n]*`context`|> `context`"
         )
         offenders = [f"{relative}: {m.group(0)}" for relative, text in v2_pages() for m in withdrawn.finditer(text)]
