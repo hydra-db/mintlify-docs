@@ -469,6 +469,7 @@ def pages():
         "---", 'title: "Connector providers"', 'sidebarTitle: "All connectors"',
         'description: "See what each connector syncs, what it needs, and who can read what it brings in."', "---", "",
         f"Choose a provider to see what to set up and what it syncs. Availability and credential fields come from your deployment's [provider catalog](/api-reference/v2/endpoint/list-connector-providers). The steps every connector shares are in the [connectors guide]({GUIDE}).", "",
+        f"To connect several accounts of the same provider, give each connector its own `provider_account_scope`, or send each account to its own collection. Separate connectors alone do not keep apart items that share a provider id. Supabase rows need separate collections when table names and keys overlap, as its page explains. See [several accounts from one provider]({GUIDE}#6-connect-several-accounts-from-one-provider).", "",
         "## How to read a connector page", "",
         "Each page opens with what the connector brings in and the limits that decide whether it fits. Then:", "",
         "1. **Permissions:** whether the provider's permissions decide who can read an item.",
