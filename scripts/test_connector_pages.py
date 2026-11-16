@@ -2,7 +2,7 @@ import json
 import re
 import unittest
 
-from generate_connector_pages import DIRECTORY, ROOT, SNAPSHOT, SCOPED_PROVIDER_EXAMPLES, pages, prose
+from generate_connector_pages import COPY, DIRECTORY, PURPOSES, ROOT, SNAPSHOT, SCOPED_PROVIDER_EXAMPLES, load_copy, pages, prose
 from generate_llms_index import page_paths
 
 
@@ -12,6 +12,41 @@ LOGOS = ROOT / "images/connectors"
 INDEX = ROOT / "essentials/v2/connector-providers.mdx"
 TITLE_LOGOS = ROOT / "connector-logos.css"
 DASHBOARD_NAMES = json.loads((ROOT / "scripts/dashboard_provider_names.json").read_text())
+FILTER_KEYS = json.loads((ROOT / "scripts/production_filter_keys.json").read_text())["filter_keys"]
+PILOT = ("slack", "bigquery", "github", "notion", "stripe", "hubspot")
+COPY_SECTIONS = ["Before you connect", "What gets synced", "How it fits into the graph", "Permissions", "Keeping in sync", "Not synced", "Questions this lets you answer", "Good to know"]
+# How a connector is built is not a customer's concern. No connector page or the overview may name it.
+INTERNAL_TERMS = (
+    "moveit", "classic", "native", "golang", "go-native", "python", "tap", "taps", "singer", "lance", "lancedb",
+    "normalizer", "normaliser", "renderer", "worker", "workers", "temporal", "kafka", "milvus", "falkordb", "turbolay",
+    "dynamodb", "mongodb", "engine", "engines", "appkind", "app_kind", "connector_type", "app source", "app-source",
+    "stream", "streams", "pipeline", "pipelines", "webhook", "webhooks", "feature flag", "environment variable",
+    "kill switch", "claim check", "drain", "tombstone", "tombstones", "lake", "resolver", "fetcher", "adapter",
+    "enricher", "linkref",
+)
+INTERNAL_PATTERNS = (
+    r"\b[A-Z][A-Z0-9]*_[A-Z0-9_]*[A-Z0-9]\b",
+    r"\b[\w/-]+\.(?:go|py)\b",
+    r"\b(?:AppKind|AppFields|AppProvider|AppExternalID|AppRelations|AppKnowledge\w*|AppMetadata|ACLOrigin\w*)\b",
+)
+# Words the provider itself shows the customer, each confirmed in that provider's reviewed fact file.
+PROVIDER_VOCABULARY = {
+    "airtable": {"LAST_MODIFIED_TIME"},  # Airtable's own formula function, named in the setup step the customer follows.
+    "github": {"classic"},  # GitHub's "classic" personal access tokens, which the customer creates.
+    "hubspot": {"pipeline", "pipelines"},  # HubSpot's deal pipeline, a field the customer sees on every deal.
+    "supabase": {"webhook", "webhooks"},  # Supabase's Database Webhooks integration, which the customer installs.
+}
+OLD_TEMPLATE = (
+    "to bring the following content into HydraDB", "The provider description lists these indexed object types",
+    "does not enumerate fixed indexed object types", "## What syncs", "## Connect\n", "## Common mistakes", "## Related",
+    "A provider page describes indexed content", "Synced content is not automatically private to each person",
+    "supplies the credential fields for your deployment", "using that account's credentials where required",
+    "Shared destinations are allowed",
+)
+
+
+def copy_pages():
+    return {path.stem: (DIRECTORY / f"{path.stem.replace('_', '-')}.mdx").read_text() for path in sorted(COPY.glob("*.json"))}
 
 
 def body(text):
@@ -48,7 +83,7 @@ class ConnectorPagesTest(unittest.TestCase):
                 for value in pair:
                     self.assertIn(f"`{value}`", text)
                 self.assertIn("caller-provided example identifiers", text)
-                self.assertIn("not validated native account-ID formats", text)
+                self.assertIn("own account ids", text)
 
     def test_all_provider_pages_keep_one_account_per_connector_and_human_enforcement(self):
         paths = list(DIRECTORY.glob("*.mdx"))
@@ -73,7 +108,7 @@ class ConnectorPagesTest(unittest.TestCase):
         for path, content in generated.items():
             with self.subTest(page=str(path.relative_to(ROOT))):
                 self.assertEqual(content, path.read_text())
-        self.assertEqual(set(DIRECTORY.glob("*.mdx")), set(generated) - {INDEX, ROOT / "docs.json", TITLE_LOGOS})
+        self.assertEqual(set(DIRECTORY.glob("*.mdx")), {path for path in generated if path.parent == DIRECTORY})
 
     def test_every_provider_page_is_registered_and_linked_from_the_catalog(self):
         config = json.loads((ROOT / "docs.json").read_text())
@@ -105,7 +140,7 @@ class ConnectorPagesTest(unittest.TestCase):
         snapshot = json.loads(SNAPSHOT.read_text())
         for provider in snapshot["providers"]:
             slug = provider["provider"].replace("_", "-")
-            if slug not in PRODUCTION_SLUGS:
+            if slug not in PRODUCTION_SLUGS or load_copy(provider["provider"]):
                 continue
             text = (DIRECTORY / f"{slug}.mdx").read_text()
             section = text.split("## What syncs\n", 1)[1].split("## Connect", 1)[0]
@@ -169,12 +204,13 @@ class ConnectorPagesTest(unittest.TestCase):
 
     def test_display_names_match_the_dashboard(self):
         names = DASHBOARD_NAMES["names"]
-        overrides = DASHBOARD_NAMES["docs_overrides"]
+        self.assertNotIn("docs_overrides", DASHBOARD_NAMES)
+        self.assertEqual({"coda": "Coda"}, DASHBOARD_NAMES["formerly"])
+        self.assertEqual("Superhuman", names["coda"])
+        self.assertIn('description: "What HydraDB syncs from Superhuman (formerly Coda), and how to connect it."', (DIRECTORY / "coda.mdx").read_text())
         self.assertEqual({provider["provider"] for provider in PRODUCTION}, set(names))
-        self.assertEqual({"coda": "Coda"}, overrides)
         index = INDEX.read_text()
-        for provider, dashboard_name in names.items():
-            name = overrides.get(provider, dashboard_name)
+        for provider, name in names.items():
             slug = provider.replace("_", "-")
             with self.subTest(provider=provider):
                 self.assertIn(f'title: "{name}"\n', (DIRECTORY / f"{slug}.mdx").read_text())
@@ -219,6 +255,122 @@ class ConnectorPagesTest(unittest.TestCase):
                 section = index.split(f"## {category['group']}\n", 1)[1].split("\n## ", 1)[0]
                 self.assertEqual([f"/{page}" for page in category["pages"]], re.findall(r'href="([^"]+)"', section))
         self.assertEqual(len(PRODUCTION_SLUGS), sum(len(category["pages"]) for category in categories))
+
+
+class PageOpeningAndOrderTest(unittest.TestCase):
+    def test_no_page_opens_with_filler(self):
+        setup_steps = {step for provider in json.loads(SNAPSHOT.read_text())["providers"] for step in provider.get("setup_guide", [])}
+        for path in sorted(DIRECTORY.glob("*.mdx")):
+            text = body(path.read_text())
+            with self.subTest(page=path.stem):
+                for phrase in ("connector to bring", "the following content", "provider description lists"):
+                    self.assertNotIn(phrase, text)
+                for line in text.splitlines():
+                    if "Use the" in line:
+                        self.assertIn(re.sub(r"^\d+\. ", "", line), {prose(step) for step in setup_steps}, "only a production setup step may say 'Use the'")
+                self.assertRegex(text, r"^\n*\S", "no blank gap under the title block")
+                self.assertNotRegex(text, r"(?im)^(this section|the following|below are)")
+
+    def test_groups_follow_the_order_customers_connect_most(self):
+        order = ["Messaging & email", "Tickets & project management", "Docs & cloud storage", "Meetings & calendar", "Engineering", "Marketing & analytics", "HR & finance", "CRM & support"]
+        config = json.loads((ROOT / "docs.json").read_text())
+        group = next(item for item in config["navigation"]["versions"][0]["tabs"][0]["groups"] if item["group"] == "Connector providers")
+        self.assertEqual(order, [category["group"] for category in group["pages"][1:]])
+        self.assertEqual(order, [title for title in re.findall(r"^## (.+)$", INDEX.read_text(), re.M) if title in order])
+
+
+class ConnectorCopyPagesTest(unittest.TestCase):
+    def test_every_pilot_provider_has_a_valid_copy_file(self):
+        for provider in PILOT:
+            with self.subTest(provider=provider):
+                copy = load_copy(provider)
+                self.assertIsNotNone(copy, f"scripts/connector_pages/{provider}.json is missing")
+                for document in copy["documents"]:
+                    self.assertTrue(document["attributes"], document["name"])
+        for path in COPY.glob("*.json"):
+            with self.subTest(copy=path.name):
+                self.assertIn(path.stem, {row["provider"] for row in PRODUCTION})
+                self.assertIsNotNone(load_copy(path.stem))
+
+    def test_a_copy_file_missing_a_section_or_label_is_rejected(self):
+        broken = json.loads((COPY / "slack.json").read_text())
+        del broken["not_synced"]
+        broken["documents"][0]["attributes"][0]["purposes"] = ["Indexed"]
+        path = COPY / "zz_broken_copy_probe.json"
+        path.write_text(json.dumps(broken))
+        try:
+            with self.assertRaisesRegex(ValueError, r"missing not_synced.*purposes \['Indexed'\]"):
+                load_copy("zz_broken_copy_probe")
+        finally:
+            path.unlink()
+
+    def test_copy_pages_have_every_section_in_order(self):
+        pages_by_provider = copy_pages()
+        self.assertLessEqual(set(PILOT), set(pages_by_provider))
+        for provider, text in pages_by_provider.items():
+            with self.subTest(provider=provider):
+                self.assertEqual(COPY_SECTIONS, re.findall(r"^## (.+)$", text, re.M))
+                intro = body(text).split("\n## ", 1)[0].strip()
+                self.assertTrue(intro, "the page opens with what the connector brings in")
+
+    def test_no_page_names_how_a_connector_is_built(self):
+        pages_to_check = {path.stem: body(path.read_text()) for path in DIRECTORY.glob("*.mdx")}
+        pages_to_check["connector-providers"] = body(INDEX.read_text())
+        for page, text in sorted(pages_to_check.items()):
+            allowed = PROVIDER_VOCABULARY.get(page.replace("-", "_"), set())
+            prose_only = re.sub(r"\]\([^)]*\)", "]", text)
+            with self.subTest(page=page):
+                found = [term for term in INTERNAL_TERMS if term not in allowed and re.search(rf"(?i)(?<![\w.-]){re.escape(term)}(?![\w-])", prose_only)]
+                self.assertEqual([], found)
+                for pattern in INTERNAL_PATTERNS:
+                    found = set(re.findall(pattern, prose_only)) - allowed
+                    self.assertFalse(found, pattern)
+
+    def test_copy_pages_and_overview_use_no_long_dashes(self):
+        for text in [*copy_pages().values(), INDEX.read_text()]:
+            self.assertNotIn("\u2014", text)
+            self.assertNotIn("\u2013", text)
+
+    def test_every_filter_key_on_a_copy_page_is_published_by_production(self):
+        for provider, text in copy_pages().items():
+            published = set(FILTER_KEYS[provider])
+            filters = re.findall(r'<ResponseField name="([^"]+)" type="Filter', text)
+            keys = set(re.findall(r"\badditional_metadata\.\w+", text))
+            with self.subTest(provider=provider):
+                self.assertTrue(filters)
+                self.assertLessEqual(set(filters), published)
+                self.assertLessEqual(keys, published)
+
+    def test_attribute_labels_are_the_plain_purpose_labels(self):
+        for provider, text in copy_pages().items():
+            section = text.split("## What gets synced\n", 1)[1].split("\n## ", 1)[0]
+            with self.subTest(provider=provider):
+                for kind in re.findall(r'<ResponseField name="[^"]+" type="([^"]+)"', section):
+                    self.assertLessEqual(set(kind.split(", ")), set(PURPOSES), kind)
+
+    def test_permissions_section_matches_production(self):
+        acl = {row["provider"]: row["acl_supported"] for row in PRODUCTION}
+        for provider, text in copy_pages().items():
+            section = text.split("## Permissions\n", 1)[1].split("\n## ", 1)[0]
+            with self.subTest(provider=provider):
+                carries = "This connector can carry" in section
+                self.assertEqual(acl[provider], carries)
+                if not acl[provider]:
+                    self.assertIn("Every synced item is visible to everyone who can query the collection", section)
+                    self.assertIn("/essentials/v2/connectors#set-your-own-rule-on-a-resource", section)
+
+    def test_copy_pages_keep_nothing_from_the_old_template(self):
+        for provider, text in copy_pages().items():
+            with self.subTest(provider=provider):
+                for sentence in OLD_TEMPLATE:
+                    self.assertNotIn(sentence, text)
+
+    def test_overview_explains_how_to_read_a_page(self):
+        index = INDEX.read_text()
+        self.assertIn("## How to read a connector page", index)
+        self.assertLess(index.index("## How to read a connector page"), index.index("<Columns"))
+        self.assertIn("](/essentials/v2/connectors)", index.split("<Columns", 1)[0])
+
 
 if __name__ == "__main__":
     unittest.main()

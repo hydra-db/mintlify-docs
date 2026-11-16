@@ -1,6 +1,7 @@
 """Generate one page per connector enabled in production, plus the providers overview.
 
 scripts/production_providers.json is refreshed from GET /connectors/providers on production.
+A provider with a copy file in scripts/connector_pages/ gets its page body rendered from that file.
 """
 import argparse
 from collections import namedtuple
@@ -18,6 +19,8 @@ TITLE_LOGOS = ROOT / "connector-logos.css"
 LOGOS = ROOT / "images/connectors"
 DIRECTORY = ROOT / "essentials/v2/connectors"
 INDEX = ROOT / "essentials/v2/connector-providers.mdx"
+COPY = ROOT / "scripts/connector_pages"
+GUIDE = "/essentials/v2/connectors"
 SCOPED_PROVIDER_EXAMPLES = {
     "slack": ("slack-account-a", "slack-account-b"),
     "github": ("github-account-a", "github-account-b"),
@@ -26,23 +29,30 @@ SCOPED_PROVIDER_EXAMPLES = {
 }
 NAVIGATION = ROOT / "docs.json"
 NAVIGATION_GROUP = "Connector providers"
+# Sidebar and overview order: what customers connect most comes first.
 GROUPS = {
-    "CRM & support": {"crm", "sales", "support"},
-    "Docs & files": {"docs", "knowledge", "storage", "cms", "design"},
-    "Engineering": {"dev_tools", "monitoring", "security"},
-    "HR & finance": {"hr", "finance"},
-    "Marketing & analytics": {"marketing", "analytics", "forms"},
-    "Meetings & calendar": {"communications", "calendar", "scheduling"},
     "Messaging & email": {"messaging", "email", "social"},
-    "Project management": {"project_management"},
+    "Tickets & project management": {"project_management"},
+    "Docs & cloud storage": {"docs", "knowledge", "storage", "cms", "design"},
+    "Meetings & calendar": {"communications", "calendar", "scheduling"},
+    "Engineering": {"dev_tools", "monitoring", "security"},
+    "Marketing & analytics": {"marketing", "analytics", "forms"},
+    "HR & finance": {"hr", "finance"},
+    "CRM & support": {"crm", "sales", "support"},
 }
 PROVIDER_GROUPS = {
-    "airtable": "Docs & files",
+    "airtable": "Docs & cloud storage",
     "microsoft_teams": "Messaging & email",
     "outlook": "Messaging & email",
     "twilio": "Messaging & email",
 }
 Logo = namedtuple("Logo", "light dark")
+# Production setup steps that explain HydraDB's internals. Each rewrite keeps the effect a customer acts on and drops the reason.
+SETUP_STEP_REWRITES = {
+    "datadog": {8: "That mirroring takes effect only once HydraDB turns on access-scoped search for this connector. Until then, a private incident is searchable by everyone in your HydraDB tenant. Ask us to turn it on, or leave out the incident_read scope if that is not acceptable: everything else syncs without it."},
+    "launchdarkly": {7: "Two things are never indexed. An environment's SDK key and mobile key are dropped before indexing, because they are live credentials for your own environment. So are a member's MFA state and whether they have a password."},
+    "sharepoint": {5: "SharePoint item and site permissions are not yet reproduced. Content is readable by everyone in your HydraDB tenant, and every item carries rbac_warning; set a resource access rule for sites that must be restricted."},
+}
 
 
 def prose(value):
@@ -135,6 +145,272 @@ def navigation(by_group):
     return text[:start] + block + text[end + 1:]
 
 
+PURPOSES = {
+    "Title": "names the item in results.",
+    "Searchable": "part of the text a query matches.",
+    "Date": "the time HydraDB uses for recency.",
+    "Filter": "a key a query can filter on, typed exactly as shown.",
+    "Link": "connects this item to another item.",
+    "Person or group in the graph": "a person or group the knowledge graph attaches the item to.",
+    "Access": "decides who can read the item.",
+    "Stored with results": "kept on the document, and shown when you open or inspect it. A search does not match it.",
+    "Not kept": "the provider has it, and HydraDB does not keep it.",
+}
+FOLDED = ("Stored with results", "Not kept")
+KINDS = {
+    "message": ("a message", "a chat or conversation message, kept with its author and its thread"),
+    "ticket": ("a ticket", "an issue, task or support ticket, with its workflow and ownership details"),
+    "knowledge_base": ("a page", "a page, article or other document-style content"),
+    "custom": ("a record", "an item that does not fit one of the specialised kinds, searched through its text"),
+    "email": ("an email", "an email message, with its sender, recipients and subject"),
+    "comment": ("a comment", "a note or comment that belongs to another item"),
+    "contact": ("a contact", "a person or organization record"),
+    "meeting": ("a meeting", "a meeting or calendar event"),
+    "container": ("a container", "a project, channel, folder or space that holds other items"),
+    "iteration": ("an iteration", "a sprint, cycle or release with dates and a goal"),
+}
+COPY_KEYS = {"description", "intro", "connect", "documents", "graph", "permissions", "sync", "not_synced", "questions", "good_to_know"}
+CALLOUT_SECTIONS = {"connect", "synced", "graph", "permissions", "sync"}
+
+
+def load_copy(identifier):
+    """Returns the provider's checked-in page copy, or None. Raises ValueError on a copy file that cannot render."""
+    path = COPY / f"{identifier}.json"
+    if not path.is_file():
+        return None
+    copy = json.loads(path.read_text())
+    problems = [f"missing {key}" for key in sorted(COPY_KEYS - copy.keys())]
+    problems += [f"unknown {key}" for key in sorted(copy.keys() - COPY_KEYS - {"callouts", "shared_attributes"})]
+    for section in copy.get("callouts", {}):
+        if section not in CALLOUT_SECTIONS:
+            problems.append(f"callout for unknown section {section}")
+    for document in copy.get("documents", []):
+        if document.get("kind") not in KINDS:
+            problems.append(f"{document.get('name')}: unknown kind {document.get('kind')}")
+    for attribute in all_attributes(copy):
+        unknown = [purpose for purpose in attribute.get("purposes", []) if purpose not in PURPOSES]
+        if unknown or not attribute.get("purposes"):
+            problems.append(f"{attribute.get('name')}: purposes {attribute.get('purposes')}")
+    if not 3 <= len(copy.get("questions", [])) <= 5:
+        problems.append("questions needs three to five entries")
+    if len(copy.get("good_to_know", [])) > 4:
+        problems.append("good_to_know has more than four entries")
+    if not isinstance(copy.get("permissions", {}).get("carried"), bool):
+        problems.append("permissions.carried must be true or false")
+    if problems:
+        raise ValueError(f"{path.relative_to(ROOT)}: {'; '.join(problems)}")
+    return copy
+
+
+def all_attributes(copy):
+    return [*copy.get("shared_attributes", []), *(attribute for document in copy.get("documents", []) for attribute in document.get("attributes", []))]
+
+
+def attribute(value):
+    return html.escape(value, quote=False).replace('"', "&quot;")
+
+
+def mdx(text):
+    """Escapes JSX-significant characters outside inline code so copy reads as plain Markdown."""
+    parts = re.split(r"(`[^`]*`)", text)
+    return "".join(part if part.startswith("`") else part.replace("{", "&#123;").replace("}", "&#125;").replace("<", "&lt;").replace(">", "&gt;") for part in parts)
+
+
+def field(name, kind, text, required=False):
+    return [f'<ResponseField name="{attribute(name)}" type="{kind}"{" required" if required else ""}>', mdx(text), "</ResponseField>", ""]
+
+
+def callout(copy, section):
+    found = copy.get("callouts", {}).get(section)
+    if not found:
+        return []
+    tag = found["kind"].capitalize()
+    return [f"<{tag}>", mdx(found["text"]), f"</{tag}>", ""]
+
+
+def labelled(label, value):
+    return f"- **{label}:** {mdx(value)}"
+
+
+def attributes(items):
+    groups = {label: [item for item in items if item["purposes"][0] == label] for label in PURPOSES}
+    lines = []
+    for label, members in groups.items():
+        if members and label not in FOLDED:
+            lines += [f"**{label}**", ""]
+            for item in members:
+                lines += field(item["name"], ", ".join(item["purposes"]), item["text"])
+    folded = [label for label in FOLDED if groups[label]]
+    if folded:
+        count = sum(len(groups[label]) for label in folded)
+        lines.append(f'<Accordion title="{" and ".join(folded).capitalize()} ({count})">')
+        lines.append("")
+        for label in folded:
+            for item in groups[label]:
+                lines += field(item["name"], ", ".join(item["purposes"]), item["text"])
+        lines += ["</Accordion>", ""]
+    return lines
+
+
+def copy_body(provider, copy, beta, acl_supported):
+    name = provider["display_name"]
+    identifier = provider["production_id"]
+    connect = copy["connect"]
+    lines = [line for paragraph in copy["intro"] for line in (mdx(paragraph), "")]
+    if beta:
+        lines += ["<Note>", f"{mdx(name)} is in beta.", "</Note>", ""]
+
+    lines += ["## Before you connect", "", *callout(copy, "connect"), mdx(connect["auth"]), "", "**Credentials**", ""]
+    for credential in connect["credentials"]:
+        lines += field(credential["name"], credential["type"], credential["text"], credential["required"])
+    if connect.get("credentials_note"):
+        lines += [mdx(connect["credentials_note"]), ""]
+    if connect.get("settings"):
+        lines += ["**Connector settings**", ""]
+        for setting in connect["settings"]:
+            lines += field(setting["name"], setting["type"], setting["text"], setting["required"])
+    if connect.get("permissions"):
+        lines += [f"**{connect.get('permissions_label', 'Permissions to grant')}**", ""]
+        lines += [f"- `{item['name']}`" + (f": {mdx(item['text'])}" if item.get("text") else "") for item in connect["permissions"]]
+        lines.append("")
+        if connect.get("permissions_note"):
+            lines += [mdx(connect["permissions_note"]), ""]
+    lines += ["**Set it up**", "", "<Steps>"]
+    for step in connect["steps"]:
+        lines += [f'  <Step title="{attribute(step["title"])}">', f"    {mdx(step['text'])}", "  </Step>"]
+    lines += ["</Steps>", ""]
+    for example in connect.get("examples", []):
+        lines += [mdx(example["intro"]), "", "<CodeGroup>"]
+        for tab in example["tabs"]:
+            lines += [f"```{tab['language']} {tab['title']}", tab["code"], "```"]
+        lines += ["</CodeGroup>", ""]
+    lines += [
+        f"Use provider `{identifier}` with [Create Connector](/api-reference/v2/endpoint/create-connector). Then call [Discover Connector Resources](/api-reference/v2/endpoint/discover-connector-resources) to list what the credentials can reach, and [Configure Connector](/api-reference/v2/endpoint/configure-connector) to choose what to sync.",
+        "",
+        f"Create one connector per account, each with that account's own credentials. {mdx(connect.get('account', ''))}".rstrip(),
+        "",
+    ]
+    if provider["provider"] in SCOPED_PROVIDER_EXAMPLES:
+        first, second = SCOPED_PROVIDER_EXAMPLES[provider["provider"]]
+        lines += [
+            f"To connect several {mdx(name)} accounts, give each connector its own `provider_account_scope`, for example `{first}` and `{second}`. Both are caller-provided example identifiers. HydraDB stores the value as given and does not check it against {mdx(name)}'s own account ids. Two connectors that share a scope and write to the same collection can overwrite each other's items. See [several accounts from one provider]({GUIDE}#6-connect-several-accounts-from-one-provider).",
+            "",
+        ]
+
+    lines += ["## What gets synced", "", *callout(copy, "synced"), "**What the labels mean**", ""]
+    lines += [f"- **{label}:** {meaning}" for label, meaning in PURPOSES.items()]
+    lines.append("")
+    if copy.get("shared_attributes"):
+        lines += [f"### On every {mdx(name)} document", ""]
+        lines += attributes(copy["shared_attributes"])
+    for document in copy["documents"]:
+        lines += [f"### {document['name']}", ""]
+        lines.append(labelled("One document", document["one_document"]))
+        lines.append(labelled("Title", document["title"]))
+        lines.append(labelled("Text", document["text"]))
+        lines.append(labelled("Date", document["date"]))
+        lines.append(labelled("Link back", document["link_back"]))
+        if document.get("files"):
+            lines.append(labelled("Files", document["files"]))
+        lines.append("")
+        lines += attributes(document["attributes"])
+
+    graph = copy["graph"]
+    lines += ["## How it fits into the graph", "", *callout(copy, "graph"), "**What each item becomes**", ""]
+    lines += [f"- {mdx(document['name'])}: {KINDS[document['kind']][0]}, {KINDS[document['kind']][1]}." for document in copy["documents"]]
+    lines += ["", f"**Connections {mdx(name)} creates**", ""]
+    lines += [f"- {mdx(item)}" for item in graph["connections"]] if isinstance(graph["connections"], list) else [mdx(graph["connections"])]
+    lines += ["", "**People and groups it names**", ""]
+    lines += [f"- {mdx(item)}" for item in graph["people"]] if isinstance(graph["people"], list) else [mdx(graph["people"])]
+    lines += [
+        "", "**What HydraDB reads from the text**", "", mdx(graph["from_text"]), "",
+        f"There is no per-connector setup for this. Every connector maps its items onto the same shared model, and HydraDB finds people, organizations, projects, products and other entities in the text the same way for every source. To steer what it looks for, use [custom instructions]({GUIDE}#4-custom-ingestion-instructions).",
+        "",
+    ]
+
+    permissions = copy["permissions"]
+    if permissions["carried"] != acl_supported:
+        raise ValueError(f"{identifier}: permissions.carried is {permissions['carried']} but production reports acl_supported {acl_supported}")
+    lines += ["## Permissions", "", *callout(copy, "permissions")]
+    if permissions["carried"]:
+        lines += [f"This connector can carry {mdx(name)} permissions into search.", ""]
+        lines += [labelled("Who can read an item", permissions["who_can_read"]), labelled("How a person is identified", permissions["identity"]), labelled("When permissions cannot be read", permissions["when_unreadable"]), ""]
+        lines += [*(f"- {mdx(item)}" for item in permissions.get("notes", [])), ""] if permissions.get("notes") else []
+        lines += [
+            f"Captured permissions filter search only when **Enforce ACL** is on for the connector. Only a signed-in human workspace owner or writer can turn it on, in the dashboard connector settings. API-key requests must omit `enforce_acl`, including `false`. See [Enforce ACL]({GUIDE}#enforce-acl). You can also [set your own rule on a resource]({GUIDE}#set-your-own-rule-on-a-resource).",
+            "",
+        ]
+    else:
+        lines += [
+            "<Warning>",
+            f"This connector does not carry {mdx(name)} permissions into search. Every synced item is visible to everyone who can query the collection, unless you [set an access rule on the resource]({GUIDE}#set-your-own-rule-on-a-resource).",
+            "</Warning>", "",
+        ]
+        lines += [*(f"- {mdx(item)}" for item in permissions.get("notes", [])), ""] if permissions.get("notes") else []
+        lines += [
+            f"**Enforce ACL** cannot be turned on for {mdx(name)}, because it needs a provider that reports `acl_supported: true`. API-key requests must omit `enforce_acl`, including `false`. See [ACL on synced content]({GUIDE}#5-acl-native-rbac-awareness).",
+            "",
+        ]
+    lines += ["Database and collection names decide where content lands; collection names do not authorize access.", ""]
+
+    sync = copy["sync"]
+    lines += ["## Keeping in sync", "", *callout(copy, "sync")]
+    lines += [labelled("First sync", sync["first_sync"]), labelled("New and changed items", sync["changes"]), labelled("Edits", sync["edits"]), labelled("Deletions", sync["deletes"])]
+    lines += [f"- {mdx(item)}" for item in sync.get("notes", [])]
+    lines += ["", "After the first sync, HydraDB syncs every hour by default. Set `sync_interval_seconds` to change it.", ""]
+
+    lines += ["## Not synced", "", *(f"- {mdx(item)}" for item in copy["not_synced"]), ""]
+    lines += ["## Questions this lets you answer", "", *(f"- {mdx(item)}" for item in copy["questions"]), ""]
+    lines += ["## Good to know", ""]
+    lines += [f"- **{mdx(item['title'])}** {mdx(item['text'])}" for item in copy["good_to_know"]]
+    lines.append("")
+    return lines
+
+
+def legacy_body(provider):
+    identifier = provider["provider"]
+    name = provider["display_name"]
+    lines = ["## What syncs", ""]
+    if provider.get("summary"):
+        lines.extend([prose(provider["summary"]), ""])
+    types = provider["indexed_object_types"]
+    if types:
+        lines.extend(["**Indexed object types**", ""])
+        lines.extend(f"- `{kind}`" for kind in types)
+    elif not provider.get("summary"):
+        lines.append("No fixed object types: what syncs is the set of resources you select when you configure the connector.")
+    lines.extend(["", "## Connect", ""])
+    lines.extend([
+        "Create one connector per account, using that account's credentials where required. Use a separate connector for a different account; see [account scopes](/essentials/v2/connectors#6-connect-several-accounts-from-one-provider). Shared destinations are allowed, but collection names do not authorize access.",
+        "",
+    ])
+    if identifier in SCOPED_PROVIDER_EXAMPLES:
+        first, second = SCOPED_PROVIDER_EXAMPLES[identifier]
+        lines.extend([
+            f"Set a stable, distinct `provider_account_scope` for each connected account yourself, for example `{first}` and `{second}`. These are caller-provided example identifiers. The API stores the supplied value as given; it does not check it against the provider's own account ids. Reusing a scope can make sources with matching external IDs overwrite each other in the same destination.",
+            "",
+        ])
+    if provider.get("setup_guide"):
+        rewrites = SETUP_STEP_REWRITES.get(identifier, {})
+        lines.extend(f"{number}. {prose(rewrites.get(number, step))}" for number, step in enumerate(provider["setup_guide"], 1))
+        lines.append("")
+    if identifier == "supabase":
+        lines.append("Follow the Supabase connection flow in the dashboard. Changes arrive as they happen, through the database webhooks you set up in Supabase.")
+    else:
+        lines.append(f"Use provider `{provider['production_id']}` with [Create Connector](/api-reference/v2/endpoint/create-connector), then [discover resources](/api-reference/v2/endpoint/discover-connector-resources) and [configure the resources](/api-reference/v2/endpoint/configure-connector) you want to sync. The [provider description](/api-reference/v2/endpoint/list-connector-providers) supplies the credential fields for your deployment.")
+    lines.extend([
+        "", "## Common mistakes", "",
+        "- A provider page describes indexed content, not the access granted to your credentials. Select resources the connected account can read.",
+        "- Synced content is not automatically private to each person. Review [ACL enforcement](/essentials/v2/connectors#enforce-acl) and set resource access rules where needed.",
+        "- API-key requests must omit `enforce_acl`, including `false`. Only a signed-in human workspace owner or writer can change **Enforce ACL** in dashboard connector settings, and enabling it requires `acl_supported: true`.",
+        "", "## Related", "",
+        "- [Connector providers](/essentials/v2/connector-providers)",
+        "- [Connectors](/essentials/v2/connectors): setup, sync, and access control",
+        "- [Get Connector Status](/api-reference/v2/endpoint/get-connector-status): progress and warnings", "",
+    ])
+    return lines
+
+
 def pages():
     production = {slug(row["provider"]): row for row in json.loads(PRODUCTION.read_text())["providers"]}
     enabled = {key: group(row) for key, row in production.items()}
@@ -144,64 +420,46 @@ def pages():
     for item in snapshot["providers"]:
         if slug(item["provider"]) in production:
             production_id = production[slug(item["provider"])]["provider"]
-            display_name = names["docs_overrides"].get(production_id, names["names"][production_id])
-            providers.append({**item, "production_id": production_id, "display_name": display_name})
+            providers.append({**item, "production_id": production_id, "display_name": names["names"][production_id]})
     providers.sort(key=lambda item: item["display_name"].casefold())
     output = {}
+    rewritten = []
     for provider in providers:
         identifier = provider["provider"]
         name = provider["display_name"]
+        row = production[slug(identifier)]
         found = logo(identifier)
+        copy = load_copy(provider["production_id"])
+        formerly = names["formerly"].get(provider["production_id"])
+        called = f"{name} (formerly {formerly})" if formerly else name
+        description = copy["description"] if copy else f"What HydraDB syncs from {called}, and how to connect it."
         lines = [
             "---", f"title: {json.dumps(name)}",
-            f"description: {json.dumps(f'What HydraDB syncs from {name}, and how to connect it.')}",
+            f"description: {json.dumps(description)}",
             *([f"icon: {json.dumps(found.light)}"] if found else []),
-            "---", "", f"Use the {prose(name)} connector to bring the following content into HydraDB.",
-            "", "## What syncs", "",
+            "---", "",
         ]
-        if provider.get("summary"):
-            lines.append(prose(provider["summary"]))
-        types = provider["indexed_object_types"]
-        if types:
-            lines.append("The provider description lists these indexed object types:")
-            lines.append("")
-            lines.extend(f"- `{kind}`" for kind in types)
-        elif not provider.get("summary"):
-            lines.append("The provider description does not enumerate fixed indexed object types. Use the setup notes below when available; the resource picker shows what your connection can select.")
-        lines.extend(["", "## Connect", ""])
-        lines.extend([
-            "Create one connector per account, using that account's credentials where required. Use a separate connector for a different account; see [account scopes](/essentials/v2/connectors#6-connect-several-accounts-from-one-provider). Shared destinations are allowed, but collection names do not authorize access.",
-            "",
-        ])
-        if identifier in SCOPED_PROVIDER_EXAMPLES:
-            first, second = SCOPED_PROVIDER_EXAMPLES[identifier]
-            lines.extend([
-                f"Set a stable, distinct `provider_account_scope` for each connected account yourself, for example `{first}` and `{second}`. These are caller-provided example identifiers, not validated native account-ID formats. The API stores the supplied value; it does not derive or validate the provider's account identity. Reusing a scope can make sources with matching external IDs overwrite each other in the same destination.",
-                "",
-            ])
-        if provider.get("setup_guide"):
-            lines.extend(f"{number}. {prose(step)}" for number, step in enumerate(provider["setup_guide"], 1))
-            lines.append("")
-        if identifier == "supabase":
-            lines.append("Follow the Supabase connection flow in the dashboard. This is a push connector; the webhook triggers, not a polling credential, deliver changes.")
+        if copy:
+            lines += copy_body(provider, copy, row["is_beta"], row["acl_supported"])
+            rewritten.append(provider)
         else:
-            lines.append(f"Use provider `{provider['production_id']}` with [Create Connector](/api-reference/v2/endpoint/create-connector), then [discover resources](/api-reference/v2/endpoint/discover-connector-resources) and [configure the resources](/api-reference/v2/endpoint/configure-connector) you want to sync. The [provider description](/api-reference/v2/endpoint/list-connector-providers) supplies the credential fields for your deployment.")
-        lines.extend([
-            "", "## Common mistakes", "",
-            "- A provider page describes indexed content, not the access granted to your credentials. Select resources the connected account can read.",
-            "- Synced content is not automatically private to each person. Review [ACL enforcement](/essentials/v2/connectors#enforce-acl) and set resource access rules where needed.",
-            "- API-key requests must omit `enforce_acl`, including `false`. Only a signed-in human workspace owner or writer can change **Enforce ACL** in dashboard connector settings, and enabling it requires `acl_supported: true`.",
-            "", "## Related", "",
-            "- [Connector providers](/essentials/v2/connector-providers)",
-            "- [Connectors](/essentials/v2/connectors): setup, sync, and access control",
-            "- [Get Connector Status](/api-reference/v2/endpoint/get-connector-status): progress and warnings", "",
-        ])
+            lines += legacy_body(provider)
         output[DIRECTORY / f"{slug(identifier)}.mdx"] = "\n".join(lines)
     lines = [
         "---", 'title: "Connector providers"', 'sidebarTitle: "All connectors"',
-        'description: "See what each connector indexes before you connect an account."', "---", "",
-        "Choose a provider to see the indexed object types and any provider-specific setup steps. These pages describe content capabilities; availability and credentials come from your deployment's [provider catalog](/api-reference/v2/endpoint/list-connector-providers).", "",
+        'description: "See what each connector syncs, what it needs, and who can read what it brings in."', "---", "",
+        f"Choose a provider to see what to set up and what it syncs. Availability and credential fields come from your deployment's [provider catalog](/api-reference/v2/endpoint/list-connector-providers). The steps every connector shares are in the [connectors guide]({GUIDE}).", "",
+        "## How to read a connector page", "",
+        "1. **Before you connect:** the credentials, permissions and steps the provider needs.",
+        "2. **What gets synced:** what one document is, and what HydraDB does with each attribute it keeps.",
+        "3. **How it fits into the graph:** what kind of item each document becomes and what it connects to.",
+        "4. **Permissions:** whether the provider's permissions decide who can read an item.",
+        "5. **Keeping in sync:** how history, edits and deletions arrive.",
+        "6. **Not synced:** what does not come across.", "",
     ]
+    if len(rewritten) < len(providers):
+        links = ", ".join(f"[{provider['display_name']}](/essentials/v2/connectors/{slug(provider['provider'])})" for provider in rewritten)
+        lines += [f"These pages follow that layout: {links}. The others list the indexed object types and setup notes while they move to it.", ""]
     by_group = {title: [provider for provider in providers if enabled[slug(provider["provider"])] == title] for title in GROUPS}
     for title, members in by_group.items():
         lines.extend([f"## {title}", "", "<Columns cols={3}>", *(card(provider, logo(provider["provider"])) for provider in members), "</Columns>", ""])
@@ -229,4 +487,5 @@ if __name__ == "__main__":
         for path in set(DIRECTORY.glob("*.mdx")) - generated.keys():
             path.unlink()
         for path, content in generated.items():
-            path.write_text(content)
+            if not path.exists() or path.read_text() != content:
+                path.write_text(content)
