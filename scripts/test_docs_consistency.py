@@ -431,5 +431,51 @@ class SharedFactsTest(unittest.TestCase):
                                     path.relative_to(ROOT))
 
 
+
+def v2_pages():
+    for path in live_files("*.mdx"):
+        relative = path.relative_to(ROOT).as_posix()
+        if "/v2/" in f"/{relative}" or relative == "AGENTS.mdx":
+            yield relative, path.read_text(encoding="utf-8")
+
+
+class PublishedQueryContractTest(unittest.TestCase):
+    """The production query contract the guides teach (PRO-1618 review, 2026-11-16)."""
+
+    def test_examples_leave_the_default_query_type_out(self):
+        explicit_all = re.compile(r"""\btype\b["']?\s*[:=]\s*["']all["']""")
+        offenders = [
+            f"{relative}: {match.group(0)}"
+            for relative, text in v2_pages()
+            for block in re.findall(r"```.*?```", text, re.S)
+            for match in explicit_all.finditer(block)
+        ]
+        self.assertEqual([], offenders, "omit type to search both stores; a unified database rejects an explicit all")
+
+    def test_withdrawn_query_aliases_and_notices_are_not_documented(self):
+        withdrawn = re.compile(
+            r"follow_forceful_relations|enrichment_enabled_by_default"
+            r"|alias(?:es)?\b[^.\n]*`context`|> `context`"
+        )
+        offenders = [f"{relative}: {m.group(0)}" for relative, text in v2_pages() for m in withdrawn.finditer(text)]
+        self.assertEqual([], offenders)
+
+    def test_declared_links_use_the_deterministic_relations_name(self):
+        offenders = [
+            f"{relative}: {m.group(0)}"
+            for relative, text in v2_pages()
+            for m in re.finditer(r"(?i)forceful[ -]relations?\b", text)
+        ]
+        self.assertEqual([], offenders)
+
+    def test_memory_ingest_path_is_not_called_legacy(self):
+        offenders = [
+            f"{relative}: {m.group(0)}"
+            for relative, text in v2_pages()
+            for m in re.finditer(r"(?i)legacy\s+`?memor", text)
+        ]
+        self.assertEqual([], offenders)
+
+
 if __name__ == "__main__":
     unittest.main()
