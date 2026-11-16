@@ -2,7 +2,7 @@ import json
 import re
 import unittest
 
-from generate_connector_pages import COPY, DIRECTORY, PURPOSES, ROOT, SNAPSHOT, SCOPED_PROVIDER_EXAMPLES, load_copy, pages, prose
+from generate_connector_pages import COPY, DIRECTORY, LOGOS as LOGO_DIRECTORY, PLACEHOLDER_MARK, PURPOSES, ROOT, SNAPSHOT, SCOPED_PROVIDER_EXAMPLES, artwork, load_copy, logo, pages, placeholder_logos, prose
 from generate_llms_index import page_paths
 
 
@@ -161,7 +161,7 @@ class ConnectorPagesTest(unittest.TestCase):
         shown = set()
         for slug in PRODUCTION_SLUGS:
             pair = {f"{slug}-light.svg", f"{slug}-dark.svg"}
-            expected = sorted(pair) if pair <= files else [f"{slug}.svg"] if f"{slug}.svg" in files else []
+            expected = sorted(pair) if pair <= files else [f"{slug}.svg"]
             page = (DIRECTORY / f"{slug}.mdx").read_text()
             card = re.search(rf'<Card title="[^"]+"(.*?) href="/essentials/v2/connectors/{slug}" horizontal />', index)
             with self.subTest(provider=slug):
@@ -219,7 +219,8 @@ class ConnectorPagesTest(unittest.TestCase):
 
     def test_monochrome_marks_change_only_their_ink_between_themes(self):
         pairs = sorted(path.name[: -len("-light.svg")] for path in LOGOS.glob("*-light.svg"))
-        self.assertEqual(["attio", "datadog", "github", "gong", "guru", "launchdarkly", "notion", "pipedrive", "sentry", "smartsheet", "twitter", "typeform", "zendesk"], pairs)
+        placeholders = ["copper", "klaviyo", "lever", "pardot", "recurly"]
+        self.assertEqual(sorted(["attio", "datadog", "github", "gong", "guru", "launchdarkly", "notion", "pipedrive", "sentry", "smartsheet", "twitter", "typeform", "zendesk", *placeholders]), pairs)
         for slug in pairs:
             light, dark = ((LOGOS / f"{slug}-{theme}.svg").read_text() for theme in ("light", "dark"))
             inks = lambda text: set(re.findall(r'(?:fill|stroke)="(#[0-9a-fA-F]+)"', text))
@@ -277,6 +278,46 @@ class PageOpeningAndOrderTest(unittest.TestCase):
         group = next(item for item in config["navigation"]["versions"][0]["tabs"][0]["groups"] if item["group"] == "Connector providers")
         self.assertEqual(order, [category["group"] for category in group["pages"][1:]])
         self.assertEqual(order, [title for title in re.findall(r"^## (.+)$", INDEX.read_text(), re.M) if title in order])
+
+
+class PlaceholderLogoTest(unittest.TestCase):
+    def test_every_production_provider_has_a_logo_file(self):
+        for row in PRODUCTION:
+            found = logo(row["provider"])
+            with self.subTest(provider=row["provider"]):
+                for path in filter(None, found):
+                    self.assertTrue((ROOT / path.lstrip("/")).is_file(), path)
+                text = (DIRECTORY / f"{row['provider'].replace('_', '-')}.mdx").read_text()
+                self.assertIn(f'icon: "{found.light}"', text)
+                self.assertIn(f'url("{found.light}")', TITLE_LOGOS.read_text())
+                self.assertIn(found.light, INDEX.read_text())
+
+    def test_placeholders_are_neutral_monograms_for_providers_without_artwork(self):
+        names = DASHBOARD_NAMES["names"]
+        placeholder_files = {path.name for path in LOGO_DIRECTORY.glob("*.svg") if PLACEHOLDER_MARK in path.read_text()}
+        missing = sorted(row["provider"] for row in PRODUCTION if artwork(row["provider"]) is None)
+        self.assertEqual(["copper", "klaviyo", "lever", "pardot", "recurly"], missing)
+        self.assertEqual({f"{slug}-{theme}.svg" for slug in missing for theme in ("light", "dark")}, placeholder_files)
+        for provider in missing:
+            light = (LOGO_DIRECTORY / f"{provider}-light.svg").read_text()
+            with self.subTest(provider=provider):
+                self.assertEqual([names[provider][0].upper()], re.findall(r">([^<]+)</text>", light))
+                self.assertNotRegex(light, r"<path|<image|href=")
+                self.assertEqual({"#363636"}, set(re.findall(r'fill="(#[0-9a-fA-F]+)"', light)))
+
+    def test_real_artwork_replaces_a_placeholder_on_the_next_run(self):
+        providers = [{"provider": "copper", "display_name": "Copper"}]
+        self.assertEqual({LOGO_DIRECTORY / "copper-light.svg", LOGO_DIRECTORY / "copper-dark.svg"}, set(placeholder_logos(providers)))
+        real = LOGO_DIRECTORY / "copper.svg"
+        real.write_text('<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><circle cx="12" cy="12" r="10"/></svg>')
+        try:
+            self.assertEqual({}, placeholder_logos(providers))
+            self.assertEqual("/images/connectors/copper.svg", logo("copper").light)
+            generated = pages()
+            self.assertNotIn(LOGO_DIRECTORY / "copper-light.svg", generated)
+            self.assertIn('url("/images/connectors/copper.svg")', generated[TITLE_LOGOS])
+        finally:
+            real.unlink()
 
 
 class ConnectorCopyPagesTest(unittest.TestCase):

@@ -72,13 +72,45 @@ def group(row):
     return next(title for title, categories in GROUPS.items() if row["category"] in categories)
 
 
-def logo(identifier):
-    """Monochrome marks ship a light-mode and a dark-mode file; multi-colour marks ship one file for both."""
-    url = lambda path: f"/{path.relative_to(ROOT)}"
+PLACEHOLDER_MARK = 'data-placeholder="monogram"'
+INKS = {"light": "#363636", "dark": "#cccccc"}
+
+
+def url(path):
+    return f"/{path.relative_to(ROOT)}"
+
+
+def is_placeholder(path):
+    return PLACEHOLDER_MARK in path.read_text()
+
+
+def artwork(identifier):
+    """The dashboard's own mark. Monochrome marks ship a light-mode and a dark-mode file; multi-colour marks ship one file for both."""
     single, light, dark = (LOGOS / f"{slug(identifier)}{suffix}.svg" for suffix in ("", "-light", "-dark"))
-    if light.is_file() and dark.is_file():
+    if light.is_file() and dark.is_file() and not is_placeholder(light):
         return Logo(url(light), url(dark))
     return Logo(url(single), None) if single.is_file() else None
+
+
+def logo(identifier):
+    return artwork(identifier) or Logo(*(url(LOGOS / f"{slug(identifier)}-{theme}.svg") for theme in INKS))
+
+
+def monogram(name, ink):
+    return "\n".join([
+        f'<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" {PLACEHOLDER_MARK}>',
+        f'<text x="12" y="12.5" text-anchor="middle" dominant-baseline="central" font-family="Helvetica, Arial, sans-serif" font-size="21" font-weight="600" fill="{ink}">{html.escape(name[0].upper())}</text>',
+        "</svg>", "",
+    ])
+
+
+def placeholder_logos(providers):
+    """The one place that decides which providers show a placeholder: those with no dashboard artwork. Adding real artwork drops the placeholder on the next run."""
+    return {
+        LOGOS / f"{slug(provider['provider'])}-{theme}.svg": monogram(provider["display_name"], ink)
+        for provider in providers if artwork(provider["provider"]) is None
+        for theme, ink in INKS.items()
+    }
 
 
 def images(found, alt, class_name):
@@ -104,8 +136,6 @@ def title_logos(providers):
     ]
     for provider in providers:
         found = logo(provider["provider"])
-        if found is None:
-            continue
         lines.append(f'{page(provider["provider"])} {{ content: ""; background-image: url("{found.light}"); }}')
         if found.dark:
             lines.append(f'{page(provider["provider"], "html.dark")} {{ background-image: url("{found.dark}"); }}')
@@ -114,9 +144,7 @@ def title_logos(providers):
 
 def card(provider, found):
     href = f"/essentials/v2/connectors/{slug(provider['provider'])}"
-    if found is None:
-        icon = ""
-    elif found.dark is None:
+    if found.dark is None:
         icon = f' icon="{found.light}"'
     else:
         icon = f" icon={{<>{''.join(images(found, '', 'connector-card-logo'))}</>}}"
@@ -436,7 +464,7 @@ def pages():
         lines = [
             "---", f"title: {json.dumps(name)}",
             f"description: {json.dumps(description)}",
-            *([f"icon: {json.dumps(found.light)}"] if found else []),
+            f"icon: {json.dumps(found.light)}",
             "---", "",
         ]
         if copy:
@@ -467,7 +495,12 @@ def pages():
     output[INDEX] = "\n".join(lines)
     output[NAVIGATION] = navigation(by_group)
     output[TITLE_LOGOS] = title_logos(providers)
+    output.update(placeholder_logos(providers))
     return output
+
+
+def stale_placeholders(generated):
+    return {path for path in LOGOS.glob("*.svg") if is_placeholder(path)} - generated.keys()
 
 
 if __name__ == "__main__":
@@ -478,13 +511,14 @@ if __name__ == "__main__":
     if args.check:
         stale = [str(path.relative_to(ROOT)) for path, content in generated.items()
                  if not path.exists() or path.read_text() != content]
-        extra = set(DIRECTORY.glob("*.mdx")) - generated.keys()
+        extra = set(DIRECTORY.glob("*.mdx")) - generated.keys() | stale_placeholders(generated)
         if stale or extra:
             raise SystemExit(f"Connector pages are stale: {stale + sorted(str(path.relative_to(ROOT)) for path in extra)}")
-        print(f"{len(generated) - 3} connector pages, the overview, the navigation group and the title logos match the snapshot")
+        placeholders = sum(1 for path in generated if path.parent == LOGOS) // 2
+        print(f"{len(generated) - 3 - 2 * placeholders} connector pages, the overview, the navigation group, the title logos and {placeholders} placeholder logos match the snapshot")
     else:
         DIRECTORY.mkdir(parents=True, exist_ok=True)
-        for path in set(DIRECTORY.glob("*.mdx")) - generated.keys():
+        for path in set(DIRECTORY.glob("*.mdx")) - generated.keys() | stale_placeholders(generated):
             path.unlink()
         for path, content in generated.items():
             if not path.exists() or path.read_text() != content:
