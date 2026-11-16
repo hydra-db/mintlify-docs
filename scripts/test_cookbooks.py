@@ -301,8 +301,7 @@ class Stubs:
         scopes = kwargs.get("collections") or [kwargs["collection"]]
         test.assertFalse("collection" in kwargs and "collections" in kwargs)
         test.assertLessEqual(set(scopes), self.collections)
-        test.assertIn(kwargs.get("type"), {None, "knowledge", "memory"},
-                      "omit type to search both stores; a unified database rejects an explicit all")
+        test.assertIn(kwargs["type"], {"knowledge", "memory", "all"})
         test.assertIn(kwargs.get("mode", "auto"), {"fast", "thinking", "auto"})
         if "max_results" in kwargs:
             test.assertLessEqual(kwargs["max_results"], 250)
