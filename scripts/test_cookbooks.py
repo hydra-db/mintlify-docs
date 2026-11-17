@@ -40,8 +40,8 @@ CONTEXT_ITEM_KEYS = {
 }
 OPERATORS = {"equals", "contains", "contains_any"}
 ATTRIBUTE_OPERATORS = {"$eq", "$ne", "$gt", "$gte", "$lt", "$lte", "$in", "$nin", "$exists", "$not"}
-# Cookbooks that bring app content in through connectors, and the variables they read.
-CONNECTOR_COOKBOOKS = {"glean", "chief-of-staff", "personal-assistant"}
+# Optional connector examples use these environment variables.
+CONNECTOR_COOKBOOKS = {"glean"}
 APP_CREDENTIALS = {
     "SLACK_TOKEN": "xoxp-test", "SLACK_WORKSPACE_ID": "T12345ACME",
     "GMAIL_CREDENTIALS": '{"refresh_token": "test"}',
@@ -444,14 +444,22 @@ class CookbookTest(unittest.TestCase):
             with self.subTest(cookbook=path.name):
                 stubs = self.run_cookbook(path)
                 steps = ["DatabasesClient.create", "DatabasesClient.status", "query"]
+                steps += ["ContextClient.ingest", "ContextClient.status"]
                 if path.stem in CONNECTOR_COOKBOOKS:
                     steps += ["ConnectorsClient.list", "ConnectorsClient.create", "ConnectorsClient.discover",
                               "ConnectorsClient.configure", "ConnectorsClient.status"]
                 else:
-                    steps += ["ContextClient.ingest", "ContextClient.status"]
                     self.assertNotIn("ConnectorsClient.create", stubs.calls)
                 for step in steps:
                     self.assertIn(step, stubs.calls)
+
+    def test_glean_connection_example_discovers_every_page(self):
+        hydra, stubs = self.load_setup()
+        source = python_blocks(ROOT / "cookbooks/v2/glean.mdx")["connect.py"]
+        with mock.patch.dict(sys.modules, {"hydra": hydra}), bounded_sleep():
+            exec(compile(source, "connect.py", "exec"), {})
+        self.assertEqual(2, stubs.calls.count("ConnectorsClient.discover"))
+        self.assertEqual(1, stubs.calls.count("ConnectorsClient.configure"))
 
     def test_connect_reuses_only_the_same_account(self):
         hydra, stubs = self.load_setup()
