@@ -38,7 +38,7 @@ CONTEXT_ITEM_KEYS = {
     "context_id", "title", "text", "conversation", "enrich", "upsert", "happened_at",
     "attributes", "custom_attributes", "context_category", "forceful_relations", "acl", "user_name",
 }
-CONTEXT_CATEGORIES = {"auto", "user_preference", "business_knowledge", "decision_trace"}
+CONTEXT_CATEGORIES = {"auto", "user_preference", "business_knowledge"}
 OPERATORS = {"equals", "contains", "contains_any"}
 ATTRIBUTE_OPERATORS = {"$eq", "$ne", "$gt", "$gte", "$lt", "$lte", "$in", "$nin", "$exists", "$not"}
 # Cookbooks that bring app content in through connectors, and the variables they read.
