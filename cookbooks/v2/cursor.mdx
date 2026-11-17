@@ -35,7 +35,7 @@ create_database(DATABASE)
 
 ## 2. Upload the files
 
-Upload source files as documents. HydraDB reads `.txt` files as plain text and rejects code extensions such as `.py`, so add `.txt` to each filename. Derive each `id` from the file's path, so that uploading a changed file again replaces the old version (`upsert` defaults to `true`). Keep the path in `additional_metadata` to cite it later. HydraDB extracts entities and relations itself; you supply no parsing rules.
+Upload source files as documents, in the `documents` field. HydraDB reads `.txt` files as plain text and rejects code extensions such as `.py`, so add `.txt` to each filename. Derive each `id` from the file's path, so that uploading a changed file again replaces the old version (`upsert` defaults to `true`). A query returns each chunk with the `context_id` of its file, not the path, so keep a map from one to the other to cite files later. HydraDB extracts entities and relations itself; you supply no parsing rules.
 
 ```python cursor.py
 def source_id(path):
@@ -46,13 +46,13 @@ files = [
     p for p in REPO.rglob("*")
     if p.is_file() and p.suffix in EXTENSIONS and ".git" not in p.parts and p.stat().st_size
 ]
+PATHS = {source_id(p.relative_to(REPO)): str(p.relative_to(REPO)) for p in files}
 ids = []
 for start in range(0, len(files), 20):
     batch = files[start : start + 20]
     handles = [open(p, "rb") for p in batch]
     try:
         result = client.context.ingest(
-            type="knowledge",
             database=DATABASE,
             collection=COLLECTION,
             documents=[(f"{p.name}.txt", h, "text/plain") for p, h in zip(batch, handles)],
@@ -75,9 +75,9 @@ for start in range(0, len(ids), 50):
 
 ## 3. Write the search tool
 
-These are the query settings from the CodeWikiBench run: hybrid matching, `thinking` mode, graph context on, and eight chunks. `thinking` mode expands the query and reranks, which helps when an answer spans several files. Graph context returns the relations HydraDB extracted, such as which function calls which.
+These are the query settings from the CodeWikiBench run: hybrid matching, `thinking` mode, graph context on, and eight chunks. `thinking` mode expands the query and reranks, which helps when an answer spans several files. The `graph` paths return the relations HydraDB extracted, such as which function calls which, each already written out as a `path_summary`.
 
-Return the chunks, graph relationships, and linked-source context together as JSON. Keep each chunk's repository path so the model can cite the file.
+Return the chunks, the graph paths, and any chunks linked by deterministic relations together as JSON. Give each chunk its repository path so the model can cite the file.
 
 ```python cursor.py
 def search_code(question):
@@ -85,21 +85,20 @@ def search_code(question):
         database=DATABASE,
         collection=COLLECTION,
         query=question,
-        type="knowledge",
         query_by="hybrid",
         mode="thinking",
         graph_context=True,
         max_results=8,
     )
-    data = json.loads(result.data.json(exclude_none=True))
-    context = {
-        "chunks": data.get("chunks") or [],
-        "graph_context": data.get("graph_context") or {},
-        "additional_graph_context": data.get("additional_graph_context") or data.get("additional_context") or {},
-    }
-    for chunk in context["chunks"]:
-        chunk["path"] = (chunk.get("additional_metadata") or {}).get("path", chunk.get("source_title"))
-    return json.dumps(context, ensure_ascii=False)
+
+    def cite(chunk):
+        return {"path": PATHS.get(chunk.context_id, chunk.context_id), "content": chunk.content}
+
+    return json.dumps({
+        "chunks": [cite(chunk) for chunk in result.data.chunks],
+        "graph": [path.path_summary for path in result.data.graph],
+        "linked": [cite(linked.chunk) for linked in result.data.forceful_relations],
+    }, ensure_ascii=False)
 ```
 
 ## 4. Let the model call it
@@ -163,6 +162,6 @@ Indexing a few hundred files takes a few minutes. The answer should name specifi
 
 ## Next steps
 
-- [Query: API Reference](/api-reference/v2/endpoint/query): the fields of `graph_context`.
+- [Query: API Reference](/api-reference/v2/endpoint/query): the fields of each `graph` path.
 - [Connectors](/essentials/v2/connectors): sync pull requests from GitHub and threads from Slack, so the assistant can answer why code was written the way it was.
 - [Claude Code](/plugins/claude-code) and [Cursor](/plugins/cursor) plugins: give an existing coding agent HydraDB memory without building your own.

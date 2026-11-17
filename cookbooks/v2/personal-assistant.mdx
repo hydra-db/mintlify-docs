@@ -21,7 +21,6 @@ A personal assistant has two jobs: remember what a person tells it, across sessi
 Each user's context lives in their own collection, named by their user ID. Nothing one user saves can appear in another user's query.
 
 ```python assistant.py
-import io
 import json
 import os
 
@@ -35,20 +34,19 @@ create_database(DATABASE)
 
 ## 2. Remember each session
 
-When a session ends, save its turns as a [memory](/essentials/v2/context#ingesting-memory). Send the dialogue as `user_assistant_pairs` with `infer: true`: HydraDB extracts the preferences and facts, including ones that are implied, and reconciles them with what it already holds. Saving session by session is how the LongMemEval run ingested its conversations.
+When a session ends, save its turns as a [`context` item](/essentials/v2/context). Send the dialogue as a `conversation`, the same `{role, content}` list you send to the model. Enrichment is on by default: HydraDB extracts the preferences and facts, including ones that are implied, and reconciles them with what it already holds. Saving session by session is how the LongMemEval run ingested its conversations.
 
 ```python assistant.py
 def remember_session(turns):
     """turns is a list of (user message, assistant reply) pairs."""
+    conversation = []
+    for user_message, reply in turns:
+        conversation += [{"role": "user", "content": user_message},
+                         {"role": "assistant", "content": reply}]
     result = client.context.ingest(
-        type="memory",
         database=DATABASE,
         collection=USER,
-        memories=json.dumps([{
-            "user_assistant_pairs": [{"user": u, "assistant": a} for u, a in turns],
-            "infer": True,
-            "user_name": "Maya",
-        }]),
+        context=json.dumps([{"conversation": conversation, "user_name": "Maya"}]),
     )
     wait_indexed(DATABASE, USER, source_ids(result))
 
@@ -64,7 +62,7 @@ remember_session([
 
 ## 3. Add the person's email and photos
 
-Email and media are knowledge, saved in the same collection. A [connector](/essentials/v2/connectors) syncs the person's mailbox; `lookback_days` sets how far back the first sync reaches. Above 30, the older mail may be fetched in the background and keep arriving after `connect` returns. Photos and videos have no text to search, so caption each one with a vision model in your application, then upload the caption, any text read from the image, and the date and place as a small file. This mirrors the ATM-Bench setup, where every item is text plus its timestamp, location, and tags.
+Email and media go in the same collection. A [connector](/essentials/v2/connectors) syncs the person's mailbox; `lookback_days` sets how far back the first sync reaches. Above 30, the older mail may be fetched in the background and keep arriving after `connect` returns. Photos and videos have no text to search, so caption each one with a vision model in your application, then save the caption, any text read from the image, and the date and place as a `context` item. This mirrors the ATM-Bench setup, where every item is text plus its timestamp, location, and tags.
 
 ```python assistant.py
 USER_EMAIL = os.environ["USER_EMAIL"]
@@ -84,15 +82,15 @@ connect(
 
 
 def add_photo(photo_id, caption, taken_at, place):
-    text = f"# Photo taken {taken_at} in {place}\n\n{caption}\n"
     result = client.context.ingest(
-        type="knowledge",
         database=DATABASE,
         collection=USER,
-        documents=[(f"{photo_id}.md", io.BytesIO(text.encode()), "text/markdown")],
-        document_metadata=json.dumps([{
-            "id": photo_id,
-            "additional_metadata": {"taken_at": taken_at, "place": place},
+        context=json.dumps([{
+            "context_id": photo_id,
+            "title": f"Photo taken {taken_at} in {place}",
+            "text": f"Photo taken {taken_at} in {place}. {caption}",
+            "happened_at": taken_at,
+            "custom_attributes": {"place": place},
         }]),
     )
     wait_indexed(DATABASE, USER, source_ids(result))
@@ -106,9 +104,9 @@ add_photo(
 )
 ```
 
-## 4. Answer from memories and items together
+## 4. Answer from sessions, email, and photos together
 
-`type: "all"` searches the user's memories and knowledge in one call. `acl` is the user's own email, so the query returns only what this person may see.
+One query searches everything in the user's collection: saved sessions, synced email, and photo captions. `acl` is the user's own email, so the query returns only what this person may see.
 
 ```python assistant.py
 def ask(question):
@@ -116,7 +114,6 @@ def ask(question):
         database=DATABASE,
         collection=USER,
         query=question,
-        type="all",
         mode="thinking",
         acl=[USER_EMAIL],
     )
@@ -140,11 +137,11 @@ The first answer suggests vegetarian options near King's Cross, not Shoreditch. 
 
 ## Common mistakes
 
-- **Saving a transcript with `infer: false`:** that stores the dialogue word for word, and the preference inside it is harder to find. Use `infer: true` for raw conversation.
+- **Saving a transcript with `enrich: false`:** that stores the dialogue word for word, and the preference inside it is harder to find. Leave enrichment on for raw conversation.
 - **Forgetting `collection` on the query:** a query without it reads the default collection, which holds nothing for this user.
-- **Ingesting images without text:** queries match text. Put a caption, any text in the image, and the date and place into the file you upload.
+- **Ingesting images without text:** queries match text. Put a caption, any text in the image, and the date and place into the item's `text`.
 
 ## Next steps
 
-- [Context](/essentials/v2/context#ingesting-memory): `infer`, per-user scope, and deleting a memory.
-- [Build your own AI Chief of Staff](/cookbooks/v2/chief-of-staff): the same memory, applied to meetings and commitments.
+- [Context](/essentials/v2/context): `conversation` items, `enrich`, per-user scope, and deleting an item.
+- [Build your own AI Chief of Staff](/cookbooks/v2/chief-of-staff): the same approach, applied to meetings and commitments.

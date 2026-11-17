@@ -2,9 +2,13 @@
 
 No network and no credentials: each SDK method is replaced by a stub that first
 binds the call to the real method's signature (so an unknown or misspelled
-argument fails), checks the JSON payloads against the documented shapes, and
-returns the SDK's own response model for that method, filled with public fields
-only. A cookbook that reads a field the public API does not return fails here.
+argument fails), checks the JSON payloads against the documented shapes of a
+unified database, and returns a response filled with public fields only. A
+cookbook that reads a field the public API does not return fails here.
+
+The query stub returns the unified response body (chunks, graph,
+forceful_relations, llm_prompt, tabular_data). The released SDK has no model
+for it, so it is built from plain objects that raise on any other attribute.
 """
 
 import ast
@@ -28,11 +32,15 @@ COOKBOOKS = sorted(p for p in (ROOT / "cookbooks/v2").glob("*.mdx") if p.name !=
 SETUP = ROOT / "snippets/cookbook-setup.mdx"
 
 DOCUMENT_METADATA_KEYS = {"id", "metadata", "additional_metadata", "relations"}
-MEMORY_KEYS = {
-    "id", "title", "text", "user_assistant_pairs", "is_markdown", "infer",
-    "custom_instructions", "user_name", "metadata", "additional_metadata",
+# The accepted item fields of a unified ingest (POST /context/ingest, `context`).
+# `instructions` is accepted by the API but is not taught on ingest pages.
+CONTEXT_ITEM_KEYS = {
+    "context_id", "title", "text", "conversation", "enrich", "upsert", "happened_at",
+    "attributes", "custom_attributes", "context_category", "forceful_relations", "acl", "user_name",
 }
+CONTEXT_CATEGORIES = {"auto", "user_preference", "business_knowledge", "decision_trace"}
 OPERATORS = {"equals", "contains", "contains_any"}
+ATTRIBUTE_OPERATORS = {"$eq", "$ne", "$gt", "$gte", "$lt", "$lte", "$in", "$nin", "$exists", "$not"}
 # Cookbooks that bring app content in through connectors, and the variables they read.
 CONNECTOR_COOKBOOKS = {"glean", "chief-of-staff", "personal-assistant"}
 APP_CREDENTIALS = {
@@ -107,6 +115,7 @@ class Stubs:
             (client.databases, "status", self.database_status),
             (client.context, "ingest", self.ingest),
             (client.context, "status", self.context_status),
+            (client.context, "list", self.context_list),
             (client, "query", self.query),
             (client.connectors, "create", self.connector_create),
             (client.connectors, "discover", self.connector_discover),
@@ -251,30 +260,40 @@ class Stubs:
         self.configured[id] = resources
         return sdk.HandlerConfigureResponse(connector_id=id)
 
-    def ingest(self, type, database, collection, documents=None, document_metadata=None,
-               memories=None):  # No app_knowledge: app content comes through connectors.
+    # A unified database takes no `type` and no split upload fields (`memories`):
+    # passing either fails the call here.
+    def ingest(self, database, collection, context=None, documents=None, document_metadata=None,
+               upsert=None):  # No app_knowledge: app content comes through connectors.
         test = self.test
         self.collections.add(collection)
         ids = []
-        if type == "memory":
-            for item in json.loads(memories):
-                test.assertLessEqual(set(item), MEMORY_KEYS)
-                test.assertEqual(1, ("text" in item) + ("user_assistant_pairs" in item))
-                for pair in item.get("user_assistant_pairs", []):
-                    test.assertEqual({"user", "assistant"}, set(pair))
-                ids.append(item.get("id", f"mem_{len(self.calls)}"))
+        test.assertNotEqual(context is None, documents is None, "send context items or files, not both")
+        if context is not None:
+            items = json.loads(context)
+            test.assertTrue(0 < len(items) <= 100)
+            for item in items:
+                test.assertLessEqual(set(item), CONTEXT_ITEM_KEYS)
+                test.assertEqual(1, ("text" in item) + ("conversation" in item))
+                for turn in item.get("conversation", []):
+                    test.assertEqual({"role", "content"}, set(turn))
+                    test.assertIn(turn["role"], {"user", "assistant", "system"})
+                    test.assertTrue(turn["content"].strip())
+                if "conversation" in item:
+                    test.assertTrue({"user", "assistant"} & {t["role"] for t in item["conversation"]})
+                test.assertLessEqual(set(item.get("attributes", {})), self.declared)
+                test.assertIn(item.get("context_category", "auto"), CONTEXT_CATEGORIES)
+                if "happened_at" in item:
+                    test.assertRegex(item["happened_at"], r"^\d{4}-\d{2}-\d{2}$")
+                ids.append(item.get("context_id", f"ctx_{len(self.calls)}_{len(ids)}"))
         else:
-            test.assertEqual("knowledge", type)
-            test.assertIsNone(memories)
-            if documents is not None:
-                items = json.loads(document_metadata)
-                test.assertEqual(len(documents), len(items))
-                for (filename, handle, content_type), item in zip(documents, items):
-                    test.assertLessEqual(set(item), DOCUMENT_METADATA_KEYS)
-                    test.assertLessEqual(set(item.get("metadata", {})), self.declared)
-                    test.assertIn(Path(filename).suffix, UPLOAD_EXTENSIONS, filename)
-                    test.assertTrue(handle.read(), f"{filename} is empty")
-                    ids.append(item["id"])
+            items = json.loads(document_metadata)
+            test.assertEqual(len(documents), len(items))
+            for (filename, handle, content_type), item in zip(documents, items):
+                test.assertLessEqual(set(item), DOCUMENT_METADATA_KEYS)
+                test.assertLessEqual(set(item.get("metadata", {})), self.declared)
+                test.assertIn(Path(filename).suffix, UPLOAD_EXTENSIONS, filename)
+                test.assertTrue(handle.read(), f"{filename} is empty")
+                ids.append(item["id"])
         test.assertTrue(ids)
         test.assertTrue(all(re.fullmatch(r"[^,\s]+", i) for i in ids), ids)
         return sdk.HandlerEnvelopeIngestionV2IngestResponse(
@@ -296,12 +315,25 @@ class Stubs:
             ])
         )
 
+    def context_list(self, database, collection, ids, acl=None):
+        self.test.assertIn(collection, self.collections)
+        self.test.assertTrue(ids)
+        if collection in self.restricted:
+            self.test.assertTrue(acl, "a list over connector-synced sources must send the caller's acl")
+        return sdk.HandlerEnvelopeListV2ListResponse(
+            data=sdk.ListV2ListResponse(sources=[
+                sdk.ListV2SourceItem(id=i, title=f"title of {i}", database=database, collection=collection,
+                                     tenant_id=database, sub_tenant_id=collection)
+                for i in ids
+            ])
+        )
+
     def query(self, **kwargs):
         test = self.test
         scopes = kwargs.get("collections") or [kwargs["collection"]]
         test.assertFalse("collection" in kwargs and "collections" in kwargs)
         test.assertLessEqual(set(scopes), self.collections)
-        test.assertIn(kwargs["type"], {"knowledge", "memory", "all"})
+        test.assertNotIn("type", kwargs, "a unified database takes no type")
         test.assertIn(kwargs.get("mode", "auto"), {"fast", "thinking", "auto"})
         if "max_results" in kwargs:
             test.assertLessEqual(kwargs["max_results"], 250)
@@ -309,21 +341,36 @@ class Stubs:
             test.assertIn(key, self.declared)
             test.assertEqual(1, len(value))
             test.assertLessEqual(set(value), OPERATORS)
+        for key, value in kwargs.get("attributes", {}).items():
+            test.assertIn(key, self.declared)
+            if isinstance(value, dict):
+                test.assertLessEqual(set(value), ATTRIBUTE_OPERATORS)
         if self.restricted & set(scopes):
             test.assertIn("acl", kwargs, "a query over connector-synced sources must send the caller's acl")
         if "acl" in kwargs:
             test.assertTrue(kwargs["acl"])
             for principal in kwargs["acl"]:
                 test.assertRegex(principal, r"^(?:[^@\s]+@[^@\s]+\.\w+|domain:\S+|group:\S+:\S+)$")
-        # Public fields only: `sources` and other internal fields stay unset,
-        # as .github/verify_v2_public_contract.py requires of the public result.
-        chunk = sdk.SearchV2Chunk(
-            id="source_1", chunk_uuid="source_1_chunk_0", chunk_content="text",
-            source_title="title", relevancy_score=0.9,
+        return unified_result(
+            chunks=[unified_chunk("source_1", "text")],
+            forceful_relations=[NS(via=NS(**{"from": "source_1", "to": "source_2"}),
+                                   chunk=unified_chunk("source_2", "linked text"))],
         )
-        return sdk.HandlerEnvelopeSearchV2RetrievalResult(
-            data=sdk.SearchV2RetrievalResult(llm_prompt="context", chunks=[chunk]),
-        )
+
+
+def unified_chunk(context_id, content):
+    """One chunk of a unified /query response, with its public fields only."""
+    return NS(chunk_id=f"{context_id}_chunk_0", context_id=context_id, score=0.9, content=content)
+
+
+def unified_result(chunks=(), graph=(), forceful_relations=()):
+    """The unified /query envelope: data carries exactly the five public keys."""
+    return NS(
+        success=True,
+        data=NS(chunks=list(chunks), graph=list(graph), forceful_relations=list(forceful_relations),
+                llm_prompt="context", tabular_data=None),
+        meta=NS(request_id="req_1"),
+    )
 
 
 class CookbookTest(unittest.TestCase):
@@ -331,47 +378,25 @@ class CookbookTest(unittest.TestCase):
         source = python_blocks(ROOT / "cookbooks/v2/cursor.mdx")["cursor.py"]
         search = next(node for node in ast.parse(source).body
                       if isinstance(node, ast.FunctionDef) and node.name == "search_code")
-        result = sdk.HandlerEnvelopeSearchV2RetrievalResult(
-            data=sdk.SearchV2RetrievalResult(
-                chunks=[sdk.SearchV2Chunk(
-                    id="auth", source_title="auth.py.txt", chunk_content="Validate the token.",
-                    additional_metadata={"path": "src/auth.py"},
-                )],
-                graph_context=sdk.SearchGraphContext(query_paths=[
-                    sdk.SearchScoredPathResponse(combined_context="Router calls validate_token."),
-                ]),
-                additional_context={"policy": sdk.SearchV2Chunk(
-                    id="policy", chunk_content="Service tokens require the admin scope.",
-                )},
-                sources=[],  # Internal SDK fields must not leak into the tool response.
-            ),
+        result = unified_result(
+            chunks=[unified_chunk("auth", "Validate the token.")],
+            graph=[NS(origin="query_path", triplets=[], path_summary="Router calls validate_token.")],
+            forceful_relations=[NS(via=NS(**{"from": "auth", "to": "policy"}),
+                                   chunk=unified_chunk("policy", "Service tokens require the admin scope."))],
         )
         scope = {"json": json, "DATABASE": "code", "COLLECTION": "repo",
+                 "PATHS": {"auth": "src/auth.py"},
                  "client": NS(query=lambda **kwargs: result)}
         exec(compile(ast.Module(body=[search], type_ignores=[]), "cursor.py", "exec"), scope)
 
         context = json.loads(scope["search_code"]("How is authentication enforced?"))
 
         self.assertEqual({
-            "chunks": [{
-                "id": "auth", "source_title": "auth.py.txt",
-                "chunk_content": "Validate the token.",
-                "additional_metadata": {"path": "src/auth.py"}, "path": "src/auth.py",
-            }],
-            "graph_context": {"query_paths": [{"combined_context": "Router calls validate_token."}]},
-            "additional_graph_context": {"policy": {
-                "id": "policy", "chunk_content": "Service tokens require the admin scope.",
-            }},
+            "chunks": [{"path": "src/auth.py", "content": "Validate the token."}],
+            "graph": ["Router calls validate_token."],
+            # A linked item the map does not know is cited by its context_id.
+            "linked": [{"path": "policy", "content": "Service tokens require the admin scope."}],
         }, context)
-
-        canonical = {"canonical_policy": {"id": "canonical_policy", "chunk_content": "Use MFA."}}
-        result = NS(data=NS(json=lambda **kwargs: json.dumps({
-            "chunks": [], "graph_context": {},
-            "additional_graph_context": canonical,
-            "additional_context": {"legacy_policy": {"id": "legacy_policy"}},
-        })))
-        context = json.loads(scope["search_code"]("How is authentication enforced?"))
-        self.assertEqual(canonical, context["additional_graph_context"])
 
     @staticmethod
     def optional_credentials(source):
