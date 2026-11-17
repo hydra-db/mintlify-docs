@@ -2,7 +2,7 @@ import json
 import re
 import unittest
 
-from generate_connector_pages import COPY, DIRECTORY, LOGOS as LOGO_DIRECTORY, PLACEHOLDER_MARK, ROOT, SNAPSHOT, SCOPED_PROVIDER_EXAMPLES, artwork, load_copy, logo, mdx, pages, placeholder_logos
+from generate_connector_pages import COPY, DIRECTORY, LOGOS as LOGO_DIRECTORY, PLACEHOLDER_MARK, ROOT, SNAPSHOT, SCOPED_PROVIDER_EXAMPLES, PROVIDER_ORDER, artwork, load_copy, logo, mdx, pages, placeholder_logos
 from generate_llms_index import page_paths
 
 
@@ -260,7 +260,7 @@ class ConnectorPagesTest(unittest.TestCase):
         self.assertEqual(PRODUCTION_SLUGS, {page.rsplit("/", 1)[1] for page in registered})
         for page in registered:
             self.assertTrue((ROOT / f"{page}.mdx").is_file(), page)
-        group = next(item for item in config["navigation"]["versions"][0]["tabs"][0]["groups"] if item["group"] == "Connector providers")
+        group = next(item for item in config["navigation"]["versions"][0]["tabs"][0]["groups"] if item["group"] == "Connector catalog")
         self.assertEqual("essentials/v2/connector-providers", group["pages"][0])
         categories = group["pages"][1:]
         self.assertEqual(8, len(categories))
@@ -269,11 +269,16 @@ class ConnectorPagesTest(unittest.TestCase):
             with self.subTest(category=category["group"]):
                 self.assertNotIn("expanded", category)
                 self.assertTrue(all(isinstance(page, str) for page in category["pages"]))
-                titles = [re.search(r'^title: "([^"]+)"', (ROOT / f"{page}.mdx").read_text(), re.M).group(1) for page in category["pages"]]
-                self.assertEqual(sorted(titles, key=str.casefold), titles)
+                slugs = [page.rsplit("/", 1)[1] for page in category["pages"]]
+                self.assertEqual([name.replace("_", "-") for name in PROVIDER_ORDER[category["group"]]], slugs)
                 section = index.split(f"## {category['group']}\n", 1)[1].split("\n## ", 1)[0]
                 self.assertEqual([f"/{page}" for page in category["pages"]], re.findall(r'href="([^"]+)"', section))
         self.assertEqual(len(PRODUCTION_SLUGS), sum(len(category["pages"]) for category in categories))
+
+    def test_each_group_opens_with_the_tools_companies_run_most(self):
+        self.assertEqual(["slack", "gmail", "outlook", "microsoft_teams", "discord", "sendgrid", "twilio"], PROVIDER_ORDER["Messaging & email"][:7])
+        self.assertEqual(["jira", "linear", "asana", "clickup", "monday", "smartsheet"], PROVIDER_ORDER["Tickets & project management"][:6])
+        self.assertEqual(["confluence", "notion", "google_drive", "dropbox", "sharepoint", "bookstack"], PROVIDER_ORDER["Docs & cloud storage"][:6])
 
 
 class PageOpeningAndOrderTest(unittest.TestCase):
@@ -290,7 +295,7 @@ class PageOpeningAndOrderTest(unittest.TestCase):
     def test_groups_follow_the_order_customers_connect_most(self):
         order = ["Messaging & email", "Tickets & project management", "Docs & cloud storage", "Meetings & calendar", "Engineering", "Marketing & analytics", "HR & finance", "CRM & support"]
         config = json.loads((ROOT / "docs.json").read_text())
-        group = next(item for item in config["navigation"]["versions"][0]["tabs"][0]["groups"] if item["group"] == "Connector providers")
+        group = next(item for item in config["navigation"]["versions"][0]["tabs"][0]["groups"] if item["group"] == "Connector catalog")
         self.assertEqual(order, [category["group"] for category in group["pages"][1:]])
         self.assertEqual(order, [title for title in re.findall(r"^## (.+)$", INDEX.read_text(), re.M) if title in order])
 
@@ -428,8 +433,11 @@ class ConnectorCopyPagesTest(unittest.TestCase):
     def test_overview_explains_how_to_read_a_page(self):
         index = INDEX.read_text()
         self.assertIn("## How to read a connector page", index)
-        self.assertLess(index.index("## How to read a connector page"), index.index("<Columns"))
-        self.assertIn("](/essentials/v2/connectors)", index.split("<Columns", 1)[0])
+        self.assertGreater(index.index("## How to read a connector page"), index.rindex("</Columns>"))
+        opening = index.split("---", 2)[2].split("## ", 1)[0]
+        self.assertIn("](/essentials/v2/connectors)", opening)
+        self.assertEqual(1, len([line for line in opening.splitlines() if line.strip()]), "the catalog starts right under one line")
+        self.assertIn("#6-connect-several-accounts-from-one-provider", index.split("## Related", 1)[1])
 
 
 class RevisedPageDesignTest(unittest.TestCase):
@@ -527,15 +535,18 @@ class RevisedPageDesignTest(unittest.TestCase):
                 self.assertNotIn("kept with its author and its thread", graph)
                 self.assertNotIn("There is no per-connector setup", graph)
 
-    def test_overview_defines_the_labels_and_graph_classes_above_the_grid(self):
+    def test_overview_collapses_the_labels_and_graph_classes_below_the_grid(self):
         index = INDEX.read_text()
-        top = index.split("<Columns", 1)[0]
-        self.assertIn("### Attribute labels", top)
-        self.assertIn("### Graph classes", top)
+        end = index.split("</Columns>")[-1]
+        labels = end.split("### Attribute labels", 1)[1].split("### Graph classes", 1)[0]
+        classes = end.split("### Graph classes", 1)[1].split("## Related", 1)[0]
+        for part in (labels, classes):
+            self.assertEqual(1, part.count("<Accordion "))
+            self.assertEqual(1, part.count("</Accordion>"))
         for badge in BADGES:
-            self.assertIn(f"- **{badge}:** ", top)
+            self.assertIn(f"- **{badge}:** ", labels.split("<Accordion ", 1)[1])
         for title in GRAPH_CLASSES:
-            self.assertIn(f"- **{title}:** ", top)
+            self.assertIn(f"- **{title}:** ", classes.split("<Accordion ", 1)[1])
 
     def test_an_attribute_must_say_when_it_is_not_searchable(self):
         broken = json.loads((COPY / "slack.json").read_text())

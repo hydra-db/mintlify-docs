@@ -28,7 +28,7 @@ SCOPED_PROVIDER_EXAMPLES = {
     "notion": ("notion-account-a", "notion-account-b"),
 }
 NAVIGATION = ROOT / "docs.json"
-NAVIGATION_GROUP = "Connector providers"
+NAVIGATION_GROUP = "Connector catalog"
 # Sidebar and overview order: what customers connect most comes first.
 GROUPS = {
     "Messaging & email": {"messaging", "email", "social"},
@@ -46,7 +46,28 @@ PROVIDER_GROUPS = {
     "outlook": "Messaging & email",
     "twilio": "Messaging & email",
 }
+# Order inside each group: the tools a company is most likely to run come first.
+# A provider missing from its list follows the listed ones, by name.
+PROVIDER_ORDER = {
+    "Messaging & email": ["slack", "gmail", "outlook", "microsoft_teams", "discord", "sendgrid", "twilio", "twitter"],
+    "Tickets & project management": ["jira", "linear", "asana", "clickup", "monday", "smartsheet", "wrike", "shortcut"],
+    "Docs & cloud storage": ["confluence", "notion", "google_drive", "dropbox", "sharepoint", "bookstack", "airtable",
+                             "guru", "coda", "contentful", "figma"],
+    "Meetings & calendar": ["google_calendar", "zoom", "calendly", "fireflies", "granola", "loom", "avoma"],
+    "Engineering": ["github", "gitlab", "sentry", "datadog", "pagerduty", "supabase", "launchdarkly", "okta"],
+    "Marketing & analytics": ["posthog", "mixpanel", "bigquery", "google_search_console", "googleads", "mailchimp",
+                              "klaviyo", "pardot", "typeform", "surveymonkey"],
+    "HR & finance": ["stripe", "quickbooks", "xero", "recurly", "bamboohr", "greenhouse", "lever"],
+    "CRM & support": ["hubspot", "zendesk", "intercom", "gong", "pipedrive", "freshdesk", "servicenow", "attio",
+                      "zoho_crm", "helpscout", "copper"],
+}
 Logo = namedtuple("Logo", "light dark")
+
+
+def ordered(title, members):
+    """Members of one group in PROVIDER_ORDER, then any unlisted provider in the name order they arrived in."""
+    rank = {provider: position for position, provider in enumerate(PROVIDER_ORDER[title])}
+    return sorted(members, key=lambda item: rank.get(item["production_id"], len(rank)))
 
 
 def slug(identifier):
@@ -139,7 +160,7 @@ def card(provider, found):
 
 
 def navigation(by_group):
-    """Rewrites only the connector providers group of docs.json, so hand-kept groups keep their layout."""
+    """Rewrites only the connector catalog group of docs.json, so hand-kept groups keep their layout."""
     text = NAVIGATION.read_text()
     marker = text.index(f'"group": "{NAVIGATION_GROUP}"')
     start = text.rindex("{", 0, marker)
@@ -465,32 +486,40 @@ def pages():
             *copy_body(provider, copy, row["is_beta"], row["acl_supported"]),
         ]
         output[DIRECTORY / f"{slug(identifier)}.mdx"] = "\n".join(lines)
+    by_group = {title: ordered(title, [provider for provider in providers if enabled[slug(provider["provider"])] == title])
+                for title in GROUPS}
     lines = [
-        "---", 'title: "Connector providers"', 'sidebarTitle: "All connectors"',
-        'description: "See what each connector syncs, what it needs, and who can read what it brings in."', "---", "",
-        f"Choose a provider to see what to set up and what it syncs. Availability and credential fields come from your deployment's [provider catalog](/api-reference/v2/endpoint/list-connector-providers). The steps every connector shares are in the [connectors guide]({GUIDE}).", "",
-        f"To connect several accounts of the same provider, give each connector its own `provider_account_scope`, or send each account to its own collection. Separate connectors alone do not keep apart items that share a provider id. Supabase rows need separate collections when table names and keys overlap, as its page explains. See [several accounts from one provider]({GUIDE}#6-connect-several-accounts-from-one-provider).", "",
-        "## How to read a connector page", "",
-        "Each page opens with what the connector brings in and the limits that decide whether it fits. Then:", "",
-        "1. **Permissions:** whether the provider's permissions decide who can read an item.",
-        "2. **Before you connect:** the credentials, permissions and steps the provider needs.",
-        "3. **Keeping in sync:** how history, edits and deletions arrive.",
-        "4. **What gets synced:** what one document is, and what HydraDB does with each attribute it keeps.",
-        "5. **How it fits into the graph:** the class of each item and the connections the connector creates.",
-        "6. **Not synced:** what does not come across.", "",
-        "### Attribute labels", "",
-        "Each attribute on a connector page carries one label for every use it has.", "",
-        *(f"- **{label}:** {meaning}" for label, meaning in USES.items()), "",
-        "An attribute without the Searchable text label says so in its description.", "",
-        "### Graph classes", "",
-        "Every synced item belongs to one class, so similar items from different tools are grouped the same way. A class names the kind of item. It does not promise that every detail below is filled: each connector page says what its items carry and which connections it creates.", "",
-        *(f"- **{title}:** {meaning}" for title, meaning in CLASSES.values()), "",
-        f"HydraDB also identifies people, organizations, projects and other named things in the searchable text of every item, whichever tool it came from. To steer what it looks for, use [custom instructions]({GUIDE}#4-custom-ingestion-instructions).", "",
+        "---", 'title: "Connector catalog"', 'sidebarTitle: "Catalog"',
+        'description: "Every app HydraDB can sync, grouped by what it is for."', "---", "",
+        f"Pick an app to see what it syncs and what it needs. The setup steps every connector shares are in the [connectors guide]({GUIDE}).", "",
     ]
-    by_group = {title: [provider for provider in providers if enabled[slug(provider["provider"])] == title] for title in GROUPS}
     for title, members in by_group.items():
         lines.extend([f"## {title}", "", "<Columns cols={3}>", *(card(provider, logo(provider["provider"])) for provider in members), "</Columns>", ""])
-    lines.extend(["## Related", "", "- [Connectors](/essentials/v2/connectors): shared setup and sync workflow", ""])
+    lines.extend([
+        "## How to read a connector page", "",
+        "Every page has the same sections, in this order:", "",
+        "- **Permissions:** whether the app's own permissions decide who can read an item.",
+        "- **Before you connect:** the credentials and steps the app needs.",
+        "- **Keeping in sync:** how history, edits and deletions arrive.",
+        "- **What gets synced:** what one document is, and each attribute HydraDB keeps.",
+        "- **How it fits into the graph:** the class of each item and the connections it gets.",
+        "- **Not synced:** what does not come across.", "",
+        "### Attribute labels", "",
+        '<Accordion title="What the label on an attribute means">', "",
+        *(f"- **{label}:** {meaning}" for label, meaning in USES.items()), "",
+        "An attribute without the Searchable text label says so in its description.", "",
+        "</Accordion>", "",
+        "### Graph classes", "",
+        '<Accordion title="The class every synced item belongs to">', "",
+        "Similar items from different apps share a class. Each connector page says which details its items carry.", "",
+        *(f"- **{title}:** {meaning}" for title, meaning in CLASSES.values()), "",
+        f"HydraDB also finds people, organizations, projects and other named things in the text of every item. To steer what it looks for, use [custom instructions]({GUIDE}#4-custom-ingestion-instructions).", "",
+        "</Accordion>", "",
+        "## Related", "",
+        f"- [Connectors]({GUIDE}): shared setup and sync workflow",
+        f"- [Several accounts from one provider]({GUIDE}#6-connect-several-accounts-from-one-provider): keep two accounts of the same app apart",
+        "- [List connector providers](/api-reference/v2/endpoint/list-connector-providers): availability and credential fields for your deployment", "",
+    ])
     output[INDEX] = "\n".join(lines)
     output[NAVIGATION] = navigation(by_group)
     output[TITLE_LOGOS] = title_logos(providers)
