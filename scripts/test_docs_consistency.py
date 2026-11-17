@@ -136,14 +136,14 @@ class UnifiedNarrativeTest(unittest.TestCase):
         for relative in ("essentials/v2/context.mdx", "api-reference/v2/endpoint/ingest-context.mdx"):
             text = self.read(relative)
             with self.subTest(page=relative):
-                self.assertIn("additional memory enrichment", text)
+                self.assertRegex(text, r"additional (?:memory )?enrichment")
                 self.assertIn("entity/graph extraction may still run", text)
                 self.assertNotIn("Explicit `false` stores the text verbatim", text)
                 self.assertNotIn("without preprocessing", text)
 
     def test_query_method_and_alpha_defaults_do_not_confuse_auto_mode(self):
         text = self.read("essentials/v2/query.mdx")
-        method = re.search(r"<td>`query_by`</td>\s*<td>(.*?)</td>", text, re.S)
+        method = re.search(r"^`query_by` picks how the text is matched: (.*)$", text, re.M)
         self.assertIsNotNone(method)
         values = set(re.findall(r'`"([^"]+)"`', method.group(1)))
         spec = json.loads(self.read("api-reference/v2/openapi.json"))
@@ -152,11 +152,10 @@ class UnifiedNarrativeTest(unittest.TestCase):
         self.assertIn('`"hybrid"` (the default)', method.group(1))
         self.assertRegex(self.read("api-reference/v2/endpoint/query.mdx"), r'name="query_by"[^\n]*default=`"hybrid"`')
         self.assertNotIn("auto", method.group(1))
-        alpha = next(line for line in text.splitlines() if line.startswith("- `alpha`"))
-        self.assertIn("Default `0.8`", alpha)
-        self.assertIn('`"auto"` also resolves to `0.8`', alpha)
-        self.assertNotIn('which `"auto"`', alpha)
-        self.assertIn('`"auto"` (the default)', text.split('<td>`mode`</td>', 1)[1].split('</td>', 1)[0])
+        alpha = next(line for line in text.splitlines() if line.startswith("- **`alpha`:**"))
+        self.assertIn('Default `0.8`, which `"auto"` also resolves to', alpha)
+        mode = next(line for line in text.splitlines() if line.startswith("- **`mode`:**"))
+        self.assertIn('`"auto"`, the default', mode)
         self.assertIn("auto selector", self.read("plugins/cli.mdx"))
 
     def test_connector_enforcement_requires_a_human_session_even_for_false(self):
@@ -166,17 +165,6 @@ class UnifiedNarrativeTest(unittest.TestCase):
             self.assertIn(phrase, section)
         self.assertIn("valid private ACLs", section)
         self.assertNotRegex(section, r"API.key[^.\n]*send[^.\n]*false")
-
-    def test_memory_authorization_covers_mutations_and_adjacent_examples(self):
-        text = self.read("essentials/v2/context.mdx")
-        memory = text.split("## Ingesting memory", 1)[1].split("## Wait for indexing", 1)[0]
-        self.assertIn("updates and deletes", memory)
-        self.assertIn("authorize", memory)
-        self.assertIn("source ID", memory)
-        self.assertIn("verified session", memory)
-        self.assertIn('collection=verified_session["memory_collection"]', memory)
-        self.assertIn("collection: verifiedSession.memoryCollection", memory)
-        self.assertIn('"collection=$SESSION_MEMORY_COLLECTION"', memory)
 
     def test_cli_shell_examples_do_not_recommend_api_keys_in_argv(self):
         text = self.read("plugins/cli.mdx")
@@ -193,12 +181,12 @@ class UnifiedNarrativeTest(unittest.TestCase):
 
     def test_memory_scope_is_derived_from_the_signed_in_session(self):
         text = self.read("essentials/v2/context.mdx")
-        memory = text.split("## Ingesting memory", 1)[1].split("## Wait for indexing", 1)[0]
+        memory = text.split("## 2. Save context", 1)[1].split("## 3. Wait for indexing", 1)[0]
         self.assertIn("signed-in session", memory)
         self.assertIn("does not authenticate", memory)
         self.assertIn("every ingest, status check, and query", memory)
-        self.assertIn("`infer: true` (default)", memory)
-        self.assertIn("`infer: false`", memory)
+        self.assertIn("`enrich: true` (the default)", memory)
+        self.assertIn("`enrich: false`", memory)
 
     def test_legacy_memory_instructions_are_not_public_guidance(self):
         for relative in (
@@ -207,9 +195,11 @@ class UnifiedNarrativeTest(unittest.TestCase):
             "cookbooks/v2/personal-assistant.mdx",
         ):
             self.assertNotIn("custom_instructions", self.read(relative), relative)
+            self.assertNotIn("`instructions`", self.read(relative), relative)
+            self.assertNotIn('name="instructions"', self.read(relative), relative)
         guide = self.read("AGENTS.mdx")
-        memories = guide.split("### Memories")[-1].split("## 7.", 1)[0]
-        self.assertNotIn("custom_instructions", memories)
+        ingest = guide.split("## 6. Source ingestion", 1)[1].split("## 7.", 1)[0]
+        self.assertNotIn("instructions", ingest)
         self.assertIn("`custom_instructions` on the connector", guide)
         self.assertIn("custom_instructions", self.read("essentials/v2/connectors.mdx"))
 
@@ -223,17 +213,21 @@ class UnifiedNarrativeTest(unittest.TestCase):
             with self.subTest(relative=relative):
                 self.assertIn("query_explicit_relations", text)
                 self.assertIn("additional_graph_context", text)
-                self.assertIn("data.additional_graph_context", text)
+                self.assertIn("forceful_relations", text)
+                self.assertNotIn("data.additional_graph_context", text)
                 self.assertNotRegex(text, r'(?:Default|default|omitted means)[^\n|]*`0\.4`')
         reference = self.read("api-reference/v2/endpoint/query.mdx")
-        self.assertRegex(reference, r'name="type"[^\n]*default=`"all"`')
+        # A unified database takes no `type`; the row documents the warning a
+        # leftover split value gets, and never a default to send.
+        self.assertRegex(reference, r'name="type"[^\n]*Do not send\.[^\n]*`type_ignored_on_unified`')
+        self.assertNotRegex(reference, r'name="type"[^\n]*default=')
         self.assertRegex(reference, r'name="recency_bias"[^\n]*default=`0\.6`')
         self.assertIn('name="query_explicit_relations"', reference)
         self.assertIn('name="additional_graph_context"', reference)
         self.assertIn("request-time hint", reference)
-        self.assertIn("response map", reference)
+        self.assertIn("into `data.forceful_relations`", reference)
         context = self.read("essentials/v2/context.mdx")
-        self.assertIn("`relations.ids`", context)
+        self.assertIn("`forceful_relations.context_ids`", context)
         self.assertNotIn("`explicit_relations`", context)
 
     def test_cli_authentication_does_not_require_a_database_or_key_in_argv(self):
@@ -257,12 +251,22 @@ class UnifiedNarrativeTest(unittest.TestCase):
 
     def test_client_auto_selection_is_not_documented_as_a_backend_wire_type(self):
         context = self.read("essentials/v2/context.mdx")
-        self.assertIn("client-side selection", context)
-        self.assertIn("defaults to `type=knowledge`", context)
-        self.assertIn("`auto` is not an API wire value", context)
-        self.assertNotIn("`type=traces`", context)
-        self.assertIn("default is `\"knowledge\"`", self.read("AGENTS.mdx"))
-        self.assertIn('default=`"knowledge"`', self.read("api-reference/v2/endpoint/ingest-context.mdx"))
+        # A unified database takes no `type`: an item's shape is its type.
+        for split_type in ("type=knowledge", "type=memory", "type=traces"):
+            self.assertNotIn(split_type, context)
+        self.assertIn("A `conversation` item", context)
+        self.assertIn("No call takes `type`", self.read("AGENTS.mdx"))
+        ingest = self.read("api-reference/v2/endpoint/ingest-context.mdx")
+        self.assertNotIn('name="type"', ingest)
+
+    def test_context_category_and_its_echo_are_not_documented(self):
+        # An item's type is its shape (text or conversation). The category
+        # label and the chunk field that echoed it are not part of the API.
+        paths = [*live_files("*.mdx"), ROOT / "llms.txt", ROOT / "api-reference/v2/openapi.json"]
+        for path in paths:
+            text = path.read_text()
+            for word in ("context_category", "enrichment_kind", "context_category_ignored"):
+                self.assertNotIn(word, text, path.relative_to(ROOT))
 
     def test_mcp_api_key_connection_can_choose_its_scope_after_authentication(self):
         text = self.read("plugins/mcp.mdx")
@@ -278,8 +282,7 @@ class UnifiedNarrativeTest(unittest.TestCase):
 
     def test_repaired_local_links_have_stable_targets(self):
         links = {
-            "essentials/v2/context.mdx": ("link-sources-deterministically", "## Link sources deterministically"),
-            "essentials/v2/connectors.mdx": ("6-connect-several-accounts-from-one-provider", "## 6. Connect several accounts from one provider"),
+                        "essentials/v2/connectors.mdx": ("6-connect-several-accounts-from-one-provider", "## 6. Connect several accounts from one provider"),
             "essentials/v2/metadata-2.mdx": ("metadata-and-additional-metadata", "## Metadata and additional metadata"),
             "plugins/cli.mdx": ("persistent-configuration", "### Persistent configuration"),
             "plugins/mcp.mdx": ("api-key-headers", "### API key headers"),

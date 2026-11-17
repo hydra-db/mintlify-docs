@@ -12,7 +12,7 @@ class DocsDiscoveryTest(unittest.TestCase):
         self.assertEqual(generate(), text)
         guide = (ROOT / "AGENTS.mdx").read_text().split("---\n", 2)[2].strip()
         self.assertTrue(text.endswith(guide + "\n"))
-        self.assertTrue(text.startswith("# Complete Agent Integration Guide\n\n> "))
+        self.assertTrue(text.startswith("# HydraDB Agent Integration Guide\n\n> "))
         config = json.loads((ROOT / "docs.json").read_text())
         self.assertFalse({"/llms.txt", "/llms-full.txt"} & {redirect["source"] for redirect in config["redirects"]})
 
