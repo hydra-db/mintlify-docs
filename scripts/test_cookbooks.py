@@ -36,9 +36,8 @@ DOCUMENT_METADATA_KEYS = {"id", "metadata", "additional_metadata", "relations"}
 # `instructions` is accepted by the API but is not taught on ingest pages.
 CONTEXT_ITEM_KEYS = {
     "context_id", "title", "text", "conversation", "enrich", "upsert", "happened_at",
-    "attributes", "custom_attributes", "context_category", "forceful_relations", "acl", "user_name",
+    "attributes", "custom_attributes", "forceful_relations", "acl", "user_name",
 }
-CONTEXT_CATEGORIES = {"auto", "user_preference", "business_knowledge"}
 OPERATORS = {"equals", "contains", "contains_any"}
 ATTRIBUTE_OPERATORS = {"$eq", "$ne", "$gt", "$gte", "$lt", "$lte", "$in", "$nin", "$exists", "$not"}
 # Cookbooks that bring app content in through connectors, and the variables they read.
@@ -281,7 +280,6 @@ class Stubs:
                 if "conversation" in item:
                     test.assertTrue({"user", "assistant"} & {t["role"] for t in item["conversation"]})
                 test.assertLessEqual(set(item.get("attributes", {})), self.declared)
-                test.assertIn(item.get("context_category", "auto"), CONTEXT_CATEGORIES)
                 if "happened_at" in item:
                     test.assertRegex(item["happened_at"], r"^\d{4}-\d{2}-\d{2}$")
                 ids.append(item.get("context_id", f"ctx_{len(self.calls)}_{len(ids)}"))

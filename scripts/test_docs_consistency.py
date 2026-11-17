@@ -263,14 +263,23 @@ class UnifiedNarrativeTest(unittest.TestCase):
 
     def test_client_auto_selection_is_not_documented_as_a_backend_wire_type(self):
         context = self.read("essentials/v2/context.mdx")
-        # A unified database takes no `type`; `auto` is the context_category default.
+        # A unified database takes no `type`: an item's shape is its type.
         for split_type in ("type=knowledge", "type=memory", "type=traces"):
             self.assertNotIn(split_type, context)
-        self.assertIn("`auto` (the default)", context)
+        self.assertIn("That shape is the item's type", context)
         self.assertIn("do not send `type` on any call", self.read("AGENTS.mdx"))
         ingest = self.read("api-reference/v2/endpoint/ingest-context.mdx")
         self.assertIn("Do not send `type`", ingest)
         self.assertNotIn('name="type"', ingest)
+
+    def test_context_category_and_its_echo_are_not_documented(self):
+        # An item's type is its shape (text or conversation). The category
+        # label and the chunk field that echoed it are not part of the API.
+        paths = [*live_files("*.mdx"), ROOT / "llms.txt", ROOT / "api-reference/v2/openapi.json"]
+        for path in paths:
+            text = path.read_text()
+            for word in ("context_category", "enrichment_kind", "context_category_ignored"):
+                self.assertNotIn(word, text, path.relative_to(ROOT))
 
     def test_mcp_api_key_connection_can_choose_its_scope_after_authentication(self):
         text = self.read("plugins/mcp.mdx")
