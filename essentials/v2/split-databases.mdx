@@ -1,0 +1,100 @@
+---
+title: "Split databases"
+description: "How databases created before unified became the default work: the knowledge and memory stores, the type selector, the older upload fields and the older query response."
+---
+
+Every other page in these docs describes a **unified** database: you send a `context` list and query without choosing a store. This page is for databases created before unified became the default. Those databases are **split**, and they keep working exactly as before. Nothing on this page is going away.
+
+To check which kind you have, read `type` on the database's entry in `GET /databases` (under `details`), or from `GET /databases/status?database=...`. It is `unified` or `split`.
+
+## What is different on a split database
+
+A split database holds two separate stores, **knowledge** and **memory**. Every ingest and query says which one it means with `type`:
+
+| `type` | On a split database |
+| --- | --- |
+| absent | `knowledge` |
+| `knowledge` | the knowledge store |
+| `memory` | the memory store |
+| `all` | both stores, on the endpoints that can answer for both. A query searches the two separately and merges them into one ranked list. An ingest refuses `all`: a write has to name the one store it lands in. |
+
+A query without `type` searches knowledge only, so saved memories do not come back. Send `type: "all"` to search both. Every response carries `meta.source_type`, which reports the store that answered.
+
+## Ingest fields
+
+A split database takes the upload fields that predate the `context` list, selected by `type`:
+
+| Field | `type` | What it ingests |
+| --- | --- | --- |
+| `documents` and `document_metadata` | `knowledge` | Files (PDF, DOCX, Markdown, CSV and more), with one metadata entry per file |
+| `app_knowledge` | `knowledge` | Structured app records. New integrations get these through [connectors](/essentials/v2/connectors). |
+| `memories` | `memory` | Memory entries, each with `text` or `user_assistant_pairs`, plus `infer`, `metadata` and `additional_metadata` |
+
+All of them are multipart form fields, and `memories` and `app_knowledge` carry a JSON list as a string.
+
+```bash cURL
+curl -X POST 'https://api.hydradb.com/context/ingest' \
+  -H "Authorization: Bearer $HYDRADB_API_KEY" \
+  -H "API-Version: 2" \
+  -F "type=memory" \
+  -F "database=legacy_app" \
+  -F "collection=user_john_123" \
+  -F 'memories=[{"text": "Prefers short, direct answers with no preamble.", "infer": true, "user_name": "John"}]'
+```
+
+A split database also accepts a `context` list. Its items are written to the **memory** store, so do not send `type: "knowledge"` with it. `context_category` is refused on a split database.
+
+A unified database refuses `type: "knowledge"`, `type: "memory"`, `memories` and `app_knowledge`. When you move code from a split database to a unified one, map the fields like this:
+
+| Split field | Unified field |
+| --- | --- |
+| `memories` list | `context` list |
+| `id` on a memory | `context_id` |
+| `user_assistant_pairs` (`{user, assistant}`) | `conversation` (`[{role, content}]`) |
+| `infer` | `enrich` (default `true`) |
+| `observation_date` | `happened_at` |
+| `metadata` | `attributes` |
+| `additional_metadata` | `custom_attributes` |
+| `relations` on a file | `forceful_relations` on an item |
+
+Files keep `documents` and `document_metadata` on both layouts. On a unified database, send them without `type`.
+
+## Query response
+
+A split database returns the older query response, unchanged:
+
+| Key | What it holds |
+| --- | --- |
+| `chunks` | The ranked chunks, each with `chunk_uuid`, the source `id`, `chunk_content`, `source_title`, `relevancy_score` and `metadata` |
+| `sources` | One entry per source a chunk came from, with its metadata |
+| `graph_context` | The extracted relationships, as `query_paths`, `chunk_relations` and `chunk_id_to_group_ids` |
+| `additional_context` | Sources you linked deterministically at ingestion, as a map. `additional_graph_context` holds the same map. |
+| `llm_prompt` | The whole result as one prompt string |
+| `tabular_data` | A table answer, or `null` |
+
+The response carries more keys than these; the [Query API reference](/api-reference/v2/endpoint/query) lists them. A unified database answers with five keys instead: `chunks`, `graph`, `forceful_relations`, `llm_prompt` and `tabular_data`, described on [Query](/essentials/v2/query#what-comes-back).
+
+```bash cURL
+curl -X POST 'https://api.hydradb.com/query' \
+  -H "Authorization: Bearer $HYDRADB_API_KEY" \
+  -H "API-Version: 2" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "database": "legacy_app",
+    "collections": ["company_docs", "user_john_123"],
+    "query": "How do I reset my password?",
+    "type": "all"
+  }'
+```
+
+When a query leaves out `recency_bias`, a split database applies a milder recency tilt than a unified one.
+
+## Moving to a unified database
+
+A split database cannot be converted. Its layout is fixed when it is created. To move to unified:
+
+1. Create a new database. It is unified.
+2. Ingest your content again, as `context` items and files, using the field mapping above.
+3. Point your application at the new database, and drop `type` from every call.
+
+Until then, the split database keeps answering exactly as it does today.

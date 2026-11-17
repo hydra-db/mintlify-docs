@@ -353,6 +353,10 @@ class SharedFactsTest(unittest.TestCase):
             relative = str(path.relative_to(ROOT))
             if relative == "essentials/v2/connectors.mdx" or "connector" in path.name:
                 continue
+            # The split-database page names app_knowledge as a field older databases
+            # still accept and points readers to connectors; it does not teach it.
+            if relative == "essentials/v2/split-databases.mdx":
+                continue
             for number, line in enumerate(path.read_text(encoding="utf-8").split("\n"), 1):
                 if pattern.search(line):
                     offenders.append(f"{relative}:{number}")
