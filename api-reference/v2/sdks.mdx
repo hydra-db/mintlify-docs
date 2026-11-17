@@ -59,7 +59,7 @@ The REST API and the Python SDK use snake_case. The TypeScript SDK uses camelCas
 In TypeScript:
 
 - **Typed fields are camelCase only.** Use `client.context.list({ database: "...", pageSize: 50 })`. The SDK sends `page_size` to the API and drops unrecognized typed fields, including a caller-supplied `page_size`.
-- **JSON strings and free-form maps are sent as written.** Inside JSON strings (`documentMetadata`, `memories`) and free-form maps (`metadataFilters`, and in Python a connector resource update's `request`), use REST field names such as `additional_metadata` or `custom_instructions`, and preserve your own metadata keys.
+- **JSON strings and free-form maps are sent as written.** Inside JSON strings (`context`, `documentMetadata`) and free-form maps (`metadataFilters`, and in Python a connector resource update's `request`), use REST field names such as `context_id`, `custom_attributes`, or `additional_metadata`, and preserve your own metadata keys.
 - **Response fields are camelCase and optional in the types.** Read them as `status.data?.infra?.readyForIngestion`.
 
 `database` and `collection` are the current field names. The former names, `tenant_id` and `sub_tenant_id`, are still accepted as deprecated aliases. See [Databases and Collections](/essentials/v2/databases-and-collections#7-migrating-from-the-legacy-tenant-and-sub-tenant-fields).
@@ -85,7 +85,7 @@ Methods are grouped under one namespace per API group: `client.context`, `client
 
 ### Query
 
-One method covers every query. Set `type` (`"knowledge"`, `"memory"`, `"all"`) and `query_by` (`"hybrid"`, `"text"`) to control it.
+One method covers every query. Scope it with `collection` or `collections`, and set `query_by` (`"hybrid"`, `"text"`) and `mode` to control it. There is no `type` to set.
 
 | Method | Endpoint |
 |---|---|
@@ -219,9 +219,56 @@ while (true) {
 ```
 </CodeGroup>
 
-### Ingest knowledge
+### Ingest context
 
-Upload files. `document_metadata` is a JSON string with one entry per file:
+Send text and conversations as a list of `context` items. In the SDKs, `context` is a JSON string:
+
+<CodeGroup>
+```python Python SDK
+import json
+
+result = client.context.ingest(
+    database="my_first_database",
+    collection="user_alex",
+    context=json.dumps([
+        {
+            "context_id": "alex_preferences",
+            "title": "Alex's preferences",
+            "text": "User prefers detailed technical explanations and dark mode",
+            "user_name": "Alex",
+            "context_category": "user_preference",
+            "custom_attributes": {"source": "onboarding"},
+        }
+    ]),
+)
+```
+```typescript TypeScript SDK
+const result = await client.context.ingest({
+  database: "my_first_database",
+  collection: "user_alex",
+  context: JSON.stringify([
+    {
+      context_id: "alex_preferences",
+      title: "Alex's preferences",
+      text: "User prefers detailed technical explanations and dark mode",
+      user_name: "Alex",
+      context_category: "user_preference",
+      custom_attributes: { source: "onboarding" },
+    },
+  ]),
+});
+```
+</CodeGroup>
+
+`enrich` defaults to `true`, so HydraDB derives implicit preferences and facts from each item. Set `enrich: false` on an item to skip that step. Send a chat as `conversation`, a list of `{ role, content }` turns, instead of `text`. See [Ingest Context](/api-reference/v2/endpoint/ingest-context#context-item-fields) for every item field.
+
+<Note>
+The `context` argument ships in the SDK release that follows 2.1.7. On an earlier SDK, send `context` with any HTTP client, or upgrade.
+</Note>
+
+### Ingest files
+
+Upload files with the same method. `document_metadata` is a JSON string with one entry per file:
 
 <CodeGroup>
 ```python Python SDK
@@ -229,7 +276,6 @@ import json
 
 with open("contract.pdf", "rb") as f1, open("policy.pdf", "rb") as f2:
     result = client.context.ingest(
-        type="knowledge",
         database="my_first_database",
         collection="company_docs",
         documents=[
@@ -252,7 +298,6 @@ with open("contract.pdf", "rb") as f1, open("policy.pdf", "rb") as f2:
 ```
 ```typescript TypeScript SDK
 const result = await client.context.ingest({
-  type: "knowledge",
   database: "my_first_database",
   collection: "company_docs",
   documents: [
@@ -275,57 +320,13 @@ const result = await client.context.ingest({
 ```
 </CodeGroup>
 
-
-### Ingest memories
-
-Use the same `ingest` method with `type: "memory"`:
-
-<CodeGroup>
-```python Python SDK
-import json
-
-result = client.context.ingest(
-    type="memory",
-    database="my_first_database",
-    collection="user_alex",
-    memories=json.dumps([
-        {
-            "id": "alex_preferences",
-            "text": "User prefers detailed technical explanations and dark mode",
-            "infer": True,
-            "user_name": "Alex",
-            "metadata": {"department": "engineering"},
-            "additional_metadata": {"source": "onboarding"},
-        }
-    ]),
-)
-```
-```typescript TypeScript SDK
-const result = await client.context.ingest({
-  type: "memory",
-  database: "my_first_database",
-  collection: "user_alex",
-  memories: JSON.stringify([
-    {
-      id: "alex_preferences",
-      text: "User prefers detailed technical explanations and dark mode",
-      infer: true,
-      user_name: "Alex",
-      metadata: { department: "engineering" },
-      additional_metadata: { source: "onboarding" },
-    },
-  ]),
-});
-```
-</CodeGroup>
-
-`infer` defaults to `false`, which stores the text verbatim. Set `infer: true` for conversational content where you want HydraDB to extract implicit preferences.
+Send files and `context` items in separate calls. `metadata` here assumes the database declares `department` in its `database_metadata_schema`.
 
 <span id="verify-processing"></span>
 
 ### Wait for indexing
 
-Sources are searchable only after indexing. Check each collection separately, using the IDs supplied at ingestion or returned in `data.results`.
+Items are searchable only after indexing. Check each collection separately, using the IDs supplied at ingestion or returned in `data.results`.
 
 <CodeGroup>
 ```python Python SDK
@@ -372,23 +373,21 @@ Three common shapes of `client.query()`:
 
 <CodeGroup>
 ```python Python SDK
-# Knowledge over documents
-knowledge = client.query(
+# Answer from documents
+answer = client.query(
     database="my_first_database",
     collection="company_docs",
     query="What is our refund policy?",
-    type="knowledge",
     query_by="hybrid",
     mode="thinking",
     graph_context=True,
 )
 
-# Shared knowledge and this user's memories
+# Shared documents and this user's context
 personalized = client.query(
     database="my_first_database",
     collections=["company_docs", "user_alex"],
     query="What is our refund policy, and how should I explain it to this user?",
-    type="all",
     query_by="hybrid",
     mode="thinking",
 )
@@ -398,29 +397,26 @@ exact = client.query(
     database="my_first_database",
     collection="company_docs",
     query="ERROR_429 rate limit",
-    type="knowledge",
     query_by="text",
     operator="phrase",
 )
 ```
 ```typescript TypeScript SDK
-// Knowledge over documents
-const knowledge = await client.query({
+// Answer from documents
+const answer = await client.query({
   database: "my_first_database",
   collection: "company_docs",
   query: "What is our refund policy?",
-  type: "knowledge",
   queryBy: "hybrid",
   mode: "thinking",
   graphContext: true,
 });
 
-// Shared knowledge and this user's memories
+// Shared documents and this user's context
 const personalized = await client.query({
   database: "my_first_database",
   collections: ["company_docs", "user_alex"],
   query: "What is our refund policy, and how should I explain it to this user?",
-  type: "all",
   queryBy: "hybrid",
   mode: "thinking",
 });
@@ -430,7 +426,6 @@ const exact = await client.query({
   database: "my_first_database",
   collection: "company_docs",
   query: "ERROR_429 rate limit",
-  type: "knowledge",
   queryBy: "text",
   operator: "phrase",
 });
@@ -443,23 +438,22 @@ For the full parameter reference, see [Query](/api-reference/v2/endpoint/query).
 
 <CodeGroup>
 ```python Python SDK
-# List knowledge sources with pagination
-sources = client.context.list(
+# List items with pagination
+items = client.context.list(
     database="my_first_database",
     collection="company_docs",
-    type="knowledge",
     page=1,
     page_size=50,
 )
 
-# Inspect graph relationships for a specific source
+# Inspect graph relationships for a specific item
 relations = client.context.relations(
     database="my_first_database",
     collection="company_docs",
     id="contract_q4",
 )
 
-# Inspect original source content or get a presigned URL
+# Inspect an item's original content or get a presigned URL
 file = client.context.inspect(
     database="my_first_database",
     collection="company_docs",
@@ -467,32 +461,30 @@ file = client.context.inspect(
     mode="url",
 )
 
-# Delete a knowledge source
+# Delete an item
 client.context.delete(
-    type="knowledge",
     database="my_first_database",
     collection="company_docs",
     ids=["contract_q4"],
 )
 ```
 ```typescript TypeScript SDK
-// List knowledge sources with pagination
-const sources = await client.context.list({
+// List items with pagination
+const items = await client.context.list({
   database: "my_first_database",
   collection: "company_docs",
-  type: "knowledge",
   page: 1,
   pageSize: 50,
 });
 
-// Inspect graph relationships for a specific source
+// Inspect graph relationships for a specific item
 const relations = await client.context.relations({
   database: "my_first_database",
   collection: "company_docs",
   id: "contract_q4",
 });
 
-// Inspect original source content or get a presigned URL
+// Inspect an item's original content or get a presigned URL
 const file = await client.context.inspect({
   database: "my_first_database",
   collection: "company_docs",
@@ -500,9 +492,8 @@ const file = await client.context.inspect({
   mode: "url",
 });
 
-// Delete a knowledge source
+// Delete an item
 await client.context.delete({
-  type: "knowledge",
   database: "my_first_database",
   collection: "company_docs",
   ids: ["contract_q4"],
@@ -557,7 +548,6 @@ try:
     result = client.query(
         database="my_first_database",
         query="...",
-        type="knowledge",
     )
 except NotFoundError:
     # Handle missing database / resource (HTTP 404)
@@ -577,7 +567,6 @@ try {
   const result = await client.query({
     database: "my_first_database",
     query: "...",
-    type: "knowledge",
   });
 } catch (error) {
   if (error instanceof HydraDBError) {
@@ -610,17 +599,17 @@ Common method changes from v1 to v2:
 
 | v1 | v2 |
 |---|---|
-| `client.upload.knowledge(...)` | `client.context.ingest(type="knowledge", ...)` |
-| `client.upload.addMemory(...)` | `client.context.ingest(type="memory", ...)` |
+| `client.upload.knowledge(...)` | `client.context.ingest(documents=..., ...)` |
+| `client.upload.addMemory(...)` | `client.context.ingest(context=..., ...)` |
 | `client.upload.verifyProcessing(...)` | `client.context.status(...)` |
-| `client.search.fullRecall(...)` | `client.query(type="knowledge", ...)` |
-| `client.search.recallPreferences(...)` | `client.query(type="memory", ...)` |
+| `client.search.fullRecall(...)` | `client.query(...)` |
+| `client.search.recallPreferences(...)` | `client.query(collection=<user collection>, ...)` |
 | `client.search.booleanRecall(...)` | `client.query(query_by="text", ...)` |
 | `client.fetch.listData(...)` | `client.context.list(...)` |
 | `client.fetch.graphRelationsBySourceId(...)` | `client.context.relations(...)` |
 | `client.fetch.content(...)` | `client.context.inspect(...)` |
-| `client.data.delete(...)` | `client.context.delete(type="knowledge", ...)` |
-| `client.upload.deleteMemory(...)` | `client.context.delete(type="memory", ...)` |
+| `client.data.delete(...)` | `client.context.delete(...)` |
+| `client.upload.deleteMemory(...)` | `client.context.delete(...)` |
 | `client.tenant.create(...)` | `client.databases.create(...)` |
 | `client.tenant.getTenantIds(...)` | `client.databases.list(...)` |
 | `client.tenant.deleteTenant(...)` | `client.databases.delete(...)` |
@@ -628,7 +617,7 @@ Common method changes from v1 to v2:
 | `client.tenant.getSubTenantIds(...)` | `client.databases.collections(...)` |
 | `client.tenant.monitor(...)` | `client.databases.stats(...)` |
 
-The v1 SDK methods remain available on the `<2.0.0` releases of `hydradb-sdk` / `@hydradb/sdk` for as long as v1 routes are supported.
+The table shows v2 calls on a unified database. A split v2 database, created before unified became the default, also takes `type`; see [Split databases](/essentials/v2/split-databases). The v1 SDK methods remain available on the `<2.0.0` releases of `hydradb-sdk` / `@hydradb/sdk` for as long as v1 routes are supported.
 
 ## Related
 
@@ -636,4 +625,4 @@ The v1 SDK methods remain available on the `<2.0.0` releases of `hydradb-sdk` / 
 - [API Reference](/api-reference/v2): every endpoint, with SDK examples
 - [Error Responses](/api-reference/v2/error-responses): status codes, error codes, and retry rules
 - [Query guide](/essentials/v2/query): how to choose and tune query parameters
-- [Context](/essentials/v2/context): ingesting knowledge and memories
+- [Context](/essentials/v2/context): ingesting context and files

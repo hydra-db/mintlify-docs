@@ -226,7 +226,10 @@ class UnifiedNarrativeTest(unittest.TestCase):
                 self.assertIn("data.additional_graph_context", text)
                 self.assertNotRegex(text, r'(?:Default|default|omitted means)[^\n|]*`0\.4`')
         reference = self.read("api-reference/v2/endpoint/query.mdx")
-        self.assertRegex(reference, r'name="type"[^\n]*default=`"all"`')
+        # A unified database takes no `type`; the row documents the warning a
+        # leftover split value gets, and never a default to send.
+        self.assertRegex(reference, r'name="type"[^\n]*Do not send\.[^\n]*`type_ignored_on_unified`')
+        self.assertNotRegex(reference, r'name="type"[^\n]*default=')
         self.assertRegex(reference, r'name="recency_bias"[^\n]*default=`0\.6`')
         self.assertIn('name="query_explicit_relations"', reference)
         self.assertIn('name="additional_graph_context"', reference)
@@ -262,7 +265,9 @@ class UnifiedNarrativeTest(unittest.TestCase):
             self.assertNotIn(split_type, context)
         self.assertIn("`auto` (the default)", context)
         self.assertIn("default is `\"knowledge\"`", self.read("AGENTS.mdx"))
-        self.assertIn('default=`"knowledge"`', self.read("api-reference/v2/endpoint/ingest-context.mdx"))
+        ingest = self.read("api-reference/v2/endpoint/ingest-context.mdx")
+        self.assertIn("Do not send `type`", ingest)
+        self.assertNotIn('name="type"', ingest)
 
     def test_mcp_api_key_connection_can_choose_its_scope_after_authentication(self):
         text = self.read("plugins/mcp.mdx")
