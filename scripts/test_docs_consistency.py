@@ -207,9 +207,11 @@ class UnifiedNarrativeTest(unittest.TestCase):
             "cookbooks/v2/personal-assistant.mdx",
         ):
             self.assertNotIn("custom_instructions", self.read(relative), relative)
+            self.assertNotIn("`instructions`", self.read(relative), relative)
+            self.assertNotIn('name="instructions"', self.read(relative), relative)
         guide = self.read("AGENTS.mdx")
-        memories = guide.split("### Memories")[-1].split("## 7.", 1)[0]
-        self.assertNotIn("custom_instructions", memories)
+        ingest = guide.split("## 6. Context ingestion", 1)[1].split("## 7.", 1)[0]
+        self.assertNotIn("instructions", ingest)
         self.assertIn("`custom_instructions` on the connector", guide)
         self.assertIn("custom_instructions", self.read("essentials/v2/connectors.mdx"))
 
@@ -264,7 +266,7 @@ class UnifiedNarrativeTest(unittest.TestCase):
         for split_type in ("type=knowledge", "type=memory", "type=traces"):
             self.assertNotIn(split_type, context)
         self.assertIn("`auto` (the default)", context)
-        self.assertIn("default is `\"knowledge\"`", self.read("AGENTS.mdx"))
+        self.assertIn("do not send `type` on any call", self.read("AGENTS.mdx"))
         ingest = self.read("api-reference/v2/endpoint/ingest-context.mdx")
         self.assertIn("Do not send `type`", ingest)
         self.assertNotIn('name="type"', ingest)
