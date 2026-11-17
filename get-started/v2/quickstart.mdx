@@ -1,6 +1,6 @@
 ---
 title: "Quickstart"
-description: "Get your API key, create a database, ingest chat or document, query and pass to agents. If you have questions email founders@hydradb.com"
+description: "Get your API key, create a database, ingest text or a conversation, query and pass to agents. If you have questions email founders@hydradb.com"
 ---
 
 <Prompt description="Working with a coding agent such as Claude Code, Cursor, or Codex?" actions={["copy", "cursor"]}>
@@ -9,7 +9,7 @@ Integrate HydraDB into this project.
 1. Read https://docs.hydradb.com/AGENTS.md before writing any code.
 2. Ask me for my HydraDB database name, and ask me to set my API key in `HYDRADB_API_KEY` myself rather than paste it here. Read the key from that variable; never hard-code it.
 3. Use the official SDK for this project's language: `hydradb-sdk` for Python or `@hydradb/sdk` for TypeScript.
-4. Ingest my documents as knowledge, wait until they are indexed, and add a query step that passes the results to the model. If the app has signed-in users, send each user's identity as `acl` on every query.
+4. Ingest my content as items in the `context` list, wait until they are indexed, and add a query step that passes the results to the model. If the app has signed-in users, send each user's identity as `acl` on every query.
 5. Show me your plan and the files you will change before changing anything.
 </Prompt>
 
@@ -25,7 +25,6 @@ export HYDRADB_API_KEY="your_api_key"
 # pip install "hydradb-sdk>=2,<3"
 import os
 from hydra_db import HydraDB
-from hydra_db.helpers import build_string
 
 client = HydraDB(token=os.environ["HYDRADB_API_KEY"])
 ```
@@ -33,7 +32,6 @@ client = HydraDB(token=os.environ["HYDRADB_API_KEY"])
 // Install: npm install @hydradb/sdk@^2
 // Needs a Node.js project with top-level await (ESM).
 import { HydraDBClient } from "@hydradb/sdk";
-import { buildString } from "@hydradb/sdk/helpers";
 
 const client = new HydraDBClient({
   token: process.env.HYDRADB_API_KEY!,
@@ -47,7 +45,9 @@ curl 'https://api.hydradb.com/databases' \
 ```
 </CodeGroup>
 
-**<u>Sample customer support agent:</u>** Create a database, ingest refund policies and customer memories, wait until everything is indexed, then query. Indexing runs in the background, which is why the code waits before querying. If you already created a database, set `database` to its name and skip the create call.
+**<u>Sample customer support agent:</u>** Create a database, ingest a refund policy and a note about one customer, wait until both are indexed, then query. Indexing runs in the background, which is why the code waits before querying. If you already created a database, set `database` to its name and skip the create call.
+
+Everything you ingest goes in one list called `context`. Each item carries either `text` or a `conversation`. The policy and the customer note below are both `text`.
 
 <CodeGroup>
 ```python Python SDK
@@ -60,27 +60,25 @@ client.databases.create(database=database)
 while not client.databases.status(database=database).data.infra.ready_for_ingestion:
     time.sleep(5)
 
-# 2. Ingest a knowledge document into the shared collection.
-with open("refund-policy.md", "w") as f:
-    f.write("# Refund policy\n\nRefunds are available within 30 days of purchase. Annual plans are refunded pro rata.\n")
+# 2. Ingest the refund policy into the shared collection.
+client.context.ingest(
+    database=database,
+    collection="company_docs",
+    context=json.dumps([{
+        "context_id": "refund_policy",
+        "title": "Refund policy",
+        "text": "Refunds are available within 30 days of purchase. Annual plans are refunded pro rata.",
+    }]),
+)
 
-with open("refund-policy.md", "rb") as f:
-    doc = client.context.ingest(
-        type="knowledge",
-        database=database,
-        collection="company_docs",
-        documents=[("refund-policy.md", f, "text/markdown")],
-        document_metadata=json.dumps([{"id": "refund_policy"}]),
-    )
-
-# 3. Save one customer's memory in that customer's collection.
-mem = client.context.ingest(
-    type="memory",
+# 3. Save a note about one customer in that customer's collection.
+client.context.ingest(
     database=database,
     collection="user_123",
-    memories=json.dumps([
-        {"text": "Customer asked for a refund on 2026-09-30 and was told to wait for the billing cycle to close."}
-    ]),
+    context=json.dumps([{
+        "context_id": "user_123_refund_request",
+        "text": "Customer asked for a refund on 2026-09-30 and was told to wait for the billing cycle to close.",
+    }]),
 )
 
 # 4. Wait until both are indexed.
@@ -95,22 +93,20 @@ def wait_for(collection, id):
             raise RuntimeError(status.error_message)
         time.sleep(2)
 
-wait_for("company_docs", doc.data.results[0].id)
-wait_for("user_123", mem.data.results[0].id)
+wait_for("company_docs", "refund_policy")
+wait_for("user_123", "user_123_refund_request")
 
-# 5. Query knowledge and the customer's memory together.
+# 5. Query the policy and the customer's note together.
 results = client.query(
     database=database,
     collections=["company_docs", "user_123"],
-    type="all",
     query="Can this customer get a refund, and what have we told them so far?",
 )
 
-print(build_string(results))
+for chunk in results.data.chunks:
+    print(chunk.content)
 ```
 ```typescript TypeScript SDK
-import { writeFileSync } from "node:fs";
-
 const database = "my_first_database";
 
 // 1. Create a database and wait until it can accept data.
@@ -121,33 +117,29 @@ while (true) {
   await new Promise((resolve) => setTimeout(resolve, 5_000));
 }
 
-// 2. Ingest a knowledge document into the shared collection.
-writeFileSync(
-  "refund-policy.md",
-  "# Refund policy\n\nRefunds are available within 30 days of purchase. Annual plans are refunded pro rata.\n",
-);
-
-const doc = await client.context.ingest({
-  type: "knowledge",
+// 2. Ingest the refund policy into the shared collection.
+await client.context.ingest({
   database,
   collection: "company_docs",
-  documents: [{ path: "refund-policy.md", filename: "refund-policy.md", contentType: "text/markdown" }],
-  documentMetadata: JSON.stringify([{ id: "refund_policy" }]),
+  context: JSON.stringify([{
+    context_id: "refund_policy",
+    title: "Refund policy",
+    text: "Refunds are available within 30 days of purchase. Annual plans are refunded pro rata.",
+  }]),
 });
 
-// 3. Save one customer's memory in that customer's collection.
-const mem = await client.context.ingest({
-  type: "memory",
+// 3. Save a note about one customer in that customer's collection.
+await client.context.ingest({
   database,
   collection: "user_123",
-  memories: JSON.stringify([
-    { text: "Customer asked for a refund on 2026-09-30 and was told to wait for the billing cycle to close." },
-  ]),
+  context: JSON.stringify([{
+    context_id: "user_123_refund_request",
+    text: "Customer asked for a refund on 2026-09-30 and was told to wait for the billing cycle to close.",
+  }]),
 });
 
 // 4. Wait until both are indexed.
-async function waitFor(collection: string, id: string | undefined) {
-  if (!id) throw new Error("Ingestion returned no id");
+async function waitFor(collection: string, id: string) {
   while (true) {
     const status = (await client.context.status({ database, collection, ids: [id] })).data?.statuses?.[0];
     if (!status) throw new Error("Status is missing");
@@ -157,18 +149,20 @@ async function waitFor(collection: string, id: string | undefined) {
   }
 }
 
-await waitFor("company_docs", doc.data?.results?.[0]?.id);
-await waitFor("user_123", mem.data?.results?.[0]?.id);
+await waitFor("company_docs", "refund_policy");
+await waitFor("user_123", "user_123_refund_request");
 
-// 5. Query knowledge and the customer's memory together.
+// 5. Query the policy and the customer's note together.
 const results = await client.query({
   database,
   collections: ["company_docs", "user_123"],
-  type: "all",
   query: "Can this customer get a refund, and what have we told them so far?",
 });
 
-console.log(buildString(results));
+if (!results.data || typeof results.data === "string") throw new Error("Expected structured query results");
+for (const chunk of results.data.chunks ?? []) {
+  console.log(chunk.content);
+}
 ```
 ```bash cURL
 DATABASE="my_first_database"
@@ -185,28 +179,38 @@ until curl -s "$API/databases/status?database=${DATABASE}" "${AUTH[@]}" \
   sleep 5
 done
 
-# 2. Ingest a knowledge document into the shared collection.
-cat > refund-policy.md <<'EOF'
-# Refund policy
-
-Refunds are available within 30 days of purchase. Annual plans are refunded pro rata.
+# 2. Ingest the refund policy into the shared collection.
+curl -s -X POST "$API/context/ingest" "${AUTH[@]}" \
+  -H "Content-Type: application/json" \
+  --data-binary @- <<EOF
+{
+  "database": "${DATABASE}",
+  "collection": "company_docs",
+  "context": [
+    {
+      "context_id": "refund_policy",
+      "title": "Refund policy",
+      "text": "Refunds are available within 30 days of purchase. Annual plans are refunded pro rata."
+    }
+  ]
+}
 EOF
 
-DOC_ID=$(curl -s -X POST "$API/context/ingest" "${AUTH[@]}" \
-  -F "type=knowledge" \
-  -F "database=${DATABASE}" \
-  -F "collection=company_docs" \
-  -F "documents=@refund-policy.md" \
-  -F 'document_metadata=[{"id":"refund_policy"}]' \
-  | jq -r '.data.results[0].id')
-
-# 3. Save one customer's memory in that customer's collection.
-MEM_ID=$(curl -s -X POST "$API/context/ingest" "${AUTH[@]}" \
-  -F "type=memory" \
-  -F "database=${DATABASE}" \
-  -F "collection=user_123" \
-  -F 'memories=[{"text":"Customer asked for a refund on 2026-09-30 and was told to wait for the billing cycle to close."}]' \
-  | jq -r '.data.results[0].id')
+# 3. Save a note about one customer in that customer's collection.
+curl -s -X POST "$API/context/ingest" "${AUTH[@]}" \
+  -H "Content-Type: application/json" \
+  --data-binary @- <<EOF
+{
+  "database": "${DATABASE}",
+  "collection": "user_123",
+  "context": [
+    {
+      "context_id": "user_123_refund_request",
+      "text": "Customer asked for a refund on 2026-09-30 and was told to wait for the billing cycle to close."
+    }
+  ]
+}
+EOF
 
 # 4. Wait until both are indexed.
 wait_for() {
@@ -223,17 +227,16 @@ wait_for() {
     sleep 2
   done
 }
-wait_for company_docs "$DOC_ID"
-wait_for user_123 "$MEM_ID"
+wait_for company_docs refund_policy
+wait_for user_123 user_123_refund_request
 
-# 5. Query knowledge and the customer's memory together.
+# 5. Query the policy and the customer's note together.
 curl -s -X POST "$API/query" "${AUTH[@]}" \
   -H "Content-Type: application/json" \
-  --data-binary @- <<EOF | jq -r '.data.chunks[].chunk_content'
+  --data-binary @- <<EOF | jq -r '.data.chunks[].content'
 {
   "database": "${DATABASE}",
   "collections": ["company_docs", "user_123"],
-  "type": "all",
   "query": "Can this customer get a refund, and what have we told them so far?"
 }
 EOF
@@ -242,13 +245,15 @@ EOF
 
 ## Checking the results
 
-The query returns chunks (passages of your sources), not a generated answer. The SDK examples print formatted context; cURL prints the chunk text. Both should include the policy and the memory:
+The query returns chunks (passages of what you ingested), not a generated answer. Each example prints the text of every chunk. The output should include the policy and the customer's note:
 
 ```text
 Refunds are available within 30 days of purchase. Annual plans are refunded pro rata.
 Customer asked for a refund on 2026-09-30 and was told to wait for the billing cycle to close.
 ```
 
-Send these chunks to your model as context. `build_string` in Python and `buildString` in TypeScript format them for a prompt. See [Query](/essentials/v2/query#7-use-the-results).
+Send these results to your model as context. The response also carries `llm_prompt`, the same results written out as one prompt with numbered citations. See [Query](/essentials/v2/query#7-use-the-results).
 
-HydraDB is serverless: there is nothing to provision, and the same code works at any scale, whether the context is a Markdown file or Slack messages synced by a [connector](/essentials/v2/connectors).
+HydraDB is serverless: there is nothing to provision, and the same code works at any scale, whether the context is a note you send yourself or Slack messages synced by a [connector](/essentials/v2/connectors).
+
+If your database was created before unified databases became the default, it is a split database and takes different fields. See [Split databases](/essentials/v2/split-databases).
