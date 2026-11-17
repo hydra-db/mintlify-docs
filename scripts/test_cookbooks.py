@@ -461,6 +461,26 @@ class CookbookTest(unittest.TestCase):
         self.assertEqual(2, stubs.calls.count("ConnectorsClient.discover"))
         self.assertEqual(1, stubs.calls.count("ConnectorsClient.configure"))
 
+    def test_executive_brief_preserves_acl_on_reads_and_writes(self):
+        source = python_blocks(ROOT / "cookbooks/v2/chief-of-staff.mdx")["chief_of_staff.py"]
+        tree = ast.parse(source)
+        functions = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in {"brief", "remember"}]
+        client = NS(query=mock.Mock(return_value=NS()), context=NS(ingest=mock.Mock(return_value=NS())))
+        scope = {"json": json, "client": client, "DATABASE": "db", "RECORDS": "work", "EXECUTIVE": "exec",
+                 "EXECUTIVE_EMAIL": "dana@acme.com", "answer": mock.Mock(),
+                 "wait_indexed": mock.Mock(), "source_ids": lambda result: ["item"]}
+        records = next(node for node in tree.body if isinstance(node, ast.Assign)
+                       and any(isinstance(target, ast.Name) and target.id == "records" for target in node.targets))
+        exec(compile(ast.Module(body=[records], type_ignores=[]), "chief-records.py", "exec"), scope)
+        self.assertTrue(all(item.get("acl") == ["dana@acme.com"] for item in scope["records"]))
+        exec(compile(ast.Module(body=functions, type_ignores=[]), "chief-functions.py", "exec"), scope)
+        scope["brief"]("What is current?")
+        self.assertEqual(["dana@acme.com"], client.query.call_args.kwargs.get("acl"))
+        scope["remember"]("A private commitment")
+        items = json.loads(client.context.ingest.call_args.kwargs["context"])
+        self.assertTrue(items)
+        self.assertTrue(all(item.get("acl") == ["dana@acme.com"] for item in items))
+
     def test_connect_reuses_only_the_same_account(self):
         hydra, stubs = self.load_setup()
         token = {"access_token": "x"}
