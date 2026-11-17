@@ -5,13 +5,13 @@ description: "Choose how HydraDB searches and ranks your context."
 
 import { Field } from "/snippets/field.jsx";
 
-A query returns ranked chunks (passages of an item), the graph paths that connect them, and a prompt ready for your model. Choose where to search with `collection` or `collections`, how to match with `query_by`, and how much retrieval work to do with `mode`. There is no `type` to choose: a query searches everything stored in the collections in scope.
+A query returns ranked chunks (passages of a source) with their source IDs. Choose how to match with `query_by`, and how much retrieval work to do with `mode`.
 
 ## Endpoint references
 
 | Endpoint | SDK method | Purpose |
 | --- | --- | --- |
-| [`POST /query`](/api-reference/v2/endpoint/query) | `query` | Retrieve context from a database |
+| [`POST /query`](/api-reference/v2/endpoint/query) | `query` | Query your context |
 | [`POST /feedback`](/api-reference/v2/endpoint/submit-feedback) | `feedback.submit` | Report how a query performed |
 
 ## Decision flow
@@ -23,18 +23,15 @@ classDef standard fill:#0f172a,stroke:#334155,stroke-width:2px,color:#f8fafc;
 classDef innovation fill:#CC4515,stroke:#FF571A,stroke-width:3px,color:#ffffff,font-weight:bold;
 
 Q([I want to retrieve context])
-S([Where should I search?])
 M([What kind of match?])
 H([query_by: hybrid])
 T([query_by: text])
 
-Q --> S
-S -- "One collection" --> M
-S -- "Several collections" --> M
+Q --> M
 M -- "Best overall relevance" --> H
 M -- "Exact term or phrase" --> T
 
-class Q,S,M,T standard;
+class Q,M,T standard;
 class H innovation;
 linkStyle default stroke:#64748b,stroke-width:2px;
 ```
@@ -49,22 +46,21 @@ These parameters shape most queries. [Query](/api-reference/v2/endpoint/query#re
 | <Field name="mode" /> | `"fast"`, `"thinking"`, `"auto"` | Choose a single pass with `"fast"`, broader retrieval with `"thinking"`, or automatic routing with `"auto"`. Defaults to `"auto"`. |
 | <Field name="max_results" /> | integer | Limit the returned chunks. Defaults to `10` for one collection. Maximum `250`. |
 | <Field name="alpha" /> | `0.0` to `1.0`, or `"auto"` | Tune hybrid matching. Lower values favor keyword matching; higher values favor semantic similarity. Default `0.8`, which `"auto"` also resolves to. |
-| <Field name="attributes" /> | object | Narrow results by the schema-backed `attributes` you set at ingest, with operators such as `$in` and `$gte`. |
-| <Field name="metadata_filters" /> | object | Deprecated in favor of `attributes`. Still the way to filter on `custom_attributes`, under `additional_metadata`. |
+| <Field name="metadata_filters" /> | object | Narrow results by metadata. Top-level keys filter schema-backed fields. Free-form fields go under `additional_metadata`. |
 | <Field name="collections" /> | `string[]` or weighted object | Search up to 100 existing collections. A list weights them equally. An object assigns relative weights, such as `{ "workspace_42": 2, "user_alex": 1 }`. |
 | <Field name="graph_context" /> | boolean | Include entity and relation context with the chunks. On by default; set `false` with `mode: "fast"` for chunk-only responses (`thinking` always includes it). |
-| <Field name="query_apps" /> | boolean | Improves matching of content synced by connectors. Enabled by default. The query still searches everything in scope. |
+| <Field name="query_apps" /> | boolean | Improves matching of content synced by connectors. Enabled by default. The query still searches all selected context. |
 
 ## Recommended configurations
 
 | User intent | Recommended config |
 |---|---|
 | Fast answers from documents | `query_by="hybrid"`, `mode="fast"`, `max_results=5-10`, `graph_context=false` |
-| Broader document search | `query_by="hybrid"`, `mode="thinking"` (thinking always includes graph paths) |
-| Personalized answer | the user's `collection`, `query_by="hybrid"`, `mode="thinking"`. If shared documents live in another collection, list both in `collections` |
-| User preferences | the user's `collection`, `query_by="hybrid"` |
+| Broader document search | `query_by="hybrid"`, `mode="thinking"` (thinking always includes graph context) |
+| Personalized answer | The user's `collection`, `query_by="hybrid"`, `mode="thinking"`. If shared documents live in another collection, list both in `collections` |
+| User preferences only | The user's `collection`, `query_by="hybrid"` |
 | Exact keyword or phrase | `query_by="text"`, `operator="phrase"` |
-| Recent operational updates | `query_by="hybrid"`, `recency_bias=0.6-0.8`, an `attributes` filter for the right document type |
+| Recent operational updates | `query_by="hybrid"`, `recency_bias=0.6-0.8`, a metadata filter for the right document type |
 | Mixed or unpredictable query complexity | `query_by="hybrid"`, `mode="auto"`: let HydraDB route each query to `fast` or `thinking` |
 
 ## Typical patterns
@@ -89,7 +85,7 @@ Answer questions from files, or from tickets, pages, and other content synced by
 
   </Accordion>
 
-  <Accordion title="Personalized answer with one user's context">
+  <Accordion title="Personalized answer with user context">
 
 Search the shared documents collection and the collection the user's context was ingested into. Both collections must already exist.
 
@@ -126,16 +122,18 @@ Search several collections and return one ranked result set. Use a list for equa
 
   <Accordion title="Filtered query for a specific slice">
 
-`attributes` filters fields declared in `database_metadata_schema`. A bare value means equals, and operators such as `$in` and `$gte` cover the rest. Separate keys combine with AND. See [Query](/api-reference/v2/endpoint/query#metadata-filters) for every operator.
+Top-level `metadata_filters` keys filter fields declared in `database_metadata_schema`. Free-form fields go under `additional_metadata`. All keys combine with AND. See [Metadata Filters](/essentials/v2/metadata) for operators.
 
 ```json
 {
   "database": "acme",
   "query": "What launch constraints apply to enterprise customers?",
   "query_by": "hybrid",
-  "attributes": {
-    "department": "product",
-    "segment": { "$in": ["enterprise", "strategic"] }
+  "metadata_filters": {
+    "department": {"equals": "product"},
+    "additional_metadata": {
+      "source": "launch_plan"
+    }
   }
 }
 ```
@@ -162,11 +160,11 @@ Use `query_by: "text"` when literal wording matters: legal clauses, SKUs, error 
 
 By default, `data.llm_prompt` contains the question and retrieved context formatted for your model. Pass this string to the model to generate an answer. See [Query](/essentials/v2/query#7-use-the-results) for the model call and response formats.
 
-The response also includes ranked `data.chunks[]`, each with the `context_id` of the item it came from, the graph paths in `data.graph`, and the items you linked at ingest in `data.forceful_relations`. Preserve chunk order when you format results yourself.
+The response also includes ranked `data.chunks[]` with source IDs, plus graph context and related chunks. Preserve chunk order when you format results yourself.
 
 ## Related
 
 - [Query](/api-reference/v2/endpoint/query): every request and response field
 - [Query guide](/essentials/v2/query): retrieval modes, ranking, and tuning
 - [Metadata Filters](/essentials/v2/metadata): filter with schema-backed and free-form metadata
-- [Query](/essentials/v2/query#5-understanding-relationships-in-your-context): graph paths and linked items
+- [Query](/essentials/v2/query#5-understanding-relationships-in-your-context): graph context and deterministic relations
