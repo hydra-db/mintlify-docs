@@ -225,7 +225,8 @@ class UnifiedNarrativeTest(unittest.TestCase):
             with self.subTest(relative=relative):
                 self.assertIn("query_explicit_relations", text)
                 self.assertIn("additional_graph_context", text)
-                self.assertIn("data.additional_graph_context", text)
+                self.assertIn("forceful_relations", text)
+                self.assertNotIn("data.additional_graph_context", text)
                 self.assertNotRegex(text, r'(?:Default|default|omitted means)[^\n|]*`0\.4`')
         reference = self.read("api-reference/v2/endpoint/query.mdx")
         # A unified database takes no `type`; the row documents the warning a
@@ -236,7 +237,7 @@ class UnifiedNarrativeTest(unittest.TestCase):
         self.assertIn('name="query_explicit_relations"', reference)
         self.assertIn('name="additional_graph_context"', reference)
         self.assertIn("request-time hint", reference)
-        self.assertIn("response map", reference)
+        self.assertIn("Linked items come back in `data.forceful_relations`", reference)
         context = self.read("essentials/v2/context.mdx")
         self.assertIn("`forceful_relations.context_ids`", context)
         self.assertNotIn("`explicit_relations`", context)
@@ -359,10 +360,6 @@ class SharedFactsTest(unittest.TestCase):
         for path in pages:
             relative = str(path.relative_to(ROOT))
             if relative == "essentials/v2/connectors.mdx" or "connector" in path.name:
-                continue
-            # The split-database page names app_knowledge as a field older databases
-            # still accept and points readers to connectors; it does not teach it.
-            if relative == "essentials/v2/split-databases.mdx":
                 continue
             for number, line in enumerate(path.read_text(encoding="utf-8").split("\n"), 1):
                 if pattern.search(line):
