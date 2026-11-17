@@ -9,7 +9,7 @@ This is where the real magic happens. Agents perform better searches with graphs
 
 ## Running a query
 
-The following sample request searches the `acme_corp` database.
+The following sample request searches the `company_docs` collection of the `acme_corp` database. There is no `type` to send: one query searches every item in the collections you name, whatever it is, in one ranked list.
 
 <Accordion title="Run a query: Python, TypeScript, or cURL">
   Set up your [SDK client](/api-reference/v2/sdks#client-setup) before running the Python or TypeScript example.
@@ -26,7 +26,7 @@ The following sample request searches the `acme_corp` database.
   )
   
   for chunk in result.data.chunks:
-      print(chunk.source_title, chunk.chunk_content)
+      print(chunk.context_id, chunk.content)
   ```
 
   ```typescript TypeScript SDK
@@ -39,7 +39,7 @@ The following sample request searches the `acme_corp` database.
   
   if (!result.data || typeof result.data === "string") throw new Error("Expected structured query results");
   for (const chunk of result.data.chunks ?? []) {
-    console.log(chunk.sourceTitle, chunk.chunkContent);
+    console.log(chunk.contextId, chunk.content);
   }
   ```
 
@@ -58,7 +58,7 @@ The following sample request searches the `acme_corp` database.
 
   </CodeGroup>
 
-  The response is wrapped in the standard envelope, so read the result from `data`. Trimmed to the fields you use most, it looks like this:
+  The response is wrapped in the standard envelope, so read the result from `data`. It looks like this, with `llm_prompt` shortened:
 
   ```json
   {
@@ -66,20 +66,35 @@ The following sample request searches the `acme_corp` database.
     "data": {
       "chunks": [
         {
-          "chunk_uuid": "runbook_keys_chunk_2",
-          "id": "runbook_keys",
-          "chunk_content": "Rotate API keys from Settings, then Security. The old key stays valid for 24 hours.",
-          "source_title": "API key runbook",
-          "relevancy_score": 0.91,
-          "metadata": { "document_type": "runbook" }
+          "chunk_id": "api_key_runbook_chunk_0",
+          "context_id": "api_key_runbook",
+          "score": 0.91,
+          "content": "Rotate API keys from Settings, then Security. The old key stays valid for 24 hours.",
+          "enrichment_kind": "business_knowledge",
+          "received_at": "2026-11-02T09:14:05Z"
         }
       ],
-      "graph_context": {
-        "query_paths": [],
-        "chunk_relations": [],
-        "chunk_id_to_group_ids": {}
-      },
-      "additional_graph_context": {}
+      "graph": [
+        {
+          "origin": "chunk_relation",
+          "triplets": [
+            {
+              "source": { "entity_id": "ent_api_key", "name": "API key" },
+              "relation": {
+                "predicate": "REMAINS_VALID_FOR",
+                "context": "The old key stays valid for 24 hours after rotation.",
+                "relationship_id": "rel_7f2c",
+                "chunk_id": "api_key_runbook_chunk_0"
+              },
+              "target": { "entity_id": "ent_24_hours", "name": "24 hours" }
+            }
+          ],
+          "path_summary": "API key remains valid for 24 hours."
+        }
+      ],
+      "forceful_relations": [],
+      "llm_prompt": "...",
+      "tabular_data": null
     },
     "error": null,
     "meta": {
@@ -121,18 +136,30 @@ The following sample request searches the `acme_corp` database.
       <td>How many chunks to return. Default `10`, maximum `250`.</td>
     </tr>
     <tr>
-      <td>`type`</td>
-      <td>Defaults to `"all"`, searching knowledge and memories together. Set `"knowledge"` for documents or `"memory"` for saved preferences.</td>
+      <td>`collection` / `collections`</td>
+      <td>One collection to search, or a list of them. Send the collections the context was ingested into. See [Choose what to search](#4-choose-what-to-search).</td>
     </tr>
   </tbody>
 </table>
 
 ### What comes back
 
-- `data.llm_prompt`**:** the query and the entire response to the query in one markdown file, complete with citations, that your agents can easily read.
-- `data.chunks`**:** the matching chunks from the graph, ranked by relevance, each with its source `id`, `chunk_content`, `source_title`, `relevancy_score`, and `metadata`.
-- **`data.graph_context`** and **`data.additional_graph_context`:** extracted relationships and deterministically linked sources, covered in [section 5](#5-understanding-relationships-in-your-context).
-- `data.tabular_data`**:** `null` for a document question. Present in thinking mode when the collection holds spreadsheets and the question is about them: a computed answer (`status: "ok"`) with `columns`, `records`, `sources` and `citations`, or a decline (`status: "not_applicable"`) when the question is not about the tables. See [Ask questions over spreadsheets](#ask-questions-over-spreadsheets).
+`data` always has exactly these five keys:
+
+- `data.chunks`**:** the matching chunks, ranked by relevance. Each has:
+  - `chunk_id` and `context_id`: the chunk, and the item it came from (your `context_id`, or the generated one).
+  - `score`: its relevance after reranking.
+  - `content`: the text of the chunk as you sent it.
+  - `enrichment`: what HydraDB inferred from the chunk, kept apart from `content`. Absent when nothing was inferred, as with `enrich: false`.
+  - `enrichment_kind`: the `context_category` you set on the item (`user_preference`, `business_knowledge` or `decision_trace`). Absent for `auto`.
+  - `received_at`: when HydraDB received the item, in RFC 3339. This is not your `happened_at`.
+  - `temporal`: dated facts from the chunk, each with `content`, `start_date` and `end_date`. Present only when the query used temporal reasoning.
+  - `chunk_metadata`: for a chunk of a spreadsheet, the rows it came from.
+
+  To read an item's title, attributes or collection, look it up by `context_id` with [`POST /context/list`](/api-reference/v2/endpoint/list-context).
+- **`data.graph`** and **`data.forceful_relations`:** extracted relationships and deterministically linked items, covered in [section 5](#5-understanding-relationships-in-your-context).
+- `data.llm_prompt`**:** the query and the entire response in one Markdown string, complete with citations, that your agents can easily read. It also carries what retrieval found that has no key of its own, such as a computed duration.
+- `data.tabular_data`**:** `null` for a question that is not about a spreadsheet. Present in thinking mode when the collection holds spreadsheets and the question is about them: a computed answer (`status: "ok"`) with `columns`, `records`, `sources` and `citations`, or a decline (`status: "not_applicable"`) when the question is not about the tables. See [Ask questions over spreadsheets](#ask-questions-over-spreadsheets).
 
 ### Ask questions over spreadsheets
 
@@ -195,12 +222,14 @@ Table answers run in thinking mode only; `"fast"` returns the ranked chunks with
 - `alpha`**:** the balance between semantic/meaning (`1.0`) and keywords (`0.0`) in a hybrid query. Default `0.8`; `"auto"` also resolves to `0.8`.
 - **`recency_bias`:** how much newer context is favored, from `0.0` to `1.0`. Default `0.6`
 - **`max_results`:** drop to `5` for tight context windows; raise to `20` when you rerank downstream.
-- **`additional_graph_context`:** a request-time string hint, such as `"user is on the billing page"`, that sharpens retrieval. It is not a filter. This is separate from the response map `data.additional_graph_context` containing linked sources.
+- **`additional_graph_context`:** a request-time string hint, such as `"user is on the billing page"`, that sharpens retrieval. It is not a filter.
 
 ## 4. Choose what to search
 
+- **One collection:** send `collection`.
 - **Several collections:** send `collections` instead, as a list, or as an object of weights to rank one collection over another. You can search up to 100 collections in one call.
-- **Metadata filtering:** `metadata_filters` narrows results before ranking, such as only specific emails or only one team's documents. [Metadata](/essentials/v2/metadata) covers all operators.
+- **Attribute filtering:** `attributes` narrows results before ranking, such as only one team's items. It filters on the `attributes` keys declared in the database's [metadata schema](/essentials/v2/metadata), with the operators `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$nin`, `$exists`, `$and`, `$or` and `$not`, as in `{"team": {"$eq": "payments"}}`. The filter applies to every part of the response: chunks, graph paths and linked items.
+- **Titles:** `titles` limits the search to items whose `title` matches one of the values, ignoring case.
 
 <Accordion title="Searching multiple collections: Python, TypeScript, or cURL">
   <CodeGroup>
@@ -210,7 +239,6 @@ Table answers run in thinking mode only; `"fast"` returns the ranked chunks with
       database="acme_corp",
       collections=["company_docs", "user_john_123"],
       query="How do I reset my password?",
-      type="all",
       mode="thinking",
       max_results=8,
   )
@@ -221,7 +249,6 @@ Table answers run in thinking mode only; `"fast"` returns the ranked chunks with
     database: "acme_corp",
     collections: ["company_docs", "user_john_123"],
     query: "How do I reset my password?",
-    type: "all",
     mode: "thinking",
     maxResults: 8,
   });
@@ -236,7 +263,6 @@ Table answers run in thinking mode only; `"fast"` returns the ranked chunks with
       "database": "acme_corp",
       "collections": ["company_docs", "user_john_123"],
       "query": "How do I reset my password?",
-      "type": "all",
       "mode": "thinking",
       "max_results": 8
     }'
@@ -244,7 +270,7 @@ Table answers run in thinking mode only; `"fast"` returns the ranked chunks with
 
   </CodeGroup>
 
-  Knowledge and memories come back together in `data.chunks`, ranked as one list. To let the user's memories outrank the shared documents, send weights instead of a list:
+  The shared documents and the user's own items come back together in `data.chunks`, ranked as one list. To let the user's own items outrank the shared documents, send weights instead of a list:
 
   ```json
   {
@@ -258,9 +284,15 @@ Table answers run in thinking mode only; `"fast"` returns the ranked chunks with
 
 ## 5. Understanding relationships in your context
 
-- `graph_context`**:** the relationships HydraDB extracted from your context during ingestion, such as "Payments team owns billing service", in `data.graph_context`.
-- **`query_explicit_relations`:** defaults to `true`. Links you declared deterministically during ingestion are returned in `data.additional_graph_context` in thinking mode only. Send `false` to skip linked sources. The legacy response alias `data.additional_context` contains the same map.
-- **`query_apps`:** for content synced by [connectors](/essentials/v2/connectors), an extra lane that rebuilds Slack threads, follows ticket and parent links, and matches exact ids and people. It still searches everything else, and has no effect on memories.
+- **`data.graph`:** the relationships HydraDB extracted from your context during ingestion, such as "Payments team owns billing service". It is one list of paths. Each path has:
+  - `origin`: `query_path` when the path was grown from the entities in your query, or `chunk_relation` when it is the neighbourhood of a chunk that ranked.
+  - `triplets`: the chain of hops, each a `source` entity, the `relation` between them and a `target` entity. Every `relation` carries the `chunk_id` it was extracted from, so you can get from any hop back to its evidence.
+  - `path_summary`: the whole chain written as one sentence.
+
+  `graph_context` (default `true`) turns the graph on. Sending `false` empties `graph` in fast mode.
+- **`data.forceful_relations`:** items you linked to a matching item at ingestion, with `forceful_relations` (see [Link sources deterministically](/essentials/v2/context#link-sources-deterministically)). Each entry is a `chunk`, shaped like a chunk in `data.chunks`, and `via`, the declared link that brought it in, as `{ "from": ..., "to": ... }`.
+- **`query_explicit_relations`:** defaults to `true`. Linked items are returned in thinking mode only. Send `false` to skip them. (On a [split database](/essentials/v2/split-databases), linked sources come back in `data.additional_graph_context` instead.)
+- **`query_apps`:** for content synced by [connectors](/essentials/v2/connectors), an extra lane that rebuilds Slack threads, follows ticket and parent links, and matches exact ids and people. It still searches everything else.
 
 
 ## 6. As an admin you can query the app on behalf of a user
@@ -279,14 +311,13 @@ An `acl` entry on a source or a query is a **principal**:
 
 ## 7. Use the results
 
-HydraDB recreates complete context that is helpful to your agents: your application. `build_string(result)` in Python and `buildString(result)` in TypeScript return `data.llm_prompt`, which numbers the ranked results `[1]`, `[2]`, and so on, so you can ask the agent to cite by those numbers.
+HydraDB recreates complete context that is helpful to your agents: your application. `data.llm_prompt` is that context as one string. It numbers the ranked results `[1]`, `[2]`, and so on, so you can ask the agent to cite by those numbers.
 
 <CodeGroup>
 
 ```python Python SDK
 import os
 from hydra_db import HydraDB
-from hydra_db.helpers import build_string
 from openai import OpenAI
 
 hydra = HydraDB(token=os.environ["HYDRADB_API_KEY"])
@@ -298,13 +329,12 @@ result = hydra.query(
     database="your-database",
     collection="your-collection",
     query=question,
-    type="knowledge",
     query_by="hybrid",
     mode="fast",
     graph_context=True,
 )
 
-context = build_string(result)
+context = result.data.llm_prompt
 
 completion = openai_client.chat.completions.create(
     model="gpt-4o",
@@ -325,7 +355,6 @@ print(completion.choices[0].message.content)
 
 ```typescript TypeScript SDK
 import { HydraDBClient } from "@hydradb/sdk";
-import { buildString } from "@hydradb/sdk/helpers";
 import OpenAI from "openai";
 
 const hydra = new HydraDBClient({ token: process.env.HYDRADB_API_KEY });
@@ -337,13 +366,13 @@ const result = await hydra.query({
   database: "your-database",
   collection: "your-collection",
   query: question,
-  type: "knowledge",
   queryBy: "hybrid",
   mode: "fast",
   graphContext: true,
 });
 
-const context = buildString(result);
+if (!result.data || typeof result.data === "string") throw new Error("Expected structured query results");
+const context = result.data.llmPrompt;
 
 const completion = await openai.chat.completions.create({
   model: "gpt-4o",
@@ -370,11 +399,10 @@ console.log(completion.choices[0].message.content);
 
 | **Common mistakes** | **Cause** | **Fix** |
 | --- | --- | --- |
-| Empty `query_paths` or `chunk_relations` | `graph_context` set to `false`, or no relationships exist for the result set | Leave `graph_context` on (the default). Empty arrays are normal when there is nothing to return. |
+| Empty `graph` | `graph_context` set to `false`, or no relationships exist for the result set | Leave `graph_context` on (the default). An empty list is normal when there is nothing to return. |
 | Recent uploads do not appear in results | Indexing not finished | Poll [`GET /context/status`](/api-reference/v2/endpoint/source-status) with the source ids. Chunks are invisible until indexing reaches at least `graph_creation`. |
-| `metadata_filters` does not narrow results | Filter key is in the wrong namespace, the value does not match exactly, or the top-level field was not declared in the metadata schema | Top-level keys match `metadata`; free-form per-source fields must be nested under `additional_metadata`. Declare hot filter keys in `database_metadata_schema` before production ingest. |
-| Memories missing from a `type: "knowledge"` query | Wrong store selected | Use `type: "memory"` or `type: "all"`. |
-| Knowledge missing from a `type: "all"` query | The documents live in a different collection from the one you sent | List both collections in `collections`. |
+| `attributes` does not narrow results | The key was not declared in the metadata schema, the value does not match exactly, or the key is in `custom_attributes` | `attributes` filters only on declared `attributes` keys, not on `custom_attributes`. Declare hot filter keys in `database_metadata_schema` before production ingest. |
+| Items you ingested are missing from results | They live in a different collection from the one you sent | List every collection in `collections`. |
 | Recency does not seem to matter | `recency_bias` was sent as `0`, or the default `0.6` tilt is too mild | Raise it toward `1.0`. |
 | `operator: "phrase"` returns `400` | `query_by` not set to `"text"` | `"and"` and `"phrase"` only apply to BM25 text queries: switch `query_by` to `"text"`. |
 | `query_explicit_relations` ignored | Request runs in `mode: "fast"` (or `auto` routed to fast) | Deterministically linked sources are fetched only in thinking mode. Set `mode: "thinking"`. |
