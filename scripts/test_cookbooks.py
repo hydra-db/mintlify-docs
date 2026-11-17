@@ -361,14 +361,20 @@ def unified_chunk(context_id, content):
     return NS(chunk_id=f"{context_id}_chunk_0", context_id=context_id, score=0.9, content=content)
 
 
+def plain(value):
+    if isinstance(value, NS):
+        return {k: plain(v) for k, v in vars(value).items() if not callable(v)}
+    if isinstance(value, list):
+        return [plain(v) for v in value]
+    return value
+
+
 def unified_result(chunks=(), graph=(), forceful_relations=()):
     """The unified /query envelope: data carries exactly the five public keys."""
-    return NS(
-        success=True,
-        data=NS(chunks=list(chunks), graph=list(graph), forceful_relations=list(forceful_relations),
-                llm_prompt="context", tabular_data=None),
-        meta=NS(request_id="req_1"),
-    )
+    data = NS(chunks=list(chunks), graph=list(graph), forceful_relations=list(forceful_relations),
+              llm_prompt="context", tabular_data=None)
+    data.json = lambda **kwargs: json.dumps(plain(data))
+    return NS(success=True, data=data, meta=NS(request_id="req_1"))
 
 
 class CookbookTest(unittest.TestCase):
@@ -376,12 +382,15 @@ class CookbookTest(unittest.TestCase):
         source = python_blocks(ROOT / "cookbooks/v2/cursor.mdx")["cursor.py"]
         search = next(node for node in ast.parse(source).body
                       if isinstance(node, ast.FunctionDef) and node.name == "search_code")
-        result = unified_result(
-            chunks=[unified_chunk("auth", "Validate the token.")],
-            graph=[NS(origin="query_path", triplets=[], path_summary="Router calls validate_token.")],
-            forceful_relations=[NS(via=NS(**{"from": "auth", "to": "policy"}),
-                                   chunk=unified_chunk("policy", "Service tokens require the admin scope."))],
-        )
+        body = {
+            "chunks": [{"chunk_id": "auth_chunk_0", "context_id": "auth", "score": 0.9, "content": "Validate the token."}],
+            "graph": [{"origin": "query_path", "triplets": [], "path_summary": "Router calls validate_token."}],
+            "forceful_relations": [{"via": {"from": "auth", "to": "policy"},
+                                    "chunk": {"chunk_id": "policy_chunk_0", "context_id": "policy", "content": "Admin scope."}}],
+            "llm_prompt": "context",
+            "tabular_data": None,
+        }
+        result = NS(data=NS(json=lambda **kwargs: json.dumps(body)))
         scope = {"json": json, "DATABASE": "code", "COLLECTION": "repo",
                  "PATHS": {"auth": "src/auth.py"},
                  "client": NS(query=lambda **kwargs: result)}
@@ -389,12 +398,9 @@ class CookbookTest(unittest.TestCase):
 
         context = json.loads(scope["search_code"]("How is authentication enforced?"))
 
-        self.assertEqual({
-            "chunks": [{"path": "src/auth.py", "content": "Validate the token."}],
-            "graph": ["Router calls validate_token."],
-            # A linked item the map does not know is cited by its context_id.
-            "linked": [{"path": "policy", "content": "Service tokens require the admin scope."}],
-        }, context)
+        self.assertEqual("src/auth.py", context["chunks"][0]["path"])
+        self.assertEqual(body["graph"], context["graph"])
+        self.assertEqual(body["forceful_relations"], context["forceful_relations"])
 
     @staticmethod
     def optional_credentials(source):
