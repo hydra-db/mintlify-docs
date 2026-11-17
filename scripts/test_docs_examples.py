@@ -34,7 +34,7 @@ import hydra_db
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_cookbooks import (  # noqa: E402
-    APP_SOURCE_KEYS, DOCUMENT_METADATA_KEYS, KIND_FIELDS, KINDS, MEMORY_KEYS,
+    DOCUMENT_METADATA_KEYS, MEMORY_KEYS,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -80,6 +80,12 @@ def resolve(schema):
     return schema
 
 
+# Documented fields the generated spec does not declare yet. The spec is synced
+# from the application and is never edited by hand, so a field whose release is
+# pending is listed here until the sync brings it in. Remove the entry then.
+PENDING_SPEC_FIELDS = set()
+
+
 def unknown_keys(value, schema, path=""):
     """List keys in value that the schema does not declare, recursively."""
     schema = resolve(schema)
@@ -94,7 +100,8 @@ def unknown_keys(value, schema, path=""):
     unknown = []
     for key, child in value.items():
         if key not in properties:
-            unknown.append(f"{path}.{key}")
+            if f"{path}.{key}" not in PENDING_SPEC_FIELDS:
+                unknown.append(f"{path}.{key}")
         else:
             unknown += unknown_keys(child, properties[key], f"{path}.{key}")
     return unknown
@@ -172,8 +179,10 @@ class FakeHydraDB:
         if key == ("GET", "/databases/status"):
             return 200, envelope({"database": query["database"][0],
                                   "infra": {"ready_for_ingestion": True}})
+        if key == ("GET", "/databases/{database}/metadata-schema"):
+            return 200, envelope({"database": "acme_corp", "fields": []})
         if key == ("POST", "/context/ingest"):
-            items = json.loads(body.get("memories") or body.get("app_knowledge")
+            items = json.loads(body.get("memories")
                                or body.get("document_metadata") or "[{}]")
             return 202, envelope({"success": True, "results": [
                 {"id": item.get("id", f"source_{n}"), "status": "queued"}
@@ -195,10 +204,19 @@ class FakeHydraDB:
             return 200, envelope({"feedback_id": "fb_1"})
         if key == ("POST", "/connectors"):
             return 201, {"connector_id": "conn_1", "provider": body.get("provider"), "status": "active"}
+        if key == ("GET", "/connectors/providers"):
+            if query.get("id"):
+                return 200, {"provider": query["id"][0], "connector_type": query["id"][0],
+                             "indexed_object_types": [], "searchable_fields": [], "filterable_fields": []}
+            return 200, {"providers": []}
         if key == ("GET", "/connectors/{id}/discover"):
-            return 200, {"resources": [{"id": "C1", "resource_type": "channel", "name": "general"}]}
+            return 200, {"provider": "slack", "resources": [{"id": "C1", "resource_type": "channel", "name": "general"}]}
         if key == ("POST", "/connectors/{id}/configure"):
-            return 200, {}
+            return 200, {"connector_id": "conn_1"}
+        if key == ("PATCH", "/connectors/{id}"):
+            return 200, {"connector_id": "conn_1"}
+        if key == ("PATCH", "/connectors/{id}/resources/{resource_id}"):
+            return 200, {"connector_id": "conn_1", "resource_id": "C1", **body}
         if key == ("GET", "/connectors/{id}/status"):
             return 200, {"connector_id": "conn_1", "status": "active"}
         if key == ("GET", "/context/inspect"):
@@ -222,13 +240,8 @@ class FakeHydraDB:
             test.assertEqual(1, ("text" in item) + ("user_assistant_pairs" in item), where)
         for item in json.loads(body.get("document_metadata") or "[]"):
             test.assertLessEqual(set(item), DOCUMENT_METADATA_KEYS, where)
-        for item in json.loads(body.get("app_knowledge") or "[]"):
-            test.assertEqual("knowledge", body["type"], where)
-            test.assertLessEqual(set(item), APP_SOURCE_KEYS, where)
-            test.assertIn(item.get("kind"), KINDS, where)
-            fields = item.get("fields", {})
-            test.assertEqual(item["kind"], fields.get("kind"), where)
-            test.assertLessEqual(set(fields) - {"kind"}, KIND_FIELDS[item["kind"]], f"{where}: {item.get('id')}")
+        # App content comes through connectors; examples must not hand-write it.
+        test.assertNotIn("app_knowledge", body, where)
 
     def handle(self, request):
         try:
@@ -292,10 +305,14 @@ def fake_openai():
     return module
 
 
+from test_docs_consistency import hidden_pages  # noqa: E402
+
+HIDDEN_PAGES = hidden_pages()
 V2_PAGES = [GUIDE] + sorted(
     page
     for folder in ("get-started/v2", "essentials/v2", "api-reference/v2", "plugins")
     for page in (ROOT / folder).rglob("*.mdx")
+    if page not in HIDDEN_PAGES
 )
 
 
@@ -470,7 +487,56 @@ class TypeScriptExamples(unittest.TestCase):
             self.assertEqual(0, result.returncode, result.stdout + result.stderr)
         finally:
             shutil.rmtree(work, ignore_errors=True)
-        self.assertGreaterEqual(count, 100)
+        self.assertGreaterEqual(count, 85)
+
+
+class CookbookPermissionDiagnostics(unittest.TestCase):
+    def test_permission_warning_distinguishes_local_abort_from_remote_sync(self):
+        import test_cookbooks
+
+        for field, response_field in (("acl_warnings", "acl_warning"), ("page_acl_warnings", "page_acl_warning")):
+            with self.subTest(field=field):
+                hydra, stubs = test_cookbooks.CookbookTest.load_setup(self)
+                getattr(stubs, field)["C2"] = "provider returned 403"
+                with mock.patch.object(hydra.client.connectors, "pause") as pause, \
+                        mock.patch.object(hydra.client.connectors, "delete") as delete, \
+                        mock.patch("time.sleep", side_effect=AssertionError("connect kept polling")), \
+                        self.assertRaises(RuntimeError) as raised:
+                    hydra.connect("slack", "T1", "db", "docs", {"access_token": "x"})
+                message = str(raised.exception)
+                for phrase in ("only the cookbook", "does not pause", "may already be readable by every caller", "scheduled syncs may continue", "Pass acl"):
+                    self.assertIn(phrase, message)
+                pause.assert_not_called()
+                delete.assert_not_called()
+                self.assertEqual(1, stubs.calls.count("ConnectorsClient.configure"))
+                self.assertNotIn("ConnectorsClient.update_resource_acl", stubs.calls)
+                self.assertTrue(all("acl" not in resource for resource in stubs.configured["conn_1"]))
+                status = hydra.client.connectors.status("conn_1")
+                self.assertEqual("active", status.lifecycle)
+                resource = next(resource for resource in status.resources if resource.resource_id == "C2")
+                self.assertEqual("provider returned 403", getattr(resource, response_field))
+
+    def test_explicit_resource_acl_recovers_without_erasing_provider_warning(self):
+        import test_cookbooks
+
+        for field, response_field in (("acl_warnings", "acl_warning"), ("page_acl_warnings", "page_acl_warning")):
+            with self.subTest(field=field):
+                hydra, stubs = test_cookbooks.CookbookTest.load_setup(self)
+                getattr(stubs, field)["C2"] = "provider returned 403"
+                with test_cookbooks.bounded_sleep(), self.assertRaises(RuntimeError):
+                    hydra.connect("slack", "T1", "db", "docs", {"access_token": "x"})
+                with test_cookbooks.bounded_sleep(), \
+                        mock.patch.object(hydra.client.connectors, "pause") as pause, \
+                        mock.patch.object(hydra.client.connectors, "delete") as delete:
+                    connector_id = hydra.connect("slack", "T1", "db", "docs", {"access_token": "x"}, acl=["domain:acme.com"])
+                self.assertEqual("conn_1", connector_id)
+                self.assertTrue(all(resource["acl"] == ["domain:acme.com"] for resource in stubs.configured[connector_id]))
+                self.assertEqual(3, stubs.calls.count("ConnectorsClient.update_resource_acl"))
+                pause.assert_not_called()
+                delete.assert_not_called()
+                status = hydra.client.connectors.status(connector_id)
+                resource = next(resource for resource in status.resources if resource.resource_id == "C2")
+                self.assertEqual("provider returned 403", getattr(resource, response_field))
 
 
 class EndpointPages(unittest.TestCase):
@@ -517,11 +583,16 @@ class EndpointPages(unittest.TestCase):
                 # for this operation's request body.
                 leaf = name.split(".")[-1].split("[")[0]
                 self.assertIn(f'"{leaf}"', FULL_TEXT.get(template, SPEC_TEXT), f"{page.name}: {name}")
-        self.assertGreaterEqual(checked, 60)
+        self.assertGreaterEqual(checked, 55)
 
 
 class JsonAndCurlExamples(unittest.TestCase):
     REFERENCE = [page for page in V2_PAGES if "plugins" not in page.parts]
+
+    def test_pending_fields_are_still_missing_from_the_spec(self):
+        """An entry must leave PENDING_SPEC_FIELDS as soon as the spec declares it."""
+        declared = {f".{name}" for schema in SCHEMAS.values() for name in schema.get("properties", {})}
+        self.assertEqual(set(), PENDING_SPEC_FIELDS & declared)
 
     def test_json_blocks_parse_and_use_public_fields(self):
         count = 0
@@ -547,7 +618,7 @@ class JsonAndCurlExamples(unittest.TestCase):
                     if isinstance(sample, dict) and "query" in sample and "database" in sample \
                             and "params" not in sample:
                         self.assertEqual([], unknown_keys(sample, request_schema(operation("POST", "/query")[1])))
-        self.assertGreaterEqual(count, 120)
+        self.assertGreaterEqual(count, 85)
 
     @staticmethod
     def curl_calls(source):
@@ -599,7 +670,7 @@ class JsonAndCurlExamples(unittest.TestCase):
                         if bound and source.strip() in request_example:
                             self.assertEqual(bound, (method, operation(method, path)[0]),
                                              "the request example does not call the endpoint this page documents")
-        self.assertGreaterEqual(calls, 80)
+        self.assertGreaterEqual(calls, 70)
 
     def test_status_values_are_the_documented_ones(self):
         pages = V2_PAGES + sorted((ROOT / "cookbooks/v2").glob("*.mdx")) + sorted((ROOT / "snippets").glob("*.mdx"))
