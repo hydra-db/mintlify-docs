@@ -34,7 +34,7 @@ import hydra_db
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_cookbooks import (  # noqa: E402
-    DOCUMENT_METADATA_KEYS, MEMORY_KEYS,
+    DOCUMENT_METADATA_KEYS, CONTEXT_ITEM_KEYS,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -233,11 +233,12 @@ class FakeHydraDB:
     def check_ingest_items(self, body, where):
         """Check the JSON-string form fields, which the spec types only as strings."""
         test = self.test
-        test.assertIn(body.get("type"), {"knowledge", "memory"}, where)
-        for item in json.loads(body.get("memories") or "[]"):
-            test.assertEqual("memory", body["type"], where)
-            test.assertLessEqual(set(item), MEMORY_KEYS, where)
-            test.assertEqual(1, ("text" in item) + ("user_assistant_pairs" in item), where)
+        test.assertIsNone(body.get("type"), where)
+        test.assertNotIn("memories", body, where)
+        items = body.get("context") or "[]"
+        for item in json.loads(items) if isinstance(items, str) else items:
+            test.assertLessEqual(set(item), CONTEXT_ITEM_KEYS, where)
+            test.assertEqual(1, ("text" in item) + ("conversation" in item), where)
         for item in json.loads(body.get("document_metadata") or "[]"):
             test.assertLessEqual(set(item), DOCUMENT_METADATA_KEYS, where)
         # App content comes through connectors; examples must not hand-write it.

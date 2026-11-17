@@ -169,7 +169,7 @@ class UnifiedNarrativeTest(unittest.TestCase):
 
     def test_memory_authorization_covers_mutations_and_adjacent_examples(self):
         text = self.read("essentials/v2/context.mdx")
-        memory = text.split("## Ingesting memory", 1)[1].split("## Wait for indexing", 1)[0]
+        memory = text.split("## Ingesting context", 1)[1].split("## Wait for indexing", 1)[0]
         self.assertIn("updates and deletes", memory)
         self.assertIn("authorize", memory)
         self.assertIn("source ID", memory)
@@ -193,7 +193,7 @@ class UnifiedNarrativeTest(unittest.TestCase):
 
     def test_memory_scope_is_derived_from_the_signed_in_session(self):
         text = self.read("essentials/v2/context.mdx")
-        memory = text.split("## Ingesting memory", 1)[1].split("## Wait for indexing", 1)[0]
+        memory = text.split("## Ingesting context", 1)[1].split("## Wait for indexing", 1)[0]
         self.assertIn("signed-in session", memory)
         self.assertIn("does not authenticate", memory)
         self.assertIn("every ingest, status check, and query", memory)
@@ -210,7 +210,7 @@ class UnifiedNarrativeTest(unittest.TestCase):
             self.assertNotIn("`instructions`", self.read(relative), relative)
             self.assertNotIn('name="instructions"', self.read(relative), relative)
         guide = self.read("AGENTS.mdx")
-        ingest = guide.split("## 6. Context ingestion", 1)[1].split("## 7.", 1)[0]
+        ingest = guide.split("## 6. Source ingestion", 1)[1].split("## 7.", 1)[0]
         self.assertNotIn("instructions", ingest)
         self.assertIn("`custom_instructions` on the connector", guide)
         self.assertIn("custom_instructions", self.read("essentials/v2/connectors.mdx"))
@@ -237,7 +237,7 @@ class UnifiedNarrativeTest(unittest.TestCase):
         self.assertIn('name="query_explicit_relations"', reference)
         self.assertIn('name="additional_graph_context"', reference)
         self.assertIn("request-time hint", reference)
-        self.assertIn("Linked items come back in `data.forceful_relations`", reference)
+        self.assertIn("into `data.forceful_relations`", reference)
         context = self.read("essentials/v2/context.mdx")
         self.assertIn("`forceful_relations.context_ids`", context)
         self.assertNotIn("`explicit_relations`", context)
@@ -266,10 +266,9 @@ class UnifiedNarrativeTest(unittest.TestCase):
         # A unified database takes no `type`: an item's shape is its type.
         for split_type in ("type=knowledge", "type=memory", "type=traces"):
             self.assertNotIn(split_type, context)
-        self.assertIn("That shape is the item's type", context)
-        self.assertIn("do not send `type` on any call", self.read("AGENTS.mdx"))
+        self.assertIn("`conversation` items", context)
+        self.assertIn("No call takes `type`", self.read("AGENTS.mdx"))
         ingest = self.read("api-reference/v2/endpoint/ingest-context.mdx")
-        self.assertIn("Do not send `type`", ingest)
         self.assertNotIn('name="type"', ingest)
 
     def test_context_category_and_its_echo_are_not_documented(self):
