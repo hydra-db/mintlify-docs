@@ -6,7 +6,7 @@ description: "An assistant that tracks decisions and commitments across meetings
 
 import Setup from "/snippets/cookbook-setup.mdx";
 
-A chief of staff remembers what was decided, who committed to what, and what has changed since. This cookbook builds one from two types of context: email and chat, and the decisions drawn from them, which HydraDB keeps current.
+A chief of staff remembers what was decided, who committed to what, and what has changed since. This cookbook builds one from two types of context: meetings and email, and the decisions drawn from them, which HydraDB keeps current.
 
 | Benchmark | Result | What it shows here |
 | --- | --- | --- |
@@ -22,9 +22,8 @@ Work records go in one collection. The executive's own decisions and commitments
 
 ```python chief_of_staff.py
 import json
-import os
 
-from hydra import answer, client, connect, create_database, source_ids, wait_indexed
+from hydra import answer, client, create_database, source_ids, wait_indexed
 
 DATABASE = "acme_corp"
 RECORDS, EXECUTIVE = "work_records", "exec_dana"
@@ -32,40 +31,40 @@ RECORDS, EXECUTIVE = "work_records", "exec_dana"
 create_database(DATABASE)
 ```
 
-## 2. Connect email and chat
+## 2. Ingest meetings and email
 
-Where the work happened is already written down in email and chat. A [connector](/essentials/v2/connectors) syncs each app into the records collection and keeps senders, participants, threads, and dates, which is what lets a query answer "what did Priya agree to in September".
-
-Slack carries its own permissions over. Gmail does not, so the mailbox gets an `acl` naming the executive: without it, anyone who queries the records collection could read their mail. `lookback_days` sets how much history the first sync fetches; the default is 30. Above 30, some providers fetch the older history in the background, so it can keep arriving after `connect` returns.
+Meetings and email go in as text items. Keep participants, senders, and dates in the text, and the date in `happened_at`, which is what lets a query answer "what did Priya agree to on the September call".
 
 ```python chief_of_staff.py
-EXECUTIVE_EMAIL = os.environ["EXECUTIVE_EMAIL"]
+records = [
+    {
+        "context_id": "gong_call_0912",
+        "title": "Q4 planning call",
+        "text": "Q4 planning call, hosted by Dana Okafor, with Priya Shah. "
+        "Dana: we launch the EU region on November 3. Priya: I will "
+        "have the data residency review done by October 15.",
+        "happened_at": "2026-09-12",
+    },
+    {
+        "context_id": "gmail_msg_1002",
+        "title": "EU launch date",
+        "text": "Email from dana@acme.com to leadership@acme.com. "
+        "Legal needs two more weeks. Moving the EU launch to November 17.",
+        "happened_at": "2026-10-02",
+    },
+]
 
-# Each provider has its own credentials: client.list_providers(id="gmail")
-# returns the shape. The second argument names the account, so a second
-# mailbox or workspace gets its own connector.
-connect(
-    "gmail",
-    EXECUTIVE_EMAIL,
-    DATABASE,
-    RECORDS,
-    credentials=json.loads(os.environ["GMAIL_CREDENTIALS"]),
-    acl=[EXECUTIVE_EMAIL],
-    lookback_days=365,
+result = client.context.ingest(
+    database=DATABASE,
+    collection=RECORDS,
+    context=json.dumps(records),
 )
-connect(
-    "slack",
-    os.environ["SLACK_WORKSPACE_ID"],
-    DATABASE,
-    RECORDS,
-    credentials={"access_token": os.environ["SLACK_TOKEN"]},
-    lookback_days=365,
-)
+wait_indexed(DATABASE, RECORDS, source_ids(result))
 ```
 
-## 3. Save decisions as context
+## 3. Save decisions
 
-After each meeting or thread, save what was decided as a [context item](/essentials/v2/context#ingesting-context). With `enrich: true`, HydraDB extracts the facts and checks them against what the collection already holds, so the October change to the launch date is reconciled with the September decision instead of sitting beside it.
+After each meeting or thread, save what was decided as a [text item](/essentials/v2/context). With `enrich: true`, HydraDB extracts the facts and checks them against what the collection already holds, so the October change to the launch date is reconciled with the September decision instead of sitting beside it.
 
 ```python chief_of_staff.py
 def remember(text):
@@ -84,7 +83,7 @@ remember("2026-10-02: Moved the EU launch to November 17 because legal needs two
 
 ## 4. Ask what is current
 
-Query both collections at once, as the executive. `acl` keeps the brief to what this person may see: their own mail, and the Slack channels they belong to. `recency_bias` favors newer context, and `thinking` mode reranks, so the current launch date ranks above the one it replaced.
+Query both collections at once. `recency_bias` favors newer context, and `thinking` mode reranks, so the current launch date ranks above the one it replaced.
 
 ```python chief_of_staff.py
 def brief(question):
@@ -94,7 +93,6 @@ def brief(question):
         query=question,
         mode="thinking",
         recency_bias=0.6,
-        acl=[EXECUTIVE_EMAIL],
     )
     return answer(question, result, "When facts conflict, the most recent one is current. "
                                     "Name the owner and due date of each commitment.")
@@ -105,24 +103,24 @@ print(brief("When is the EU launch, and what is still open before it?"))
 
 ## Run it
 
-Set `GMAIL_CREDENTIALS`, `SLACK_TOKEN`, `SLACK_WORKSPACE_ID`, and `EXECUTIVE_EMAIL`, replace the two sample decisions and the question with your own, and run:
-
 ```bash
 python chief_of_staff.py
 ```
 
-With the sample decisions, the answer gives November 17, notes that the date moved from November 3, and lists Priya's data residency review as the open commitment. It adds whatever your email and chat say on the subject.
+The answer should give November 17, note that the date moved from November 3, and list Priya's data residency review as the open commitment.
 
-Keep step 3 in your application: decide what counts as a decision, and save it when the meeting or thread ends.
+## Use real data
+
+Connect the calendar, meeting, and email apps with [connectors](/essentials/v2/connectors) in place of step 2. Keep step 3 in your application: decide what counts as a decision, and save it when the meeting ends.
 
 ## Common mistakes
 
-- **Keeping the transcript only:** a transcript records what was said. A saved decision records what is true now. Save both.
+- **Saving the transcript only:** a transcript records what was said. A decision records what is true now. Save both.
 - **Querying one collection:** a query that names only `RECORDS` does not read the decisions. Use `collections` with both names.
 - **Leaving dates out of decisions:** write the date into the decision text. It is what lets a later change supersede an earlier one.
 
 ## Next steps
 
-- [Context](/essentials/v2/context#ingesting-context): when to use `enrich`, and how to update or delete an item.
+- [Context](/essentials/v2/context): when to use `enrich`, and how to update or delete an item.
 - [Query](/essentials/v2/query): `recency_bias` and `mode`.
 - [Build your own personal assistant](/cookbooks/v2/personal-assistant): the same memory, for one person's life outside work.

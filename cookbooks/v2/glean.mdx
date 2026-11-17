@@ -1,12 +1,12 @@
 ---
 title: "Build your own Glean"
 sidebarTitle: "Company Brain"
-description: "Company search across Slack, Jira, and Confluence that respects each person's permissions and cites its sources."
+description: "Company search across Slack, Jira, and Notion that respects each person's permissions and cites its sources."
 ---
 
 import Setup from "/snippets/cookbook-setup.mdx";
 
-Company search answers a question from everything the company has written, and shows each person only what they are allowed to see. This cookbook builds it with three ideas: one collection for all company knowledge, connectors that sync each app along with its permissions, and the asker's identity on every query.
+Company search answers a question from everything the company has written, and shows each person only what they are allowed to see. This cookbook builds it with three ideas: one collection for all company context, an ACL on each source, and the asker's identity on every query.
 
 | Benchmark | Result | What it shows here |
 | --- | --- | --- |
@@ -21,42 +21,51 @@ Put everything in one collection so a single query searches all of it. Separate 
 
 ```python glean.py
 import json
-import os
 
-from hydra import answer, client, connect, create_database
+from hydra import answer, client, create_database, source_ids, wait_indexed
 
 DATABASE, COLLECTION = "acme_corp", "company"
 
 create_database(DATABASE)
 ```
 
-## 2. Connect each app
+## 2. Ingest sources from each app
 
-A [connector](/essentials/v2/connectors) syncs one app account into the collection and keeps it in sync on a schedule. For Slack, Jira, Confluence, and the other providers [that capture permissions](/essentials/v2/connectors#examples-of-what-each-provider-captures), it also copies the app's permissions into each source's ACL, so a private Slack channel stays private in search. `connect` from `hydra.py` makes the connector calls: create, discover, configure, and status.
+Send records your code already holds as text items. `text` carries the record's content, `happened_at` its date, and `acl` lists who may see it. The samples include an outdated wiki page and the Slack message that replaced it, and a ticket only the finance lead can see.
 
 ```python glean.py
-connect(
-    "slack",
-    os.environ["SLACK_WORKSPACE_ID"],
-    DATABASE,
-    COLLECTION,
-    credentials={"access_token": os.environ["SLACK_TOKEN"]},
+sources = [
+    {
+        "context_id": "notion_pricing_2025",
+        "title": "Pricing (2025)",
+        "text": "Pro is $79 per seat per month. Enterprise is $199.",
+        "happened_at": "2025-03-01",
+        "acl": ["domain:acme.com"],
+    },
+    {
+        "context_id": "slack_C01_1788000000_000100",
+        "title": "Pricing change - Slack #product",
+        "text": "alice@acme.com: Decision: from October 1, 2026, Pro moves from $79 to $89 per seat.",
+        "happened_at": "2026-09-01",
+        "acl": ["domain:acme.com"],
+    },
+    {
+        "context_id": "jira_FIN_42",
+        "title": "FIN-42: Enterprise discount floor",
+        "text": "Do not discount Enterprise below $150 per seat without CFO approval. "
+        "Status: open. Assignee: grace@acme.com.",
+        "happened_at": "2026-09-03",
+        "acl": ["grace@acme.com"],
+    },
+]
+
+result = client.context.ingest(
+    database=DATABASE,
+    collection=COLLECTION,
+    context=json.dumps(sources),
 )
-
-# Add one call per app, all pointing at the same collection. Each provider has
-# its own credentials: client.list_providers(id="jira") returns the shape.
-for provider in ("jira", "confluence"):
-    variable = f"{provider.upper()}_CREDENTIALS"
-    if variable in os.environ:
-        site = os.environ[f"{provider.upper()}_SITE"]  # For example acme.atlassian.net.
-        connect(provider, site, DATABASE, COLLECTION, credentials=json.loads(os.environ[variable]))
+wait_indexed(DATABASE, COLLECTION, source_ids(result))
 ```
-
-The first time it runs for an account, `connect` syncs every channel, page, or project the credentials can reach, and the last 30 days of each. To sync only some, pass a shorter `resources` list to [`configure`](/api-reference/v2/endpoint/configure-connector). To fetch more history, pass `lookback_days`.
-
-<Warning>
-A provider that does not capture permissions, such as Notion or Gmail, syncs its content with no ACL, so every asker could retrieve it. `connect` refuses such a provider unless you pass `acl` to set who may read what it syncs. It also stops if a provider's permissions could not be read, because that content would be readable by everyone until the next successful sync.
-</Warning>
 
 ## 3. Query as the person asking
 
@@ -77,7 +86,7 @@ def search(question, user_email):
 
 ## 4. Answer with citations
 
-Each chunk in the query result carries the ID of the source it came from, and [`POST /context/list`](/api-reference/v2/endpoint/list-context) returns the titles. Print each source once under the answer.
+Each chunk in the query result carries the ID of the source it came from, and [`POST /context/list`](/api-reference/v2/endpoint/list-context) returns its title. Print each source once under the answer.
 
 ```python glean.py
 def ask(question, user_email):
@@ -86,36 +95,56 @@ def ask(question, user_email):
     cited = list(dict.fromkeys(chunk.context_id for chunk in result.data.chunks))
     if not cited:
         return
-    listed = client.context.list(
-        database=DATABASE, collection=COLLECTION, ids=cited, acl=[user_email]
-    ).data
-    for source in listed.sources or []:
+    listed = client.context.list(database=DATABASE, collection=COLLECTION, ids=cited).data
+    for source in listed.sources:
         print(f"  - {source.title} ({source.id})")
 
 
-ask("What did we decide about pricing?", "bob@acme.com")
-ask("What did we decide about pricing?", "grace@acme.com")
+ask("What does Pro cost per seat?", "bob@acme.com")
+ask("How far can we discount Enterprise?", "bob@acme.com")
+ask("How far can we discount Enterprise?", "grace@acme.com")
 ```
 
 ## Run it
-
-Set `SLACK_TOKEN` and `SLACK_WORKSPACE_ID`, and optionally `JIRA_CREDENTIALS` with `JIRA_SITE`, and `CONFLUENCE_CREDENTIALS` with `CONFLUENCE_SITE`. Replace the two emails with people in your workspace, and run:
 
 ```bash
 python glean.py
 ```
 
-The first run waits for the first sync, which takes a few minutes. Each answer cites the Slack messages and pages it came from. If the decision was made in a private channel, only the person who is a member of that channel gets it; the other is told the context does not say.
+The first answer should give $89 and cite the Slack decision alongside the older page. The second should say it does not know, because the ticket is restricted to Grace. The third should give the $150 floor and cite FIN-42.
+
+## Use real data
+
+Replace step 2 with [connectors](/essentials/v2/connectors): HydraDB then syncs each app on a schedule and copies its permissions into each source's ACL. Create one connector per app, all pointing at the same collection.
+
+```python connect.py
+from hydra import client
+
+connector = client.connectors.create(
+    provider="slack",
+    database="acme_corp",
+    collection="company",
+    provider_account_scope="T12345ACME",
+    credentials={"access_token": "xoxp-..."},
+)
+found = client.connectors.discover(connector.connector_id)
+client.connectors.configure(
+    connector.connector_id,
+    resources=[
+        {"resource_id": r.id, "resource_type": r.resource_type, "name": r.name}
+        for r in found.resources
+    ],
+)
+```
 
 Keep sending `acl` on every query, and leave [`enforce_acl`](/essentials/v2/connectors#enforce-acl) off for this application. With `enforce_acl` on, HydraDB ignores the request's `acl` and uses the identity of whoever created the API key, so every user of your application would see what the key's creator can see. Enforcement fits a caller who authenticates as themselves, such as a user signed in through MCP OAuth.
 
 ## Common mistakes
 
 - **Turning on `enforce_acl` behind one API key:** every query then runs with the key creator's permissions, not the asker's.
-- **Connecting a provider that captures no permissions:** its content is synced unrestricted and reaches every asker. Pass `acl` to `connect` for it.
 - **Querying without `acl`:** the query returns restricted sources to everyone. Send the user's identity on every query.
 - **One collection per app or team:** a query that names one collection does not read the others. Keep one collection and narrow with [metadata filters](/essentials/v2/metadata).
-- **Group permissions:** an email matches its `domain:` principal automatically, but not groups. Send `group:` principals yourself. See [Query](/essentials/v2/query#6-as-an-admin-you-can-query-the-app-on-behalf-of-a-user).
+- **Group permissions:** an email matches its `domain:` principal automatically, but not groups. Send `group:` principals yourself. See [Query](/essentials/v2/query#6-query-on-behalf-of-a-user).
 
 ## Next steps
 
