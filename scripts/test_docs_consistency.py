@@ -136,7 +136,7 @@ class UnifiedNarrativeTest(unittest.TestCase):
         for relative in ("essentials/v2/context.mdx", "api-reference/v2/endpoint/ingest-context.mdx"):
             text = self.read(relative)
             with self.subTest(page=relative):
-                self.assertIn("additional memory enrichment", text)
+                self.assertRegex(text, r"additional (?:memory )?enrichment")
                 self.assertIn("entity/graph extraction may still run", text)
                 self.assertNotIn("Explicit `false` stores the text verbatim", text)
                 self.assertNotIn("without preprocessing", text)
@@ -197,8 +197,8 @@ class UnifiedNarrativeTest(unittest.TestCase):
         self.assertIn("signed-in session", memory)
         self.assertIn("does not authenticate", memory)
         self.assertIn("every ingest, status check, and query", memory)
-        self.assertIn("`infer: true` (default)", memory)
-        self.assertIn("`infer: false`", memory)
+        self.assertIn("`enrich: true` (default)", memory)
+        self.assertIn("`enrich: false`", memory)
 
     def test_legacy_memory_instructions_are_not_public_guidance(self):
         for relative in (
@@ -233,7 +233,7 @@ class UnifiedNarrativeTest(unittest.TestCase):
         self.assertIn("request-time hint", reference)
         self.assertIn("response map", reference)
         context = self.read("essentials/v2/context.mdx")
-        self.assertIn("`relations.ids`", context)
+        self.assertIn("`forceful_relations.context_ids`", context)
         self.assertNotIn("`explicit_relations`", context)
 
     def test_cli_authentication_does_not_require_a_database_or_key_in_argv(self):
@@ -257,10 +257,10 @@ class UnifiedNarrativeTest(unittest.TestCase):
 
     def test_client_auto_selection_is_not_documented_as_a_backend_wire_type(self):
         context = self.read("essentials/v2/context.mdx")
-        self.assertIn("client-side selection", context)
-        self.assertIn("defaults to `type=knowledge`", context)
-        self.assertIn("`auto` is not an API wire value", context)
-        self.assertNotIn("`type=traces`", context)
+        # A unified database takes no `type`; `auto` is the context_category default.
+        for split_type in ("type=knowledge", "type=memory", "type=traces"):
+            self.assertNotIn(split_type, context)
+        self.assertIn("`auto` (the default)", context)
         self.assertIn("default is `\"knowledge\"`", self.read("AGENTS.mdx"))
         self.assertIn('default=`"knowledge"`', self.read("api-reference/v2/endpoint/ingest-context.mdx"))
 
