@@ -50,7 +50,7 @@ The HTTP status tells you the class of failure; the error code tells you what to
 | `422` | Well-formed request that failed validation, or a query sent before the database finished provisioning | Only `TENANT_INFRA_NOT_READY`, once the database is ready |
 | `429` | Rate limit exceeded | Yes, with backoff |
 | `500` | Internal server error | Yes, with backoff |
-| `503` | Temporary service unavailability | Yes, with backoff |
+| `503` | Temporary service unavailability, including a status read that did not complete | Yes, after `Retry-After` when present, otherwise with backoff |
 
 ## Common error codes
 
@@ -70,7 +70,7 @@ The HTTP status tells you the class of failure; the error code tells you what to
 | `CORPUS_TYPE_UNSUPPORTED` | `400` | The `type` value does not fit this endpoint or database, for example `type: "all"` on ingest. |
 | `RATE_LIMITED` | `429` | The API key exceeded its current rate limit. |
 | `INTERNAL_ERROR` | `500` | HydraDB hit an unexpected server-side error. A rare auth-layer failure reports `INTERNAL_SERVER_ERROR` instead. |
-| `SERVICE_UNAVAILABLE` | `503` | A dependency is temporarily unavailable or the service is under load. |
+| `SERVICE_UNAVAILABLE` | `503` | A dependency is temporarily unavailable or the service is under load. On `GET /context/status` it means the status could not be read; your sources are unaffected. Retry after the number of seconds in the `Retry-After` header. |
 
 Endpoint pages list the most common codes for that operation. New codes may be added over time, so handle unknown `error.code` values gracefully.
 
@@ -89,10 +89,19 @@ Many storage- and capacity-related ingestion errors are **transient**: the pipel
 | `E1002` | Unsupported file format. Read this code in the upload response. The file is not queued. | Upload a supported format. |
 | `E2002` | The file contains no readable text. | Upload a version with text. |
 | `E6001` | Processed data could not be stored. | Retried automatically. |
+| `E6010` | HydraDB could not access its storage while indexing the source. This is a fault on the HydraDB side, not in your content. | Ingest the source again with the same ID after a few minutes. If it ends with `E6010` again, contact support with the source ID. |
+| `E6011` | The source produced a knowledge graph write larger than HydraDB accepts in one step. Retrying gives the same result. | Contact support with the source ID so HydraDB can finish indexing it. |
+| `E7005` | Indexing of the source stalled and HydraDB ended the run, so the source does not stay in progress. | Ingest the source again with the same ID to start a new run. If it ends with `E7005` again, contact support with the source ID. |
+| `E9001` | Processing failed with no more specific code. | Ingest the source again. If it fails again with `E9001`, contact support with the source ID and `meta.request_id`. |
+| `E9002` | HydraDB could not confirm that the upload was queued for processing. Read this code in the upload response; `GET /context/status` reports the same code. | Ingest the source again with the same ID. Retrying is safe: with `upsert` left on, the new upload replaces the earlier one. |
 | `E9003` | A source with this ID already exists and the request set `upsert` to `false`. Read this code in the ingest response. | Send a new ID, or leave `upsert` on to replace the source. |
 | `E9004` | The status record expired before the source finished indexing. | Ingest the source again. |
 
 Files rejected with `E1002` have no ingestion status record. Handle this code from the upload response. See [Supported file formats](/api-reference/v2/endpoint/ingest-context#supported-file-formats).
+
+`E9002` and `E7005` are both resolved by ingesting the source again. They differ in where the source stopped: `E9002` stopped at the handoff to processing, and `E7005` was queued and stopped partway.
+
+`E6010` and `E6011` end a source after a few attempts instead of retrying for hours, because another attempt would meet the same refusal.
 
 ## Retry pattern
 
