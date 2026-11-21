@@ -20,6 +20,7 @@ Competitor signals go stale fast: a pricing page changes, and last quarter's ver
 Declare the fields you will filter on when you create the database. [Metadata filters](/essentials/v2/metadata) work only on declared fields.
 
 ```python intel.py
+import io
 import json
 
 from hydra import answer, client, create_database, source_ids, wait_indexed
@@ -42,20 +43,19 @@ create_database(DATABASE, schema=[text_field("competitor"), text_field("signal")
 
 ## 2. Ingest signals with stable IDs
 
-Send each page as an [app source](/essentials/v2/context#send-app-sources) with the competitor and signal type in `metadata`. Build the `id` from the page, not from the day you fetched it: ingesting the same `id` again replaces the stored version, because `upsert` defaults to `true`.
+Upload each page as a small Markdown file, with the competitor and signal type in `metadata`. Build the `id` from the page, not from the day you fetched it: ingesting the same `id` again replaces the stored version, because `upsert` defaults to `true`.
 
 ```python intel.py
 def signal(source_id, competitor, kind_of_signal, title, body, fetched_at, url):
+    text = f"# {title}\n\nFetched {fetched_at} from {url}\n\n{body}\n"
     return {
-        "id": source_id,
-        "title": title,
-        "kind": "knowledge_base",
-        "provider": "web",
-        "external_id": source_id,
-        "url": url,
-        "timestamp": fetched_at,
-        "fields": {"kind": "knowledge_base", "title": title, "body": body, "updated_at": fetched_at},
-        "metadata": {"competitor": competitor, "signal": kind_of_signal},
+        # The stored title comes from the filename, so name the file by its id.
+        "file": (f"{source_id}.md", io.BytesIO(text.encode()), "text/markdown"),
+        "metadata": {
+            "id": source_id,
+            "metadata": {"competitor": competitor, "signal": kind_of_signal},
+            "additional_metadata": {"url": url, "fetched_at": fetched_at},
+        },
     }
 
 
@@ -64,11 +64,11 @@ def ingest(signals):
         type="knowledge",
         database=DATABASE,
         collection=COLLECTION,
-        app_knowledge=json.dumps(signals),
+        documents=[s["file"] for s in signals],
+        document_metadata=json.dumps([s["metadata"] for s in signals]),
     )
     # A source must finish indexing before the same id is ingested again.
     wait_indexed(DATABASE, COLLECTION, source_ids(result))
-
 
 ingest([
     signal("northwind_pricing", "northwind", "pricing", "Northwind pricing",
@@ -107,7 +107,7 @@ def ask(competitor, question):
         max_results=8,
         metadata_filters={"competitor": {"equals": competitor}},
     )
-    return answer(question, result, "Cite the source title and its date for every claim.")
+    return answer(question, result, "Cite the page title and the date it was fetched for every claim.")
 
 
 print(ask("northwind", "What does the Team plan cost?"))
