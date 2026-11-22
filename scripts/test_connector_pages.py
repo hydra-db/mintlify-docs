@@ -440,6 +440,32 @@ class ConnectorCopyPagesTest(unittest.TestCase):
         self.assertIn("#6-connect-several-accounts-from-one-provider", index.split("## Related", 1)[1])
 
 
+class ConnectorGraphLinksMergeTest(unittest.TestCase):
+    def test_sentry_copy_and_page_keep_project_team_links_and_limits(self):
+        copy = load_copy("sentry")
+        for text in (json.dumps(copy), (DIRECTORY / "sentry.mdx").read_text()):
+            with self.subTest(source="copy" if text.startswith("{") else "page"):
+                self.assertIn("Issues link to their project through `part_of`", text)
+                self.assertIn("assigned to a team, to that team through `related_to`", text)
+                self.assertIn("Projects link to each owning team through `part_of`", text)
+                self.assertIn("Sentry's project and team IDs, not display names", text)
+                self.assertIn("target is indexed in the same database and collection", text)
+                self.assertIn("An event's numeric group ID does not identify the issue's short ID", text)
+                self.assertIn("a user ID is distinct from an organization member ID", text)
+                self.assertNotIn("an issue is not linked to its project", text)
+
+    def test_klaviyo_copy_and_page_keep_audience_configuration_links(self):
+        copy = load_copy("klaviyo")
+        for text in (json.dumps(copy), (DIRECTORY / "klaviyo.mdx").read_text()):
+            with self.subTest(source="copy" if text.startswith("{") else "page"):
+                self.assertIn("included and excluded list or segment audiences through `targets` and `excludes`, respectively", text)
+                self.assertIn("audience configuration, not message delivery", text)
+                self.assertIn("Segments link to lists or segments referenced in their definitions through `related_to`", text)
+                self.assertIn("a reference in a negative rule does not assert positive membership", text)
+                self.assertIn("profiles are not linked to their lists or segments", text)
+                self.assertNotIn("records are not linked to each other", text)
+
+
 class RevisedPageDesignTest(unittest.TestCase):
     def test_permissions_come_first_and_setup_has_real_subheadings(self):
         for provider, text in copy_pages().items():
