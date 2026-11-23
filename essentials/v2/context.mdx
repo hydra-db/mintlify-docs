@@ -1,112 +1,147 @@
 ---
 title: "Context"
-description: "Context is everything you give HydraDB so the database can organize it and your AI can find it. You can directly ingest docs, emails, and all forms of knowledge or you can use our data connectors."
+description: "Text and conversations: the two shapes of context HydraDB stores, how to ingest each, and how they work together."
 ---
 
 import { Field } from "/snippets/field.jsx";
 
-# Overview
+Context is everything you give HydraDB so your AI can find it later. It comes in two shapes, and most applications use both:
 
-<table>
-  <colgroup>
-    <col width="164" />
-    <col width="217" />
-    <col width="267" />
-    <col width="266" />
-    <col width="234" />
-  </colgroup>
-  <thead>
-    <tr>
-      <th></th>
-      <th>**Default**</th>
-      <th>**Knowledge**</th>
-      <th>**Memory**</th>
-      <th>**Traces (Experimental)**</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td>Description</td>
-      <td>The CLI and MCP use an auto selector to choose the request layout for your input. This is client-side selection, not a backend content classifier. Choose knowledge or memory explicitly when you need a specific type.</td>
-      <td>All the data your agent should be able to access: docs, emails, chats, transcripts, code, and sheets. You can directly ingest context or use connectors API to programmatically ingest data from your apps (RBAC aware).</td>
-      <td>What your agent has learned about a user and their preferences, used to personalize search on each query.</td>
-      <td>Agent decisions or traces: a record of every agent run, successful or failed, so future agents have a procedural memory of what works and what doesn't.</td>
-    </tr>
-    <tr>
-      <td>Examples</td>
-      <td>Everything in the following columns</td>
-      <td>Product docs, policy PDFs, runbooks, Slack threads, Linear tickets, emails</td>
-      <td>User preferences, chats, and past decisions</td>
-      <td>Tool calls and agent logs</td>
-    </tr>
-    <tr>
-      <td>RBAC</td>
-      <td>Use multi-tenancy features to maintain access controls (ACLs).</td>
-      <td>Ranges from org-wide (tribal) knowledge to team knowledge, and sometimes personal knowledge.</td>
-      <td>Same as knowledge, but usually scoped to individual users.</td>
-      <td>Same as knowledge, but usually org-wide, so agent runs across all sessions improve together.</td>
-    </tr>
-    <tr>
-      <td>Ingestion</td>
-      <td>CLI/MCP: auto selection by default. The public multipart API defaults to `type=knowledge`; send `type=memory` with `memories` items. `auto` is not an API wire value.</td>
-      <td>`type=knowledge`</td>
-      <td>`type=memory`</td>
-      <td>Not a public ingestion type. Store trace text as knowledge or memories.</td>
-    </tr>
-    <tr>
-      <td>Evolves temporally</td>
-      <td>HydraDB maintains a temporally versioned graph of everything you ingest.</td>
-      <td>As knowledge changes, HydraDB keeps a version history. The latest node is a snapshot of the current information and links back through a chain of earlier nodes that record past states.</td>
-      <td>A preference changes whenever the user says or does something new, which happens often.</td>
-      <td>Build agents that improve after every run, with procedural memory.</td>
-    </tr>
-  </tbody>
-</table>
+| | Text | Conversation |
+|---|---|---|
+| What it is | What your organization has written down, or a fact your agent saved | What a user and your agent said to each other |
+| Examples | Product docs, policy PDFs, runbooks, Slack threads, tickets, emails, a saved preference | Support chats, assistant sessions, past conversations |
+| Usually shared by | Everyone who may read it, or one user | One user |
+| What you send | Files, or a `text` item | A `conversation` item |
+| Changes when | The document changes | The user says or does something new |
 
-## Ingesting Knowledge
+Both work the same way. Both go to [`POST /context/ingest`](/api-reference/v2/endpoint/ingest-context), both are saved in a [collection](/essentials/v2/databases-and-collections), both are indexed in the background, and both come back from [`POST /query`](/api-reference/v2/endpoint/query). Each item you ingest is a **source**; HydraDB splits it into searchable passages called **chunks** and builds a context graph from it.
 
-There are two ways to ingest knowledge/context
+A support agent, for example, answers from the help center and from the fact that this customer already tried restarting.
 
-1. Directly using the ingest API. You have to set your own ACLs with multi tenancy features within the database
-2. Connectors API - programmatically ingest data from slack, gmail, linear, and 70+ connectors with all RBAC aware. Read more in  [Connectors](/essentials/v2/connectors).
+## 1. Ingest files
 
-### Upload with metadata
+There are two ways to ingest what your organization has written down:
+
+- **Files:** upload PDF, DOCX, Markdown, CSV, or TXT files, and HydraDB reads them for you.
+- **[Connectors](/essentials/v2/connectors):** connect an app such as Slack, Google Drive, Notion, or GitHub once, and HydraDB keeps it in sync.
+
+### Upload files
+
+The request is **multipart/form-data** with these fields:
+
+| Form field | What to send |
+|---|---|
+| `database` | An existing [database](/api-reference/v2/endpoint/create-database) |
+| `collection` | Optional. Leave it out to use the database's default collection. A query that names another collection does not read the default one. |
+| `documents` | One or more files |
+| `document_metadata` | One item per file, in the same order, as a JSON string. Optional, but this is where a file's `id` and `metadata` go. |
+| `upsert` | Leave it out. It defaults to `true`, so a file sent again with the same `id` replaces the saved one. |
+
+<Accordion title="Upload files: Python, TypeScript, or cURL">
+
+Set up your [SDK client](/api-reference/v2/sdks#client-setup) before running the Python or TypeScript example.
+
+<CodeGroup>
+```python Python SDK
+import json
+
+with open("/path/to/policy.pdf", "rb") as f1, open("/path/to/runbook.pdf", "rb") as f2:
+    result = client.context.ingest(
+        database="acme_corp",
+        documents=[
+            ("policy.pdf", f1, "application/pdf"),
+            ("runbook.pdf", f2, "application/pdf"),
+        ],
+        document_metadata=json.dumps([
+            {"id": "policy_v2", "metadata": {"document_type": "policy", "status": "approved"}},
+            {"id": "runbook_deploy", "metadata": {"document_type": "runbook"}},
+        ]),
+    )
+```
+```typescript TypeScript SDK
+const result = await client.context.ingest({
+  database: "acme_corp",
+  documents: [
+    { path: "/path/to/policy.pdf", filename: "policy.pdf", contentType: "application/pdf" },
+    { path: "/path/to/runbook.pdf", filename: "runbook.pdf", contentType: "application/pdf" },
+  ],
+  documentMetadata: JSON.stringify([
+    { id: "policy_v2", metadata: { document_type: "policy", status: "approved" } },
+    { id: "runbook_deploy", metadata: { document_type: "runbook" } },
+  ]),
+});
+```
+```bash cURL
+curl -X POST 'https://api.hydradb.com/context/ingest' \
+  -H "Authorization: Bearer $HYDRADB_API_KEY" \
+  -H "API-Version: 2" \
+  -F "database=acme_corp" \
+  -F "documents=@/path/to/policy.pdf" \
+  -F "documents=@/path/to/runbook.pdf" \
+  -F 'document_metadata=[
+    { "id": "policy_v2", "metadata": { "document_type": "policy", "status": "approved" } },
+    { "id": "runbook_deploy", "metadata": { "document_type": "runbook" } }
+  ]'
+```
+</CodeGroup>
+
+The response lists each file in `data.results` with its `id` and a `status` of `queued`. The payload is wrapped in the standard envelope, so read it from `response.data`:
+
+```json
+{
+  "success": true,
+  "data": {
+    "success": true,
+    "message": "Knowledge uploaded successfully",
+    "results": [
+      { "id": "policy_v2", "filename": "policy.pdf", "status": "queued", "error": null },
+      { "id": "runbook_deploy", "filename": "runbook.pdf", "status": "queued", "error": null }
+    ],
+    "success_count": 2,
+    "failed_count": 0
+  },
+  "error": null,
+  "meta": {
+    "request_id": "9d13aef4-02f4-4e73-8c62-4c2601d04f9d",
+    "latency_ms": 12.3
+  }
+}
+```
+
+</Accordion>
+
+Each `document_metadata` item takes these properties:
 
 | Property | What it is |
 |---|---|
 | `id` | Your stable ID for the file, and the upsert key. Send the same `id` later to replace the file, or use it to check status and delete. Leave it out to have one generated; the response returns it either way. |
 | `metadata` | Values you filter on at query time, such as `document_type`. Declare the keys in the database's [metadata schema](/essentials/v2/metadata). Up to 16 KiB as compact JSON. |
 | `additional_metadata` | Free-form values for display and bookkeeping. Filterable only when nested under `additional_metadata` in `metadata_filters`. Up to 1 KiB as compact JSON. |
-| `relations` | Other sources this file belongs with, as `{ "ids": [...] }`. See [Link sources deterministically](#link-sources-deterministically). |
+| `relations` | Other sources this file belongs with, as `{ "ids": [...] }`. See [Link documents that belong together](#6-link-sources-that-belong-together). |
 
-### Spreadsheets become queryable tables
+The key list is closed. Any other key, including `title`, `type`, `url`, and `timestamp`, returns `400`. [Ingest Context](/api-reference/v2/endpoint/ingest-context#supported-file-formats) lists the supported file formats.
 
-A CSV, TSV or Excel workbook (`.xlsx`, `.xlsm`, `.xlsb`, `.xls`, `.ods`) uploaded here, or delivered by a file connector such as Google Drive, Dropbox, Box, SharePoint or Nextcloud, is ingested two ways at once. Its cells are rendered as text and indexed like any other document, and its rows are kept as a typed table: HydraDB infers a column type for every column and records the row ranges each chunk came from. A workbook yields one table per sheet.
+<a id="2-save-memories"></a>
+<a id="ingesting-memory"></a>
+<a id="ingesting-context"></a>
 
-Nothing changes in how you upload. The difference shows at query time: a question that needs filtering, grouping or arithmetic over the rows is answered by SQL that HydraDB writes and runs over the complete table, with the result returned under `tabular_data`. See [Ask questions over spreadsheets](/essentials/v2/query#ask-questions-over-spreadsheets).
+## 2. Save context
 
-Replacing the file with the same `id` replaces the table too; the previous version is no longer queried once the new one is indexed. A table is bounded at 4,096 columns; a file with more columns is ingested as text only.
+HydraDB does not capture conversations on its own: your application saves an item when a user states a preference, makes a decision, finishes a task, or corrects the agent. Give each user their own collection, such as `user_john_123`, and send it on every ingest, status check, and query. Your backend picks it from the signed-in session; the name itself does not authenticate anyone.
 
-## Ingesting memory
+The request is the same as for files, with a `context` list in place of `documents`:
 
-HydraDB does not capture memories on its own: your application saves one when a user states a preference, makes a decision in a specific way, finishes a task, or corrects the agent.
+| Form field | What to send |
+|---|---|
+| `database` | An existing [database](/api-reference/v2/endpoint/create-database) |
+| `collection` | The user's own collection, such as `user_john_123`. |
+| `context` | A list of items, as a JSON string |
+| `upsert` | Leave it out. It defaults to `true`, so sending an item again with the same `context_id` replaces the saved one. |
 
-Give each user their own collection, such as `user_john_123`, and send it on every ingest, status check, and query. Your backend picks the collection from the signed-in session, never from untrusted client input; the collection name itself does not authenticate anyone.
-
-Apply the same server-derived scope and authorization to updates and deletes. Before any operation, authorize the signed-in user's access to the source in that collection; knowing a source ID or collection name is not permission to read or change it.
-
-1. **Let HydraDB infer**: `infer` controls whether HydraDB extracts memories and preferences from what you send.
-   1. `infer: true` (default): Extracts the preferences, trait, or fact from messy or indirect evidence. Omitting `infer` means `true`.
-   2. `infer: false`: Disables additional memory enrichment for that item. Ingestion, indexing, and entity/graph extraction may still run.
-2. **Ingest memory**: It can be via `text` or `user_assistant_pairs`, not both.
-   - `text`: Any prose, such as observations, facts, meeting notes, or semi-structured records. Set `is_markdown: true` for Markdown content so HydraDB keeps its structure when chunking and embedding.
-   - `user_assistant_pairs`: Dialogue, especially when a preference is implied rather than stated. Each pair is `{ "user": "...", "assistant": "..." }`.
-
-<Accordion title="Save a memory: Python, TypeScript, or cURL">
+<Accordion title="Save context: Python, TypeScript, or cURL">
 
 Set up your [SDK client](/api-reference/v2/sdks#client-setup) before running the Python or TypeScript example.
-
-The `verified_session` / `verifiedSession` objects and `SESSION_MEMORY_COLLECTION` below stand in for scope already resolved by your backend from a verified session. Their values are examples, not authentication code. Replace them with your server's authenticated context, never a user ID or collection supplied in the incoming request.
 
 <CodeGroup>
 
@@ -116,16 +151,14 @@ import os
 from hydra_db import HydraDB
 
 client = HydraDB(token=os.environ["HYDRADB_API_KEY"])
-verified_session = {"memory_collection": "user_john_123"}
 
 result = client.context.ingest(
-    type="memory",
     database="acme_corp",
-    collection=verified_session["memory_collection"],
-    memories=json.dumps([
+    collection="user_john_123",
+    context=json.dumps([
         {
             "text": "Prefers short, direct answers with no preamble.",
-            "infer": True,
+            "enrich": True,
             "user_name": "John",
         }
     ]),
@@ -138,16 +171,14 @@ import { HydraDBClient } from "@hydradb/sdk";
 const client = new HydraDBClient({
   token: process.env.HYDRADB_API_KEY,
 });
-const verifiedSession = { memoryCollection: "user_john_123" };
 
 const result = await client.context.ingest({
-  type: "memory",
   database: "acme_corp",
-  collection: verifiedSession.memoryCollection,
-  memories: JSON.stringify([
+  collection: "user_john_123",
+  context: JSON.stringify([
     {
       text: "Prefers short, direct answers with no preamble.",
-      infer: true,
+      enrich: true,
       user_name: "John",
     },
   ]),
@@ -155,18 +186,15 @@ const result = await client.context.ingest({
 ```
 
 ```bash cURL
-SESSION_MEMORY_COLLECTION="user_john_123"
-
 curl -X POST 'https://api.hydradb.com/context/ingest' \
   -H "Authorization: Bearer $HYDRADB_API_KEY" \
   -H "API-Version: 2" \
-  -F "type=memory" \
   -F "database=acme_corp" \
-  -F "collection=$SESSION_MEMORY_COLLECTION" \
-  -F 'memories=[
+  -F "collection=user_john_123" \
+  -F 'context=[
     {
       "text": "Prefers short, direct answers with no preamble.",
-      "infer": true,
+      "enrich": true,
       "user_name": "John"
     }
   ]'
@@ -174,16 +202,16 @@ curl -X POST 'https://api.hydradb.com/context/ingest' \
 
 </CodeGroup>
 
-The response lists each memory in `data.results` with its `id` and a `status` of `queued`. The payload is wrapped in the standard envelope, so read it from `response.data`:
+The response lists each item in `data.results` with its `id` and a `status` of `queued`. The payload is wrapped in the standard envelope, so read it from `response.data`:
 
 ```json
 {
   "success": true,
   "data": {
     "success": true,
-    "message": "Memories queued for ingestion successfully",
+    "message": "Context queued for ingestion successfully",
     "results": [
-      { "id": "mem_abc123", "status": "queued", "infer": true }
+      { "id": "ctx_abc123", "status": "queued" }
     ],
     "success_count": 1,
     "failed_count": 0
@@ -198,39 +226,399 @@ The response lists each memory in `data.results` with its `id` and a `status` of
 
 </Accordion>
 
-| Form field | What to send |
-| --- | --- |
-| `type` | `memory` |
-| `database` | An existing [database](/api-reference/v2/endpoint/create-database) |
-| `collection` | The user's own collection, resolved and authorized by your backend from the signed-in session. |
-| `memories` | One item or a list of items, as a JSON string |
-| `upsert` | Leave it out. It defaults to `true`, so sending an item again with the same `id` replaces the saved memory. |
+### Let HydraDB enrich it
 
-## Wait for indexing
+`enrich` controls whether HydraDB extracts the facts from what you send or stores it as written.
 
-Use polling or webhooks to check indexing status:
+| | `enrich: true` (the default) | `enrich: false` |
+|---|---|---|
+| What HydraDB does | Extracts the useful preference, trait, or fact from messy or indirect evidence. | Skips that additional enrichment and indexes what you send as written; entity/graph extraction may still run. |
+| Use it for | Dialogue where the preference is implicit, behavior logs and event streams, and feedback like "the last summary was too long." | Facts you already captured, such as `"User's plan tier is Pro"`, pre-structured notes, and text you want to retrieve exactly as written. |
 
-- **Webhooks:** register a [webhook](/api-reference/v2/endpoint/webhooks-overview) and HydraDB notifies you when indexing finishes, so you don't need to poll.
-- **Polling:** call [`GET /context/status`](/api-reference/v2/endpoint/source-status) with those ids and the same `collection` every few seconds until `indexing_status` is `completed` or `errored`.
-  - At `graph_creation`, the source becomes searchable but its graph is still building. Queries sent right away can miss it, and a new collection can still be reported as not existing.
-  - At `completed`, the source and its graph are ready to query.
+<Accordion title="Infer a preference from a behavior log: Python, TypeScript, or cURL">
 
-[Ingestion Status](/api-reference/v2/endpoint/source-status) lists every status.
+A user has been toggling dark mode in your application. Instead of extracting the preference yourself, send the raw behavior log and let HydraDB extract it.
 
-## Upsert or Delete
+<CodeGroup>
 
-To change a source, send it again with the same `id`. `upsert` defaults to `true`, so the saved one is replaced; include everything you want to keep. Wait for the previous ingestion to reach `completed` or `errored` before sending the next update for the same `id`.
+```python Python SDK
+import json
+
+client.context.ingest(
+    database="acme_corp",
+    collection="user_john_123",
+    context=json.dumps([
+        {
+            "text": (
+                "User opened the app 14 times in the last week. "
+                "Switched to dark mode on first session. "
+                "Toggled back to light once on 2026-04-12 at 3pm, "
+                "then switched back to dark within 4 minutes. "
+                "Has not changed theme since."
+            ),
+            "enrich": True,
+            "user_name": "John",
+        }
+    ]),
+)
+```
+
+```typescript TypeScript SDK
+const result = await client.context.ingest({
+  database: "acme_corp",
+  collection: "user_john_123",
+  context: JSON.stringify([
+    {
+      text:
+        "User opened the app 14 times in the last week. " +
+        "Switched to dark mode on first session. " +
+        "Toggled back to light once on 2026-04-12 at 3pm, " +
+        "then switched back to dark within 4 minutes. " +
+        "Has not changed theme since.",
+      enrich: true,
+      user_name: "John",
+    },
+  ]),
+});
+```
+
+```bash cURL
+curl -X POST 'https://api.hydradb.com/context/ingest' \
+  -H "Authorization: Bearer $HYDRADB_API_KEY" \
+  -H "API-Version: 2" \
+  -F "database=acme_corp" \
+  -F "collection=user_john_123" \
+  -F 'context=[
+    {
+      "text": "User opened the app 14 times in the last week. Switched to dark mode on first session. Toggled back to light once on 2026-04-12 at 3pm, then switched back to dark within 4 minutes. Has not changed theme since.",
+      "enrich": true,
+      "user_name": "John"
+    }
+  ]'
+```
+
+</CodeGroup>
+
+Later, when [`POST /query`](/api-reference/v2/endpoint/query) runs with a query like `"what UI settings does the user prefer?"`, HydraDB can return the extracted preference (for example, `"prefers dark mode"`) in the chunk's `enrichment`, next to the raw event log.
+
+If you sent the same input with `enrich: false`, HydraDB would index the event log verbatim. That is useful only when you want to retrieve the log itself.
+
+</Accordion>
+
+### Send text or a conversation
+
+Each item takes either `text` or `conversation`, **not both** (sending both returns `400`).
+
+- **`text`:** prose of any kind, such as observations, captured facts, meeting notes, or semi-structured records.
+- **`conversation`:** dialogue, especially when the preference is implied rather than stated. Each turn is `{ "role": "...", "content": "..." }`, with `role` set to `user`, `assistant`, or `system`.
+
+<Accordion title="Input shapes: text, Markdown, and a conversation">
+
+Markdown notes, stored as written:
+
+```json
+{
+  "text": "# Meeting Notes\n\n## Key Points\n- Budget approved",
+  "enrich": false
+}
+```
+
+A plain statement, with the preference extracted:
+
+```json
+{
+  "text": "Prefers detailed technical explanations and works in PST.",
+  "enrich": true
+}
+```
+
+A conversation, with the preference extracted:
+
+```json
+{
+  "conversation": [
+    { "role": "user", "content": "Remember I like dark mode" },
+    { "role": "assistant", "content": "Noted." }
+  ],
+  "enrich": true
+}
+```
+
+</Accordion>
+
+## 3. Wait for indexing
+
+Files and items are indexed the same way, in the background: HydraDB parses each source, splits it into chunks, enriches it if `enrich` is on, finds the people, teams, and topics it mentions and how they relate, and builds the search indexes. The ingest request returns `202 Accepted` with each source's `id`.
+
+Poll [`GET /context/status`](/api-reference/v2/endpoint/source-status) with those ids and the same `collection` every few seconds. A source's `indexing_status` moves forward through `queued`, `processing`, `graph_creation`, and `completed`, or lands in `errored` on failure:
+
+- At `graph_creation` the source becomes searchable within a few seconds, while its graph is still building. A query sent the moment this status appears can miss the source, and a collection that is new can still be reported as not existing.
+- At `completed` the source and its graph are ready. Wait for `completed` when you query straight after ingesting. Most documents complete in 1 to 5 minutes.
+
+[Ingestion Status](/api-reference/v2/endpoint/source-status) has the full status table. To skip polling, register a [webhook](/api-reference/v2/endpoint/webhooks-overview).
+
+<Accordion title="Poll until indexed: Python, TypeScript, or cURL">
+<CodeGroup>
+```python Python SDK
+import time
+
+ids = ["policy_v2", "runbook_deploy"]
+
+while True:
+    status = client.context.status(
+        database="acme_corp",
+        collection="default",
+        ids=ids,
+    )
+    statuses = status.data.statuses
+    failed = [s.id for s in statuses if s.indexing_status == "errored"]
+    if failed:
+        raise RuntimeError(f"Indexing failed for {failed}; inspect the status response before querying.")
+    if len(statuses) == len(ids) and all(s.indexing_status == "completed" for s in statuses):
+        break
+    time.sleep(5)
+```
+```typescript TypeScript SDK
+const ids = ["policy_v2", "runbook_deploy"];
+
+let status;
+while (true) {
+  status = await client.context.status({
+    database: "acme_corp",
+    collection: "default",
+    ids: ids,
+  });
+
+  const statuses = status.data?.statuses ?? [];
+  const failed = statuses.filter((s) => s.indexingStatus === "errored");
+  if (failed.length > 0) {
+    throw new Error(`Indexing failed; inspect the status response: ${JSON.stringify(failed)}`);
+  }
+  const allDone = statuses.length === ids.length && statuses.every((s) => s.indexingStatus === "completed");
+  if (allDone) break;
+
+  await new Promise((r) => setTimeout(r, 5_000));
+}
+```
+```bash cURL
+while true; do
+  response=$(curl -fsS -G 'https://api.hydradb.com/context/status' \
+    -H "Authorization: Bearer $HYDRADB_API_KEY" \
+    -H "API-Version: 2" \
+    --data-urlencode "database=acme_corp" \
+    --data-urlencode "collection=default" \
+    --data-urlencode "ids=policy_v2" \
+    --data-urlencode "ids=runbook_deploy") || exit 1
+
+  if echo "$response" | jq -e 'any(.data.statuses[]?; .indexing_status == "errored")' >/dev/null; then
+    echo "Indexing failed; inspect this response before querying:" >&2
+    echo "$response" | jq >&2
+    exit 1
+  fi
+  if echo "$response" | jq -e '(.data.statuses | length) == 2 and all(.data.statuses[]; .indexing_status == "completed")' >/dev/null; then
+    echo "$response" | jq
+    break
+  fi
+  sleep 5
+done
+```
+</CodeGroup>
+
+Each status in the `data` payload looks like this:
+
+```json
+{
+  "statuses": [
+    {
+      "id": "policy_v2",
+      "indexing_status": "completed",
+      "success": true
+    }
+  ]
+}
+```
+
+</Accordion>
+
+## 4. Query everything together
+
+[`POST /query`](/api-reference/v2/endpoint/query) reads everything in the collections you name. Shared documents usually live in one collection and each user's conversations in their own, so list both in `collections`. If some sources carry an `acl`, also send the caller's identity as `acl`. [Query](/essentials/v2/query) covers the other parameters and how to pass the result to a model.
+
+<Accordion title="Search shared documents and a user's conversations together: Python, TypeScript, or cURL">
+
+<CodeGroup>
+```python Python SDK
+result = client.query(
+    database="acme_corp",
+    collections=["company_docs", "user_john_123"],
+    query="How do I reset my password?",
+    mode="thinking",
+    max_results=8,
+)
+```
+```typescript TypeScript SDK
+const result = await client.query({
+  database: "acme_corp",
+  collections: ["company_docs", "user_john_123"],
+  query: "How do I reset my password?",
+  mode: "thinking",
+  maxResults: 8,
+});
+```
+```bash cURL
+curl -X POST 'https://api.hydradb.com/query' \
+  -H "Authorization: Bearer $HYDRADB_API_KEY" \
+  -H "API-Version: 2" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "database": "acme_corp",
+    "collections": ["company_docs", "user_john_123"],
+    "query": "How do I reset my password?",
+    "mode": "thinking",
+    "max_results": 8
+  }'
+```
+</CodeGroup>
+
+Everything comes back together in `data.chunks`, ranked as one list. To let the user's conversations outrank the shared documents, send weights instead of a list:
+
+```json
+{
+  "collections": {
+    "user_john_123": 2,
+    "company_docs": 1
+  }
+}
+```
+
+</Accordion>
+
+## 5. Update or delete context
+
+To change a file or an item, send it again with the same `id` or `context_id`. `upsert` defaults to `true`, so the saved one is replaced; include everything you want to keep. Wait for the previous ingestion to reach `completed` or `errored` before sending the next update for the same `id`.
 
 To remove one, call [`DELETE /context`](/api-reference/v2/endpoint/delete-source) with its `id` and the same `collection`.
 
-<a id="6-link-sources-that-belong-together"></a>
+## 6. Link sources that belong together
 
-## Link sources deterministically
+Deterministic relations are links you declare between sources when you ingest them. When a query matches a source that has deterministic relations, HydraDB returns the linked sources in the `forceful_relations` field of the response, alongside the primary chunks.
 
-Deterministic relations are links you declare between knowledge sources at ingestion. When a query matches one of those sources, HydraDB returns the linked sources in the response map `data.additional_graph_context`, alongside the primary chunks. The legacy response alias `data.additional_context` contains the same map.
+This is separate from the context graph HydraDB builds on its own. Use deterministic relations for documents that belong together when the text does not say so: a contract and its addendum, or a runbook and its troubleshooting guide. They link whole **sources**. To declare the entity and relation graph within one document, replacing extraction for it, use [Bring Your Own Graph](/essentials/v2/bring-your-own-graph#using-byog-without-cypher).
 
-This is separate from the relations in the context graph HydraDB builds on its own.
+On a file, set `relations.ids` on its `document_metadata` item. On a `context` item, set `forceful_relations.context_ids`.
 
-On a file, set `relations.ids` on its `document_metadata` item. `relations.ids` is what makes the linked text come back with query results.
+<Accordion title="Link a runbook to its troubleshooting guide: Python, TypeScript, or cURL">
 
-`query_explicit_relations` defaults to `true`; set it to `false` to skip the linked sources. Linked-source retrieval runs only in `thinking` mode. This describes deterministic source links, not a new ingestion field: keep using `relations.ids`.
+This guide links to a troubleshooting page already ingested with the `id` `auth-troubleshooting`. Ingest that page first and wait for `completed`.
+
+<CodeGroup>
+```python Python SDK
+client.context.ingest(
+    database="acme_corp",
+    context=json.dumps([
+        {
+            "context_id": "auth-guide",
+            "title": "Authentication Guide",
+            "text": "...",
+            "forceful_relations": {"context_ids": ["auth-troubleshooting"]},
+        }
+    ]),
+)
+```
+```typescript TypeScript SDK
+await client.context.ingest({
+  database: "acme_corp",
+  context: JSON.stringify([
+    {
+      context_id: "auth-guide",
+      title: "Authentication Guide",
+      text: "...",
+      forceful_relations: { context_ids: ["auth-troubleshooting"] },
+    },
+  ]),
+});
+```
+```bash cURL
+curl -X POST 'https://api.hydradb.com/context/ingest' \
+  -H "Authorization: Bearer $HYDRADB_API_KEY" \
+  -H "API-Version: 2" \
+  -F "database=acme_corp" \
+  -F 'context=[
+    {
+      "context_id": "auth-guide",
+      "title": "Authentication Guide",
+      "text": "...",
+      "forceful_relations": { "context_ids": ["auth-troubleshooting"] }
+    }
+  ]'
+```
+</CodeGroup>
+
+</Accordion>
+
+`query_explicit_relations` defaults to `true`; set it to `false` to skip the linked sources.
+
+<Note>
+**`thinking` mode only:** Linked context is fetched only when `mode: "thinking"` is set on the query, or when `mode: "auto"` routes to thinking. In `fast` mode, `query_explicit_relations` is ignored even if set to `true`.
+</Note>
+
+## Field reference
+
+<AccordionGroup>
+<Accordion title="Ingest request fields">
+
+| Field | Default | Description |
+|---|---|---|
+| <Field name="database" type="string" required /> | None | Target database. |
+| <Field name="collection" type="string" /> | default collection | The collection to save into. If omitted, context goes to the database's default collection, which a query naming another `collection` does not read. |
+| <Field name="documents" type="file[]" /> | None | Files for HydraDB to parse. A request sends `documents` or `context`, not both. |
+| <Field name="document_metadata" type="string (JSON array)" /> | None | One item per file in `documents`, in the same order. |
+| <Field name="context" type="string (JSON array)" /> | None | Text and conversation items. |
+| <Field name="upsert" type="boolean" /> | `true` | Replace existing context with the same `id`. |
+
+</Accordion>
+<Accordion title="Context item fields">
+
+| Field | Description |
+|---|---|
+| <Field name="context_id" type="string" /> | Optional stable ID. Acts as the upsert key. |
+| <Field name="title" type="string" /> | Short label for display in `/context/list`. |
+| <Field name="text" type="string" recommended /> | Raw text or Markdown content. Required unless `conversation` is provided. |
+| <Field name="conversation" type="array" recommended /> | Conversation turns in the shape `{ "role": "...", "content": "..." }`. Required unless `text` is provided. |
+| <Field name="enrich" type="boolean" /> | When `true` (the default), HydraDB extracts the underlying preference, trait, or fact. When `false`, it stores the input as written. |
+| <Field name="user_name" type="string" /> | User name used during enrichment. |
+| <Field name="attributes" type="object" /> | Metadata schema fields for filtering. Send this as an object inside each `context[]` item, for example `"attributes": { "department": "support" }`. Up to 16 KiB as compact JSON. |
+| <Field name="custom_attributes" type="object" /> | Free-form per-item fields for display or bookkeeping. Send this as an object. Up to 1 KiB as compact JSON. |
+
+`context` is a JSON string. Inside each item, `attributes` and `custom_attributes` are plain objects; do not stringify them again.
+
+```json
+{
+  "context_id": "pref_dark_mode",
+  "text": "User prefers dark mode and concise answers.",
+  "enrich": true,
+  "attributes": { "department": "support", "workspace": "docs" },
+  "custom_attributes": { "source": "onboarding" }
+}
+```
+
+</Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Mistake | What goes wrong | Fix |
+|---|---|---|
+| Omitting `collection` for per-user context | The item lands in the default collection and may surface in the wrong scope | Use the user's ID as `collection` to keep each user separate. |
+| Querying before indexing finishes | Results are empty, or a new collection returns `400` as not existing | Wait for `indexing_status` to reach `completed`. |
+| Sending `document_metadata` or `context` as a JSON object | `multipart/form-data` validation fails | Send each as a JSON string. |
+| Sending pre-extracted facts with `enrich` left on | HydraDB may re-derive the fact and change the original phrasing | Use `enrich: false` for already-structured facts. |
+| Extracting preferences yourself instead of sending the raw logs | You duplicate work HydraDB can do for you | Send the raw signal with `enrich: true`. |
+
+## Related
+
+- [Query](/essentials/v2/query): search context and pass the result to a model
+- [Databases and Collections](/essentials/v2/databases-and-collections): where context is saved, and how to keep users apart
+- [Metadata Filters](/essentials/v2/metadata): fields to filter on
+- [Connectors](/essentials/v2/connectors): keep an app's content in sync
+- [Ingest Context: API Reference](/api-reference/v2/endpoint/ingest-context)
