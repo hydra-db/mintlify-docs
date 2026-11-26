@@ -410,6 +410,66 @@ class PythonExamples(unittest.TestCase):
             self.assertIn(expected, fake.calls)
 
 
+class ErrorHandlingExample(unittest.TestCase):
+    """Run the `except ApiError` example on the Error Responses page against real error bodies.
+
+    The examples above only ever see successful responses, so an `except`
+    branch never runs there. The SDK parses the error body into a typed model
+    for the statuses the spec declares on an operation and leaves it a dict for
+    the rest, and a body that is not JSON arrives as a string. The example has
+    to read `error.code` from each of them.
+    """
+
+    PAGE = ROOT / "api-reference/v2/error-responses.mdx"
+    # (status, error code or None for a body that is not JSON, does the example handle it)
+    CASES = [
+        (400, "INVALID_INPUT", False),
+        (401, "UNAUTHORIZED", False),
+        (403, "FORBIDDEN", False),
+        (404, "DATABASE_NOT_FOUND", True),
+        (404, None, False),
+    ]
+
+    def test_example_reads_the_code_from_every_body_shape(self):
+        examples = [source for _, source in blocks("python", self.PAGE) if "except ApiError" in source]
+        self.assertEqual(1, len(examples))
+        source = textwrap.dedent(examples[0])
+        shapes = set()
+        for status, code, handled in self.CASES:
+            def respond(request, status=status, code=code):
+                if code is None:
+                    return httpx.Response(status, text="404 page not found")
+                return httpx.Response(status, json={
+                    "success": False, "data": None,
+                    "error": {"code": code, "message": "refused"},
+                    "meta": {"request_id": "req_1", "api_version": "2.0.1", "latency_ms": 1.0},
+                    "detail": {"error_code": code, "message": "refused", "success": False},
+                })
+
+            client = hydra_db.HydraDB(token="test", httpx_client=httpx.Client(transport=httpx.MockTransport(respond)))
+            namespace = {"__name__": "__main__", "client": client}
+            with self.subTest(status=status, code=code), tempfile.TemporaryDirectory() as directory:
+                Path(directory, "policy.pdf").write_bytes(b"%PDF-1.4 test")
+                previous = os.getcwd()
+                os.chdir(directory)
+                try:
+                    exec(compile(source, f"{self.PAGE.name}:error-handling", "exec"), namespace)
+                    reraised = None
+                except hydra_db.core.api_error.ApiError as error:
+                    reraised = error
+                finally:
+                    os.chdir(previous)
+                # Anything but ApiError (an AttributeError on a typed body, say) fails above.
+                self.assertEqual(handled, reraised is None)
+                self.assertEqual(code, namespace["error_code"])
+                self.assertEqual("req_1" if code else None, namespace["request_id"])
+                if reraised is not None:
+                    shapes.add("dict" if isinstance(reraised.body, dict) else
+                               "text" if isinstance(reraised.body, str) else "model")
+        # The cases must keep covering every shape, or the test stops proving anything.
+        self.assertEqual({"dict", "model", "text"}, shapes)
+
+
 class TypeScriptExamples(unittest.TestCase):
     """Type-check every TypeScript example in the v2 docs against @hydradb/sdk."""
 
