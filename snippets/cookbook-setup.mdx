@@ -4,9 +4,17 @@
 - An OpenAI API key, set as `OPENAI_API_KEY`. HydraDB returns context, not answers, so any model works; swap the `answer` function below for your own.
 - Python 3.10 or later, with the SDKs: `pip install "hydradb-sdk>=2.1.7,<3" openai`.
 
-Save this as `hydra.py`. Every cookbook imports it. It holds what every HydraDB application does around its own logic: wait for the database, check what an ingest accepted, wait for indexing, and pass query results to a model.
+Save this as `hydra.py`. Every cookbook imports it. It holds what every HydraDB application does around its own logic: wait for the database, connect an app, check what an ingest accepted, wait for indexing, and pass query results to a model.
+
+If `connect` raises because provider permissions could not be read, it aborts only the cookbook. It does not pause or delete the remote connector: content without a valid ACL may already be readable by every caller, and scheduled syncs may continue. Inspect the persistent `acl_warning` / `page_acl_warning` in connector status, then repair provider permissions or rerun `connect` with an explicit resource `acl` to restrict that content. Existing valid private ACLs and revocations remain enforced.
+
+`connect` hashes the complete `(provider, database, collection, account)` tuple for its lookup name and checks returned connector metadata before reuse. `account` is your application's stable account label, not a validated native account identity. Resolve it from trusted server configuration and authorize the caller separately; a connector name is not authentication. An incomplete, mismatched, or ambiguous same-name identity raises before resource or ACL changes. The `timeout` bounds first-sync polling after setup; zero or an already-expired deadline raises `TimeoutError` with a diagnostic instead of polling.
+
+**Existing deployments:** The hashed helper intentionally does not adopt legacy connectors, so older remote syncs can continue alongside a new one. Before switching, list connectors with `client.connectors.list()` and record their `connector_id` values. Verify full `(provider, database, collection, account)` ownership using trusted server configuration and credentials, checking `provider_account_scope` where applicable; connector names are not proof of ownership. Reconcile duplicate remote syncs only under that verified identity, without legacy-name adoption, automatic ACL reassignment, or blanket pause/delete.
 
 ```python hydra.py
+import hashlib
+import json
 import os
 import time
 
@@ -30,6 +38,123 @@ def create_database(database, schema=None):
         pass  # The database already exists.
     while not client.databases.status(database=database).data.infra.ready_for_ingestion:
         time.sleep(5)
+
+
+# Providers that take an account scope. Without one, two accounts whose
+# sources share an ID overwrite each other.
+SCOPED = {"slack", "github", "linear", "notion"}
+
+
+def connect(provider, account, database, collection, credentials,
+            acl=None, lookback_days=30, timeout=1800):
+    """Connect one app account, sync what its credentials can reach, and wait for the first sync.
+
+    account names the account the credentials belong to: a Slack workspace ID,
+    a mailbox address, a Jira site. Each account gets its own connector.
+    Pass acl for a provider that does not capture permissions, such as Gmail or
+    Notion. Without it, everything that provider syncs is readable by every caller.
+    connect refuses such a provider before setup when acl is left out. If a
+    permission read fails after sync, it stops only the cookbook, not the remote
+    connector: content without a valid ACL may already be public, and scheduled
+    syncs may continue. Inspect the persistent status warnings and pass an
+    explicit resource acl or repair provider permissions. Valid private ACLs
+    remain enforced. An empty explicit list lets nobody read the content.
+    The credentials are used when the connector
+    is created; to rotate them later, call client.connectors.update.
+    """
+    if acl is None:  # Then only the provider's own permissions restrict this content.
+        catalog = client.list_providers().providers or []
+        if not any(p.provider == provider and getattr(p, "acl_supported", False) for p in catalog):
+            raise ValueError(f"{provider} captures no permissions: pass acl to say who may read it")
+    identity = json.dumps([provider, database, collection, account], separators=(",", ":"))
+    name = "cookbook-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    connectors = client.connectors.list().connectors or []
+    existing = [c for c in connectors if c.name == name]
+    if existing:  # This account was connected on an earlier run.
+        if len(existing) != 1:
+            raise RuntimeError(f"Cannot verify connector identity: multiple connectors named {name}")
+        connector = existing[0]
+        scope_matches = (
+            connector.provider_account_scope == account if provider in SCOPED
+            else connector.provider_account_scope in (None, "")
+        )
+        if (not connector.connector_id
+                or (connector.provider, connector.database, connector.collection) != (provider, database, collection)
+                or not scope_matches):
+            raise RuntimeError(f"Cannot verify connector identity for {name}; no resources or ACLs were changed")
+        connector_id = connector.connector_id
+    else:
+        scope = {"provider_account_scope": account} if provider in SCOPED else {}
+        connector_id = client.connectors.create(
+            provider=provider,
+            name=name,
+            database=database,
+            collection=collection,
+            credentials=credentials,
+            **scope,
+        ).connector_id
+
+    if client.connectors.status(connector_id).lifecycle == "pending_setup":
+        resources, cursor = [], None
+        while True:  # Discover returns up to 100 resources per page.
+            page = client.connectors.discover(connector_id, cursor=cursor, limit=100)
+            resources += page.resources or []
+            if not page.has_more:
+                break
+            cursor = page.next_cursor
+        if not resources:
+            raise RuntimeError(f"The {provider} credentials can reach nothing to sync")
+        rule = {} if acl is None else {"acl": acl}
+        client.connectors.configure(
+            connector_id,
+            lookback_days=lookback_days,
+            resources=[
+                {"resource_id": r.id, "resource_type": r.resource_type, "name": r.name, **rule}
+                for r in resources
+            ],
+        )
+    elif acl is not None:  # Already configured: set the rule asked for now on every resource.
+        for resource in client.connectors.list_resources(connector_id).resources or []:
+            client.connectors.update_resource_acl(
+                connector_id, resource.resource_id, request={"acl": acl}
+            )
+
+    detail = f"first-sync polling did not run for {connector_id}"
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        status = client.connectors.status(connector_id)
+        if status.status in ("failed", "paused", "capped") or status.lifecycle == "reconnect":
+            raise RuntimeError(f"The {provider} connector is {status.status}: {status.error}")
+        failed = [r for r in status.resources or [] if r.status == "failed"]
+        detail = "; ".join(f"{r.display_name or r.resource_id}: {r.message}" for r in failed)
+        if any(r.retryable is False for r in failed):  # Waiting will not fix these.
+            raise RuntimeError(f"The {provider} connector cannot sync {detail}")
+        if status.lifecycle == "active":
+            unread = [
+                r.display_name or r.resource_id
+                for r in status.resources or []
+                if r.acl_warning or r.page_acl_warning
+            ]
+            if acl is None and unread:  # Synced without permissions: readable by everyone.
+                raise RuntimeError(
+                    f"The {provider} connector could not read the permissions of "
+                    + ", ".join(unread)
+                    + ". Pass acl to restrict them."
+                    + " This exception stops only the cookbook; it does not pause or delete the remote connector."
+                    + " Content without a valid ACL may already be readable by every caller, and scheduled syncs may continue."
+                    + " Inspect acl_warning/page_acl_warning in connector status and repair provider permissions or rerun with an explicit resource acl."
+                )
+            if status.status == "healthy":
+                return connector_id
+            raise RuntimeError(
+                f"The {provider} connector is {status.status}, so its content is incomplete: "
+                + (detail or str(status.error))
+            )
+        time.sleep(10)
+    raise TimeoutError(
+        f"The {provider} connector synced nothing within {timeout} seconds"
+        + (f" ({detail})" if detail else "")
+    )
 
 
 def source_ids(result):

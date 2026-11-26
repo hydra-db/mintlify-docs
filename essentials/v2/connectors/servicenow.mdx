@@ -1,0 +1,398 @@
+---
+title: "ServiceNow"
+description: "Sync knowledge articles, catalog items, ticket rows and custom-table rows from the ServiceNow resources you choose. ServiceNow read access carries over where its rules can be read and Enforce ACL is on."
+icon: "/images/connectors/servicenow.svg"
+---
+
+Sync the ServiceNow knowledge bases, service catalogs, ticket tables and custom tables you select. Each knowledge article, catalog item and table row is one document. Comments and work notes are searchable with the record they belong to, and attachments are read when the service account can download them and their format is supported.
+
+Readers come from knowledge-base and catalog-item criteria and from table read rules. Rules with conditions or scripts cannot be captured, and standard ticket tables often use them. Search applies captured readers only when Enforce ACL is on. Work notes share their record's readers. Rows deleted in ServiceNow stay in HydraDB.
+
+## Permissions
+
+Turn on **Enforce ACL** for this connector to make search follow ServiceNow permissions. With Enforce ACL off, HydraDB does not enforce them. Only a workspace owner or writer signed in to HydraDB can turn it on. API-key requests must omit `enforce_acl`, including `false`. See [Enforce ACL](/essentials/v2/connectors#enforce-acl).
+
+- **Who can read an item:** A knowledge article can be read by the users its knowledge base's Can Read criteria allow, minus those its Cannot Read criteria exclude. A knowledge base with no criteria follows the instance's policy for that case. When the instance turns on article-level criteria, an article is limited further to users both allow. A catalog item can be read by the users its own criteria allow. Catalogs themselves carry no readers. A ticket or custom-table row can be read by users who hold the roles its table's read rules require, across the table and its parent tables, including roles held through a group. Comments and work notes share their record's readers. Rules that resolve to no users leave the item readable by no one.
+- **How a person is identified:** A ServiceNow user's email address.
+- **When permissions cannot be read:** If a read rule has a condition or script, uses advanced user criteria, or yields more users than HydraDB can capture, the connector reports a permission warning. On HydraDB Cloud, with Enforce ACL on, such an item follows the access rule you set on its resource. With no rule, it is hidden from search. Self-hosted deployments can be configured differently. Permission warnings appear in [Get Connector Status](/api-reference/v2/endpoint/get-connector-status).
+- Standard ticket-table read rules often use scripts, so on many instances ticket readers cannot be captured. Set an access rule on such tables.
+- If an article's own criteria cannot be read, the article follows its knowledge base's readers, with a warning. That can be wider than the article's own rule.
+- Work notes are marked internal in ServiceNow, but they have no separate readers in HydraDB.
+
+You can also [set your own rule on a resource](/essentials/v2/connectors#set-your-own-rule-on-a-resource).
+
+## Before you connect
+
+### Credentials
+
+ServiceNow uses an OAuth application with the client credentials grant. Its OAuth Application User is a dedicated service account. Basic authentication is not supported, and HydraDB never stores a user password.
+
+<ResponseField name="instance" type="string" required>
+The instance name only, for example `acme` for `acme.service-now.com`.
+</ResponseField>
+
+<ResponseField name="client_id" type="string" required>
+The client id of the OAuth application.
+</ResponseField>
+
+<ResponseField name="client_secret" type="secret string" required>
+The client secret of that application.
+</ResponseField>
+
+**Roles for the service account**
+
+- `admin`: required. Reads every selected table, the lists HydraDB offers for selection, comments, work notes and attachments.
+- `snc_read_only`: required. Blocks every write from the service account, so it can only read.
+
+Reading permissions needs `admin` and `snc_read_only`, or read access to `sys_security_acl`, `sys_security_acl_role`, `user_criteria`, `sys_user`, `sys_user_has_role`, `sys_group_has_role` and `sys_user_grmember`.
+
+### Set it up
+
+<Steps>
+  <Step title="Create a service account">
+    In ServiceNow, create a dedicated web-service user and give it the `admin` and `snc_read_only` roles. Set its timezone to GMT, so date windows line up as expected.
+  </Step>
+  <Step title="Create an OAuth application">
+    Create an OAuth application for the client credentials grant, and set the service user as its OAuth Application User.
+  </Step>
+  <Step title="Create the connector">
+    Enter the instance name, not the URL, as `instance`, then the client id and client secret.
+  </Step>
+  <Step title="Select resources">
+    HydraDB lists the instance's knowledge bases, service catalogs, ticket tables and custom tables. Select the ones to sync. Nothing outside your selection is read. Each ticket table reads only rows of its exact class, so selecting a parent table does not bring in its child tables' rows, and selecting both never indexes a row twice.
+  </Step>
+</Steps>
+
+One connector reads one ServiceNow instance.
+
+<Accordion title="Connect through the API">
+
+Use provider `servicenow` with [Create Connector](/api-reference/v2/endpoint/create-connector). Then call [Discover Connector Resources](/api-reference/v2/endpoint/discover-connector-resources) to list the resources the connector can sync, and [Configure Connector](/api-reference/v2/endpoint/configure-connector) to choose what to sync.
+
+</Accordion>
+
+## Keeping in sync
+
+- **First sync:** Each selected resource reaches back the window set by `lookback_days`, 30 days by default. Only published, latest-version articles and active catalog items are read.
+- **New and changed items:** Each selected resource syncs on its own and reads rows updated since the last sync. A record whose comment, work note or attachment changed is read again too.
+- **Edits:** An updated row is read again and updates its document. A new version of an article updates the same document, keyed by the article number.
+- **Deletions:** Rows deleted in ServiceNow stay searchable in HydraDB. An article that is retired, or a catalog item that is deactivated, is not removed when it stops being read.
+- A service account without access to comments and work notes can get an empty answer instead of an error, so a ticket can sync without them.
+- A catalog item in several selected catalogs is one document, filed under the selected catalog with the lowest id.
+
+After the first sync, HydraDB syncs every hour by default. Set `sync_interval_seconds` on the connector to change it.
+
+## What gets synced
+
+### On every ServiceNow item
+
+<ResponseField name="comments" type="Searchable text, Graph identity">
+Comments and work notes the service account can read, each with its author and time, searchable with the record. The graph records each author.
+</ResponseField>
+
+<ResponseField name="attachments" type="Searchable text">
+Text read from attached files that downloaded and parsed successfully, searchable with the record. Each keeps a link to the original file.
+</ResponseField>
+
+<ResponseField name="additional_metadata.servicenow_table" type="Query filter">
+The source table, such as `incident` or `kb_knowledge`. Limits a query to one table. Not searchable.
+</ResponseField>
+
+<ResponseField name="additional_metadata.servicenow_kind" type="Query filter">
+Whether the item is an article, catalog item, ticket or custom row. Not searchable.
+</ResponseField>
+
+<ResponseField name="additional_metadata.servicenow_sys_id" type="Query filter">
+The row's current sys_id. Targets one row. For articles, use the number instead, because a new version has a new sys_id. Not searchable.
+</ResponseField>
+
+<ResponseField name="additional_metadata.sys_class_name" type="Query filter">
+The row's ServiceNow class, when supplied. Not searchable.
+</ResponseField>
+
+<ResponseField name="additional_metadata.container_id" type="Query filter">
+The selected knowledge base, catalog or table. Limits a query to it. Not searchable.
+</ResponseField>
+
+<ResponseField name="additional_metadata.container_name" type="Query filter">
+The name of the selected knowledge base, catalog or table, when available. Not searchable.
+</ResponseField>
+
+<ResponseField name="additional_metadata.container_type" type="Query filter">
+Whether the item came from a knowledge base, a catalog or a table. Not searchable.
+</ResponseField>
+
+<ResponseField name="connector_id" type="Query filter">
+Limits a query to this connector's items. Not searchable.
+</ResponseField>
+
+<ResponseField name="provider" type="Query filter">
+Always `servicenow`. Not searchable.
+</ResponseField>
+
+<ResponseField name="acl" type="Access rule">
+The users who can read the item, worked out as described under Permissions. Not searchable.
+</ResponseField>
+
+### Knowledge articles
+
+- **One document:** One knowledge article, in its published latest version.
+- **Title:** The short description, else the article number. Otherwise `ServiceNow article` and its id.
+- **Text:** The article text converted from HTML, else its wiki text, else the short description. The author and an `Updated` line are part of the text too. The title is searchable too.
+- **Date:** When the article was last updated, else when it was created.
+- **Link back:** The article in the ServiceNow knowledge view, by its number.
+- **Files:** Attachments the service account can download are read when their format is supported, up to 25 MiB by default. Image fields are not read. Not every file yields text.
+
+<ResponseField name="author" type="Searchable text, Graph identity">
+The article's author. The graph records the article as written by that person.
+</ResponseField>
+
+<ResponseField name="additional_metadata.author_email" type="Query filter, Graph identity">
+The author's email. Limits a query to one author, and identifies the author in the graph. Not searchable.
+</ResponseField>
+
+<ResponseField name="additional_metadata.number" type="Searchable text, Query filter">
+The article number. Keeps every version of the article on one document, builds the link back, and becomes the title when there is no short description. Targets one article.
+</ResponseField>
+
+<ResponseField name="updated_at" type="Searchable text, Result date">
+When the article was last updated, written as an `Updated` line.
+</ResponseField>
+
+<ResponseField name="created_at" type="Result date">
+When the article was created. Used as the result date only when the update time is missing. Not searchable.
+</ResponseField>
+
+<ResponseField name="additional_metadata.workflow_state" type="Query filter">
+The article's workflow state. Only published articles are synced. Not searchable.
+</ResponseField>
+
+<ResponseField name="additional_metadata.article_version" type="Query filter">
+The article's version, when supplied. Not searchable.
+</ResponseField>
+
+<ResponseField name="additional_metadata.kb_category" type="Query filter">
+The knowledge category. Limits a query to one category. Not searchable.
+</ResponseField>
+
+<ResponseField name="additional_metadata.language" type="Query filter">
+The article's language code. Not searchable.
+</ResponseField>
+
+<Accordion title="Stored only, not searchable (2)">
+
+<ResponseField name="updated_by" type="Stored only">
+The user name of the last editor. The editor is not attached to the article as a person.
+</ResponseField>
+
+<ResponseField name="published_at" type="Stored only">
+When the article was published. It is not the result date.
+</ResponseField>
+
+</Accordion>
+
+### Catalog items
+
+- **One document:** One active catalog item.
+- **Title:** The item name, else the short description. Otherwise `ServiceNow catalog item` and its id.
+- **Text:** The short description, then the full description converted from HTML. An `Updated` line is part of the text too. The title is searchable too.
+- **Date:** When the item was last updated, else when it was created.
+- **Link back:** The catalog item in ServiceNow.
+- **Files:** Attachments the service account can download are read when their format is supported, up to 25 MiB by default. Image fields are not read. Not every file yields text.
+
+<ResponseField name="updated_at" type="Searchable text, Result date">
+When the item was last updated, written as an `Updated` line.
+</ResponseField>
+
+<ResponseField name="created_at" type="Result date">
+When the item was created. Used as the result date only when the update time is missing. Not searchable.
+</ResponseField>
+
+<ResponseField name="additional_metadata.number" type="Query filter">
+The item's number, when it has one. Targets one item. Not searchable.
+</ResponseField>
+
+<ResponseField name="additional_metadata.category" type="Query filter">
+The item's category. Limits a query to one category. Not searchable.
+</ResponseField>
+
+<Accordion title="Stored only, not searchable (1)">
+
+<ResponseField name="updated_by" type="Stored only">
+The user name of the last editor.
+</ResponseField>
+
+</Accordion>
+
+### Tickets
+
+- **One document:** One row of a selected ticket table, such as an incident, problem, change request, request, requested item or catalog task, with its comments and work notes.
+- **Title:** The short description, else the ticket number. Otherwise `ServiceNow`, the table name and the row id.
+- **Text:** The description, then labeled sections when present: `Close notes`, `Resolution notes`, `Cause notes`, `Fix notes`, `Workaround`, `Implementation plan`, `Backout plan`, `Test plan` and `Justification`. The status, priority, assignee, reporter, ticket type, resolution date, parent and creation time are part of the text too, with the ticket's key. The title is searchable too.
+- **Date:** When the row was last updated, else when it was created.
+- **Link back:** The record form in ServiceNow.
+- **Files:** Attachments the service account can download are read when their format is supported, up to 25 MiB by default. Image fields are not read. Not every file yields text.
+
+<ResponseField name="status" type="Searchable text">
+The displayed state.
+</ResponseField>
+
+<ResponseField name="priority" type="Searchable text">
+The displayed priority.
+</ResponseField>
+
+<ResponseField name="assignee" type="Searchable text, Graph identity">
+The assigned person's name. The graph records the ticket as assigned to that person.
+</ResponseField>
+
+<ResponseField name="additional_metadata.assignee_email" type="Query filter, Graph identity">
+The assignee's email. Limits a query to one assignee, and identifies the assignee in the graph. Not searchable.
+</ResponseField>
+
+<ResponseField name="reporter" type="Searchable text, Graph identity">
+The caller, requested-for person or opener. The graph records the ticket as reported by that person.
+</ResponseField>
+
+<ResponseField name="additional_metadata.reporter_email" type="Query filter, Graph identity">
+The reporter's email. Limits a query to one reporter, and identifies the reporter in the graph. Not searchable.
+</ResponseField>
+
+<ResponseField name="ticket_type" type="Searchable text">
+The table's label, such as Incident.
+</ResponseField>
+
+<ResponseField name="resolved_at" type="Searchable text">
+When the ticket was resolved. It is not the result date.
+</ResponseField>
+
+<ResponseField name="parent_id" type="Searchable text, Graph connection">
+The ticket's parent, else its requested item, else its request. Places the ticket under that record when its table is selected.
+</ResponseField>
+
+<ResponseField name="additional_metadata.number" type="Searchable text, Query filter">
+The ticket number. Targets one ticket. Becomes the title when there is no short description.
+</ResponseField>
+
+<ResponseField name="external_id" type="Searchable text">
+The row's id, written into the text as the ticket's key. Keeps later syncs on the same document.
+</ResponseField>
+
+<ResponseField name="created_at" type="Searchable text, Result date">
+When the row was created, written as a `Created` line. Used as the result date only when the update time is missing.
+</ResponseField>
+
+<ResponseField name="updated_at" type="Result date">
+When the row was last updated. Not searchable.
+</ResponseField>
+
+<ResponseField name="additional_metadata.assignment_group" type="Query filter">
+The assignment group's name. Limits a query to one group. Not searchable.
+</ResponseField>
+
+<ResponseField name="additional_metadata.state_code" type="Query filter">
+The raw state code. Not searchable.
+</ResponseField>
+
+<ResponseField name="additional_metadata.priority_code" type="Query filter">
+The raw priority code. Not searchable.
+</ResponseField>
+
+<ResponseField name="additional_metadata.impact_code" type="Query filter">
+The raw impact code. Not searchable.
+</ResponseField>
+
+<ResponseField name="additional_metadata.urgency_code" type="Query filter">
+The raw urgency code. Not searchable.
+</ResponseField>
+
+<ResponseField name="additional_metadata.category" type="Query filter">
+The ticket's category. Not searchable.
+</ResponseField>
+
+<Accordion title="Stored only, not searchable (2)">
+
+<ResponseField name="due_date" type="Stored only">
+The ticket's deadline.
+</ResponseField>
+
+<ResponseField name="custom_fields" type="Stored only">
+Impact, urgency, severity, subcategory, close and resolution codes, contact type, approval, risk, referenced names, and opened and closed dates.
+</ResponseField>
+
+</Accordion>
+
+### Custom table rows
+
+- **One document:** One row of a selected custom table.
+- **Title:** The table's display field, else `name`, `u_name`, the number or the short description. Otherwise `ServiceNow`, the table name and the row id.
+- **Text:** The row's non-empty text columns as `Label: value` lines, converted from HTML. The title is used when there are none.
+- **Date:** When the row was last updated, else when it was created.
+- **Link back:** The record form in ServiceNow.
+- **Files:** Attachments the service account can download are read when their format is supported, up to 25 MiB by default. Image fields are not read. Not every file yields text.
+
+<ResponseField name="Text columns" type="Searchable text">
+The row's non-empty text columns, with their display labels.
+</ResponseField>
+
+<ResponseField name="updated_at" type="Result date">
+When the row was last updated. Not searchable.
+</ResponseField>
+
+<ResponseField name="created_at" type="Result date">
+When the row was created. Used as the result date only when the update time is missing. Not searchable.
+</ResponseField>
+
+<ResponseField name="additional_metadata.number" type="Query filter">
+The row's number, when it has one. Targets one row. Not searchable.
+</ResponseField>
+
+<Accordion title="Stored only, not searchable (1)">
+
+<ResponseField name="table" type="Stored only">
+The custom table's name. Filter on it with `additional_metadata.servicenow_table`.
+</ResponseField>
+
+</Accordion>
+
+**Example searches**
+
+- How was the VPN outage incident resolved?
+- What does the knowledge base say about requesting a new laptop?
+- What work notes were left on change CHG0030012?
+
+## How it fits into the graph
+
+- Knowledge articles use the Page class.
+- Catalog items use the Page class.
+- Tickets use the Ticket class.
+- Custom table rows use the Record class.
+
+[Graph classes](/essentials/v2/connector-providers#graph-classes) explains each class.
+
+**Connections ServiceNow creates**
+
+- A ticket to its parent, else its requested item, else its request, and to any other of the three.
+- A ticket to its problem and to the record that caused it.
+- A ticket to its change request.
+- A link reaches a record only when that record's table is selected.
+- Each item is grouped under the knowledge base, catalog or table it came from.
+- No links to other tools.
+
+**People and groups**
+
+- The assignee and reporter of each ticket.
+- The author of each article.
+- The author of each comment and work note.
+- The assignment group is a filter, not a person or group in the graph.
+
+**Found in the text**
+
+Descriptions, resolution and plan notes, comments and work notes, article text, and text read from attachments. HydraDB identifies people, organizations, projects and other named things in this text. To steer what it looks for, use [custom instructions](/essentials/v2/connectors#4-custom-ingestion-instructions).
+
+## Not synced
+
+- Knowledge bases, catalogs and tables you did not select.
+- Unpublished and older article versions, and inactive catalog items.
+- Users, groups, CMDB items, journal entries and attachments as documents of their own.
+- Image fields, files over the download limit, and files whose text cannot be read.
+- Comments, work notes and attachments the service account cannot read.
