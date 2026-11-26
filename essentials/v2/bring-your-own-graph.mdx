@@ -774,8 +774,8 @@ curl -X POST 'https://api.hydradb.com/context/ingest' \
   -F 'graph_payload={
     "billing-policy-doc": {
       "entities": {
-        "alice":   { "name": "Alice Carter",  "type": "PERSON", "namespace": "employees" },
-        "billing": { "name": "Billing Policy", "type": "POLICY", "namespace": "policies" }
+        "alice":   { "id": "emp-1001",   "name": "Alice Carter",   "type": "PERSON" },
+        "billing": { "id": "policy-42",  "name": "Billing Policy", "type": "POLICY" }
       },
       "relations": [
         { "source": "alice", "target": "billing", "predicate": "OWNS",
@@ -789,12 +789,85 @@ curl -X POST 'https://api.hydradb.com/context/ingest' \
   the source is still chunked and embedded. Relations appear in `/query`
   `graph_context` tagged `origin: "byog"`, with no query-side changes.
 - **Persists across re-ingest:** re-ingesting without a `graph_payload`
-  re-applies the stored graph; sending a new one replaces it.
+  re-applies the stored graph; sending a new one replaces it. See
+  [Replace a graph](#replace-a-graph).
 - **Limits:** at most 5,000 entities, 10,000 relations, and 500 relations per
-  entity; oversized payloads return `400`. A key matching no source in the
+  graph node; oversized payloads return `400`. Entities that share an `id` are
+  one node, so their relations count together. A key matching no source in the
   request is rejected with `400`.
 - **Whole-graph only:** there are no per-triple updates, and relations link to
   their best-matching chunk even when the match is weak.
+
+### Key entities by your own ID
+
+Give an entity an `id` when your system already knows who or what it is: a
+contact ID, an account ID, a policy number. The `id` is the entity's identity
+in the graph.
+
+- **The same `id` is always the same entity** within a database and
+  collection. Every source that sends `emp-1001` adds to one node, whatever
+  `name` or `type` each source uses for it. Rename Alice in a later document and
+  her relations stay on the same node.
+- **Different IDs stay apart.** Two entities named `John Smith` with two IDs are
+  two nodes. HydraDB never merges an entity that has an `id` with another one by
+  name.
+- **Names stay searchable.** Put the readable name in `name` and your key in
+  `id`. Graph search matches the words in a question against `name`, so
+  `"name": "contact:6f5dbda0"` is never found, while `"name": "Alice Carter"`
+  is.
+- **Without an `id`**, an entity's identity is its `namespace`, `type` and
+  `name`, as before: two entities with the same three values are one node.
+  With an `id`, `namespace` is not used.
+- **The ID is matched exactly.** `Emp-1001` and `emp-1001` are two entities.
+  An `id` can be up to 256 bytes and cannot have leading or trailing spaces or
+  control characters; otherwise the request returns `400`.
+- **The ID is readable on the node.** HydraDB stores it as the entity's
+  `identifier` unless you send your own `identifier`.
+
+A `namespace` of exactly `id:` or `eid:` followed by 32 lowercase hex digits is
+reserved for entities keyed by ID and returns `400`.
+
+### Replace a graph
+
+To change a source's graph, send the source again with the same `id` and a new
+`graph_payload`. Ingest upserts by default (`upsert=true`), so you do not need to
+delete the source first:
+
+```bash
+curl -X POST 'https://api.hydradb.com/context/ingest' \
+  -H "Authorization: Bearer $HYDRADB_API_KEY" \
+  -H "API-Version: 2" \
+  -F "type=knowledge" \
+  -F "database=acme_corp" \
+  -F "upsert=true" \
+  -F "documents=@/path/to/billing-policy.pdf" \
+  -F 'document_metadata=[{ "id": "billing-policy-doc" }]' \
+  -F 'graph_payload={
+    "billing-policy-doc": {
+      "entities": {
+        "alice":   { "id": "emp-1001",  "name": "Alice Carter",   "type": "PERSON" },
+        "dana":    { "id": "emp-2040",  "name": "Dana Ruiz",      "type": "PERSON" },
+        "billing": { "id": "policy-42", "name": "Billing Policy", "type": "POLICY" }
+      },
+      "relations": [
+        { "source": "dana", "target": "billing", "predicate": "OWNS",
+          "context": "Dana Ruiz took over the billing policy from Alice Carter." }
+      ]
+    }
+  }'
+```
+
+- **The new graph replaces the old one.** The relations this source wrote
+  before are removed and the new ones are written; nothing is merged. In the
+  example, `alice OWNS billing` is gone and `dana OWNS billing` takes its place.
+- **Other sources keep theirs.** An entity that other sources also reference,
+  such as `emp-1001`, stays in the graph with the relations those sources wrote.
+- **The source is processed again.** An upsert re-chunks and re-embeds the
+  document along with the new graph, and the source reads `completed` once both
+  are written. Poll [`GET /context/status`](/api-reference/v2/endpoint/source-status)
+  as for any ingest.
+- **`upsert=false` refuses it:** a source whose `id` exists comes back
+  `failed` with `error_code: "E9003"`, and the stored graph is unchanged.
 
 See the [`graph_payload` field reference](/api-reference/v2/endpoint/ingest-context)
 for the full shape.
