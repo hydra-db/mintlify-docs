@@ -41,7 +41,7 @@ PROVIDER_VOCABULARY = {
     "airtable": {"LAST_MODIFIED_TIME"},  # Airtable's own formula function, named in the setup step the customer follows.
     "copper": {"pipeline", "pipelines"},  # Copper's opportunity pipelines, which the customer sets up in Copper.
     "datadog": {"declared"},  # Datadog's "declared incident" and its declaration time, shown on every incident.
-    "discord": {"acl_supported", "GUILD_MEMBERS", "VIEW_CHANNEL", "READ_MESSAGE_HISTORY", "MANAGE_THREADS"},
+    "discord": {"acl_supported", "GUILD_MEMBERS", "VIEW_CHANNEL", "READ_MESSAGE_HISTORY", "MANAGE_THREADS", "RBAC_ACL_FAIL_CLOSED"},
     "github": {"classic"},  # GitHub's "classic" personal access tokens, which the customer creates.
     "gitlab": {"pipelines"},  # GitLab's CI/CD pipelines, named in Not synced so customers know they are left out.
     "hubspot": {"pipeline", "pipelines"},  # HubSpot's deal pipeline, a field the customer sees on every deal.
@@ -481,6 +481,7 @@ class DiscordPermissionsCopyTest(unittest.TestCase):
                 self.assertIn("An actionable warning in the dashboard", text)
                 self.assertIn("confirm the warning clears", text)
                 self.assertIn("explicitly enable `ACLFailClosed`", text)
+                self.assertIn("`RBAC_ACL_FAIL_CLOSED=true`", text)
                 self.assertIn("only when the connector's `enforce_acl` and the catalog's `acl_supported` are both enabled", text)
                 self.assertIn("unreadable permissions with no customer rule are hidden instead", text)
 
@@ -491,7 +492,11 @@ class DiscordPermissionsCopyTest(unittest.TestCase):
                 self.assertIn("paginated to completion", text)
                 self.assertIn("`with_member=true`", text)
                 self.assertIn("partial reader list is never used as a grant", text)
-                self.assertIn("including ordinary content syncs and permission-only refreshes", text)
+                self.assertIn("After rollout, member and thread lists are paginated to completion", text)
+                self.assertIn("Ordinary content syncs retain a customer server rule even with `ACLFailClosed` enabled", text)
+                self.assertIn("Default permission-only refreshes also inherit the customer server rule when capture is unavailable", text)
+                self.assertIn("With explicit fail-closed enabled, a permission-only refresh writes `__private__` as a message ACL instead, which takes precedence over the server rule", text)
+                self.assertNotIn("including ordinary content syncs and permission-only refreshes", text)
 
     def test_discord_warning_attribute_distinguishes_current_and_pending_behavior(self):
         warning = next(item for item in load_copy("discord")["shared_attributes"] if item["name"] == "additional_metadata.rbac_warning")
