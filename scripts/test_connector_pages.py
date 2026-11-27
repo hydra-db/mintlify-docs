@@ -41,6 +41,7 @@ PROVIDER_VOCABULARY = {
     "airtable": {"LAST_MODIFIED_TIME"},  # Airtable's own formula function, named in the setup step the customer follows.
     "copper": {"pipeline", "pipelines"},  # Copper's opportunity pipelines, which the customer sets up in Copper.
     "datadog": {"declared"},  # Datadog's "declared incident" and its declaration time, shown on every incident.
+    "discord": {"acl_supported", "GUILD_MEMBERS", "VIEW_CHANNEL", "READ_MESSAGE_HISTORY", "MANAGE_THREADS"},
     "github": {"classic"},  # GitHub's "classic" personal access tokens, which the customer creates.
     "gitlab": {"pipelines"},  # GitLab's CI/CD pipelines, named in Not synced so customers know they are left out.
     "hubspot": {"pipeline", "pipelines"},  # HubSpot's deal pipeline, a field the customer sees on every deal.
@@ -438,6 +439,66 @@ class ConnectorCopyPagesTest(unittest.TestCase):
         self.assertIn("](/essentials/v2/connectors)", opening)
         self.assertEqual(1, len([line for line in opening.splitlines() if line.strip()]), "the catalog starts right under one line")
         self.assertIn("#6-connect-several-accounts-from-one-provider", index.split("## Related", 1)[1])
+
+
+class DiscordPermissionsCopyTest(unittest.TestCase):
+    def texts(self):
+        return (json.dumps(load_copy("discord")), (DIRECTORY / "discord.mdx").read_text())
+
+    def test_discord_keeps_capture_pending_until_paired_deployment_and_catalog_enablement(self):
+        self.assertFalse(load_copy("discord")["permissions"]["carried"])
+        self.assertFalse(next(row for row in PRODUCTION if row["provider"] == "discord")["acl_supported"])
+        for text in self.texts():
+            with self.subTest(source="copy" if text.startswith("{") else "page"):
+                self.assertIn("Current production behavior: Discord permission capture remains disabled", text)
+                self.assertIn("pending paired application and Discord connector deployment", text)
+                self.assertIn("explicit catalog enablement (`acl_supported`)", text)
+                self.assertIn("not a shipped production feature", text)
+
+    def test_discord_describes_readers_without_promising_email_identity_mapping(self):
+        for text in self.texts():
+            with self.subTest(source="copy" if text.startswith("{") else "page"):
+                self.assertIn("`group:discord:user:<id>`", text)
+                self.assertIn("A trusted backend must derive and explicitly send", text)
+                self.assertIn("never accept it from untrusted client input", text)
+                self.assertIn("API-key identity remains email-bound", text)
+                self.assertIn("no automatic email mapping", text)
+                self.assertNotIn("roles and channel permissions cannot be matched", text)
+                self.assertNotIn("Member email addresses and Discord permissions.", text)
+
+    def test_discord_names_bot_grants_and_private_thread_access(self):
+        copy = load_copy("discord")
+        grants = {item["name"] for item in copy["connect"]["permissions"]}
+        self.assertLessEqual({"GUILD_MEMBERS", "Message Content Intent", "VIEW_CHANNEL", "READ_MESSAGE_HISTORY", "CONNECT", "MANAGE_THREADS"}, grants)
+        for text in self.texts():
+            with self.subTest(source="copy" if text.startswith("{") else "page"):
+                self.assertIn("private threads require parent read access plus thread membership or `MANAGE_THREADS`", text)
+
+    def test_discord_explains_unreadable_permissions_and_the_fail_closed_gates(self):
+        for text in self.texts():
+            with self.subTest(source="copy" if text.startswith("{") else "page"):
+                self.assertIn("`__public__` when no customer resource rule exists", text)
+                self.assertIn("An actionable warning in the dashboard", text)
+                self.assertIn("confirm the warning clears", text)
+                self.assertIn("explicitly enable `ACLFailClosed`", text)
+                self.assertIn("only when the connector's `enforce_acl` and the catalog's `acl_supported` are both enabled", text)
+                self.assertIn("unreadable permissions with no customer rule are hidden instead", text)
+
+    def test_discord_refreshes_permissions_beyond_the_content_lookback_and_preserves_rules(self):
+        for text in self.texts():
+            with self.subTest(source="copy" if text.startswith("{") else "page"):
+                self.assertIn("including messages outside `lookback_days`", text)
+                self.assertIn("paginated to completion", text)
+                self.assertIn("`with_member=true`", text)
+                self.assertIn("partial reader list is never used as a grant", text)
+                self.assertIn("including ordinary content syncs and permission-only refreshes", text)
+
+    def test_discord_warning_attribute_distinguishes_current_and_pending_behavior(self):
+        warning = next(item for item in load_copy("discord")["shared_attributes"] if item["name"] == "additional_metadata.rbac_warning")
+        self.assertIn("Current production", warning["text"])
+        self.assertIn("After rollout", warning["text"])
+        self.assertIn("Successful capture clears the warning", warning["text"])
+        self.assertNotIn("A fixed note on every message", warning["text"])
 
 
 class ConnectorGraphLinksMergeTest(unittest.TestCase):
